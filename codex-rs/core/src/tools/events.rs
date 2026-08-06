@@ -4,6 +4,7 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
 use codex_apply_patch::AppliedPatchDelta;
+use codex_apply_patch::AppliedPatchFileChange;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::SandboxErr;
@@ -621,6 +622,45 @@ async fn emit_patch_end(
             }),
         )
         .await;
+
+    // File snapshots (RFC §6.3): persist the patch's pre-images so a
+    // restore to this turn recovers files the turn-start scan missed
+    // (e.g. paths outside the workspace). Exact deltas only — inexact
+    // deltas fall back to the turn-boundary checkpoints.
+    if let TurnDiffTrackerUpdate::Track { delta, .. } = &tracker_update
+        && delta.is_exact()
+        && let Some(file_snapshots) = ctx.session.file_snapshots.clone()
+    {
+        let pre_images: Vec<(PathBuf, Option<Vec<u8>>)> = delta
+            .changes()
+            .iter()
+            .filter_map(|change| {
+                // Local environments only: skip paths that don't resolve
+                // to native filesystem paths.
+                let path = change.path.to_abs_path().ok()?.to_path_buf();
+                let pre_content = match &change.change {
+                    AppliedPatchFileChange::Add {
+                        overwritten_content,
+                        ..
+                    } => overwritten_content.clone().map(String::into_bytes),
+                    AppliedPatchFileChange::Update { old_content, .. } => {
+                        Some(old_content.clone().into_bytes())
+                    }
+                    AppliedPatchFileChange::Delete { content } => {
+                        Some(content.clone().into_bytes())
+                    }
+                };
+                Some((path, pre_content))
+            })
+            .collect();
+        if !pre_images.is_empty() {
+            let turn_id = ctx.turn.sub_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                file_snapshots.attach_pre_edits_blocking(&turn_id, pre_images);
+            })
+            .await;
+        }
+    }
 
     if let Some(tracker) = ctx.turn_diff_tracker {
         let (should_emit_turn_diff, unified_diff) = {
