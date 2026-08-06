@@ -140,20 +140,39 @@ Note the continuity with existing infrastructure: `TurnDiffTracker` already reta
 
 Shell/MCP/`write_stdin`/user-`!` edits inside the workspace are captured by the *next* checkpoint; outside the workspace they are out of scope (documented limitation, same as every peer tool).
 
-### 6.4 Persistence of snapshot references
+### 6.4 Persistence: fully decoupled from the rollout
 
-Add an optional field to `TurnContextItem` (`protocol/src/protocol.rs:3283-3327`):
+The rollout format is **not modified at all**. The snapshot subsystem keeps
+its own per-thread log (`refs/<thread-id>` — an ordered list of
+`{turn_id, manifest_id}` pairs) and references the rollout's existing turn
+ids; the rollout never references the snapshot store. The join key is the
+`turn_id` already present on `TurnStarted` items, stamped onto each
+checkpoint at capture time. "The state at turn N" is by definition the
+checkpoint captured at turn N's start.
 
-```rust
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub file_snapshot: Option<FileSnapshotRef>,  // {manifest_id}
-```
+This inverted reference direction eliminates three hazards the embedded
+alternative (a `TurnContextItem` field) would carry:
+- no interaction with `TurnContextItem`'s whole-struct dedup
+  (`core/src/session/mod.rs:3689`) or its compaction reference paths;
+- nothing new persists in the rollout, so the legacy `ghost_snapshot`
+  stripper (`rollout/src/recorder.rs:1004-1128`) is irrelevant;
+- fork truncation cannot lose snapshot refs — they are not in the rollout;
+  restore resolves `(source thread_id, before_turn_id)` directly against
+  the snapshot store's log.
 
-- Forward/backward compatible: old binaries ignore it; new binaries tolerate its absence. No new match arms, no schema-generation churn (vs. a new `RolloutItem` variant: ~10 exhaustive matches + TS/Python binding regen).
-- **Caveat (verified)**: `TurnContextItem` persistence is deduped by whole-struct equality (`core/src/session/mod.rs:3689`); the field must be attached **at the persist site** (`mod.rs:3745`), *not* inside `to_turn_context_item`, or it would defeat dedup and leak into compaction reference items.
-- **Do not reuse the name `ghost_snapshot`**: `rollout/src/recorder.rs:1004-1128` actively strips legacy `ghost_snapshot` rollout lines on resume — items with that shape would be silently deleted.
+**Session tracking state needs no rollout field either**: with
+session-scoped binding (§9), the existence of a thread's snapshot log —
+created empty at session start when the feature is on — *is* the
+persisted "tracking enabled" marker. `resume` and fork consult the store.
+(If other surfaces later need to see tracking state, expose a read-only
+app-server query; still no rollout change.)
 
-The session's tracking-enabled state is persisted in session metadata so `resume` honors the state the session was created with (§9).
+Consequences accepted: refs are advisory (restore validates manifest
+existence and aborts cleanly before mutating anything if the target is
+missing); an orphan sweep removes logs for threads whose sessions are
+gone; a rollout file alone no longer carries rewind ability (snapshots
+are host-local data regardless); and `turn_id` becomes the join contract
+between the two stores.
 
 ### 6.5 Restore: backtrack integration
 
@@ -161,7 +180,7 @@ Hook: **app-server `thread_fork_inner`** (`app-server/src/request_processors/thr
 
 Restore procedure for target turn N:
 1. **Safety checkpoint** of the current tracked set → manifest S′ (this makes every subsequent step reversible, and is what enables redo).
-2. Locate turn N's manifest. **Ordering constraint (verified)**: fork-before-N truncates strictly before `TurnStarted(N)` (`core/src/thread_rollout_truncation.rs:215-221`) while N's `TurnContextItem` is persisted after it — so the ref must be read from the **source thread's untruncated history**, which `thread_fork_inner` has in hand.
+2. Locate turn N's manifest in the **snapshot store's own thread log** by `turn_id` (§6.4). The log lives outside the rollout, so fork truncation cannot lose it (fork-before-N truncates strictly before `TurnStarted(N)`, `core/src/thread_rollout_truncation.rs:215-221` — irrelevant to an external ref). Refs are advisory: a missing manifest aborts the restore cleanly before any mutation.
 3. For each entry in manifest N: restore content/mode if it differs (skip paths matched by the *current* ignore file).
 4. Deletion pass — delete only on **positive evidence of non-existence at N**: a file (present per the safety checkpoint, in scope, absent from manifest N) is deleted when either (a) manifest N was a **complete scope scan** (workspace mode — absence is definitive; this also lets redo remove files a prior restore recreated), or (b) its **birth was witnessed** (first observed in a manifest later than N). Bounded fallback-mode captures get only rule (b): with a 100-cap tracked set, absence from manifest N alone does not prove non-existence at N. Files the system has never seen are never deleted, and every deleted file is recoverable from the safety checkpoint by construction.
 5. Record fork metadata: `{forked_from: T, restored_to: N, safety: S′}`.
@@ -209,7 +228,7 @@ A second restore surface — `thread/rollback` (`core/src/session/handlers.rs:45
 |---|---|---|
 | 1 | `codex-file-snapshots` crate: stat cache, blob store (reflink-aware), manifests, refcount GC — no changes to existing code | 1–2 wk |
 | 2 | Capture wiring: turn-start + pre-tool checkpoints, `AppliedPatchDelta` pre-images, session metadata flag | 3–5 d |
-| 3 | Persistence + restore: `TurnContextItem` field, `restoreFiles` fork param, restore/deletion procedure, redo metadata | ~1 wk |
+| 3 | Restore integration: `restoreFiles` fork param (+ schema/bindings regen), restore procedure in `thread_fork_inner`, fork log inheritance, session-delete cleanup | 3–5 d |
 | 4 | Config/feature key, TUI confirmation + hints + `/status` line, insta snapshot-test updates | 3–5 d |
 
 Total ≈ 4–6 engineer-weeks for a solid v1 behind an experimental flag. A later phase can add the app-server query surface ("list snapshots for thread") that lets the IDE extension and Desktop adopt the substrate.
