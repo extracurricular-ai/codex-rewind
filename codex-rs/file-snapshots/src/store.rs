@@ -75,6 +75,71 @@ impl SnapshotStore {
         Ok(cp)
     }
 
+    /// Whether `thread_id` has a snapshot log. With session-scoped binding,
+    /// log existence *is* the persisted "tracking enabled" state (RFC §6.4).
+    pub fn thread_exists(&self, thread_id: &str) -> bool {
+        self.refs.exists(thread_id)
+    }
+
+    /// Create the (empty) snapshot log for `thread_id` if missing — called
+    /// at session start when the feature is enabled, marking the thread as
+    /// tracking for its whole lifetime.
+    pub fn ensure_thread(&self, thread_id: &str) -> Result<()> {
+        self.refs.ensure(thread_id)
+    }
+
+    /// Retroactively record a pre-edit image for `path_key` under `turn_id`
+    /// (RFC §6.3: pre-images from the apply-patch pipeline).
+    ///
+    /// If the latest manifest already covers the path (the turn-start scan
+    /// saw it) or the file did not exist before the edit (`pre_content` is
+    /// `None` — absence is already implied by absence from the manifest),
+    /// nothing is appended and `Ok(None)` is returned. Otherwise a
+    /// supplemental manifest (latest + the pre-edit entry) is appended
+    /// under the same turn id, so restoring to this turn recovers the
+    /// pre-edit content; returns its id. Restore resolution for a turn with
+    /// several entries should pick the last (most complete) one.
+    pub fn attach_pre_edit(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        path_key: &str,
+        pre_content: Option<&[u8]>,
+    ) -> Result<Option<String>> {
+        let latest = self.latest_manifest(thread_id)?.unwrap_or_default();
+        if latest.entries.contains_key(path_key) {
+            return Ok(None);
+        }
+        let Some(content) = pre_content else {
+            return Ok(None);
+        };
+
+        let hash = self.blobs.store_bytes(content)?;
+        let mut manifest = latest;
+        manifest.entries.insert(
+            path_key.to_string(),
+            crate::manifest::FileEntry {
+                // Pre-edit images come from patch content, not the
+                // filesystem: no stat is available. The zero fingerprint
+                // simply disables the stat-cache fast path for this entry.
+                mode: 0o644,
+                size: content.len() as u64,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                hash,
+            },
+        );
+        let id = self.manifests.save(&manifest)?;
+        self.refs.append(
+            thread_id,
+            SnapshotRef {
+                turn_id: turn_id.to_string(),
+                manifest_id: id.clone(),
+            },
+        )?;
+        Ok(Some(id))
+    }
+
     /// The thread's snapshot log with each manifest loaded, in capture order.
     pub fn thread_history(&self, thread_id: &str) -> Result<Vec<(SnapshotRef, Manifest)>> {
         let log = self.refs.load(thread_id)?;

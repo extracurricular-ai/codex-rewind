@@ -50,6 +50,26 @@ impl RefStore {
         Ok(())
     }
 
+    /// Whether a log file exists for `thread_id`. With session-scoped
+    /// binding, log existence *is* the persisted "tracking enabled" state.
+    pub fn exists(&self, thread_id: &str) -> bool {
+        self.log_path(thread_id).exists()
+    }
+
+    /// Create an empty log for `thread_id` if none exists — the durable
+    /// marker that this thread is tracking (RFC §6.4).
+    pub fn ensure(&self, thread_id: &str) -> Result<()> {
+        let path = self.log_path(thread_id);
+        if path.exists() {
+            return Ok(());
+        }
+        let tmp = path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(&ThreadLog::default())?;
+        fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
+        fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
+        Ok(())
+    }
+
     /// Load a thread's log; a thread with no snapshots yields an empty log.
     pub fn load(&self, thread_id: &str) -> Result<ThreadLog> {
         let path = self.log_path(thread_id);

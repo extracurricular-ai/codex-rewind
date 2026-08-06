@@ -151,3 +151,78 @@ fn restore_preserves_permissions() {
     let mode = fs::metadata(&script).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode, 0o755, "executable bit restored");
 }
+
+#[test]
+fn thread_marker_and_pre_edit_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+
+    // Log existence is the session-scoped "tracking on" marker.
+    assert!(!store.thread_exists(THREAD));
+    store.ensure_thread(THREAD).unwrap();
+    assert!(store.thread_exists(THREAD));
+    store.ensure_thread(THREAD).unwrap(); // idempotent
+
+    // Turn-start scan sees only a.txt.
+    fs::write(ws.join("a.txt"), "alpha").unwrap();
+    let cp1 = store
+        .checkpoint(THREAD, "turn-1", workspace_files(&ws).unwrap(), true)
+        .unwrap();
+
+    // Agent edits a file OUTSIDE the workspace scan: pre-image attaches
+    // retroactively under the same turn.
+    let outside = dir.path().join("outside.cfg");
+    let attached = store
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &outside.to_string_lossy(),
+            Some(b"pre-edit state"),
+        )
+        .unwrap()
+        .expect("new path should attach");
+    fs::write(&outside, "post-edit state").unwrap();
+
+    // Already covered by the scan → no-op. Born-by-edit (no pre-image) → no-op.
+    assert!(
+        store
+            .attach_pre_edit(
+                THREAD,
+                "turn-1",
+                &ws.join("a.txt").to_string_lossy(),
+                Some(b"x")
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None)
+            .unwrap()
+            .is_none()
+    );
+
+    // The supplemental manifest extends the turn-start one.
+    let history = store.thread_history(THREAD).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].0.turn_id, "turn-1");
+    assert_eq!(history[1].0.manifest_id, attached);
+    assert!(history[1].1.entries.len() == cp1.manifest.entries.len() + 1);
+
+    // Restoring to the supplemental manifest recovers the pre-edit content.
+    store
+        .restore_to(
+            THREAD,
+            &attached,
+            workspace_files(&ws)
+                .unwrap()
+                .into_iter()
+                .chain([outside.clone()]),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+    assert_eq!(read(&outside), "pre-edit state");
+}
