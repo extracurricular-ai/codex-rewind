@@ -522,6 +522,17 @@ pub struct ThreadForkParams {
     #[ts(optional = nullable)]
     pub before_turn_id: Option<String>,
 
+    /// Also restore tracked workspace files to their state at the fork
+    /// point, using the source thread's file snapshots. Requires
+    /// `before_turn_id`; only effective when the source thread has file
+    /// snapshot tracking enabled. Restore is advisory: if no snapshot
+    /// exists for the fork point the fork still succeeds without touching
+    /// files. A safety checkpoint of the pre-restore state is recorded on
+    /// the source thread first, so the restore is always reversible.
+    #[experimental("thread/fork.restoreFiles")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restore_files: bool,
+
     /// [UNSTABLE] Specify the rollout path to fork from.
     /// If specified, the thread_id param will be ignored.
     #[experimental("thread/fork.path")]

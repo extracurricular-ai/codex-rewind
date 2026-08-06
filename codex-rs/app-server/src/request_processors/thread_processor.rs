@@ -14,6 +14,8 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::protocol::ThreadHistoryMode;
+use std::collections::BTreeSet;
+use std::path::Path;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 pub(super) const THREAD_LIST_MAX_LIMIT: usize = 100;
@@ -4019,6 +4021,7 @@ impl ThreadRequestProcessor {
             thread_id,
             last_turn_id,
             before_turn_id,
+            restore_files,
             path,
             model,
             model_provider,
@@ -4054,6 +4057,14 @@ impl ThreadRequestProcessor {
         if last_turn_id.is_some() && before_turn_id.is_some() {
             return Err(invalid_request(
                 "`beforeTurnId` cannot be combined with `lastTurnId`",
+            ));
+        }
+        if restore_files && before_turn_id.is_none() {
+            return Err(invalid_request("`restoreFiles` requires `beforeTurnId`"));
+        }
+        if restore_files && paginated_source {
+            return Err(invalid_request(
+                "`restoreFiles` is not supported for paginated threads",
             ));
         }
         if ephemeral && defer_goal_continuation {
@@ -4293,6 +4304,28 @@ impl ThreadRequestProcessor {
             app_server_client_version,
         )
         .await?;
+        if restore_files && let Some(before_turn_id) = before_turn_id.as_deref() {
+            // Awaited so the client observes restored files when the fork
+            // response arrives. Failures are advisory: the fork stands.
+            let codex_home = self.config.codex_home.to_path_buf();
+            let source = source_thread_id.to_string();
+            let forked = thread_id.to_string();
+            let turn = before_turn_id.to_string();
+            let cwd = source_thread.cwd.clone();
+            match tokio::task::spawn_blocking(move || {
+                restore_files_for_fork(&codex_home, &source, &forked, &turn, &cwd)
+            })
+            .await
+            {
+                Ok(Ok(summary)) => tracing::info!("thread/fork restoreFiles: {summary}"),
+                Ok(Err(err)) => {
+                    tracing::warn!("thread/fork restoreFiles failed (fork unaffected): {err}");
+                }
+                Err(join_err) => {
+                    tracing::warn!("thread/fork restoreFiles task failed: {join_err}");
+                }
+            }
+        }
         if session_configured.rollout_path.is_some()
             && let Some(name) = source_thread_name.clone()
         {
@@ -5132,6 +5165,87 @@ fn thread_store_archive_error(operation: &str, err: ThreadStoreError) -> JSONRPC
         } => unsupported_thread_store_operation(unsupported_operation),
         err => internal_error(format!("failed to {operation} session: {err}")),
     }
+}
+
+/// Restore tracked workspace files to the fork point and inherit the
+/// snapshot log into the forked thread (`thread/fork.restoreFiles`,
+/// RFC in docs/rfc-file-snapshot-rewind.md §6.5). Blocking — run via
+/// `spawn_blocking`. Advisory by design: every failure path leaves the
+/// already-created fork intact and is reported to the caller for logging.
+fn restore_files_for_fork(
+    codex_home: &Path,
+    source_thread_id: &str,
+    new_thread_id: &str,
+    before_turn_id: &str,
+    source_cwd: &Path,
+) -> Result<String, String> {
+    use codex_file_snapshots::SnapshotStore;
+    use codex_file_snapshots::find_workspace_root;
+    use codex_file_snapshots::is_ignored;
+    use codex_file_snapshots::load_ignore;
+    use codex_file_snapshots::workspace_files;
+
+    let store =
+        SnapshotStore::open(codex_home.join("file_snapshots")).map_err(|e| e.to_string())?;
+    if !store.thread_exists(source_thread_id) {
+        return Ok("source thread is not tracking file snapshots; nothing restored".to_string());
+    }
+    // Inherit first: the forked thread becomes a tracking thread sharing
+    // the source's manifests up to the fork point, regardless of whether a
+    // restore is possible below.
+    let inherited = store
+        .inherit_log(source_thread_id, new_thread_id, before_turn_id)
+        .map_err(|e| e.to_string())?;
+    let Some(target) = store
+        .manifest_id_for_turn(source_thread_id, before_turn_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(format!(
+            "no snapshot recorded for turn {before_turn_id}; forked without file restore ({inherited} log entries inherited)"
+        ));
+    };
+
+    // Safety-checkpoint scope: the current workspace scan (when a root is
+    // found) plus every path the thread ever observed — the latter covers
+    // outside-workspace files recorded via pre-edit attach.
+    let markers = vec![".git".to_string()];
+    let root = find_workspace_root(source_cwd, &markers);
+    let mut files: BTreeSet<PathBuf> = match &root {
+        Some(root) => workspace_files(root)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect(),
+        None => BTreeSet::new(),
+    };
+    files.extend(
+        store
+            .tracked_paths(source_thread_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(PathBuf::from),
+    );
+
+    // Protection follows the *current* ignore rules (RFC correctness rule 5).
+    let ignore = root.as_ref().map(|root| load_ignore(root));
+    let is_protected = move |key: &str| {
+        ignore
+            .as_ref()
+            .is_some_and(|ig| is_ignored(ig, Path::new(key)))
+    };
+
+    let outcome = store
+        .restore_to(
+            source_thread_id,
+            &target,
+            files,
+            /*current_complete*/ root.is_some(),
+            &is_protected,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "restored files to turn {before_turn_id}: {} written, {} deleted; safety checkpoint {}; {inherited} log entries inherited",
+        outcome.stats.written, outcome.stats.deleted, outcome.safety_manifest_id
+    ))
 }
 
 fn set_thread_name_from_title(thread: &mut Thread, title: String) {

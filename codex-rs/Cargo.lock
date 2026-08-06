@@ -2015,6 +2015,7 @@ dependencies = [
  "codex-features",
  "codex-feedback",
  "codex-file-search",
+ "codex-file-snapshots",
  "codex-file-watcher",
  "codex-git-attribution",
  "codex-git-utils",
