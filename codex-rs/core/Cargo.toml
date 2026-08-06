@@ -40,6 +40,7 @@ codex-extension-api = { workspace = true }
 codex-extension-items = { workspace = true }
 codex-features = { workspace = true }
 codex-feedback = { workspace = true }
+codex-file-snapshots = { workspace = true }
 codex-file-system = { workspace = true }
 codex-login = { workspace = true }
 codex-memories-read = { workspace = true }

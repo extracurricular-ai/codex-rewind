@@ -261,6 +261,24 @@ pub(crate) async fn run_turn(
         TurnDiffTracker::with_environment_display_roots(display_roots),
     ));
 
+    // Turn-start file snapshot (RFC §6.3): capture the tracked state before
+    // the model acts, so backtrack can restore to this boundary. Awaited so
+    // the checkpoint reflects true turn-start state; incremental via the
+    // stat cache. Local environments only — the first turn environment
+    // whose cwd resolves to a native path.
+    if let Some(file_snapshots) = sess.file_snapshots.clone()
+        && let Some(local_cwd) = first_step_context
+            .environments
+            .turn_environments()
+            .find_map(|environment| environment.cwd().to_abs_path().ok())
+    {
+        let turn_id = turn_context.sub_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            file_snapshots.checkpoint_turn_start_blocking(&turn_id, &local_cwd.to_path_buf());
+        })
+        .await;
+    }
+
     // `ModelClientSession` is turn-scoped and caches WebSocket + sticky routing state, so we reuse
     // one instance across retries within this turn.
     // Pending input is drained into history before building the next model request.

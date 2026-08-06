@@ -9,6 +9,7 @@
 
 mod blob;
 mod checkpoint;
+mod controller;
 mod error;
 mod manifest;
 mod refs;
@@ -20,6 +21,7 @@ pub use blob::BlobStore;
 pub use checkpoint::Checkpoint;
 pub use checkpoint::CheckpointStats;
 pub use checkpoint::capture;
+pub use controller::FileSnapshotsController;
 pub use error::Result;
 pub use error::SnapshotError;
 pub use manifest::FileEntry;

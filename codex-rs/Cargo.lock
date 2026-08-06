@@ -2731,6 +2731,7 @@ dependencies = [
  "codex-extension-items",
  "codex-features",
  "codex-feedback",
+ "codex-file-snapshots",
  "codex-file-system",
  "codex-git-utils",
  "codex-home",
@@ -3199,6 +3200,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

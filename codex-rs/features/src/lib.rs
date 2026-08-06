@@ -150,6 +150,8 @@ pub enum Feature {
     LocalThreadStoreCompression,
     /// Enable the Chronicle sidecar for passive screen-context memories.
     Chronicle,
+    /// Track per-turn file snapshots so backtrack can restore workspace state.
+    FileSnapshots,
     /// Compress request bodies (zstd) when sending streaming requests to codex-backend.
     EnableRequestCompression,
     /// Start the managed network proxy for sandboxed sessions.
@@ -1009,6 +1011,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Chronicle,
         key: "chronicle",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::FileSnapshots,
+        key: "file_snapshots",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
