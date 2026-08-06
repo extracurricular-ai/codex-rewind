@@ -140,6 +140,60 @@ impl SnapshotStore {
         Ok(Some(id))
     }
 
+    /// Resolve "the state at `turn_id`'s start" to a manifest id: the
+    /// **last** log entry recorded under that turn id (later entries for a
+    /// turn are supplemental pre-edit attaches extending the turn-start
+    /// scan, so last = most complete). `None` if the turn has no snapshot.
+    pub fn manifest_id_for_turn(&self, thread_id: &str, turn_id: &str) -> Result<Option<String>> {
+        let log = self.refs.load(thread_id)?;
+        Ok(log
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.turn_id == turn_id)
+            .map(|entry| entry.manifest_id.clone()))
+    }
+
+    /// Union of every path key observed across the thread's manifests.
+    /// Used to build the safety-checkpoint scope for a restore: it covers
+    /// outside-workspace paths recorded via pre-edit attach that a plain
+    /// workspace scan would miss.
+    pub fn tracked_paths(&self, thread_id: &str) -> Result<std::collections::BTreeSet<String>> {
+        let mut out = std::collections::BTreeSet::new();
+        for (_, manifest) in self.thread_history(thread_id)? {
+            out.extend(manifest.entries.into_keys());
+        }
+        Ok(out)
+    }
+
+    /// Fork inheritance (RFC §6.5): copy the source thread's log entries up
+    /// to and including the **last** entry for `through_turn_id` into
+    /// `new_thread_id`'s log. Creates the new log if missing (which also
+    /// marks the forked thread as tracking). Manifests are shared, not
+    /// copied — GC marks from every log. Returns the number of entries
+    /// inherited; 0 if the source has no entry for that turn.
+    pub fn inherit_log(
+        &self,
+        source_thread_id: &str,
+        new_thread_id: &str,
+        through_turn_id: &str,
+    ) -> Result<usize> {
+        let log = self.refs.load(source_thread_id)?;
+        let Some(cut) = log
+            .entries
+            .iter()
+            .rposition(|entry| entry.turn_id == through_turn_id)
+        else {
+            self.refs.ensure(new_thread_id)?;
+            return Ok(0);
+        };
+        self.refs.ensure(new_thread_id)?;
+        for entry in &log.entries[..=cut] {
+            self.refs.append(new_thread_id, entry.clone())?;
+        }
+        Ok(cut + 1)
+    }
+
     /// The thread's snapshot log with each manifest loaded, in capture order.
     pub fn thread_history(&self, thread_id: &str) -> Result<Vec<(SnapshotRef, Manifest)>> {
         let log = self.refs.load(thread_id)?;

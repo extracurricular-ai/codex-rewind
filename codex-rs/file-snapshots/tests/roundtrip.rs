@@ -226,3 +226,55 @@ fn thread_marker_and_pre_edit_attach() {
         .unwrap();
     assert_eq!(read(&outside), "pre-edit state");
 }
+
+#[test]
+fn turn_resolution_and_fork_inheritance() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store
+        .checkpoint(THREAD, "turn-1", workspace_files(&ws).unwrap(), true)
+        .unwrap();
+    // Supplemental attach under the same turn: resolution must pick it.
+    let outside = dir.path().join("ext.cfg");
+    let supplemental = store
+        .attach_pre_edit(THREAD, "turn-1", &outside.to_string_lossy(), Some(b"pre"))
+        .unwrap()
+        .unwrap();
+    fs::write(ws.join("a.txt"), "v2").unwrap();
+    store
+        .checkpoint(THREAD, "turn-2", workspace_files(&ws).unwrap(), true)
+        .unwrap();
+
+    assert_eq!(
+        store.manifest_id_for_turn(THREAD, "turn-1").unwrap(),
+        Some(supplemental.clone()),
+        "last entry for the turn wins"
+    );
+    assert_eq!(store.manifest_id_for_turn(THREAD, "nope").unwrap(), None);
+
+    // tracked_paths covers the outside-workspace attach.
+    let paths = store.tracked_paths(THREAD).unwrap();
+    assert!(paths.contains(&outside.to_string_lossy().into_owned()));
+    assert!(paths.iter().any(|p| p.ends_with("a.txt")));
+
+    // Fork inherits entries through turn-1 (scan + supplemental), not turn-2.
+    let inherited = store.inherit_log(THREAD, "fork-1", "turn-1").unwrap();
+    assert_eq!(inherited, 2);
+    assert!(store.thread_exists("fork-1"));
+    let fork_history = store.thread_history("fork-1").unwrap();
+    assert_eq!(fork_history.len(), 2);
+    assert_eq!(fork_history.last().unwrap().0.manifest_id, supplemental);
+
+    // Unknown turn: log created (tracking marker) but nothing inherited.
+    assert_eq!(store.inherit_log(THREAD, "fork-2", "nope").unwrap(), 0);
+    assert!(store.thread_exists("fork-2"));
+
+    // Shared manifests survive GC while either thread references them.
+    store.remove_thread(THREAD).unwrap();
+    let gc = store.gc().unwrap();
+    assert!(gc.manifests_kept >= 2, "fork-1 still references manifests");
+}
