@@ -1,0 +1,227 @@
+# RFC: A Cross-Surface File Snapshot & Rewind Subsystem for Codex (git-free)
+
+- **Status**: Draft for discussion
+- **Demand**: [#9203](https://github.com/openai/codex/issues/9203) (373 👍, "Please make /undo back"), [#11626](https://github.com/openai/codex/issues/11626) (196 👍, "/rewind restoring both chat and code"), [#2788](https://github.com/openai/codex/issues/2788), [#3585](https://github.com/openai/codex/issues/3585), [#19205](https://github.com/openai/codex/issues/19205) ("Undo should never depend on Git"), [#22100](https://github.com/openai/codex/issues/22100), [#27636](https://github.com/openai/codex/issues/27636)
+- **Cross-surface pain this addresses**: [#29388](https://github.com/openai/codex/issues/29388) (Desktop checkpoint blobs: 102 GB, no GC), [#28241](https://github.com/openai/codex/issues/28241) (Desktop turn-diff refs break libgit2 clients), [#4535](https://github.com/openai/codex/issues/4535) / [#15367](https://github.com/openai/codex/issues/15367) / [#2998](https://github.com/openai/codex/issues/2998) (IDE undo toolbar scope & reliability)
+- **History**: #8214 (undo data-loss incident), PR #8424 (un-ship undo), PR #19481 (remove ghost snapshots)
+- **Scope**: `codex-rs` (core + app-server capability; TUI as first consumer)
+
+---
+
+## 1. Summary
+
+Codex today has **three divergent, each-partially-broken checkpoint mechanisms across its surfaces** — and none of them lets a user rewind conversation and workspace state together. This RFC proposes one **opt-in, git-free file snapshot subsystem** in `codex-rs` core, exposed through the app-server protocol, that every surface can consume:
+
+- the **CLI/TUI** backtrack flow (double-Esc) gains "also restore files" — the tracker's highest-voted open request (#9203, #11626);
+- the **IDE extension** gains a reliable substrate for its undo/changes toolbar, covering shell-made edits its current edit-tool-scoped tracking misses (#4535, #15367);
+- **Desktop** gains a storage backend that does not write unbounded git objects into the user's own repository (#29388, #28241).
+
+Snapshots are captured incrementally at turn boundaries and before tool executions, stored in a content-addressed store under `CODEX_HOME` (never in the user's repo, never touching the user's git state), scoped by a dedicated versioned ignore file, and garbage-collected by reference counting tied to session lifetime.
+
+The design synthesizes what works in peer tools and answers, point by point, the failure modes that killed Codex's own ghost-commit feature (PR #19481):
+
+| | Claude Code `file-history` | opencode shadow-git | Codex ghost commits (removed) | Codex Desktop turn-diffs (today) | **This proposal** |
+|---|---|---|---|---|---|
+| Storage | plain per-file copies | shadow git repo | dangling commits in the **user's** repo | git objects in the **user's** repo | content-addressed store in `CODEX_HOME` |
+| Requires git | no | yes | yes | yes | **no** |
+| Touches user git state | no | no | **yes** (object DB) | **yes** (refs + objects; breaks libgit2 clients, #28241) | **no** |
+| Coverage | only tool-edited files | whole worktree | whole repo | whole tree per capture | workspace + tool-edited files outside it |
+| Scope control | none | `.gitignore` (inflexible) | `.gitignore` + hardcoded lists | none (#29388: databases/models snapshotted) | **dedicated versioned ignore file** |
+| Change detection | mtime/content per file | git index stat cache | **throwaway temp index (no cache)** | full-tree blob writes | own persistent stat cache |
+| GC | 100-snapshot cap | `git gc` 7-day prune | n/a | **none — 102 GB incident** | refcount, tied to session lifetime |
+| Redo | no | yes | no | n/a | yes (fork model + safety checkpoint) |
+| Conversation integration | yes | yes | **no (file-only)** | no | yes (backtrack/fork integration) |
+
+## 2. Motivation
+
+### 2.1 The demand is the top of the tracker
+
+#9203 (373 👍) asks for `/undo` back; #11626 (196 👍) asks for exactly this feature — checkpoint restore covering both chat context and Codex-applied edits. The motivating incidents are consistent: Codex deletes or overwrites files that are untracked or uncommitted in git, and the user has no recourse.
+
+### 2.2 Three surfaces, three divergent mechanisms, all partially broken
+
+| Surface | Today | Failure mode |
+|---|---|---|
+| CLI/TUI | conversation-only backtrack (fork) | files stay at latest state → *old-context/new-files mismatch* (#22100): the model reasons from a conversation state that predates files it sees on disk |
+| Desktop | full-tree git-object checkpoints under `refs/codex/turn-diffs/` **inside the user's repo** | no scope control, no GC: 102 GB of orphan objects on a 5.7 GB project (#29388); non-standard refs break libgit2-based tools (#28241) |
+| IDE extension | edit-tool-scoped "View changes / Undo" toolbar | toolbar silently disappears when the model edits via shell (`cat`/`python`) instead of the edit tool (#4535); unreliable undo (#3567, #3104, #15367) |
+
+The team has acknowledged this is an active product area — on #4535: *"we're in the process of trying to make this more robust through both model and product work"*, and on #2998: *"We will also be iterating on this surface over time."* This RFC is intended as concrete input to that work: the three surfaces are each missing the same underlying capability, and each has independently grown a partial, mutually inconsistent substitute. That is precisely the "consistency across all Codex surfaces" concern from `docs/contributing.md` — as an argument **for** building the capability once, in core.
+
+Notably, the #29388 reporter's own suggested fix ("store checkpoints in a separate repository under `~/.codex/`") converges on the storage model proposed here.
+
+### 2.3 Git is not an acceptable foundation for this
+
+A safety net that only works for git users, only inside repos, and only for git-visible files fails precisely the users who need it most (#19205; the #9203 incidents are about *untracked* files). Worse, both git-based attempts so far entangled Codex with user-owned git state: ghost commits wrote to the user's object DB and the restore path caused the #8214 index-clobbering data loss; Desktop's turn-diff refs bloat the user's repo and break third-party tooling. The lesson is not "be more careful with git" — it is that **session history belongs to Codex's own state directory, not the user's repository**.
+
+## 3. Post-mortem of ghost commits, and how this design answers it
+
+The removed feature (`Feature::GhostCommit`, key `"undo"`) died of three specific causes. Each maps to a design decision here:
+
+### Death cause 1: it manipulated user-owned git state
+Ghost commits wrote dangling commit objects into the user's real repository and restore touched the user's index. Two days after the #8214 data-loss fix, the feature was un-shipped (PR #8424).
+
+> **Answer**: zero interaction with the user's git state. Snapshots live entirely under `CODEX_HOME/file_snapshots/`. Restore writes file contents only; it never runs git, never touches `.git`. (This also resolves the #29388/#28241 class of problems for any surface that adopts the subsystem.)
+
+### Death cause 2: snapshot latency
+Each snapshot ran `git status --untracked-files=all` (full tree walk) plus a **throwaway temporary index** (`GIT_INDEX_FILE` in a tempdir: `read-tree HEAD` → `add --all` → `write-tree`) — deliberately avoiding the user's index for safety, and thereby forfeiting git's stat cache. Every snapshot re-hashed changed files from scratch. The resulting slowness forced async execution, a mutating-tool readiness gate, a 240-second watchdog, and hardcoded exclusion lists (10 MiB files, 200-file dirs, `node_modules`/`.venv`/…).
+
+> **Answer**: a **persistent stat cache owned by the snapshot subsystem** — the manifest records `(path, size, mtime, content_hash)`; a checkpoint stats the tracked set and re-hashes only entries whose stat fingerprint changed. This is exactly the mechanism that makes `git status` fast, reclaimed without the safety conflict that forbade ghost commits from using it. Combined with a bounded tracked set (§6.2), checkpoints are a fast stat-walk and can run synchronously — eliminating the gate/watchdog complexity entirely.
+
+### Death cause 3: untracked-file bookkeeping
+Because ghost snapshots were *partial* (size/dir exclusions), restore needed fragile `preexisting_untracked_files/dirs` bookkeeping to know which files it could safely delete.
+
+> **Answer**: three structural rules replace the bookkeeping (§7): full rescan at every checkpoint (the manifest *is* the existence inventory), a **safety checkpoint immediately before any restore** (deletion is always recoverable), and a **witnessed-birth deletion rule** (only delete files whose creation the snapshot system actually observed).
+
+## 4. Architectural fit: a core capability, client-consumed
+
+Codex's protocol has twice codified that history rewind does not revert files — `Op::ThreadRollback` and the v2 `thread/rollback` docs both state: *"Clients are responsible for undoing any edits on disk."* This RFC does **not** propose reversing that division of responsibility. It proposes giving clients the shared infrastructure the doctrine currently assumes but no surface actually has:
+
+- **Core** owns capture (it is the only layer that sees tool execution and turn boundaries) and the snapshot store.
+- **Clients decide** when and whether to restore. The TUI's backtrack confirmation is the first consumer; the app-server protocol exposes the capability (a `restoreFiles` opt-in on `thread/fork`, plus a small query surface for "what snapshots exist for this thread") so the IDE extension and Desktop can consume the same substrate instead of maintaining their own divergent mechanisms.
+- Nothing changes for clients that ignore the capability; the feature is opt-in at both the config level and the per-restore level.
+
+This inverts the current situation — where the doctrine says "clients are responsible" but clients have nothing to be responsible *with* — without moving the responsibility boundary.
+
+## 5. Goals and non-goals
+
+**Goals**
+1. One snapshot subsystem usable by every surface; TUI backtrack is the first consumer (restore workspace files and conversation together).
+2. No git dependency; works in non-git directories; never touches user git state.
+3. User-controlled tracking scope via a dedicated, versioned ignore file.
+4. Cover files modified by shell commands (within the workspace) via checkpoint rescans; cover tool edits outside the workspace via track-on-edit.
+5. Redo: no restore is ever irreversible.
+6. Opt-in, with disk usage visible and a clean degradation story when off.
+
+**Non-goals (v1)**
+- Restoring files modified by shell/MCP *outside* the workspace scope (unobservable).
+- Remote/cloud environments (`RemoteFileSystem`/`PathUri` paths) — v1 is local-only.
+- Migrating Desktop/IDE onto the subsystem — v1 only ensures the capability is exposed where they could adopt it.
+- Sub-file delta storage (chunking). The blob store interface is designed so content-defined chunking (FastCDC, as in restic/borg and Hugging Face's Xet) can be added later without changing callers.
+- A standalone `/undo` command. v1 integrates with backtrack; a dedicated command can come later.
+
+## 6. Design
+
+### 6.1 Storage: content-addressed store + manifests + stat cache
+
+```
+CODEX_HOME/file_snapshots/
+  blobs/<xx>/<hash>          # content-addressed file contents (dedup for free)
+  manifests/<manifest-id>    # one per checkpoint: [(path, mode, size, mtime, hash)]
+  refs/<thread-id>           # thread → list of (turn_id, manifest-id) + refcounts
+```
+
+- **Checkpoint** = stat-walk of the tracked set; entries whose `(size, mtime)` match the previous manifest reuse its hash (no read); changed/new entries are hashed and their blobs stored if absent. Result: a new manifest (itself content-addressed — identical states dedup to one manifest).
+- Large-file copies attempt reflink (`copy_file_range` / FICLONE) first, falling back to plain copy — O(1) large-file snapshots on btrfs/XFS/APFS.
+- Naming note: "snapshot" is already overloaded in this codebase (`shell_snapshot` feature, insta test snapshots). The crate and feature use **`file_snapshots`** consistently.
+
+### 6.2 Scope: workspace resolution + seed tracking + ignore file
+
+**Workspace root resolution** (git-style walk-up, reusing `project_root_markers` config and `codex-file-system/src/find_up.rs`):
+1. Walk up from cwd looking for a project marker. If found → workspace mode: the tracked set is the workspace subtree, filtered by the ignore file.
+2. No marker → **fallback mode** with seeded tracking: if the directory holds ≤ 50 eligible files, track all; otherwise seed with the 30 most recently modified. The set then grows via track-on-edit, hard-capped at **100 tracked files**. (These guardrails replace the old hardcoded exclusion lists — activity-based rather than attribute-based. They are also what Desktop's mechanism is missing when it snapshots databases and model weights, #29388.)
+
+**Dedicated ignore file** (gitignore syntax via the `ignore` crate, already a workspace dependency — parse as in `file-search/src/lib.rs:370-384`):
+- Separate from `.gitignore` by design: session history may legitimately track files git ignores (scratch notes, generated docs) — and vice versa.
+- **Symmetric semantics**: an ignored path is never snapshotted, never restored, and **never deleted** by a restore. Ignore means invisible in both directions. This one rule replaces the entire `preexisting_untracked` bookkeeping class of the old design.
+- **Versioned like `.gitignore`**: the ignore file itself is tracked. At restore time, the *current* ignore file governs protection; if the restore replaces the ignore file, subsequent operations follow the restored rules. Rules never change mid-operation.
+
+**Outside the workspace**: track-on-edit — files the agent's own tools modify are tracked by absolute path, captured from pre-images already available in the apply-patch pipeline (§6.3). The bulk rescan never leaves the workspace.
+
+### 6.3 Capture points
+
+| When | Mechanism | Cost |
+|---|---|---|
+| Turn start (each user message) | full checkpoint of tracked set, in `run_turn` next to `TurnDiffTracker` instantiation (`core/src/session/turn.rs:~256`) | stat-walk |
+| Before each tool execution (incl. shell) | incremental checkpoint | stat-walk |
+| Per structured edit | **free pre-images**: `AppliedPatchDelta` already carries pre-edit content keyed by absolute path (`apply-patch/src/lib.rs:224-245`); persist it where `track_delta` is invoked (`core/src/tools/events.rs:625-654`) via a store handle sibling to `SharedTurnDiffTracker` in `ToolInvocation` (`tools/context.rs:59-71`). Fallback to an eager read when `delta.is_exact() == false`. | ~zero |
+
+Note the continuity with existing infrastructure: `TurnDiffTracker` already retains per-turn pre-images in memory (`baseline_by_path`) for diff display; this subsystem persists the same class of data durably, and closes the gap `TurnDiffTracker` deliberately leaves open (shell-made edits, which it invalidates on) via checkpoint rescans — the same gap that hides the IDE extension's undo toolbar (#4535).
+
+Shell/MCP/`write_stdin`/user-`!` edits inside the workspace are captured by the *next* checkpoint; outside the workspace they are out of scope (documented limitation, same as every peer tool).
+
+### 6.4 Persistence of snapshot references
+
+Add an optional field to `TurnContextItem` (`protocol/src/protocol.rs:3283-3327`):
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub file_snapshot: Option<FileSnapshotRef>,  // {manifest_id}
+```
+
+- Forward/backward compatible: old binaries ignore it; new binaries tolerate its absence. No new match arms, no schema-generation churn (vs. a new `RolloutItem` variant: ~10 exhaustive matches + TS/Python binding regen).
+- **Caveat (verified)**: `TurnContextItem` persistence is deduped by whole-struct equality (`core/src/session/mod.rs:3689`); the field must be attached **at the persist site** (`mod.rs:3745`), *not* inside `to_turn_context_item`, or it would defeat dedup and leak into compaction reference items.
+- **Do not reuse the name `ghost_snapshot`**: `rollout/src/recorder.rs:1004-1128` actively strips legacy `ghost_snapshot` rollout lines on resume — items with that shape would be silently deleted.
+
+The session's tracking-enabled state is persisted in session metadata so `resume` honors the state the session was created with (§9).
+
+### 6.5 Restore: backtrack integration
+
+Hook: **app-server `thread_fork_inner`** (`app-server/src/request_processors/thread_processor.rs:4214-4296`) — the only place that simultaneously holds `before_turn_id`, the source rollout, cwd, and (post-fork) the new thread id. Gated by a new opt-in `ThreadForkParams` flag (e.g. `restoreFiles`), set by the TUI from the backtrack confirmation (`tui/src/app_backtrack.rs:187-204` → `event_dispatch.rs:284-362` → `app_server_session.rs:704-810`). Because the hook lives in app-server rather than the TUI, **any** protocol client (IDE, Desktop) gets the same capability for free.
+
+Restore procedure for target turn N:
+1. **Safety checkpoint** of the current tracked set → manifest S′ (this makes every subsequent step reversible, and is what enables redo).
+2. Locate turn N's manifest. **Ordering constraint (verified)**: fork-before-N truncates strictly before `TurnStarted(N)` (`core/src/thread_rollout_truncation.rs:215-221`) while N's `TurnContextItem` is persisted after it — so the ref must be read from the **source thread's untruncated history**, which `thread_fork_inner` has in hand.
+3. For each entry in manifest N: restore content/mode if it differs (skip paths matched by the *current* ignore file).
+4. Deletion pass — **witnessed-birth rule**: delete a file only if it is (a) in tracking scope, (b) absent from manifest N, and (c) **first observed in a manifest later than N** (its birth was witnessed). Files the system has never seen are never deleted. Because tracking-set membership varies over time (100-cap), "absent from manifest N" alone does not prove "did not exist at N"; the birth requirement closes that hole.
+5. Record fork metadata: `{forked_from: T, restored_to: N, safety: S′}`.
+
+**Redo** falls out of the fork model: the original thread T is preserved by design (source-preserving branch), so conversation redo is "go back to T"; file redo is "restore manifest S′". No soft-revert state machine needed.
+
+A second restore surface — `thread/rollback` (`core/src/session/handlers.rs:451-553`) — can reuse steps 1–4 after `apply_rollout_reconstruction`; v1 may defer this (the API is deprecated in favor of `thread/fork`).
+
+### 6.6 Known coverage gaps (documented, not hidden)
+
+- Shell/MCP edits **outside** the workspace: unobservable (same as all peer tools). UX must state restores are scoped.
+- Sub-agent threads: their edits are keyed to their own turn ids; restoring a parent turn should aggregate descendant-thread manifests spawned during that turn (`thread_id` vs `session_id`, `core/src/session/session.rs:495-501`). v1 may restrict backtrack-restore to threads without sub-agents and lift the restriction later.
+- Steered mid-turn messages have no `TurnStarted` of their own; backtrack already refuses to fork at steer prompts (`app_backtrack.rs:552-553`) — consistent, documented.
+- Remote environments: paths are `PathUri` via `RemoteFileSystem` — v1 skips capture/restore for non-local environments explicitly.
+- Paginated-history threads take the `prepare_fork`/`ForkBoundary` path (`thread_processor.rs:4074-4105`); v1 excludes them explicitly.
+
+## 7. Correctness rules (summary)
+
+1. **Never touch user git state.** No exceptions.
+2. **Safety checkpoint before every restore.** Deletion is therefore always recoverable.
+3. **Witnessed-birth deletion.** Never delete a file whose creation was not observed.
+4. **Symmetric ignore.** Ignored paths are never snapshotted, restored, or deleted.
+5. **Current ignore wins at restore start**; a restored ignore file governs from the next operation on.
+6. **Never-tracked files are never modified in any direction.**
+
+## 8. Garbage collection
+
+- Manifests reference blobs; thread refs reference manifests; all refcounted.
+- **Snapshot lifetime = session lifetime**: deleting a session drops its refs; orphaned manifests/blobs are removed. No timers, no retention windows (the `shell_snapshots` 3-day sweep pattern is explicitly *not* copied — it would break restore for older forks; #29388 is the no-GC failure mode this rules out by construction).
+- Forked threads share manifests with their source via refcounts — cheap and correct.
+
+## 9. Configuration & UX
+
+- **Feature key `file_snapshots`** (new key; `Stage::Experimental` → appears in the `/experimental` menu automatically, CLI `--enable file_snapshots` works for free). The retired `"undo"` key is **not** reused: old configs in the wild still carry materialized `undo = <bool>` values that would silently re-bind (`features/src/lib.rs:488-490, 760-781`).
+- **Config section `[file_snapshots]`** cloned from the `GhostSnapshotConfig` plumbing pattern (`config_toml.rs:733-744`) — but as a *new* struct: `GhostSnapshotConfig` is public API via `core-api/src/lib.rs:44` and stays untouched.
+- **Session-scoped binding**: the toggle answers one question — *do NEW sessions track?* Enabling does not affect existing sessions; disabling does not stop sessions already tracking. A session's snapshot chain is therefore always complete-from-turn-1 or absent, and the state is persisted with the session so `resume`/fork honor it. No mid-session partial states exist.
+- **Disk disclosure** in the toggle description: enabling uses additional disk under `CODEX_HOME/file_snapshots/` (content-addressed, deduped).
+- **Usage visibility**: `/status` shows the store's current size.
+- **Discoverability hint**: when backtracking with the feature off, the confirmation shows one line — "file changes will not be restored (enable `file_snapshots` in /experimental)".
+- Deliberately omitted (v1): size caps, prune commands, retention settings — refcount GC plus bounded tracking keeps growth in check; add knobs only if real usage demands them.
+
+## 10. Phasing & effort
+
+| Phase | Content | Est. |
+|---|---|---|
+| 1 | `codex-file-snapshots` crate: stat cache, blob store (reflink-aware), manifests, refcount GC — no changes to existing code | 1–2 wk |
+| 2 | Capture wiring: turn-start + pre-tool checkpoints, `AppliedPatchDelta` pre-images, session metadata flag | 3–5 d |
+| 3 | Persistence + restore: `TurnContextItem` field, `restoreFiles` fork param, restore/deletion procedure, redo metadata | ~1 wk |
+| 4 | Config/feature key, TUI confirmation + hints + `/status` line, insta snapshot-test updates | 3–5 d |
+
+Total ≈ 4–6 engineer-weeks for a solid v1 behind an experimental flag. A later phase can add the app-server query surface ("list snapshots for thread") that lets the IDE extension and Desktop adopt the substrate.
+
+## 11. Open questions
+
+1. Eviction policy when the 100-file cap is hit in fallback mode (proposal: evict least-recently-changed; never evict files touched by the agent's own edits).
+2. Should turn-start checkpoints be per-user-message only, or also before every shell execution by default (finer intra-turn granularity at slightly higher stat-walk cost)?
+3. Future: per-pattern attribute routing in the ignore file (`full` / `stub` / `ignore`, LFS-attributes-style) so large binaries can be tracked as metadata-only stubs instead of excluded — directly relevant to the #29388 "databases and model weights" case.
+4. Future: content-defined chunking (FastCDC) behind the blob-store interface for long-lived histories.
+5. Adoption path for Desktop/IDE: should the v1 app-server surface already include the snapshot-query API, or is the fork `restoreFiles` flag enough until a surface commits to adopting?
+
+---
+
+*Prepared with a full archaeology of the removed ghost-commit feature (commits e0fbc112c7 → 052b052832 → 014235f533 → 7a8407bbb6 → 4e05f3053c → f50c02d7bc → 862b2122ee) and function-level verification of every integration point cited above against current `main`.*
