@@ -70,12 +70,19 @@ pub struct Manifest {
     /// Path → entry. Paths are stored as strings (lossy UTF-8) so
     /// manifests serialize portably; keys are absolute paths.
     pub entries: BTreeMap<String, FileEntry>,
+    /// Whether this capture enumerated its entire scope (workspace mode).
+    /// For a complete manifest, a path's absence is positive evidence the
+    /// file did not exist at capture time, so restores may delete on
+    /// absence alone. Bounded captures (fallback mode) leave this false
+    /// and get the conservative witnessed-birth deletion rule instead.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 impl Manifest {
     /// Content-addressed id: SHA-256 of the canonical JSON serialization.
     pub fn id(&self) -> Result<String> {
-        let bytes = serde_json::to_vec(&self.entries)?;
+        let bytes = serde_json::to_vec(self)?;
         Ok(BlobStore::hash_bytes(&bytes))
     }
 }

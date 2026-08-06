@@ -38,16 +38,23 @@ pub struct Checkpoint {
 /// Capture the state of `files` into a new persisted manifest.
 ///
 /// `prev` is the previous checkpoint of the same tracked set (if any) and
-/// serves as the stat cache. Paths that cannot be read (deleted between
-/// enumeration and capture, unreadable, non-regular) are skipped — a
-/// checkpoint records what verifiably exists at capture time.
+/// serves as the stat cache. `complete` records whether `files` covers
+/// the entire scope (workspace scan) or a bounded subset (fallback mode);
+/// it determines how restores may interpret absence (see `Manifest`).
+/// Paths that cannot be read (deleted between enumeration and capture,
+/// unreadable, non-regular) are skipped — a checkpoint records what
+/// verifiably exists at capture time.
 pub fn capture(
     blobs: &BlobStore,
     manifests: &ManifestStore,
     files: impl IntoIterator<Item = PathBuf>,
     prev: Option<&Manifest>,
+    complete: bool,
 ) -> Result<Checkpoint> {
-    let mut manifest = Manifest::default();
+    let mut manifest = Manifest {
+        complete,
+        ..Default::default()
+    };
     let mut stats = CheckpointStats::default();
 
     for path in files {
@@ -137,7 +144,7 @@ mod tests {
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
 
-        let cp = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
+        let cp = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
         assert_eq!(cp.stats.hashed, 1);
         assert_eq!(cp.stats.reused, 0);
 
@@ -152,8 +159,15 @@ mod tests {
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
 
-        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
-        let cp2 = capture(&f.blobs, &f.manifests, vec![a.clone()], Some(&cp1.manifest)).unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
+        let cp2 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            Some(&cp1.manifest),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(cp2.stats.reused, 1);
         assert_eq!(cp2.stats.hashed, 0);
@@ -166,10 +180,17 @@ mod tests {
         let f = fixture();
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
-        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
 
         fs::write(&a, b"alpha-2").unwrap();
-        let cp2 = capture(&f.blobs, &f.manifests, vec![a.clone()], Some(&cp1.manifest)).unwrap();
+        let cp2 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            Some(&cp1.manifest),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(cp2.stats.hashed, 1);
         assert_ne!(cp1.id, cp2.id);
@@ -184,7 +205,7 @@ mod tests {
     fn vanished_files_are_skipped() {
         let f = fixture();
         let ghost = f.ws.join("ghost.txt");
-        let cp = capture(&f.blobs, &f.manifests, vec![ghost], None).unwrap();
+        let cp = capture(&f.blobs, &f.manifests, vec![ghost], None, true).unwrap();
         assert_eq!(cp.stats.skipped, 1);
         assert!(cp.manifest.entries.is_empty());
     }
@@ -199,10 +220,17 @@ mod tests {
         fs::write(&a, b"#!/bin/sh").unwrap();
         fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
         // chmod alone may leave size+mtime untouched → stat-cache hit path.
         fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
-        let cp2 = capture(&f.blobs, &f.manifests, vec![a.clone()], Some(&cp1.manifest)).unwrap();
+        let cp2 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            Some(&cp1.manifest),
+            true,
+        )
+        .unwrap();
 
         let key = a.to_string_lossy().into_owned();
         assert_eq!(cp2.manifest.entries[&key].mode, 0o755);

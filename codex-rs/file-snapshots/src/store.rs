@@ -1,0 +1,167 @@
+//! `SnapshotStore`: the facade tying blobs, manifests, thread logs,
+//! checkpoints, restore, and GC together under one root directory
+//! (`CODEX_HOME/file_snapshots/` in production).
+
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+
+use crate::blob::BlobStore;
+use crate::checkpoint::Checkpoint;
+use crate::checkpoint::capture;
+use crate::error::Result;
+use crate::error::SnapshotError;
+use crate::manifest::Manifest;
+use crate::manifest::ManifestStore;
+use crate::refs::GcStats;
+use crate::refs::RefStore;
+use crate::refs::SnapshotRef;
+use crate::refs::collect_garbage;
+use crate::restore::ApplyStats;
+use crate::restore::RestorePlan;
+use crate::restore::apply_plan;
+use crate::restore::plan_restore;
+
+/// Turn-id prefix used for the safety checkpoint recorded before a restore.
+pub const SAFETY_TURN_PREFIX: &str = "safety-restore:";
+
+pub struct SnapshotStore {
+    blobs: BlobStore,
+    manifests: ManifestStore,
+    refs: RefStore,
+    root: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct RestoreOutcome {
+    /// The safety checkpoint of the pre-restore state; restoring to it
+    /// undoes this restore (redo).
+    pub safety_manifest_id: String,
+    pub plan: RestorePlan,
+    pub stats: ApplyStats,
+}
+
+impl SnapshotStore {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        Ok(Self {
+            blobs: BlobStore::open(root.join("blobs"))?,
+            manifests: ManifestStore::open(root.join("manifests"))?,
+            refs: RefStore::open(root.join("refs"))?,
+            root,
+        })
+    }
+
+    /// Capture a checkpoint of `files` for `thread_id` and append it to
+    /// the thread's snapshot log. The previous checkpoint (if any) serves
+    /// as the stat cache. `complete` declares whether `files` covers the
+    /// entire tracking scope (workspace scan) or a bounded subset.
+    pub fn checkpoint(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        files: impl IntoIterator<Item = PathBuf>,
+        complete: bool,
+    ) -> Result<Checkpoint> {
+        let prev = self.latest_manifest(thread_id)?;
+        let cp = capture(&self.blobs, &self.manifests, files, prev.as_ref(), complete)?;
+        self.refs.append(
+            thread_id,
+            SnapshotRef {
+                turn_id: turn_id.to_string(),
+                manifest_id: cp.id.clone(),
+            },
+        )?;
+        Ok(cp)
+    }
+
+    /// The thread's snapshot log with each manifest loaded, in capture order.
+    pub fn thread_history(&self, thread_id: &str) -> Result<Vec<(SnapshotRef, Manifest)>> {
+        let log = self.refs.load(thread_id)?;
+        let mut out = Vec::with_capacity(log.entries.len());
+        for entry in log.entries {
+            let manifest = self.manifests.load(&entry.manifest_id)?;
+            out.push((entry, manifest));
+        }
+        Ok(out)
+    }
+
+    pub fn latest_manifest(&self, thread_id: &str) -> Result<Option<Manifest>> {
+        let log = self.refs.load(thread_id)?;
+        match log.entries.last() {
+            Some(entry) => Ok(Some(self.manifests.load(&entry.manifest_id)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Restore `thread_id`'s tracked state to `target_manifest_id`.
+    ///
+    /// `current_files` is the present tracked set (it is re-captured as the
+    /// safety checkpoint first, so the restore is reversible); `is_protected`
+    /// is the symmetric-ignore predicate over manifest path keys, evaluated
+    /// against the *current* ignore rules (RFC rule 5).
+    pub fn restore_to(
+        &self,
+        thread_id: &str,
+        target_manifest_id: &str,
+        current_files: impl IntoIterator<Item = PathBuf>,
+        current_complete: bool,
+        is_protected: &dyn Fn(&str) -> bool,
+    ) -> Result<RestoreOutcome> {
+        // 1. Safety checkpoint (appends to the log → becomes history.last()).
+        let safety = self.checkpoint(
+            thread_id,
+            &format!("{SAFETY_TURN_PREFIX}{target_manifest_id}"),
+            current_files,
+            current_complete,
+        )?;
+
+        // 2. Locate the target (latest occurrence: with content-addressed
+        // manifests the same state may recur; deleting only files born
+        // after its most recent occurrence is the conservative reading).
+        let history = self.thread_history(thread_id)?;
+        let manifests: Vec<Manifest> = history.into_iter().map(|(_, m)| m).collect();
+        let target_index = manifests
+            .iter()
+            .rposition(|m| m.id().is_ok_and(|id| id == target_manifest_id))
+            .ok_or_else(|| SnapshotError::MissingManifest(target_manifest_id.to_string()))?;
+
+        // 3-4. Plan (writes + witnessed-birth deletes) and apply.
+        let plan = plan_restore(&manifests, target_index, is_protected);
+        let stats = apply_plan(&self.blobs, &plan)?;
+
+        Ok(RestoreOutcome {
+            safety_manifest_id: safety.id,
+            plan,
+            stats,
+        })
+    }
+
+    /// Drop a thread's snapshot log (its data becomes garbage for `gc`).
+    pub fn remove_thread(&self, thread_id: &str) -> Result<()> {
+        self.refs.remove(thread_id)
+    }
+
+    /// Mark-and-sweep unreferenced manifests and blobs.
+    pub fn gc(&self) -> Result<GcStats> {
+        collect_garbage(&self.refs, &self.manifests, &self.blobs)
+    }
+
+    /// Total bytes on disk under the store root (for `/status` display).
+    pub fn disk_usage(&self) -> Result<u64> {
+        fn dir_size(path: &Path) -> std::io::Result<u64> {
+            let mut total = 0;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if meta.is_dir() {
+                    total += dir_size(&entry.path())?;
+                } else {
+                    total += meta.len();
+                }
+            }
+            Ok(total)
+        }
+        dir_size(&self.root).map_err(|e| SnapshotError::io(&self.root, e))
+    }
+}

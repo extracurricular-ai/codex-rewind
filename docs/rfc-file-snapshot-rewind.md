@@ -163,7 +163,7 @@ Restore procedure for target turn N:
 1. **Safety checkpoint** of the current tracked set → manifest S′ (this makes every subsequent step reversible, and is what enables redo).
 2. Locate turn N's manifest. **Ordering constraint (verified)**: fork-before-N truncates strictly before `TurnStarted(N)` (`core/src/thread_rollout_truncation.rs:215-221`) while N's `TurnContextItem` is persisted after it — so the ref must be read from the **source thread's untruncated history**, which `thread_fork_inner` has in hand.
 3. For each entry in manifest N: restore content/mode if it differs (skip paths matched by the *current* ignore file).
-4. Deletion pass — **witnessed-birth rule**: delete a file only if it is (a) in tracking scope, (b) absent from manifest N, and (c) **first observed in a manifest later than N** (its birth was witnessed). Files the system has never seen are never deleted. Because tracking-set membership varies over time (100-cap), "absent from manifest N" alone does not prove "did not exist at N"; the birth requirement closes that hole.
+4. Deletion pass — delete only on **positive evidence of non-existence at N**: a file (present per the safety checkpoint, in scope, absent from manifest N) is deleted when either (a) manifest N was a **complete scope scan** (workspace mode — absence is definitive; this also lets redo remove files a prior restore recreated), or (b) its **birth was witnessed** (first observed in a manifest later than N). Bounded fallback-mode captures get only rule (b): with a 100-cap tracked set, absence from manifest N alone does not prove non-existence at N. Files the system has never seen are never deleted, and every deleted file is recoverable from the safety checkpoint by construction.
 5. Record fork metadata: `{forked_from: T, restored_to: N, safety: S′}`.
 
 **Redo** falls out of the fork model: the original thread T is preserved by design (source-preserving branch), so conversation redo is "go back to T"; file redo is "restore manifest S′". No soft-revert state machine needed.
@@ -182,7 +182,7 @@ A second restore surface — `thread/rollback` (`core/src/session/handlers.rs:45
 
 1. **Never touch user git state.** No exceptions.
 2. **Safety checkpoint before every restore.** Deletion is therefore always recoverable.
-3. **Witnessed-birth deletion.** Never delete a file whose creation was not observed.
+3. **Definitive-absence deletion.** Delete only on positive evidence: absence from a complete-scan target manifest, or a witnessed birth. Never delete a file whose existence at target time is uncertain.
 4. **Symmetric ignore.** Ignored paths are never snapshotted, restored, or deleted.
 5. **Current ignore wins at restore start**; a restored ignore file governs from the next operation on.
 6. **Never-tracked files are never modified in any direction.**
