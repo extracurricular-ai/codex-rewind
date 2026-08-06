@@ -169,7 +169,7 @@ mod tests {
     fn plans_writes_for_changed_and_missing_files() {
         let target = manifest(&[("/a", "h-old"), ("/b", "h-b")]);
         let current = manifest(&[("/a", "h-new")]); // /b deleted since target
-        let history = vec![target.clone(), current];
+        let history = vec![target, current];
 
         let plan = plan_restore(&history, 0, &|_| false);
         let paths: Vec<&str> = plan.writes.iter().map(|w| w.path.as_str()).collect();

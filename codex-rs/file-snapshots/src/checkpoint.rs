@@ -163,7 +163,7 @@ mod tests {
         let cp2 = capture(
             &f.blobs,
             &f.manifests,
-            vec![a.clone()],
+            vec![a],
             Some(&cp1.manifest),
             true,
         )

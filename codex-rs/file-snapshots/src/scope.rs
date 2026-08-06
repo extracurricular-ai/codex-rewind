@@ -208,7 +208,7 @@ mod tests {
         let markers = vec![".codex".to_string()];
         assert_eq!(
             find_workspace_root(&deep, &markers),
-            Some(root.clone()),
+            Some(root),
             "nearest ancestor with marker wins"
         );
         let elsewhere = tempfile::tempdir().unwrap();
