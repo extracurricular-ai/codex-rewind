@@ -552,6 +552,9 @@
             "fast_mode": {
               "type": "boolean"
             },
+            "file_snapshots": {
+              "type": "boolean"
+            },
             "goals": {
               "type": "boolean"
             },
@@ -5178,6 +5181,9 @@
           "type": "boolean"
         },
         "fast_mode": {
+          "type": "boolean"
+        },
+        "file_snapshots": {
           "type": "boolean"
         },
         "goals": {

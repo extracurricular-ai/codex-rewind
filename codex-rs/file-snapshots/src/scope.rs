@@ -70,7 +70,7 @@ pub fn find_workspace_root(start: &Path, markers: &[String]) -> Option<PathBuf> 
 pub fn load_ignore(root: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
     builder.add(root.join(SNAPSHOT_IGNORE_FILENAME));
-    // An unparseable ignore file degrades to "nothing ignored" rather than
+    // An unparsable ignore file degrades to "nothing ignored" rather than
     // failing the checkpoint; restores stay conservative either way.
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
