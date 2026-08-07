@@ -160,14 +160,7 @@ mod tests {
         fs::write(&a, b"alpha").unwrap();
 
         let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
-        let cp2 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a],
-            Some(&cp1.manifest),
-            true,
-        )
-        .unwrap();
+        let cp2 = capture(&f.blobs, &f.manifests, vec![a], Some(&cp1.manifest), true).unwrap();
 
         assert_eq!(cp2.stats.reused, 1);
         assert_eq!(cp2.stats.hashed, 0);

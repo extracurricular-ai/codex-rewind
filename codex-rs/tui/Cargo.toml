@@ -37,6 +37,7 @@ codex-connectors = { workspace = true }
 codex-core-plugins = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-features = { workspace = true }
+codex-file-snapshots = { workspace = true }
 codex-feedback = { workspace = true }
 codex-file-search = { workspace = true }
 codex-git-utils = { workspace = true }

@@ -12,6 +12,7 @@ use crate::width::display_width;
 use chrono::DateTime;
 use chrono::Local;
 use codex_app_server_protocol::AskForApproval;
+use codex_features::Feature;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
@@ -117,6 +118,8 @@ struct StatusHistoryCell {
     thread_name: Option<String>,
     session_id: Option<String>,
     forked_from: Option<String>,
+    /// Store size when file snapshots are enabled (RFC §9 disk disclosure).
+    file_snapshots: Option<String>,
     token_usage: StatusTokenUsageData,
     rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
 }
@@ -244,6 +247,34 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     )
 }
 
+/// Disk usage of the file snapshot store, shown only when the feature is
+/// enabled (the RFC's disk-usage disclosure). Reads the store directory
+/// once per `/status`; the store is bounded and content-addressed, and any
+/// I/O error degrades to "enabled" without a size.
+fn file_snapshots_summary(config: &Config) -> Option<String> {
+    if !config.features.enabled(Feature::FileSnapshots) {
+        return None;
+    }
+    let root = config.codex_home.as_path().join("file_snapshots");
+    let bytes = codex_file_snapshots::SnapshotStore::open(&root)
+        .and_then(|store| store.disk_usage())
+        .ok();
+    Some(match bytes {
+        Some(bytes) => format!("enabled ({} on disk)", format_bytes_compact(bytes)),
+        None => "enabled".to_string(),
+    })
+}
+
+fn format_bytes_compact(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
 impl StatusHistoryCell {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -365,6 +396,7 @@ impl StatusHistoryCell {
                 thread_name,
                 session_id,
                 forked_from,
+                file_snapshots: file_snapshots_summary(config),
                 token_usage,
                 agents_summary,
                 rate_limit_state: rate_limit_state.clone(),
@@ -757,6 +789,9 @@ impl HistoryCell for StatusHistoryCell {
         if thread_name.is_some() {
             push_label(&mut labels, &mut seen, "Thread name");
         }
+        if self.file_snapshots.is_some() {
+            push_label(&mut labels, &mut seen, "File snapshots");
+        }
         if self.session_id.is_some() {
             push_label(&mut labels, &mut seen, "Session");
         }
@@ -847,6 +882,9 @@ impl HistoryCell for StatusHistoryCell {
             && let Some(forked_from) = self.forked_from.as_ref()
         {
             lines.push(formatter.line("Forked from", vec![Span::from(forked_from.clone())]));
+        }
+        if let Some(file_snapshots) = self.file_snapshots.as_ref() {
+            lines.push(formatter.line("File snapshots", vec![Span::from(file_snapshots.clone())]));
         }
 
         lines.push(Line::from(Vec::<Span<'static>>::new()));

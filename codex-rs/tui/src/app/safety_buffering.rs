@@ -167,7 +167,8 @@ impl App {
                 /*before_turn_id*/ Some(turn_id),
                 ForkGoalContinuation::DeferUntilNextTurn,
                 // Safety re-forks replay the same turn; files must not move.
-                /*restore_files*/ false,
+                /*restore_files*/
+                false,
             )
             .await;
         let started = match started {

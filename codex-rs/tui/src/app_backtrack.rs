@@ -28,7 +28,6 @@ use crate::app::App;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
 use crate::bottom_pane::LocalImageAttachment;
-use codex_features::Feature;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::UserMessage;
 use crate::chatwidget::mention_bindings_from_user_inputs;
@@ -43,6 +42,7 @@ use crate::tui::TuiEvent;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
+use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::models::local_image_label_text;
 use color_eyre::eyre::Result;
@@ -71,6 +71,9 @@ pub(crate) struct BacktrackState {
     pub(crate) nth_user_message: usize,
     /// True when the transcript overlay is showing a backtrack preview.
     pub(crate) overlay_preview_active: bool,
+    /// Whether the "file changes will not be restored" hint has been shown;
+    /// it is surfaced at most once per session.
+    pub(crate) file_restore_hint_shown: bool,
 }
 
 /// A user-visible backtrack choice that can be reopened on a source-preserving branch.
@@ -202,6 +205,15 @@ impl App {
         // started before the feature was enabled simply have no snapshots and
         // the fork proceeds without touching files.
         let restore_files = self.config.features.enabled(Feature::FileSnapshots);
+        if !restore_files && !self.backtrack.file_restore_hint_shown {
+            // Surface the capability once per session: without it, users have
+            // no way to discover that backtrack can also rewind files.
+            self.backtrack.file_restore_hint_shown = true;
+            self.chat_widget.add_info_message(
+                "File changes will not be restored.".to_string(),
+                Some("enable \"File snapshots\" in /experimental to rewind code with the conversation".to_string()),
+            );
+        }
         self.app_event_tx.send(AppEvent::ForkSessionForPromptEdit {
             thread_id: selection.thread_id,
             nth_user_message: selection.nth_user_message,
