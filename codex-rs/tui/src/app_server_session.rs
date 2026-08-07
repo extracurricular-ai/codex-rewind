@@ -697,6 +697,7 @@ impl AppServerSession {
             /*last_turn_id*/ None,
             /*before_turn_id*/ None,
             ForkGoalContinuation::StartIfIdle,
+            /*restore_files*/ false,
         )
         .await
     }
@@ -708,6 +709,7 @@ impl AppServerSession {
         last_turn_id: Option<String>,
         before_turn_id: Option<String>,
         goal_continuation: ForkGoalContinuation,
+        restore_files: bool,
     ) -> Result<AppServerStartedThread> {
         self.fork_thread_at_with_presentation(
             config,
@@ -716,6 +718,7 @@ impl AppServerSession {
             before_turn_id,
             goal_continuation,
             ForkPresentation::Regular,
+            restore_files,
         )
         .await
     }
@@ -732,6 +735,7 @@ impl AppServerSession {
             /*before_turn_id*/ None,
             ForkGoalContinuation::StartIfIdle,
             ForkPresentation::SideConversation,
+            /*restore_files*/ false,
         )
         .await
     }
@@ -744,6 +748,7 @@ impl AppServerSession {
         before_turn_id: Option<String>,
         goal_continuation: ForkGoalContinuation,
         presentation: ForkPresentation,
+        restore_files: bool,
     ) -> Result<AppServerStartedThread> {
         let fork_parent = match presentation {
             ForkPresentation::Regular => self
@@ -759,9 +764,13 @@ impl AppServerSession {
                 || presentation == ForkPresentation::SideConversation);
         let request_id = self.next_request_id();
         let session_config = self.session_config_with_effective_service_tier(&config);
+        // File restore is only meaningful for a fork bounded by a turn; the
+        // server rejects the combination otherwise.
+        let restore_files = restore_files && before_turn_id.is_some();
         let mut params = ThreadForkParams {
             last_turn_id,
             before_turn_id,
+            restore_files,
             defer_goal_continuation: goal_continuation == ForkGoalContinuation::DeferUntilNextTurn,
             exclude_turns,
             ..thread_fork_params_from_config(

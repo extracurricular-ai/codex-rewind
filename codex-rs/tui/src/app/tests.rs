@@ -6011,6 +6011,7 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             thread_id,
             nth_user_message,
             prompt,
+            ..
         } if thread_id == expected.thread_id
             && nth_user_message == expected.nth_user_message
             && prompt == expected.prompt
@@ -6572,6 +6573,7 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             thread_id: source_thread_id,
             nth_user_message: 1,
             prompt: prompt.clone(),
+            restore_files: false,
         },
     ))
     .await?;
@@ -6670,6 +6672,7 @@ async fn prompt_edit_before_first_prompt_starts_fresh_thread() -> Result<()> {
             thread_id: source_thread_id,
             nth_user_message: 0,
             prompt: crate::chatwidget::UserMessage::from("first prompt"),
+            restore_files: false,
         },
     ))
     .await?;

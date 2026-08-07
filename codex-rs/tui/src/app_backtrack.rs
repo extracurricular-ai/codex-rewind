@@ -28,6 +28,7 @@ use crate::app::App;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
 use crate::bottom_pane::LocalImageAttachment;
+use codex_features::Feature;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::UserMessage;
 use crate::chatwidget::mention_bindings_from_user_inputs;
@@ -196,10 +197,16 @@ impl App {
             return;
         }
 
+        // Restore workspace files alongside the conversation when file
+        // snapshots are enabled. The request is advisory end-to-end: sessions
+        // started before the feature was enabled simply have no snapshots and
+        // the fork proceeds without touching files.
+        let restore_files = self.config.features.enabled(Feature::FileSnapshots);
         self.app_event_tx.send(AppEvent::ForkSessionForPromptEdit {
             thread_id: selection.thread_id,
             nth_user_message: selection.nth_user_message,
             prompt: selection.prompt,
+            restore_files,
         });
     }
 

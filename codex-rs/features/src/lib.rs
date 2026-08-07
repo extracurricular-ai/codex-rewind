@@ -1017,7 +1017,15 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::FileSnapshots,
         key: "file_snapshots",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Experimental {
+            name: "File snapshots",
+            menu_description: "Track per-turn file snapshots so backtrack can restore workspace \
+                               state. Uses additional disk space under CODEX_HOME/file_snapshots \
+                               (content-addressed, deduplicated). Applies to new sessions.",
+            announcement: "NEW: File snapshots can now be enabled from /experimental. Backtrack \
+                           can then restore workspace files together with the conversation for \
+                           sessions started after enabling it.",
+        },
         default_enabled: false,
     },
     FeatureSpec {

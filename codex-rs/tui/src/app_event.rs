@@ -317,6 +317,10 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
         nth_user_message: usize,
         prompt: UserMessage,
+        /// Also restore tracked workspace files to the fork point
+        /// (`file_snapshots` feature; ignored when the session is not
+        /// tracking).
+        restore_files: bool,
     },
 
     /// Request to exit the application.

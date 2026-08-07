@@ -285,6 +285,7 @@ impl App {
                 thread_id,
                 nth_user_message,
                 mut prompt,
+                restore_files,
             } => {
                 if self.chat_widget.thread_id() != Some(thread_id) {
                     return Ok(AppRunControl::Continue);
@@ -320,6 +321,7 @@ impl App {
                                     /*last_turn_id*/ None,
                                     before_turn_id,
                                     ForkGoalContinuation::StartIfIdle,
+                                    restore_files,
                                 )
                                 .await
                         }
