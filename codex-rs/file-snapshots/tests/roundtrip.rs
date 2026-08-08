@@ -35,9 +35,13 @@ fn full_rewind_redo_gc_scenario() {
 
     // Turn 1 checkpoint.
     let cp1 = store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws).unwrap(), true)
+        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
         .unwrap();
-    assert_eq!(cp1.manifest.entries.len(), 3, "log is not snapshotted");
+    assert_eq!(
+        cp1.manifest.entries.len(),
+        2,
+        "the ignored log and the (hidden) ignore file are both out of scope"
+    );
 
     // Agent work during turn 1: modify a, delete b, create c.
     fs::write(ws.join("a.txt"), "alpha v2 (agent)").unwrap();
@@ -46,9 +50,13 @@ fn full_rewind_redo_gc_scenario() {
 
     // Turn 2 checkpoint observes the agent's changes.
     let cp2 = store
-        .checkpoint(THREAD, "turn-2", workspace_files(&ws).unwrap(), true)
+        .checkpoint(THREAD, "turn-2", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
         .unwrap();
-    assert!(cp2.manifest.entries.len() == 3);
+    assert_eq!(
+        cp2.manifest.entries.len(),
+        2,
+        "a.txt modified, b.txt deleted, c.txt created"
+    );
 
     // Between checkpoints: the user creates a file (never yet captured)
     // and edits the ignored log.
@@ -62,7 +70,7 @@ fn full_rewind_redo_gc_scenario() {
         .restore_to(
             THREAD,
             &cp1.id,
-            workspace_files(&ws).unwrap(),
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &protect,
         )
@@ -92,7 +100,7 @@ fn full_rewind_redo_gc_scenario() {
         .restore_to(
             THREAD,
             &outcome.safety_manifest_id,
-            workspace_files(&ws).unwrap(),
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &protect2,
         )
@@ -128,20 +136,20 @@ fn restore_preserves_permissions() {
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
     let cp1 = store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws).unwrap(), true)
+        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
         .unwrap();
 
     fs::write(&script, "#!/bin/sh\necho changed\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).unwrap();
     store
-        .checkpoint(THREAD, "turn-2", workspace_files(&ws).unwrap(), true)
+        .checkpoint(THREAD, "turn-2", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
         .unwrap();
 
     store
         .restore_to(
             THREAD,
             &cp1.id,
-            workspace_files(&ws).unwrap(),
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &|_| false,
         )
@@ -168,7 +176,7 @@ fn thread_marker_and_pre_edit_attach() {
     // Turn-start scan sees only a.txt.
     fs::write(ws.join("a.txt"), "alpha").unwrap();
     let cp1 = store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws).unwrap(), true)
+        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
         .unwrap();
 
     // Agent edits a file OUTSIDE the workspace scan: pre-image attaches
@@ -216,7 +224,7 @@ fn thread_marker_and_pre_edit_attach() {
         .restore_to(
             THREAD,
             &attached,
-            workspace_files(&ws)
+            workspace_files(&ws, /*include_hidden*/ false)
                 .unwrap()
                 .into_iter()
                 .chain([outside.clone()]),
@@ -236,7 +244,7 @@ fn turn_resolution_and_fork_inheritance() {
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws).unwrap(), true)
+        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
         .unwrap();
     // Supplemental attach under the same turn: resolution must pick it.
     let outside = dir.path().join("ext.cfg");
@@ -246,7 +254,7 @@ fn turn_resolution_and_fork_inheritance() {
         .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
     store
-        .checkpoint(THREAD, "turn-2", workspace_files(&ws).unwrap(), true)
+        .checkpoint(THREAD, "turn-2", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
         .unwrap();
 
     assert_eq!(

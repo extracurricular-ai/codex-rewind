@@ -5211,7 +5211,10 @@ fn restore_files_for_fork(
     let markers = vec![".git".to_string()];
     let root = find_workspace_root(source_cwd, &markers);
     let mut files: BTreeSet<PathBuf> = match &root {
-        Some(root) => workspace_files(root)
+        // Hidden entries stay out of the safety checkpoint's scan for the
+        // same reason they stay out of capture; anything actually tracked
+        // arrives through `tracked_paths` below.
+        Some(root) => workspace_files(root, /*include_hidden*/ false)
             .map_err(|e| e.to_string())?
             .into_iter()
             .collect(),

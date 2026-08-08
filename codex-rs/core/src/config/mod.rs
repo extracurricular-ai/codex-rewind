@@ -191,6 +191,7 @@ pub struct FileSnapshotsConfig {
     pub seed_full_limit: usize,
     pub seed_recent: usize,
     pub max_tracked_files: usize,
+    pub track_hidden_files: bool,
 }
 
 impl Default for FileSnapshotsConfig {
@@ -200,6 +201,7 @@ impl Default for FileSnapshotsConfig {
             seed_full_limit: defaults.full_limit,
             seed_recent: defaults.recent_seed,
             max_tracked_files: defaults.cap,
+            track_hidden_files: false,
         }
     }
 }
@@ -3846,6 +3848,9 @@ impl Config {
                 }
                 if let Some(cap) = toml.max_tracked_files {
                     config.max_tracked_files = cap;
+                }
+                if let Some(hidden) = toml.track_hidden_files {
+                    config.track_hidden_files = hidden;
                 }
             }
             config

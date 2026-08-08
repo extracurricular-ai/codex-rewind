@@ -46,6 +46,8 @@ pub struct FileSnapshotsController {
     thread_id: String,
     /// Seeding limits for fallback mode, from `[file_snapshots]`.
     seed_policy: SeedPolicy,
+    /// Whether scans descend into dot-files and dot-directories.
+    include_hidden: bool,
     state: Mutex<TrackState>,
 }
 
@@ -75,6 +77,7 @@ impl FileSnapshotsController {
         is_new_thread: bool,
         thread_id: String,
         seed_policy: SeedPolicy,
+        include_hidden: bool,
     ) -> Option<Arc<Self>> {
         let store = match SnapshotStore::open(codex_home.join(STORE_DIR_NAME)) {
             Ok(store) => store,
@@ -100,6 +103,7 @@ impl FileSnapshotsController {
             store,
             thread_id,
             seed_policy,
+            include_hidden,
             state: Mutex::new(TrackState::default()),
         }))
     }
@@ -120,14 +124,19 @@ impl FileSnapshotsController {
         self.lock_state().ignore_root =
             Some(workspace_root.clone().unwrap_or_else(|| cwd.to_path_buf()));
         let (mut files, complete): (BTreeSet<PathBuf>, bool) = match workspace_root {
-            Some(root) => (workspace_files(&root)?.into_iter().collect(), true),
+            Some(root) => (
+                    workspace_files(&root, self.include_hidden)?
+                        .into_iter()
+                        .collect(),
+                    true,
+                ),
             None => {
                 let policy = self.seed_policy.clone();
                 let mut state = self.lock_state();
                 let tracked = match &mut state.fallback {
                     Some(tracked) => tracked,
                     None => {
-                        let seed = seed_fallback_files(cwd, &policy)?;
+                        let seed = seed_fallback_files(cwd, &policy, self.include_hidden)?;
                         state
                             .fallback
                             .get_or_insert(TrackedSet::new(seed, policy.cap))
@@ -219,7 +228,8 @@ mod tests {
                 false,
                 true,
                 "t1".into(),
-                SeedPolicy::default()
+                SeedPolicy::default(),
+                /*include_hidden*/ false,
             )
             .is_none()
         );
@@ -230,7 +240,8 @@ mod tests {
                 true,
                 true,
                 "t1".into(),
-                SeedPolicy::default()
+                SeedPolicy::default(),
+                /*include_hidden*/ false,
             )
             .is_some()
         );
@@ -241,7 +252,8 @@ mod tests {
                 false,
                 false,
                 "t1".into(),
-                SeedPolicy::default()
+                SeedPolicy::default(),
+                /*include_hidden*/ false,
             )
             .is_some()
         );
@@ -252,9 +264,55 @@ mod tests {
                 true,
                 false,
                 "t2".into(),
-                SeedPolicy::default()
+                SeedPolicy::default(),
+                /*include_hidden*/ false,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn hidden_entries_are_skipped_unless_edited() {
+        let home = tempfile::tempdir().unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            SeedPolicy::default(),
+            /*include_hidden*/ false,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".git")).unwrap();
+        std::fs::write(ws.path().join(".env"), "SECRET=1").unwrap();
+        std::fs::create_dir_all(ws.path().join(".github/workflows")).unwrap();
+        std::fs::write(ws.path().join(".github/workflows/ci.yml"), "on: push").unwrap();
+        std::fs::write(ws.path().join("src.rs"), "code").unwrap();
+
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path());
+        let scanned = ctl.store.tracked_paths("t1").unwrap();
+        assert!(
+            scanned.iter().all(|p| !p.contains("/.env")),
+            "tool state and credentials stay out of snapshots: {scanned:?}"
+        );
+        assert!(scanned.iter().all(|p| !p.contains("/.git")));
+        assert!(scanned.iter().any(|p| p.ends_with("src.rs")));
+
+        // An edited hidden file is a different matter: it is work product,
+        // so the edit hook tracks it and a rewind can restore it.
+        let workflow = ws.path().join(".github/workflows/ci.yml");
+        ctl.attach_pre_edits_blocking(
+            "turn-1",
+            vec![(workflow.clone(), Some(b"on: push".to_vec()))],
+        );
+        assert!(
+            ctl.store
+                .tracked_paths("t1")
+                .unwrap()
+                .contains(&workflow.to_string_lossy().into_owned()),
+            "explicitly edited hidden files must remain restorable"
         );
     }
 
@@ -268,7 +326,14 @@ mod tests {
             recent_seed: 3,
             cap: 4,
         };
-        let ctl = FileSnapshotsController::maybe_new(home.path(), true, true, "t1".into(), policy)
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            policy,
+            /*include_hidden*/ false,
+        )
             .unwrap();
 
         // No `.git` marker → fallback mode, where seeding applies.
@@ -296,6 +361,7 @@ mod tests {
             true,
             "t1".into(),
             SeedPolicy::default(),
+            /*include_hidden*/ false,
         )
         .unwrap();
 
@@ -341,6 +407,7 @@ mod tests {
             true,
             "t1".into(),
             SeedPolicy::default(),
+            /*include_hidden*/ false,
         )
         .unwrap();
 
@@ -365,6 +432,7 @@ mod tests {
             true,
             "t2".into(),
             SeedPolicy::default(),
+            /*include_hidden*/ false,
         )
         .unwrap();
         ctl2.checkpoint_turn_start_blocking("turn-1", loose.path());

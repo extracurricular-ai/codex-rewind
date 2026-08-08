@@ -746,6 +746,11 @@ pub struct FileSnapshotsToml {
     pub seed_recent: Option<usize>,
     /// Hard cap on tracked files, including growth from edits.
     pub max_tracked_files: Option<usize>,
+    /// Scan dot-files and dot-directories too. Off by default: hidden
+    /// entries are mostly tool state (editor settings, virtualenvs, caches,
+    /// credentials) that a rewind should leave alone. Files the agent edits
+    /// are tracked either way. `.git` is never scanned.
+    pub track_hidden_files: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]

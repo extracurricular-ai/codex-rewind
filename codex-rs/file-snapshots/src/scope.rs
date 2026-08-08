@@ -81,13 +81,22 @@ pub fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
 }
 
 /// Enumerate the tracked files of a workspace: every regular file under
-/// `root`, minus `.git` directories and paths matched by the snapshot
-/// ignore file. Results are sorted for deterministic manifests.
-pub fn workspace_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// `root`, minus `.git`, minus paths matched by the snapshot ignore file,
+/// and — unless `include_hidden` — minus dot-files and dot-directories.
+///
+/// Hidden entries are excluded by default because they are mostly tool
+/// state rather than work product: editor settings, virtualenvs, caches,
+/// credentials. Rewinding a turn should not roll those back. Anything the
+/// agent actually edits is tracked through the edit hook regardless, so an
+/// explicitly modified `.github/workflows/ci.yml` still restores.
+/// Results are sorted for deterministic manifests.
+pub fn workspace_files(root: &Path, include_hidden: bool) -> Result<Vec<PathBuf>> {
     let ignore = load_ignore(root);
     let walker = WalkBuilder::new(root)
         .standard_filters(false)
-        .hidden(false)
+        // `.git` is excluded even when hidden entries are tracked: restoring
+        // repository internals would corrupt the user's history.
+        .hidden(!include_hidden)
         .follow_links(false)
         .filter_entry(|entry| entry.file_name() != ".git")
         .build();
@@ -108,8 +117,12 @@ pub fn workspace_files(root: &Path) -> Result<Vec<PathBuf>> {
 
 /// Fallback-mode seed: all eligible files if at most `policy.full_limit`,
 /// otherwise the `policy.recent_seed` most recently modified.
-pub fn seed_fallback_files(dir: &Path, policy: &SeedPolicy) -> Result<Vec<PathBuf>> {
-    let all = workspace_files(dir)?;
+pub fn seed_fallback_files(
+    dir: &Path,
+    policy: &SeedPolicy,
+    include_hidden: bool,
+) -> Result<Vec<PathBuf>> {
+    let all = workspace_files(dir, include_hidden)?;
     if all.len() <= policy.full_limit {
         return Ok(all);
     }
@@ -228,19 +241,29 @@ mod tests {
         touch(&root.join(".git/HEAD"), "ref");
         touch(&root.join(SNAPSHOT_IGNORE_FILENAME), "*.log\n");
 
-        let files = workspace_files(root).unwrap();
+        let files = workspace_files(root, /*include_hidden*/ false).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(
             names,
-            vec![
-                SNAPSHOT_IGNORE_FILENAME.to_string(),
-                "keep.txt".to_string(),
-                "sub/keep2.txt".to_string(),
-            ],
-            "logs ignored, .git skipped, ignore file itself tracked (it is versioned)"
+            vec!["keep.txt".to_string(), "sub/keep2.txt".to_string()],
+            "logs ignored; .git and other dot-entries skipped — including the \
+             ignore file itself, which follows the same rule as any other \
+             hidden file and is tracked only if the agent edits it"
+        );
+
+        // Opting in reaches hidden entries, but never `.git`.
+        let with_hidden = workspace_files(root, /*include_hidden*/ true).unwrap();
+        let names: Vec<String> = with_hidden
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&SNAPSHOT_IGNORE_FILENAME.to_string()));
+        assert!(
+            names.iter().all(|name| !name.starts_with(".git/")),
+            "repository internals are never scanned: {names:?}"
         );
     }
 
@@ -250,7 +273,7 @@ mod tests {
         for i in 0..5 {
             touch(&dir.path().join(format!("f{i}.txt")), "x");
         }
-        let seed = seed_fallback_files(dir.path(), &SeedPolicy::default()).unwrap();
+        let seed = seed_fallback_files(dir.path(), &SeedPolicy::default(), /*include_hidden*/ false).unwrap();
         assert_eq!(seed.len(), 5);
     }
 
@@ -265,7 +288,7 @@ mod tests {
             set_mtime(&p, base + Duration::from_secs(i));
         }
         let policy = SeedPolicy::default();
-        let seed = seed_fallback_files(dir.path(), &policy).unwrap();
+        let seed = seed_fallback_files(dir.path(), &policy, /*include_hidden*/ false).unwrap();
         assert_eq!(seed.len(), policy.recent_seed);
         assert!(seed.contains(&dir.path().join("f59.txt")));
         assert!(seed.contains(&dir.path().join("f30.txt")));

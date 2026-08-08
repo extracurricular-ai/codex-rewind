@@ -1199,6 +1199,7 @@ impl Session {
                     recent_seed: config.file_snapshots.seed_recent,
                     cap: config.file_snapshots.max_tracked_files,
                 },
+                config.file_snapshots.track_hidden_files,
             );
             let sess = Arc::new(Session {
                 thread_id,
