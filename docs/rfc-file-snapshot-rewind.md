@@ -98,7 +98,7 @@ This inverts the current situation — where the doctrine says "clients are resp
 - Remote/cloud environments (`RemoteFileSystem`/`PathUri` paths) — v1 is local-only.
 - Migrating Desktop/IDE onto the subsystem — v1 only ensures the capability is exposed where they could adopt it.
 - Sub-file delta storage (chunking). The blob store interface is designed so content-defined chunking (FastCDC, as in restic/borg and Hugging Face's Xet) can be added later without changing callers.
-- A standalone `/undo` command. v1 integrates with backtrack; a dedicated command can come later.
+- A standalone `/undo` that restores files without rewinding the conversation. Rewind is offered through backtrack (Esc) and `/rewind`, both of which branch the conversation as well.
 
 ## 6. Design
 
@@ -196,6 +196,7 @@ A second restore surface — `thread/rollback` (`core/src/session/handlers.rs:45
 - Steered mid-turn messages have no `TurnStarted` of their own; backtrack already refuses to fork at steer prompts (`app_backtrack.rs:552-553`) — consistent, documented.
 - Remote environments: paths are `PathUri` via `RemoteFileSystem` — v1 skips capture/restore for non-local environments explicitly.
 - Paginated-history threads take the `prepare_fork`/`ForkBoundary` path (`thread_processor.rs:4074-4105`); v1 excludes them explicitly.
+- Models that declare `tool_mode: code_mode_only` route every file change through the code-mode host rather than `apply_patch`, so the pre-image hook sees nothing for them. Turn-boundary checkpoints still capture their edits — which is the point of capturing at boundaries rather than relying on per-edit hooks — but intra-turn granularity is lost.
 
 ## 7. Correctness rules (summary)
 
@@ -215,10 +216,11 @@ A second restore surface — `thread/rollback` (`core/src/session/handlers.rs:45
 ## 9. Configuration & UX
 
 - **Feature key `file_snapshots`** (new key; `Stage::Experimental` → appears in the `/experimental` menu automatically, CLI `--enable file_snapshots` works for free). The retired `"undo"` key is **not** reused: old configs in the wild still carry materialized `undo = <bool>` values that would silently re-bind (`features/src/lib.rs:488-490, 760-781`).
-- **Config section `[file_snapshots]`** cloned from the `GhostSnapshotConfig` plumbing pattern (`config_toml.rs:733-744`) — but as a *new* struct: `GhostSnapshotConfig` is public API via `core-api/src/lib.rs:44` and stays untouched.
+- **Config section `[file_snapshots]`** cloned from the `GhostSnapshotConfig` plumbing pattern (`config_toml.rs:733-744`) — but as a *new* struct: `GhostSnapshotConfig` is public API via `core-api/src/lib.rs:44` and stays untouched. It carries the fallback-mode seeding limits (`seed_full_limit`, `seed_recent`, `max_tracked_files`); workspace mode needs no seeding.
 - **Session-scoped binding**: the toggle answers one question — *do NEW sessions track?* Enabling does not affect existing sessions; disabling does not stop sessions already tracking. A session's snapshot chain is therefore always complete-from-turn-1 or absent, and the state is persisted with the session so `resume`/fork honor it. No mid-session partial states exist.
 - **Disk disclosure** in the toggle description: enabling uses additional disk under `CODEX_HOME/file_snapshots/` (content-addressed, deduped).
 - **Usage visibility**: `/status` shows the store's current size.
+- **`/rewind` command**: lists the session's prompts, newest first, so a target can be picked directly. Esc-stepping remains for the common "undo the last turn" case, but it walks back one prompt per press and is undiscoverable on its own.
 - **Discoverability hint**: when backtracking with the feature off, the confirmation shows one line — "file changes will not be restored (enable `file_snapshots` in /experimental)".
 - Deliberately omitted (v1): size caps, prune commands, retention settings — refcount GC plus bounded tracking keeps growth in check; add knobs only if real usage demands them.
 
