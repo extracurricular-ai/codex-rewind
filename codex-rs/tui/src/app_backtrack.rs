@@ -200,9 +200,10 @@ impl App {
             return;
         }
 
-        // `prime_backtrack` records the thread the selection belongs to, which
-        // `backtrack_selection` later verifies against.
-        self.prime_backtrack();
+        // Deliberately not `prime_backtrack()`: priming is the Esc flow's
+        // state, and any non-Esc keystroke clears it — including the arrows
+        // and Enter used to work the picker. The thread is re-established
+        // when the selection lands instead.
         self.chat_widget.clear_esc_backtrack_hint();
 
         let total = user_count(&self.transcript_cells);
@@ -235,6 +236,11 @@ impl App {
 
     /// Rewind to the prompt chosen from the `/rewind` list.
     pub(crate) fn rewind_to_nth_user_message(&mut self, nth_user_message: usize) {
+        // The picker was built from the current thread's transcript and is
+        // modal over it, so that thread is the base by construction. Setting
+        // it here keeps the flow independent of Esc-priming state, which
+        // popup keystrokes clear.
+        self.backtrack.base_id = self.chat_widget.thread_id();
         let Some(selection) = self.backtrack_selection(nth_user_message) else {
             self.reset_backtrack_state();
             return;

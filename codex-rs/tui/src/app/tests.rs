@@ -6026,6 +6026,73 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
 }
 
 #[tokio::test]
+async fn rewind_picker_survives_popup_keystrokes() {
+    // Regression: the picker used to reuse the Esc-priming state, which any
+    // non-Esc keypress clears — including the arrows and Enter needed to work
+    // the popup. Selecting an entry then silently did nothing at all.
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+    let thread_id = ThreadId::new();
+    app.chat_widget
+        .handle_thread_session(crate::session_state::ThreadSessionState {
+            thread_id,
+            forked_from_id: None,
+            fork_parent_title: None,
+            thread_name: None,
+            model: "gpt-test".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: ApprovalsReviewer::User,
+            permission_profile: PermissionProfile::read_only(),
+            active_permission_profile: None,
+            cwd: test_path_buf("/home/user/project").abs(),
+            runtime_workspace_roots: Vec::new(),
+            instruction_source_paths: Vec::new(),
+            reasoning_effort: None,
+            collaboration_mode: None,
+            personality: None,
+            message_history: None,
+            network_proxy: None,
+            rollout_path: Some(PathBuf::new()),
+        });
+
+    app.transcript_cells = vec![
+        Arc::new(UserHistoryCell {
+            message: "first prompt".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+        Arc::new(UserHistoryCell {
+            message: "second prompt".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>,
+    ];
+
+    // Arrowing through the popup and pressing Enter runs the non-Esc branch
+    // in `App::handle_key_event`, which clears any primed backtrack. Applying
+    // that effect directly keeps the test free of a Tui and app server.
+    app.reset_backtrack_state();
+
+    app.rewind_to_nth_user_message(0);
+
+    let event = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .find(|event| matches!(event, AppEvent::ForkSessionForPromptEdit { .. }))
+        .expect("selecting a prompt should request a branch");
+    assert_matches!(
+        event,
+        AppEvent::ForkSessionForPromptEdit {
+            thread_id: forked_from,
+            nth_user_message,
+            ..
+        } if forked_from == thread_id && nth_user_message == 0
+    );
+}
+
+#[tokio::test]
 async fn backtrack_branch_failure_restores_selected_prompt_snapshot() {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
 
