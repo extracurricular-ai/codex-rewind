@@ -26,6 +26,8 @@ use crate::error::Result;
 use crate::scope::SeedPolicy;
 use crate::scope::TrackedSet;
 use crate::scope::find_workspace_root;
+use crate::scope::is_ignored;
+use crate::scope::load_ignore;
 use crate::scope::seed_fallback_files;
 use crate::scope::workspace_files;
 use crate::store::SnapshotStore;
@@ -54,6 +56,11 @@ struct TrackState {
     /// every checkpoint scan so post-edit states keep being observed.
     /// In-memory for v1: lost on resume (recorded manifests stay valid).
     extras: BTreeSet<PathBuf>,
+    /// Directory whose ignore rules scope this session's captures: the
+    /// workspace root when one was found, else the invocation directory.
+    /// Recorded by the turn-start checkpoint, which always precedes tool
+    /// execution within a turn.
+    ignore_root: Option<PathBuf>,
 }
 
 impl FileSnapshotsController {
@@ -103,24 +110,28 @@ impl FileSnapshotsController {
 
     fn checkpoint_inner(&self, turn_id: &str, cwd: &Path) -> Result<()> {
         let markers: Vec<String> = WORKSPACE_MARKERS.iter().map(ToString::to_string).collect();
-        let (mut files, complete): (BTreeSet<PathBuf>, bool) =
-            match find_workspace_root(cwd, &markers) {
-                Some(root) => (workspace_files(&root)?.into_iter().collect(), true),
-                None => {
-                    let mut state = self.lock_state();
-                    let policy = SeedPolicy::default();
-                    let tracked = match &mut state.fallback {
-                        Some(tracked) => tracked,
-                        None => {
-                            let seed = seed_fallback_files(cwd, &policy)?;
-                            state
-                                .fallback
-                                .get_or_insert(TrackedSet::new(seed, policy.cap))
-                        }
-                    };
-                    (tracked.files().cloned().collect(), false)
-                }
-            };
+        let workspace_root = find_workspace_root(cwd, &markers);
+        // Whichever directory scoped this scan also scopes the ignore rules
+        // applied to edit-hook captures (see `attach_pre_edits_blocking`).
+        self.lock_state().ignore_root =
+            Some(workspace_root.clone().unwrap_or_else(|| cwd.to_path_buf()));
+        let (mut files, complete): (BTreeSet<PathBuf>, bool) = match workspace_root {
+            Some(root) => (workspace_files(&root)?.into_iter().collect(), true),
+            None => {
+                let mut state = self.lock_state();
+                let policy = SeedPolicy::default();
+                let tracked = match &mut state.fallback {
+                    Some(tracked) => tracked,
+                    None => {
+                        let seed = seed_fallback_files(cwd, &policy)?;
+                        state
+                            .fallback
+                            .get_or_insert(TrackedSet::new(seed, policy.cap))
+                    }
+                };
+                (tracked.files().cloned().collect(), false)
+            }
+        };
         files.extend(self.lock_state().extras.iter().cloned());
 
         let checkpoint = self
@@ -145,7 +156,21 @@ impl FileSnapshotsController {
         turn_id: &str,
         pre_images: Vec<(PathBuf, Option<Vec<u8>>)>,
     ) {
+        // Symmetric ignore (RFC correctness rule 4): a path the user excluded
+        // from snapshots must not enter the store through the edit hook
+        // either. Without this, editing an ignored file would both store its
+        // pre-edit content and register the path as an extra, so every later
+        // checkpoint would capture it as well — bypassing the scan's own
+        // ignore filter. The rules are read fresh so the current ignore file
+        // governs (rule 5).
+        let ignore = self.lock_state().ignore_root.as_deref().map(load_ignore);
         for (path, pre_content) in pre_images {
+            if ignore
+                .as_ref()
+                .is_some_and(|rules| is_ignored(rules, &path))
+            {
+                continue;
+            }
             {
                 let mut state = self.lock_state();
                 if let Some(tracked) = &mut state.fallback
@@ -197,6 +222,44 @@ mod tests {
         assert!(
             FileSnapshotsController::maybe_new(home.path(), true, false, "t2".into()).is_none()
         );
+    }
+
+    #[test]
+    fn ignored_paths_are_not_captured_through_the_edit_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let ctl = FileSnapshotsController::maybe_new(home.path(), true, true, "t1".into()).unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".git")).unwrap();
+        std::fs::write(
+            ws.path().join(crate::scope::SNAPSHOT_IGNORE_FILENAME),
+            "secrets/**\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.path().join("secrets")).unwrap();
+        std::fs::write(ws.path().join("secrets/key.pem"), "private").unwrap();
+        std::fs::write(ws.path().join("src.rs"), "code").unwrap();
+
+        // Turn-start scan establishes the ignore scope for the session.
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path());
+
+        let secret = ws.path().join("secrets/key.pem");
+        let tracked = ws.path().join("src.rs");
+        ctl.attach_pre_edits_blocking(
+            "turn-1",
+            vec![
+                (secret.clone(), Some(b"private".to_vec())),
+                (tracked.clone(), Some(b"code".to_vec())),
+            ],
+        );
+        ctl.checkpoint_turn_start_blocking("turn-2", ws.path());
+
+        let paths = ctl.store.tracked_paths("t1").unwrap();
+        assert!(
+            !paths.contains(&secret.to_string_lossy().into_owned()),
+            "ignored path must never reach the store, not even via the edit hook: {paths:?}"
+        );
+        assert!(paths.contains(&tracked.to_string_lossy().into_owned()));
     }
 
     #[test]
