@@ -35,6 +35,7 @@ pub enum SlashCommand {
     Delete,
     Resume,
     Fork,
+    Rewind,
     App,
     Init,
     Compact,
@@ -93,6 +94,7 @@ impl SlashCommand {
             SlashCommand::Delete => "permanently delete this session and exit",
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
+            SlashCommand::Rewind => "rewind the conversation, and code when file snapshots are on",
             SlashCommand::App => "continue this session in the Desktop app",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Copy => "copy last response as markdown",
@@ -194,6 +196,7 @@ impl SlashCommand {
             | SlashCommand::Archive
             | SlashCommand::Delete
             | SlashCommand::Fork
+            | SlashCommand::Rewind
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Keymap

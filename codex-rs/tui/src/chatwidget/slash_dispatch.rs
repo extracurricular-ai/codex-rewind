@@ -245,6 +245,9 @@ impl ChatWidget {
                 self.app_event_tx
                     .send(AppEvent::ForkCurrentSession { name: None });
             }
+            SlashCommand::Rewind => {
+                self.app_event_tx.send(AppEvent::OpenBacktrackPicker);
+            }
             SlashCommand::App => {
                 let Some(thread_id) = self.thread_id else {
                     self.add_error_message(
@@ -1096,6 +1099,7 @@ impl ChatWidget {
             | SlashCommand::Clear
             | SlashCommand::Resume
             | SlashCommand::Fork
+            | SlashCommand::Rewind
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Review

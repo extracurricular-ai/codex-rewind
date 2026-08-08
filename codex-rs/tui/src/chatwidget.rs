@@ -1486,6 +1486,34 @@ impl ChatWidget {
         }
     }
 
+    /// Show the `/rewind` prompt list. `entries` is `(nth_user_message, label)`
+    /// newest first; `total` is the number of prompts in the session.
+    pub(crate) fn show_rewind_picker(&mut self, entries: Vec<(usize, String)>, total: usize) {
+        let items = entries
+            .into_iter()
+            .map(|(nth, label)| SelectionItem {
+                name: label,
+                description: Some(format!("prompt {} of {total}", nth + 1)),
+                actions: vec![Box::new(move |tx| {
+                    tx.send(AppEvent::RewindToNthUserMessage { nth });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            })
+            .collect();
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Rewind to a previous prompt".to_string()),
+            subtitle: Some(
+                "The conversation branches before the prompt you pick, and its text returns to the composer."
+                    .to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
     pub(crate) fn add_info_message(&mut self, message: String, hint: Option<String>) {
         self.add_to_history(history_cell::new_info_event(message, hint));
         self.request_redraw();

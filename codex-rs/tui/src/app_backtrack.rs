@@ -187,6 +187,62 @@ impl App {
         }
     }
 
+    /// `/rewind`: list every prompt of this session so one can be picked
+    /// directly. Esc-stepping walks backwards one turn per press, which is
+    /// fine for the last turn and tedious for the tenth.
+    pub(crate) fn open_backtrack_from_command(&mut self, tui: &mut tui::Tui) {
+        if self.overlay.is_some() {
+            return;
+        }
+        if self.chat_widget.side_conversation_active() {
+            self.chat_widget
+                .add_error_message(SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE.to_string());
+            return;
+        }
+
+        // `prime_backtrack` records the thread the selection belongs to, which
+        // `backtrack_selection` later verifies against.
+        self.prime_backtrack();
+        self.chat_widget.clear_esc_backtrack_hint();
+
+        let total = user_count(&self.transcript_cells);
+        if total == 0 {
+            self.reset_backtrack_state();
+            self.chat_widget
+                .add_info_message(NO_PREVIOUS_MESSAGE_TO_EDIT.to_string(), /*hint*/ None);
+            tui.frame_requester().schedule_frame();
+            return;
+        }
+
+        // Newest first: rewinding usually targets something recent, and the
+        // list stays stable as the session grows.
+        let entries: Vec<(usize, String)> = (0..total)
+            .rev()
+            .filter_map(|nth| {
+                let cell = nth_user_position(&self.transcript_cells, nth)
+                    .and_then(|idx| self.transcript_cells.get(idx))?;
+                let text = cell
+                    .as_any()
+                    .downcast_ref::<UserHistoryCell>()
+                    .map(|user| prompt_summary(&user.message))?;
+                Some((nth, text))
+            })
+            .collect();
+
+        self.chat_widget.show_rewind_picker(entries, total);
+        tui.frame_requester().schedule_frame();
+    }
+
+    /// Rewind to the prompt chosen from the `/rewind` list.
+    pub(crate) fn rewind_to_nth_user_message(&mut self, nth_user_message: usize) {
+        let Some(selection) = self.backtrack_selection(nth_user_message) else {
+            self.reset_backtrack_state();
+            return;
+        };
+        self.reset_backtrack_state();
+        self.apply_backtrack_selection(selection);
+    }
+
     /// Request a source-preserving branch before the selected prompt.
     pub(crate) fn apply_backtrack_selection(&mut self, selection: BacktrackSelection) {
         if self.chat_widget.side_conversation_active() {
@@ -621,6 +677,21 @@ pub(crate) fn is_hidden_nested_review_turn(previous: &Turn, turn: &Turn) -> bool
         ),
         (Some(first), Some(second), None) if first == second
     )
+}
+
+/// Collapse a prompt to a single line for the `/rewind` list.
+fn prompt_summary(message: &str) -> String {
+    const MAX: usize = 72;
+    let mut text = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() > MAX {
+        text = text.chars().take(MAX - 1).collect::<String>();
+        text.push('…');
+    }
+    if text.is_empty() {
+        "(empty prompt)".to_string()
+    } else {
+        text
+    }
 }
 
 pub(crate) fn user_count(cells: &[Arc<dyn crate::history_cell::HistoryCell>]) -> usize {

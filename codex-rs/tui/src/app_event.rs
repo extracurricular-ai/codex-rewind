@@ -313,6 +313,14 @@ pub(crate) enum AppEvent {
     },
 
     /// Branch before a selected prompt and reopen it in the new thread's composer.
+    /// Open the backtrack prompt picker (the `/rewind` command).
+    OpenBacktrackPicker,
+
+    /// Rewind to the prompt chosen from the `/rewind` picker.
+    RewindToNthUserMessage {
+        nth: usize,
+    },
+
     ForkSessionForPromptEdit {
         thread_id: ThreadId,
         nth_user_message: usize,

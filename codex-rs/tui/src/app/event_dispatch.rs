@@ -281,6 +281,13 @@ impl App {
                 self.chat_widget.maybe_send_next_queued_input();
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenBacktrackPicker => {
+                self.open_backtrack_from_command(tui);
+            }
+            AppEvent::RewindToNthUserMessage { nth } => {
+                self.rewind_to_nth_user_message(nth);
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::ForkSessionForPromptEdit {
                 thread_id,
                 nth_user_message,
