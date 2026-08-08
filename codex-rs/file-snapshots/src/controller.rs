@@ -44,6 +44,8 @@ const STORE_DIR_NAME: &str = "file_snapshots";
 pub struct FileSnapshotsController {
     store: SnapshotStore,
     thread_id: String,
+    /// Seeding limits for fallback mode, from `[file_snapshots]`.
+    seed_policy: SeedPolicy,
     state: Mutex<TrackState>,
 }
 
@@ -72,6 +74,7 @@ impl FileSnapshotsController {
         feature_enabled: bool,
         is_new_thread: bool,
         thread_id: String,
+        seed_policy: SeedPolicy,
     ) -> Option<Arc<Self>> {
         let store = match SnapshotStore::open(codex_home.join(STORE_DIR_NAME)) {
             Ok(store) => store,
@@ -96,6 +99,7 @@ impl FileSnapshotsController {
         Some(Arc::new(Self {
             store,
             thread_id,
+            seed_policy,
             state: Mutex::new(TrackState::default()),
         }))
     }
@@ -118,8 +122,8 @@ impl FileSnapshotsController {
         let (mut files, complete): (BTreeSet<PathBuf>, bool) = match workspace_root {
             Some(root) => (workspace_files(&root)?.into_iter().collect(), true),
             None => {
+                let policy = self.seed_policy.clone();
                 let mut state = self.lock_state();
-                let policy = SeedPolicy::default();
                 let tracked = match &mut state.fallback {
                     Some(tracked) => tracked,
                     None => {
@@ -210,24 +214,90 @@ mod tests {
 
         // New session, feature off → inactive, no marker.
         assert!(
-            FileSnapshotsController::maybe_new(home.path(), false, true, "t1".into()).is_none()
+            FileSnapshotsController::maybe_new(
+                home.path(),
+                false,
+                true,
+                "t1".into(),
+                SeedPolicy::default()
+            )
+            .is_none()
         );
         // New session, feature on → active, marker created.
-        assert!(FileSnapshotsController::maybe_new(home.path(), true, true, "t1".into()).is_some());
+        assert!(
+            FileSnapshotsController::maybe_new(
+                home.path(),
+                true,
+                true,
+                "t1".into(),
+                SeedPolicy::default()
+            )
+            .is_some()
+        );
         // Resume with feature now OFF → marker wins, still tracking.
         assert!(
-            FileSnapshotsController::maybe_new(home.path(), false, false, "t1".into()).is_some()
+            FileSnapshotsController::maybe_new(
+                home.path(),
+                false,
+                false,
+                "t1".into(),
+                SeedPolicy::default()
+            )
+            .is_some()
         );
         // Resume of a session that never tracked, feature now ON → stays off.
         assert!(
-            FileSnapshotsController::maybe_new(home.path(), true, false, "t2".into()).is_none()
+            FileSnapshotsController::maybe_new(
+                home.path(),
+                true,
+                false,
+                "t2".into(),
+                SeedPolicy::default()
+            )
+            .is_none()
         );
+    }
+
+    #[test]
+    fn seed_policy_from_config_bounds_fallback_tracking() {
+        let home = tempfile::tempdir().unwrap();
+        // Deliberately tiny limits: a directory of 5 files exceeds
+        // `full_limit`, so only `recent_seed` files may be tracked.
+        let policy = SeedPolicy {
+            full_limit: 2,
+            recent_seed: 3,
+            cap: 4,
+        };
+        let ctl = FileSnapshotsController::maybe_new(home.path(), true, true, "t1".into(), policy)
+            .unwrap();
+
+        // No `.git` marker → fallback mode, where seeding applies.
+        let loose = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(loose.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        ctl.checkpoint_turn_start_blocking("turn-1", loose.path());
+
+        let history = ctl.store.thread_history("t1").unwrap();
+        assert_eq!(
+            history[0].1.entries.len(),
+            3,
+            "configured seed_recent must bound the tracked set"
+        );
+        assert!(!history[0].1.complete, "fallback captures are partial");
     }
 
     #[test]
     fn ignored_paths_are_not_captured_through_the_edit_hook() {
         let home = tempfile::tempdir().unwrap();
-        let ctl = FileSnapshotsController::maybe_new(home.path(), true, true, "t1".into()).unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            SeedPolicy::default(),
+        )
+        .unwrap();
 
         let ws = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(ws.path().join(".git")).unwrap();
@@ -265,7 +335,14 @@ mod tests {
     #[test]
     fn checkpoint_workspace_and_fallback_modes() {
         let home = tempfile::tempdir().unwrap();
-        let ctl = FileSnapshotsController::maybe_new(home.path(), true, true, "t1".into()).unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            SeedPolicy::default(),
+        )
+        .unwrap();
 
         // Workspace mode: .git marker present → complete scan.
         let ws = tempfile::tempdir().unwrap();
@@ -282,8 +359,14 @@ mod tests {
         // pre-edit attach are observed by later checkpoints.
         let loose = tempfile::tempdir().unwrap();
         std::fs::write(loose.path().join("note.md"), "n1").unwrap();
-        let ctl2 =
-            FileSnapshotsController::maybe_new(home.path(), true, true, "t2".into()).unwrap();
+        let ctl2 = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t2".into(),
+            SeedPolicy::default(),
+        )
+        .unwrap();
         ctl2.checkpoint_turn_start_blocking("turn-1", loose.path());
         let outside = home.path().join("elsewhere.cfg");
         ctl2.attach_pre_edits_blocking("turn-1", vec![(outside.clone(), Some(b"pre".to_vec()))]);

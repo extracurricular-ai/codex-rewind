@@ -1194,6 +1194,11 @@ impl Session {
                 config.features.enabled(codex_features::Feature::FileSnapshots),
                 !matches!(initial_history, InitialHistory::Resumed(_)),
                 thread_id.to_string(),
+                codex_file_snapshots::SeedPolicy {
+                    full_limit: config.file_snapshots.seed_full_limit,
+                    recent_seed: config.file_snapshots.seed_recent,
+                    cap: config.file_snapshots.max_tracked_files,
+                },
             );
             let sess = Arc::new(Session {
                 thread_id,

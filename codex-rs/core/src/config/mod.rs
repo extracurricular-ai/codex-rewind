@@ -184,6 +184,26 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
 
+/// Resolved `[file_snapshots]` tuning. Only consulted in fallback mode: with
+/// a project marker the whole workspace is tracked, so no seeding is needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSnapshotsConfig {
+    pub seed_full_limit: usize,
+    pub seed_recent: usize,
+    pub max_tracked_files: usize,
+}
+
+impl Default for FileSnapshotsConfig {
+    fn default() -> Self {
+        let defaults = codex_file_snapshots::SeedPolicy::default();
+        Self {
+            seed_full_limit: defaults.full_limit,
+            seed_recent: defaults.recent_seed,
+            max_tracked_files: defaults.cap,
+        }
+    }
+}
+
 /// Compatibility-only config retained so legacy `ghost_snapshot` settings
 /// continue to load even though snapshots are no longer produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1051,6 +1071,9 @@ pub struct Config {
     /// Compatibility-only settings retained for legacy `ghost_snapshot`
     /// config loading.
     pub ghost_snapshot: GhostSnapshotConfig,
+
+    /// Tuning for the file snapshot subsystem.
+    pub file_snapshots: FileSnapshotsConfig,
 
     /// Settings specific to the task-path-based multi-agent tool surface.
     pub multi_agent_v2: MultiAgentV2Config,
@@ -3812,6 +3835,22 @@ impl Config {
             config
         };
 
+        let file_snapshots = {
+            let mut config = FileSnapshotsConfig::default();
+            if let Some(toml) = cfg.file_snapshots.as_ref() {
+                if let Some(limit) = toml.seed_full_limit {
+                    config.seed_full_limit = limit;
+                }
+                if let Some(recent) = toml.seed_recent {
+                    config.seed_recent = recent;
+                }
+                if let Some(cap) = toml.max_tracked_files {
+                    config.max_tracked_files = cap;
+                }
+            }
+            config
+        };
+
         let use_experimental_unified_exec_tool = features.enabled(Feature::UnifiedExec);
 
         let forced_chatgpt_workspace_id = cfg
@@ -4210,6 +4249,7 @@ impl Config {
             use_experimental_unified_exec_tool,
             background_terminal_max_timeout,
             ghost_snapshot,
+            file_snapshots,
             multi_agent_v2,
             token_budget,
             rollout_budget,

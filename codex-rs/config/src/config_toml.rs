@@ -462,6 +462,9 @@ pub struct ConfigToml {
     #[serde(default)]
     pub ghost_snapshot: Option<GhostSnapshotToml>,
 
+    /// Tuning for file snapshots; see [`FileSnapshotsToml`].
+    pub file_snapshots: Option<FileSnapshotsToml>,
+
     /// Markers used to detect the project root when searching parent
     /// directories for `.codex` folders. Defaults to [".git"] when unset.
     #[serde(default)]
@@ -728,6 +731,21 @@ pub struct AgentRoleToml {
 
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+}
+
+/// `[file_snapshots]` — tuning for the git-free file snapshot subsystem
+/// (`docs/rfc-file-snapshot-rewind.md`). Enabling the subsystem itself is a
+/// feature flag (`[features] file_snapshots = true`); this section only
+/// shapes what a session tracks when no project marker scopes the workspace.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct FileSnapshotsToml {
+    /// Track every eligible file when the directory holds at most this many.
+    pub seed_full_limit: Option<usize>,
+    /// Otherwise seed tracking with this many most-recently-modified files.
+    pub seed_recent: Option<usize>,
+    /// Hard cap on tracked files, including growth from edits.
+    pub max_tracked_files: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
