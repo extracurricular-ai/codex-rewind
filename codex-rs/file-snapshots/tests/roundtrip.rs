@@ -1,12 +1,13 @@
 //! End-to-end scenario from the RFC: checkpoint → agent edits →
 //! checkpoint → user edits → rewind (with safety checkpoint,
-//! witnessed-birth deletion, symmetric ignore) → redo → GC.
+//! complete-scan deletion, symmetric ignore) → redo → GC.
 
 #![allow(clippy::unwrap_used)]
 
 use std::fs;
 use std::path::Path;
 
+use codex_file_snapshots::RestoreKind;
 use codex_file_snapshots::SNAPSHOT_IGNORE_FILENAME;
 use codex_file_snapshots::SnapshotStore;
 use codex_file_snapshots::is_ignored;
@@ -15,6 +16,7 @@ use codex_file_snapshots::workspace_files;
 use pretty_assertions::assert_eq;
 
 const THREAD: &str = "thread-1";
+const WS_KEY: &str = "/workspace/under-test";
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
@@ -35,7 +37,12 @@ fn full_rewind_redo_gc_scenario() {
 
     // Turn 1 checkpoint.
     let cp1 = store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
+        .checkpoint(
+            THREAD,
+            "turn-1",
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            true,
+        )
         .unwrap();
     assert_eq!(
         cp1.manifest.entries.len(),
@@ -50,7 +57,12 @@ fn full_rewind_redo_gc_scenario() {
 
     // Turn 2 checkpoint observes the agent's changes.
     let cp2 = store
-        .checkpoint(THREAD, "turn-2", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
+        .checkpoint(
+            THREAD,
+            "turn-2",
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            true,
+        )
         .unwrap();
     assert_eq!(
         cp2.manifest.entries.len(),
@@ -69,7 +81,9 @@ fn full_rewind_redo_gc_scenario() {
     let outcome = store
         .restore_to(
             THREAD,
-            &cp1.id,
+            WS_KEY,
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &protect,
@@ -92,6 +106,10 @@ fn full_rewind_redo_gc_scenario() {
     assert_eq!(read(&ws.join("build.log")), "log v2 (user)");
     assert_eq!(outcome.stats.written, 2);
     assert_eq!(outcome.stats.deleted, 2);
+    assert!(
+        store.last_restore_target(WS_KEY).unwrap().is_some(),
+        "the rewind left an undo behind"
+    );
 
     // Redo: restore the safety checkpoint → pre-rewind state returns.
     let ignore2 = load_ignore(&ws);
@@ -99,7 +117,9 @@ fn full_rewind_redo_gc_scenario() {
     store
         .restore_to(
             THREAD,
-            &outcome.safety_manifest_id,
+            WS_KEY,
+            &outcome.safety,
+            RestoreKind::Undo,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &protect2,
@@ -110,8 +130,13 @@ fn full_rewind_redo_gc_scenario() {
     assert_eq!(read(&ws.join("c.txt")), "charlie (agent)");
     assert_eq!(read(&ws.join("user-note.txt")), "user data");
     assert_eq!(read(&ws.join("build.log")), "log v2 (user)");
+    assert!(
+        store.last_restore_target(WS_KEY).unwrap().is_none(),
+        "the undo consumed the rewind it reversed, so there is nothing left to undo"
+    );
 
-    // Session lifetime GC: dropping the thread empties the store.
+    // Session lifetime GC: with the undo spent, dropping the thread leaves
+    // nothing reachable and the store empties.
     assert!(store.disk_usage().unwrap() > 0);
     store.remove_thread(THREAD).unwrap();
     let gc = store.gc().unwrap();
@@ -136,19 +161,31 @@ fn restore_preserves_permissions() {
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
     let cp1 = store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
+        .checkpoint(
+            THREAD,
+            "turn-1",
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            true,
+        )
         .unwrap();
 
     fs::write(&script, "#!/bin/sh\necho changed\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).unwrap();
     store
-        .checkpoint(THREAD, "turn-2", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
+        .checkpoint(
+            THREAD,
+            "turn-2",
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            true,
+        )
         .unwrap();
 
     store
         .restore_to(
             THREAD,
-            &cp1.id,
+            WS_KEY,
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &|_| false,
@@ -176,7 +213,12 @@ fn thread_marker_and_pre_edit_attach() {
     // Turn-start scan sees only a.txt.
     fs::write(ws.join("a.txt"), "alpha").unwrap();
     let cp1 = store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
+        .checkpoint(
+            THREAD,
+            "turn-1",
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            true,
+        )
         .unwrap();
 
     // Agent edits a file OUTSIDE the workspace scan: pre-image attaches
@@ -223,7 +265,9 @@ fn thread_marker_and_pre_edit_attach() {
     store
         .restore_to(
             THREAD,
-            &attached,
+            WS_KEY,
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false)
                 .unwrap()
                 .into_iter()
@@ -244,7 +288,12 @@ fn turn_resolution_and_fork_inheritance() {
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store
-        .checkpoint(THREAD, "turn-1", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
+        .checkpoint(
+            THREAD,
+            "turn-1",
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            true,
+        )
         .unwrap();
     // Supplemental attach under the same turn: resolution must pick it.
     let outside = dir.path().join("ext.cfg");
@@ -254,15 +303,23 @@ fn turn_resolution_and_fork_inheritance() {
         .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
     store
-        .checkpoint(THREAD, "turn-2", workspace_files(&ws, /*include_hidden*/ false).unwrap(), true)
+        .checkpoint(
+            THREAD,
+            "turn-2",
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            true,
+        )
         .unwrap();
 
     assert_eq!(
-        store.manifest_id_for_turn(THREAD, "turn-1").unwrap(),
+        store
+            .target_for_turn("turn-1")
+            .unwrap()
+            .map(|t| t.manifest_id().to_string()),
         Some(supplemental.clone()),
         "last entry for the turn wins"
     );
-    assert_eq!(store.manifest_id_for_turn(THREAD, "nope").unwrap(), None);
+    assert!(store.target_for_turn("nope").unwrap().is_none());
 
     // tracked_paths covers the outside-workspace attach.
     let paths = store.tracked_paths(THREAD).unwrap();
@@ -285,4 +342,144 @@ fn turn_resolution_and_fork_inheritance() {
     store.remove_thread(THREAD).unwrap();
     let gc = store.gc().unwrap();
     assert!(gc.manifests_kept >= 2, "fork-1 still references manifests");
+}
+
+#[test]
+fn rewinding_twice_still_restores() {
+    // Mirrors real use: rewind, undo it, rewind again. The second rewind must
+    // put the files back, not quietly decide there is nothing to do.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    let turn1 = store.checkpoint(THREAD, "turn-1", scan(), true).unwrap();
+
+    fs::write(ws.join("a.txt"), "v2").unwrap();
+    store.checkpoint(THREAD, "turn-2", scan(), true).unwrap();
+
+    // Rewind to turn 1.
+    let turn1_target = store.target_for_turn("turn-1").unwrap().unwrap();
+    store
+        .restore_to(
+            THREAD,
+            WS_KEY,
+            &turn1_target,
+            RestoreKind::Rewind,
+            scan(),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+    assert_eq!(read(&ws.join("a.txt")), "v1", "first rewind");
+
+    // Undo that rewind.
+    let safety = store.last_restore_target(WS_KEY).unwrap().unwrap();
+    let out = store
+        .restore_to(
+            THREAD,
+            WS_KEY,
+            &safety,
+            RestoreKind::Undo,
+            scan(),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+    assert_eq!(
+        read(&ws.join("a.txt")),
+        "v2",
+        "undo restores the newer state"
+    );
+
+    // Rewind to turn 1 again — the case that regressed in real use. The
+    // target must resolve to the same entry as before, even though the undo
+    // recorded that very state again further down the log.
+    store
+        .restore_to(
+            THREAD,
+            WS_KEY,
+            &turn1_target,
+            RestoreKind::Rewind,
+            scan(),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+    assert_eq!(
+        read(&ws.join("a.txt")),
+        "v1",
+        "second rewind must still work"
+    );
+}
+
+#[test]
+fn undo_walks_back_through_successive_rewinds() {
+    // Rewinding twice in a row and then undoing twice has to retrace those
+    // steps in reverse. If the undo target were simply "the last restore",
+    // the second undo would reverse the first undo and the files would
+    // oscillate between two states while the conversation kept moving back.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2"), ("turn-3", "v3")] {
+        fs::write(ws.join("a.txt"), contents).unwrap();
+        store.checkpoint(THREAD, turn, scan(), true).unwrap();
+    }
+
+    let rewind = |turn: &str| {
+        let target = store.target_for_turn(turn).unwrap().unwrap();
+        store
+            .restore_to(
+                THREAD,
+                WS_KEY,
+                &target,
+                RestoreKind::Rewind,
+                scan(),
+                true,
+                &|_| false,
+            )
+            .unwrap();
+    };
+    let undo = || {
+        let target = store.last_restore_target(WS_KEY).unwrap().unwrap();
+        store
+            .restore_to(
+                THREAD,
+                WS_KEY,
+                &target,
+                RestoreKind::Undo,
+                scan(),
+                true,
+                &|_| false,
+            )
+            .unwrap();
+    };
+
+    rewind("turn-2");
+    assert_eq!(read(&ws.join("a.txt")), "v2");
+    rewind("turn-1");
+    assert_eq!(read(&ws.join("a.txt")), "v1");
+
+    undo();
+    assert_eq!(
+        read(&ws.join("a.txt")),
+        "v2",
+        "first undo retraces one step"
+    );
+    undo();
+    assert_eq!(
+        read(&ws.join("a.txt")),
+        "v3",
+        "second undo retraces the earlier rewind, back to where we started"
+    );
+    assert!(
+        store.last_restore_target(WS_KEY).unwrap().is_none(),
+        "both rewinds have been spent"
+    );
 }

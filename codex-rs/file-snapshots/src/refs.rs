@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -122,6 +123,187 @@ impl RefStore {
     }
 }
 
+/// How many restores a workspace remembers. Undo only needs the most recent
+/// one; the rest is history that would otherwise keep manifests alive.
+const MAX_RESTORE_HISTORY: usize = 20;
+
+/// A restore that has been applied to a workspace, recorded so it can be
+/// undone. Bound to the workspace rather than to a thread: a restore changes
+/// files, which belong to the workspace, and the user who wants it undone
+/// may well be on a different branch by then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreRecord {
+    /// What the workspace was restored to.
+    pub target_manifest_id: String,
+    /// What it looked like just before — where an undo returns to.
+    pub safety_manifest_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreLog {
+    pub entries: Vec<RestoreRecord>,
+}
+
+/// Maps turn ids to the state captured at their start, and workspaces to
+/// their restore history. Both are deliberately independent of any thread:
+/// a fork inherits its parent's turn ids, so a turn resolves to the same
+/// snapshot from every branch, and an undo works wherever the user happens
+/// to be.
+pub struct TurnIndex {
+    turns_root: PathBuf,
+    restores_root: PathBuf,
+}
+
+impl TurnIndex {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let turns_root = root.join("turns");
+        let restores_root = root.join("restores");
+        fs::create_dir_all(&turns_root).map_err(|e| SnapshotError::io(&turns_root, e))?;
+        fs::create_dir_all(&restores_root).map_err(|e| SnapshotError::io(&restores_root, e))?;
+        Ok(Self {
+            turns_root,
+            restores_root,
+        })
+    }
+
+    /// Record the snapshot captured at `turn_id`'s start. Later writes win:
+    /// a supplemental pre-edit attach extends that turn's capture.
+    pub fn set_turn(&self, turn_id: &str, manifest_id: &str) -> Result<()> {
+        let path = self.turn_path(turn_id);
+        write_atomic(&path, manifest_id.as_bytes())
+    }
+
+    pub fn manifest_for_turn(&self, turn_id: &str) -> Result<Option<String>> {
+        let path = self.turn_path(turn_id);
+        match fs::read_to_string(&path) {
+            Ok(id) => Ok(Some(id.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(SnapshotError::io(&path, e)),
+        }
+    }
+
+    pub fn all_manifest_ids(&self) -> Result<BTreeSet<String>> {
+        let mut out = BTreeSet::new();
+        let entries =
+            fs::read_dir(&self.turns_root).map_err(|e| SnapshotError::io(&self.turns_root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| SnapshotError::io(&self.turns_root, e))?;
+            if let Ok(id) = fs::read_to_string(entry.path()) {
+                out.insert(id.trim().to_string());
+            }
+        }
+        for log in self.all_restore_logs()? {
+            for record in log.entries {
+                out.insert(record.target_manifest_id);
+                out.insert(record.safety_manifest_id);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn push_restore(&self, workspace: &str, record: RestoreRecord) -> Result<()> {
+        let mut log = self.restore_log(workspace)?;
+        log.entries.push(record);
+        // Undo reaches back one step, so a long tail only pins storage.
+        if log.entries.len() > MAX_RESTORE_HISTORY {
+            let excess = log.entries.len() - MAX_RESTORE_HISTORY;
+            log.entries.drain(..excess);
+        }
+        let path = self.restore_path(workspace);
+        write_atomic(&path, &serde_json::to_vec_pretty(&log)?)
+    }
+
+    /// The most recent restore applied to this workspace, if any.
+    pub fn last_restore(&self, workspace: &str) -> Result<Option<RestoreRecord>> {
+        Ok(self.restore_log(workspace)?.entries.pop())
+    }
+
+    /// Discard the most recent restore record, because it has just been
+    /// reversed. The log is a stack: rewinds push, undos pop, so repeated
+    /// undos walk back through repeated rewinds instead of oscillating
+    /// between the last two states.
+    pub fn pop_restore(&self, workspace: &str) -> Result<Option<RestoreRecord>> {
+        let mut log = self.restore_log(workspace)?;
+        let popped = log.entries.pop();
+        if popped.is_some() {
+            let path = self.restore_path(workspace);
+            write_atomic(&path, &serde_json::to_vec_pretty(&log)?)?;
+        }
+        Ok(popped)
+    }
+
+    fn restore_log(&self, workspace: &str) -> Result<RestoreLog> {
+        let path = self.restore_path(workspace);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RestoreLog::default()),
+            Err(e) => Err(SnapshotError::io(&path, e)),
+        }
+    }
+
+    fn all_restore_logs(&self) -> Result<Vec<RestoreLog>> {
+        let mut out = Vec::new();
+        let entries = fs::read_dir(&self.restores_root)
+            .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
+            if let Ok(bytes) = fs::read(entry.path())
+                && let Ok(log) = serde_json::from_slice::<RestoreLog>(&bytes)
+            {
+                out.push(log);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drop index entries for turns no thread holds any more.
+    pub fn retain_turns(&self, live_turn_ids: &BTreeSet<String>) -> Result<()> {
+        let entries =
+            fs::read_dir(&self.turns_root).map_err(|e| SnapshotError::io(&self.turns_root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| SnapshotError::io(&self.turns_root, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tmp") || live_turn_ids.contains(&name) {
+                continue;
+            }
+            fs::remove_file(entry.path()).map_err(|e| SnapshotError::io(entry.path(), e))?;
+        }
+        Ok(())
+    }
+
+    fn turn_path(&self, turn_id: &str) -> PathBuf {
+        self.turns_root.join(safe_file_name(turn_id))
+    }
+
+    fn restore_path(&self, workspace: &str) -> PathBuf {
+        self.restores_root.join(format!(
+            "{}.json",
+            crate::blob::BlobStore::hash_bytes(workspace.as_bytes())
+        ))
+    }
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).map_err(|e| SnapshotError::io(&tmp, e))?;
+    fs::rename(&tmp, path).map_err(|e| SnapshotError::io(path, e))
+}
+
+/// Thread and turn ids are UUID-like; anything else is mapped to a
+/// filename-safe character set.
+fn safe_file_name(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GcStats {
     pub manifests_kept: usize,
@@ -134,15 +316,21 @@ pub struct GcStats {
 /// referenced by any live manifest are live; everything else is removed.
 pub fn collect_garbage(
     refs: &RefStore,
+    turns: &TurnIndex,
     manifests: &ManifestStore,
     blobs: &BlobStore,
 ) -> Result<GcStats> {
     let mut live_manifests = BTreeSet::new();
+    let mut live_turn_ids = BTreeSet::new();
     for log in refs.thread_logs()? {
         for entry in log.entries {
+            live_turn_ids.insert(safe_file_name(&entry.turn_id));
             live_manifests.insert(entry.manifest_id);
         }
     }
+    // A turn only matters while some thread still holds it.
+    turns.retain_turns(&live_turn_ids)?;
+    live_manifests.extend(turns.all_manifest_ids()?);
 
     let mut stats = GcStats::default();
     let mut live_blobs = BTreeSet::new();
@@ -208,6 +396,7 @@ mod tests {
     fn gc_sweeps_unreferenced_manifests_and_blobs() {
         let dir = tempfile::tempdir().unwrap();
         let refs = RefStore::open(dir.path().join("refs")).unwrap();
+        let turns = TurnIndex::open(dir.path()).unwrap();
         let manifests = ManifestStore::open(dir.path().join("manifests")).unwrap();
         let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
 
@@ -240,7 +429,7 @@ mod tests {
         )
         .unwrap();
 
-        let stats = collect_garbage(&refs, &manifests, &blobs).unwrap();
+        let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
         assert_eq!(stats.manifests_kept, 1);
         assert_eq!(stats.manifests_removed, 1);
         assert_eq!(stats.blobs_kept, 1);
@@ -252,7 +441,7 @@ mod tests {
 
         // Dropping the thread makes everything garbage.
         refs.remove("t1").unwrap();
-        let stats = collect_garbage(&refs, &manifests, &blobs).unwrap();
+        let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
         assert_eq!(stats.manifests_removed, 1);
         assert_eq!(stats.blobs_removed, 1);
         assert_eq!(manifests.ids().unwrap().len(), 0);

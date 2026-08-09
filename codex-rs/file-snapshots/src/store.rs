@@ -15,7 +15,9 @@ use crate::manifest::Manifest;
 use crate::manifest::ManifestStore;
 use crate::refs::GcStats;
 use crate::refs::RefStore;
+use crate::refs::RestoreRecord;
 use crate::refs::SnapshotRef;
+use crate::refs::TurnIndex;
 use crate::refs::collect_garbage;
 use crate::restore::ApplyStats;
 use crate::restore::RestorePlan;
@@ -25,18 +27,40 @@ use crate::restore::plan_restore;
 /// Turn-id prefix used for the safety checkpoint recorded before a restore.
 pub const SAFETY_TURN_PREFIX: &str = "safety-restore:";
 
+/// The state a restore moves the workspace to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTarget {
+    manifest_id: String,
+}
+
+/// Which direction a restore moves the workspace's undo history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreKind {
+    /// Going back in the conversation; leaves an undo behind.
+    Rewind,
+    /// Reversing the most recent rewind; consumes that undo, so undoing
+    /// twice walks back through two rewinds rather than oscillating.
+    Undo,
+}
+
+impl RestoreTarget {
+    pub fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+}
+
 pub struct SnapshotStore {
     blobs: BlobStore,
     manifests: ManifestStore,
     refs: RefStore,
+    turns: TurnIndex,
     root: PathBuf,
 }
 
 #[derive(Debug)]
 pub struct RestoreOutcome {
-    /// The safety checkpoint of the pre-restore state; restoring to it
-    /// undoes this restore (redo).
-    pub safety_manifest_id: String,
+    /// The pre-restore state; restoring to it undoes this restore (redo).
+    pub safety: RestoreTarget,
     pub plan: RestorePlan,
     pub stats: ApplyStats,
 }
@@ -48,6 +72,7 @@ impl SnapshotStore {
             blobs: BlobStore::open(root.join("blobs"))?,
             manifests: ManifestStore::open(root.join("manifests"))?,
             refs: RefStore::open(root.join("refs"))?,
+            turns: TurnIndex::open(&root)?,
             root,
         })
     }
@@ -72,6 +97,9 @@ impl SnapshotStore {
                 manifest_id: cp.id.clone(),
             },
         )?;
+        // Turn ids survive forking, so this index is what lets a rewind
+        // resolve the same state from any branch.
+        self.turns.set_turn(turn_id, &cp.id)?;
         Ok(cp)
     }
 
@@ -137,21 +165,32 @@ impl SnapshotStore {
                 manifest_id: id.clone(),
             },
         )?;
+        // A supplemental attach extends this turn's capture, so it becomes
+        // the state the turn resolves to.
+        self.turns.set_turn(turn_id, &id)?;
         Ok(Some(id))
     }
 
-    /// Resolve "the state at `turn_id`'s start" to a manifest id: the
-    /// **last** log entry recorded under that turn id (later entries for a
-    /// turn are supplemental pre-edit attaches extending the turn-start
-    /// scan, so last = most complete). `None` if the turn has no snapshot.
-    pub fn manifest_id_for_turn(&self, thread_id: &str, turn_id: &str) -> Result<Option<String>> {
-        let log = self.refs.load(thread_id)?;
-        Ok(log
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.turn_id == turn_id)
-            .map(|entry| entry.manifest_id.clone()))
+    /// The state captured at `turn_id`'s start (or extended by a later
+    /// pre-edit attach). Resolved through the turn index rather than any
+    /// thread's log, so every branch holding that turn gets the same answer.
+    pub fn target_for_turn(&self, turn_id: &str) -> Result<Option<RestoreTarget>> {
+        Ok(self
+            .turns
+            .manifest_for_turn(turn_id)?
+            .map(|manifest_id| RestoreTarget { manifest_id }))
+    }
+
+    /// Where an undo returns to: the state captured just before the most
+    /// recent restore applied to `workspace`. Bound to the workspace, not to
+    /// a thread, so it answers correctly from whatever branch the user is on.
+    pub fn last_restore_target(&self, workspace: &str) -> Result<Option<RestoreTarget>> {
+        Ok(self
+            .turns
+            .last_restore(workspace)?
+            .map(|record| RestoreTarget {
+                manifest_id: record.safety_manifest_id,
+            }))
     }
 
     /// Union of every path key observed across the thread's manifests.
@@ -222,35 +261,48 @@ impl SnapshotStore {
     pub fn restore_to(
         &self,
         thread_id: &str,
-        target_manifest_id: &str,
+        workspace: &str,
+        target: &RestoreTarget,
+        kind: RestoreKind,
         current_files: impl IntoIterator<Item = PathBuf>,
         current_complete: bool,
         is_protected: &dyn Fn(&str) -> bool,
     ) -> Result<RestoreOutcome> {
-        // 1. Safety checkpoint (appends to the log → becomes history.last()).
+        // 1. Capture what is about to be replaced, so this restore can be
+        // undone. It is recorded on the thread doing the restoring, but the
+        // undo path finds it through the workspace's restore log below.
         let safety = self.checkpoint(
             thread_id,
-            &format!("{SAFETY_TURN_PREFIX}{target_manifest_id}"),
+            &format!("{SAFETY_TURN_PREFIX}{}", target.manifest_id),
             current_files,
             current_complete,
         )?;
 
-        // 2. Locate the target (latest occurrence: with content-addressed
-        // manifests the same state may recur; deleting only files born
-        // after its most recent occurrence is the conservative reading).
-        let history = self.thread_history(thread_id)?;
-        let manifests: Vec<Manifest> = history.into_iter().map(|(_, m)| m).collect();
-        let target_index = manifests
-            .iter()
-            .rposition(|m| m.id().is_ok_and(|id| id == target_manifest_id))
-            .ok_or_else(|| SnapshotError::MissingManifest(target_manifest_id.to_string()))?;
-
-        // 3-4. Plan (writes + witnessed-birth deletes) and apply.
-        let plan = plan_restore(&manifests, target_index, is_protected);
+        // 2. Compare the two states directly. Nothing here consults a
+        // thread's history, so the outcome depends only on where the
+        // workspace is and where it is going.
+        let current = self.manifests.load(&safety.id)?;
+        let target_manifest = self.manifests.load(&target.manifest_id)?;
+        let plan = plan_restore(&target_manifest, &current, is_protected);
         let stats = apply_plan(&self.blobs, &plan)?;
 
+        match kind {
+            RestoreKind::Rewind => self.turns.push_restore(
+                workspace,
+                RestoreRecord {
+                    target_manifest_id: target.manifest_id.clone(),
+                    safety_manifest_id: safety.id.clone(),
+                },
+            )?,
+            RestoreKind::Undo => {
+                self.turns.pop_restore(workspace)?;
+            }
+        }
+
         Ok(RestoreOutcome {
-            safety_manifest_id: safety.id,
+            safety: RestoreTarget {
+                manifest_id: safety.id,
+            },
             plan,
             stats,
         })
@@ -261,9 +313,11 @@ impl SnapshotStore {
         self.refs.remove(thread_id)
     }
 
-    /// Mark-and-sweep unreferenced manifests and blobs.
+    /// Mark-and-sweep unreferenced manifests and blobs. Roots are the thread
+    /// logs plus everything the turn index and workspace restore logs still
+    /// point at.
     pub fn gc(&self) -> Result<GcStats> {
-        collect_garbage(&self.refs, &self.manifests, &self.blobs)
+        collect_garbage(&self.refs, &self.turns, &self.manifests, &self.blobs)
     }
 
     /// Total bytes on disk under the store root (for `/status` display).

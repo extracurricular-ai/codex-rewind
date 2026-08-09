@@ -47,6 +47,8 @@ pub use scope::is_ignored;
 pub use scope::load_ignore;
 pub use scope::seed_fallback_files;
 pub use scope::workspace_files;
+pub use store::RestoreKind;
 pub use store::RestoreOutcome;
+pub use store::RestoreTarget;
 pub use store::SAFETY_TURN_PREFIX;
 pub use store::SnapshotStore;
