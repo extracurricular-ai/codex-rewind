@@ -6656,7 +6656,17 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
         app.chat_widget.remote_image_urls(),
         prompt.remote_image_urls
     );
-    assert_eq!(std::fs::read_to_string(&source_path)?, source_before);
+    // Retiring the rewound thread moves its rollout into the archive rather
+    // than destroying it — that file is what /redo returns to.
+    let archived_path = config
+        .codex_home
+        .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR)
+        .join(source_path.file_name().expect("rollout paths are files"));
+    assert!(
+        !source_path.exists(),
+        "the rewound thread should have left the live sessions directory"
+    );
+    assert_eq!(std::fs::read_to_string(&archived_path)?, source_before);
     assert_eq!(
         app_server
             .thread_read(source_thread_id, /*include_turns*/ true)
@@ -6676,6 +6686,36 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             .map(|turn| turn.id.as_str())
             .collect::<Vec<_>>(),
         vec!["turn-1"]
+    );
+    // The rewound thread is kept on disk for /redo (read above) but retired
+    // from the session list, so a rewind reads as one continuing conversation
+    // rather than as two branches the user has to tell apart.
+    let listed = app_server
+        .thread_list(codex_app_server_protocol::ThreadListParams {
+            // `archived: false` is the filter `/resume` itself applies, so this
+            // asks the same question the user's session list does.
+            archived: Some(false),
+            cursor: None,
+            limit: None,
+            sort_key: None,
+            sort_direction: None,
+            model_providers: None,
+            source_kinds: None,
+            section_id: None,
+            parent_thread_id: None,
+            ancestor_thread_id: None,
+            cwd: None,
+            use_state_db_only: false,
+            search_term: None,
+        })
+        .await?
+        .data
+        .into_iter()
+        .map(|thread| thread.id)
+        .collect::<Vec<_>>();
+    assert!(
+        !listed.contains(&source_thread_id.to_string()),
+        "the rewound thread should not still be offered alongside its continuation: {listed:?}"
     );
 
     let history = std::iter::from_fn(|| app_event_rx.try_recv().ok())

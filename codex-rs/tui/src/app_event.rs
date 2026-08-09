@@ -321,6 +321,9 @@ pub(crate) enum AppEvent {
         nth: usize,
     },
 
+    /// Undo the last rewind (the `/redo` command).
+    UndoLastRewind,
+
     ForkSessionForPromptEdit {
         thread_id: ThreadId,
         nth_user_message: usize,

@@ -105,6 +105,8 @@ use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnarchiveResponse;
+use codex_app_server_protocol::ThreadUndoFileRestoreParams;
+use codex_app_server_protocol::ThreadUndoFileRestoreResponse;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
 use codex_app_server_protocol::ThreadUnsubscribeResponse;
 use codex_app_server_protocol::Turn;
@@ -962,6 +964,26 @@ impl AppServerSession {
         )
         .await?;
         Ok(response.thread)
+    }
+
+    /// Undo `thread_id`'s last file restore. `None` means there was no
+    /// restore to undo.
+    pub(crate) async fn thread_undo_file_restore(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<Option<String>> {
+        let request_id = self.next_request_id();
+        let response: ThreadUndoFileRestoreResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadUndoFileRestore {
+                request_id,
+                params: ThreadUndoFileRestoreParams {
+                    thread_id: thread_id.to_string(),
+                },
+            })
+            .await
+            .wrap_err("failed to undo the file restore")?;
+        Ok(response.summary)
     }
 
     pub(crate) async fn thread_archive(&mut self, thread_id: ThreadId) -> Result<()> {

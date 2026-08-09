@@ -1876,6 +1876,11 @@ impl ChatWidget {
             .unwrap_or_default()
     }
 
+    /// The thread this one branched from, when it is a rewind fork.
+    pub(crate) fn forked_from(&self) -> Option<ThreadId> {
+        self.forked_from
+    }
+
     pub(crate) fn thread_id(&self) -> Option<ThreadId> {
         self.thread_id
     }
