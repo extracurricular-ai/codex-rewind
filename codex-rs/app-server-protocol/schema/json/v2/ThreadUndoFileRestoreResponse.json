@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "summary": {
+      "description": "Null when the thread has no restore to undo, which callers should report rather than treat as success.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "ThreadUndoFileRestoreResponse",
+  "type": "object"
+}

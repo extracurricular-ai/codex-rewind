@@ -661,6 +661,24 @@ fn instruction_source_path_uris(sources: &[LegacyAppPathString]) -> Vec<PathUri>
         .collect()
 }
 
+/// Undo this thread's most recent `restoreFiles` rewind by returning the
+/// workspace to the safety checkpoint taken just before it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadUndoFileRestoreParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadUndoFileRestoreResponse {
+    /// Null when the thread has no restore to undo, which callers should
+    /// report rather than treat as success.
+    pub summary: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

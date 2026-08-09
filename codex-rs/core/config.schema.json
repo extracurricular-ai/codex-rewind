@@ -1115,6 +1115,10 @@
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "track_hidden_files": {
+          "description": "Scan dot-files and dot-directories too. Off by default: hidden entries are mostly tool state (editor settings, virtualenvs, caches, credentials) that a rewind should leave alone. Files the agent edits are tracked either way. `.git` is never scanned.",
+          "type": "boolean"
         }
       },
       "type": "object"

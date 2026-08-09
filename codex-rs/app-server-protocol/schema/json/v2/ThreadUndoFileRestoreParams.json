@@ -1,0 +1,14 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Undo this thread's most recent `restoreFiles` rewind by returning the workspace to the safety checkpoint taken just before it.",
+  "properties": {
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId"
+  ],
+  "title": "ThreadUndoFileRestoreParams",
+  "type": "object"
+}

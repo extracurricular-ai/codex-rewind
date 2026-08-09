@@ -430,6 +430,91 @@ async fn paginated_thread_fork_at_named_boundaries_keeps_only_terminal_prefix() 
         .await
 }
 
+#[tokio::test]
+async fn paginated_thread_fork_accepts_restore_files() -> Result<()> {
+    // Regression: paginated threads were rejected outright, which disabled
+    // file restore for the default history mode. Snapshots are keyed by
+    // (thread id, turn id) in their own store, so the rollout's fork
+    // mechanics are irrelevant to them.
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let start_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadStartResponse {
+        thread: source_thread,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
+    let source_thread_id = source_thread.id.clone();
+
+    let mut turn_ids = Vec::new();
+    for text in ["first", "second"] {
+        let turn_request_id = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: source_thread_id.clone(),
+                client_user_message_id: None,
+                input: vec![UserInput::Text {
+                    text: text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })
+            .await?;
+        let TurnStartResponse { turn } =
+            timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_request_id)).await??;
+        turn_ids.push(turn.id);
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+    }
+
+    // The session was not tracking snapshots, so nothing is restored — the
+    // point is that the request is accepted and the fork still happens.
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: source_thread_id.clone(),
+            before_turn_id: Some(turn_ids[1].clone()),
+            restore_files: true,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse {
+        thread: forked_thread,
+        ..
+    } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    assert_eq!(forked_thread.forked_from_id, Some(source_thread_id));
+    assert_eq!(
+        forked_thread
+            .turns
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect::<Vec<_>>(),
+        turn_ids[..1]
+    );
+    // A reference-backed fork has no user message of its own, so without an
+    // inherited preview it would be missing from every session listing —
+    // leaving a rewind's branch invisible while the files already match it.
+    // "first" is the source thread's own preview, its first user message.
+    assert_eq!(
+        forked_thread.preview, "first",
+        "the branch should be discoverable under the work it continues"
+    );
+    Ok(())
+}
+
 async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     history_mode: ThreadHistoryMode,
 ) -> Result<()> {

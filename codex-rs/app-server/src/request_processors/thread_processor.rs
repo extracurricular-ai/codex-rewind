@@ -519,6 +519,33 @@ impl ThreadRequestProcessor {
         .map(|()| None)
     }
 
+    /// `thread/undoFileRestore`: put the workspace back to the safety
+    /// checkpoint taken before this thread's last file restore. Returns a
+    /// summary, or `None` when there is nothing to undo — callers surface
+    /// that rather than reporting success.
+    pub(crate) async fn thread_undo_file_restore(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadUndoFileRestoreParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let stored = self
+            .read_stored_thread_for_resume(&params.thread_id, /*path*/ None, false)
+            .await?;
+        let codex_home = self.config.codex_home.to_path_buf();
+        let thread_id = params.thread_id.clone();
+        let cwd = stored.cwd.clone();
+        let summary =
+            tokio::task::spawn_blocking(move || undo_files_restore(&codex_home, &thread_id, &cwd))
+                .await
+                .map_err(|err| internal_error(format!("undo file restore task failed: {err}")))?
+                .map_err(internal_error)?;
+
+        self.outgoing
+            .send_response(request_id, ThreadUndoFileRestoreResponse { summary })
+            .await;
+        Ok(None)
+    }
+
     pub(crate) async fn thread_archive(
         &self,
         request_id: ConnectionRequestId,
@@ -4062,11 +4089,6 @@ impl ThreadRequestProcessor {
         if restore_files && before_turn_id.is_none() {
             return Err(invalid_request("`restoreFiles` requires `beforeTurnId`"));
         }
-        if restore_files && paginated_source {
-            return Err(invalid_request(
-                "`restoreFiles` is not supported for paginated threads",
-            ));
-        }
         if ephemeral && defer_goal_continuation {
             return Err(invalid_request(
                 "`deferGoalContinuation` cannot be combined with `ephemeral`",
@@ -4082,6 +4104,7 @@ impl ThreadRequestProcessor {
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
+        let source_preview = source_thread.preview.clone();
         let prepared_fork = if paginated_source {
             let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
                 (Some(turn_id), None) => {
@@ -4305,6 +4328,9 @@ impl ThreadRequestProcessor {
         )
         .await?;
         if restore_files && let Some(before_turn_id) = before_turn_id.as_deref() {
+            // Runs for paginated and copied-history forks alike: snapshots are
+            // keyed by (thread id, turn id) in their own store, so how the
+            // rollout was forked does not matter here.
             // Awaited so the client observes restored files when the fork
             // response arrives. Failures are advisory: the fork stands.
             let codex_home = self.config.codex_home.to_path_buf();
@@ -4439,6 +4465,28 @@ impl ThreadRequestProcessor {
         }
         if let Some(name) = source_thread_name {
             set_thread_name_from_title(&mut thread, name);
+        }
+        // A reference-backed fork holds no user message of its own, so nothing
+        // derives a preview for it and session listings — which require one —
+        // skip it entirely. After a rewind that leaves the branch invisible
+        // while the workspace already matches it, so carry the source's
+        // preview over: the branch continues that same piece of work.
+        if thread.preview.trim().is_empty() && !source_preview.trim().is_empty() {
+            thread.preview = source_preview.clone();
+            if let Err(err) = self
+                .thread_manager
+                .update_thread_metadata(
+                    thread_id,
+                    StoreThreadMetadataPatch {
+                        preview: Some(source_preview.clone()),
+                        ..Default::default()
+                    },
+                    /*include_archived*/ false,
+                )
+                .await
+            {
+                tracing::warn!("failed to seed forked thread preview: {err}");
+            }
         }
         thread.can_accept_direct_input = Some(can_accept_direct_input(
             forked_thread.multi_agent_version(),
@@ -5172,44 +5220,26 @@ fn thread_store_archive_error(operation: &str, err: ThreadStoreError) -> JSONRPC
 /// RFC in docs/rfc-file-snapshot-rewind.md §6.5). Blocking — run via
 /// `spawn_blocking`. Advisory by design: every failure path leaves the
 /// already-created fork intact and is reported to the caller for logging.
-fn restore_files_for_fork(
-    codex_home: &Path,
-    source_thread_id: &str,
-    new_thread_id: &str,
-    before_turn_id: &str,
-    source_cwd: &Path,
-) -> Result<String, String> {
-    use codex_file_snapshots::SnapshotStore;
+/// Put `thread_id`'s tracked files back to `target_manifest_id`, recording a
+/// safety checkpoint first so the restore itself can be undone.
+fn restore_thread_files_to(
+    store: &codex_file_snapshots::SnapshotStore,
+    thread_id: &str,
+    target: &codex_file_snapshots::RestoreTarget,
+    kind: codex_file_snapshots::RestoreKind,
+    cwd: &Path,
+) -> Result<codex_file_snapshots::RestoreOutcome, String> {
+    let workspace = workspace_key(cwd);
     use codex_file_snapshots::find_workspace_root;
     use codex_file_snapshots::is_ignored;
     use codex_file_snapshots::load_ignore;
     use codex_file_snapshots::workspace_files;
 
-    let store =
-        SnapshotStore::open(codex_home.join("file_snapshots")).map_err(|e| e.to_string())?;
-    if !store.thread_exists(source_thread_id) {
-        return Ok("source thread is not tracking file snapshots; nothing restored".to_string());
-    }
-    // Inherit first: the forked thread becomes a tracking thread sharing
-    // the source's manifests up to the fork point, regardless of whether a
-    // restore is possible below.
-    let inherited = store
-        .inherit_log(source_thread_id, new_thread_id, before_turn_id)
-        .map_err(|e| e.to_string())?;
-    let Some(target) = store
-        .manifest_id_for_turn(source_thread_id, before_turn_id)
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(format!(
-            "no snapshot recorded for turn {before_turn_id}; forked without file restore ({inherited} log entries inherited)"
-        ));
-    };
-
     // Safety-checkpoint scope: the current workspace scan (when a root is
     // found) plus every path the thread ever observed — the latter covers
     // outside-workspace files recorded via pre-edit attach.
     let markers = vec![".git".to_string()];
-    let root = find_workspace_root(source_cwd, &markers);
+    let root = find_workspace_root(cwd, &markers);
     let mut files: BTreeSet<PathBuf> = match &root {
         // Hidden entries stay out of the safety checkpoint's scan for the
         // same reason they stay out of capture; anything actually tracked
@@ -5222,7 +5252,7 @@ fn restore_files_for_fork(
     };
     files.extend(
         store
-            .tracked_paths(source_thread_id)
+            .tracked_paths(thread_id)
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(PathBuf::from),
@@ -5236,18 +5266,105 @@ fn restore_files_for_fork(
             .is_some_and(|ig| is_ignored(ig, Path::new(key)))
     };
 
-    let outcome = store
+    store
         .restore_to(
-            source_thread_id,
-            &target,
+            thread_id,
+            &workspace,
+            target,
+            kind,
             files,
             /*current_complete*/ root.is_some(),
             &is_protected,
         )
+        .map_err(|e| e.to_string())
+}
+
+/// Identifies the tree a restore applies to. Undo has to agree with the
+/// restore it reverses, so both sides derive the key the same way.
+fn workspace_key(cwd: &Path) -> String {
+    use codex_file_snapshots::find_workspace_root;
+
+    let markers = vec![".git".to_string()];
+    find_workspace_root(cwd, &markers)
+        .unwrap_or_else(|| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Undo this thread's most recent restore by returning to the safety
+/// checkpoint taken just before it (`thread/rewindUndo`).
+fn undo_files_restore(
+    codex_home: &Path,
+    thread_id: &str,
+    cwd: &Path,
+) -> Result<Option<String>, String> {
+    use codex_file_snapshots::SnapshotStore;
+
+    let store =
+        SnapshotStore::open(codex_home.join("file_snapshots")).map_err(|e| e.to_string())?;
+    if !store.thread_exists(thread_id) {
+        return Ok(None);
+    }
+    let Some(target) = store
+        .last_restore_target(&workspace_key(cwd))
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let outcome = restore_thread_files_to(
+        &store,
+        thread_id,
+        &target,
+        codex_file_snapshots::RestoreKind::Undo,
+        cwd,
+    )?;
+    Ok(Some(format!(
+        "{} written, {} deleted",
+        outcome.stats.written, outcome.stats.deleted
+    )))
+}
+
+fn restore_files_for_fork(
+    codex_home: &Path,
+    source_thread_id: &str,
+    new_thread_id: &str,
+    before_turn_id: &str,
+    source_cwd: &Path,
+) -> Result<String, String> {
+    use codex_file_snapshots::SnapshotStore;
+
+    let store =
+        SnapshotStore::open(codex_home.join("file_snapshots")).map_err(|e| e.to_string())?;
+    if !store.thread_exists(source_thread_id) {
+        return Ok("source thread is not tracking file snapshots; nothing restored".to_string());
+    }
+    // Inherit first: the forked thread becomes a tracking thread sharing
+    // the source's manifests up to the fork point, regardless of whether a
+    // restore is possible below.
+    let inherited = store
+        .inherit_log(source_thread_id, new_thread_id, before_turn_id)
         .map_err(|e| e.to_string())?;
+    let Some(target) = store
+        .target_for_turn(before_turn_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(format!(
+            "no snapshot recorded for turn {before_turn_id}; forked without file restore ({inherited} log entries inherited)"
+        ));
+    };
+
+    let outcome = restore_thread_files_to(
+        &store,
+        source_thread_id,
+        &target,
+        codex_file_snapshots::RestoreKind::Rewind,
+        source_cwd,
+    )?;
     Ok(format!(
         "restored files to turn {before_turn_id}: {} written, {} deleted; safety checkpoint {}; {inherited} log entries inherited",
-        outcome.stats.written, outcome.stats.deleted, outcome.safety_manifest_id
+        outcome.stats.written,
+        outcome.stats.deleted,
+        outcome.safety.manifest_id()
     ))
 }
 

@@ -507,6 +507,8 @@ export type { ThreadTokenUsageUpdatedNotification } from "./ThreadTokenUsageUpda
 export type { ThreadUnarchiveParams } from "./ThreadUnarchiveParams";
 export type { ThreadUnarchiveResponse } from "./ThreadUnarchiveResponse";
 export type { ThreadUnarchivedNotification } from "./ThreadUnarchivedNotification";
+export type { ThreadUndoFileRestoreParams } from "./ThreadUndoFileRestoreParams";
+export type { ThreadUndoFileRestoreResponse } from "./ThreadUndoFileRestoreResponse";
 export type { ThreadUnsubscribeParams } from "./ThreadUnsubscribeParams";
 export type { ThreadUnsubscribeResponse } from "./ThreadUnsubscribeResponse";
 export type { ThreadUnsubscribeStatus } from "./ThreadUnsubscribeStatus";

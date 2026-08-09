@@ -307,6 +307,30 @@
             },
             "method": {
               "enum": [
+                "thread/undoFileRestore"
+              ],
+              "title": "Thread/undoFileRestoreRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadUndoFileRestoreParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/undoFileRestoreRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/archive"
               ],
               "title": "Thread/archiveRequestMethod",
@@ -21458,6 +21482,34 @@
           "threadId"
         ],
         "title": "ThreadUnarchivedNotification",
+        "type": "object"
+      },
+      "ThreadUndoFileRestoreParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Undo this thread's most recent `restoreFiles` rewind by returning the workspace to the safety checkpoint taken just before it.",
+        "properties": {
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadUndoFileRestoreParams",
+        "type": "object"
+      },
+      "ThreadUndoFileRestoreResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "summary": {
+            "description": "Null when the thread has no restore to undo, which callers should report rather than treat as success.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ThreadUndoFileRestoreResponse",
         "type": "object"
       },
       "ThreadUnsubscribeParams": {
