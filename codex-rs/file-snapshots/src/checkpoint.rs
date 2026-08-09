@@ -20,18 +20,34 @@ use crate::manifest::ManifestStore;
 use crate::manifest::mode_of;
 use crate::manifest::mtime_parts;
 
-/// How recently a file may have been written before its `(size, mtime)`
-/// fingerprint stops being proof that it is unchanged.
+/// How close to the moment of capture a file's mtime may be before its
+/// `(size, mtime)` fingerprint stops being proof that it is unchanged.
 ///
 /// Two writes inside one timestamp tick are indistinguishable by stat alone,
-/// so a file touched moments ago can differ while looking identical — git
-/// calls such entries "racily clean". Re-reading anything this fresh costs
-/// little, because a file just written is the one most likely to have
-/// changed, and it removes a failure mode where a snapshot silently records
-/// the previous contents.
+/// so a file written again right after we read it differs while looking
+/// identical — git calls such entries "racily clean". The hash cannot go into
+/// the fingerprint to settle this: the fingerprint exists precisely so the
+/// file need not be read, and the hash is the value being cached, not part of
+/// the key.
+///
+/// So raciness is decided once, when the entry is written, and recorded in the
+/// entry itself (below). Judging it later — "is this file young *now*" —
+/// would only cover the first couple of seconds, and a second write in the
+/// original tick would be trusted forever after that.
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 
-fn fingerprint_is_trustworthy(meta: &fs::Metadata, now: SystemTime) -> bool {
+/// The fingerprint stored for an entry captured too soon after its own last
+/// write to be sure we read the final bytes.
+///
+/// A zero mtime never matches a real one, so the entry can only ever be
+/// re-read — the fast path stays disabled for it until some later capture
+/// sees the file settled and records a real fingerprint. The same convention
+/// marks pre-edit images, which have no stat of their own.
+const RACY_FINGERPRINT: (i64, u32) = (0, 0);
+
+/// Whether `meta`'s mtime is far enough from `now` that a matching
+/// fingerprint proves the contents are unchanged.
+fn settled_before(meta: &fs::Metadata, now: SystemTime) -> bool {
     meta.modified()
         .ok()
         .and_then(|modified| now.duration_since(modified).ok())
@@ -71,12 +87,24 @@ pub fn capture(
     prev: Option<&Manifest>,
     complete: bool,
 ) -> Result<Checkpoint> {
+    capture_at(blobs, manifests, files, prev, complete, SystemTime::now())
+}
+
+/// `capture` with the capture instant supplied, so that the racy-window
+/// decision can be exercised without waiting for wall-clock time to pass.
+fn capture_at(
+    blobs: &BlobStore,
+    manifests: &ManifestStore,
+    files: impl IntoIterator<Item = PathBuf>,
+    prev: Option<&Manifest>,
+    complete: bool,
+    now: SystemTime,
+) -> Result<Checkpoint> {
     let mut manifest = Manifest {
         complete,
         ..Default::default()
     };
     let mut stats = CheckpointStats::default();
-    let now = SystemTime::now();
 
     for path in files {
         let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -92,7 +120,6 @@ pub fn capture(
 
         if let Some(prev_entry) = prev.and_then(|m| m.entries.get(&key))
             && prev_entry.stat_matches(&meta)
-            && fingerprint_is_trustworthy(&meta, now)
         {
             let mut entry = prev_entry.clone();
             // Permission changes don't necessarily bump mtime; mode is
@@ -110,7 +137,11 @@ pub fn capture(
             continue;
         };
         let hash = blobs.store_bytes(&content)?;
-        let (mtime_secs, mtime_nanos) = mtime_parts(&meta);
+        let (mtime_secs, mtime_nanos) = if settled_before(&meta, now) {
+            mtime_parts(&meta)
+        } else {
+            RACY_FINGERPRINT
+        };
         manifest.entries.insert(
             key,
             FileEntry {
@@ -246,6 +277,76 @@ mod tests {
                 .as_slice(),
             b"v2"
         );
+    }
+
+    #[test]
+    fn time_passing_never_restores_trust_in_a_racy_capture() {
+        // The dangerous write is the one that lands in the same timestamp
+        // tick as the read that preceded it: nothing observable changes, so
+        // it can only be caught by refusing to trust that reading ever again.
+        // Asking "was this file written recently?" at the *next* capture is
+        // not enough — by then the write is old, and the stale hash would be
+        // reused forever.
+        let f = fixture();
+        let a = f.ws.join("a.txt");
+        fs::write(&a, b"v1").unwrap();
+
+        let captured_at = fs::symlink_metadata(&a).unwrap().modified().unwrap();
+        let cp1 = capture_at(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            None,
+            true,
+            captured_at,
+        )
+        .unwrap();
+
+        // Second write inside the tick: same length, and the stat restored to
+        // exactly what the capture above saw.
+        let key = a.to_string_lossy().into_owned();
+        fs::write(&a, b"v2").unwrap();
+        let (orig_secs, orig_nanos) = {
+            let d = captured_at.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            (d.as_secs() as i64, d.subsec_nanos())
+        };
+        set_mtime_parts(&a, orig_secs, orig_nanos);
+
+        // A minute later the file looks entirely settled.
+        let cp2 = capture_at(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            Some(&cp1.manifest),
+            true,
+            captured_at + Duration::from_secs(60),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cp2.stats.hashed, 1,
+            "an entry captured inside its own write's tick stays untrusted"
+        );
+        assert_eq!(
+            f.blobs
+                .load(&cp2.manifest.entries[&key].hash)
+                .unwrap()
+                .as_slice(),
+            b"v2"
+        );
+
+        // And the doubt is not permanent: once a capture sees the file
+        // settled, the fingerprint is recorded and the fast path resumes.
+        let cp3 = capture_at(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            Some(&cp2.manifest),
+            true,
+            captured_at + Duration::from_secs(120),
+        )
+        .unwrap();
+        assert_eq!(cp3.stats.reused, 1, "a settled file is cached again");
     }
 
     #[test]

@@ -36,6 +36,14 @@ pub struct FileEntry {
 impl FileEntry {
     /// Stat-cache check: does `meta` match this entry's fingerprint?
     pub fn stat_matches(&self, meta: &fs::Metadata) -> bool {
+        // A zero mtime is the marker for an entry whose fingerprint was never
+        // trustworthy — captured within its own write's timestamp tick, or
+        // reconstructed from a pre-edit image that had no stat at all. Such an
+        // entry must never satisfy the fast path, including against a file
+        // that genuinely carries an epoch mtime.
+        if (self.mtime_secs, self.mtime_nanos) == (0, 0) {
+            return false;
+        }
         let (secs, nanos) = mtime_parts(meta);
         self.size == meta.len() && self.mtime_secs == secs && self.mtime_nanos == nanos
     }
