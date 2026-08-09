@@ -109,9 +109,12 @@ CODEX_HOME/file_snapshots/
   blobs/<xx>/<hash>          # content-addressed file contents (dedup for free)
   manifests/<manifest-id>    # one per checkpoint: [(path, mode, size, mtime, hash)]
   refs/<thread-id>           # thread → list of (turn_id, manifest-id) + refcounts
+  turns/<turn-id>            # turn → manifest-id, global and branch-independent
+  restores/<workspace-hash>  # workspace → recent {target, safety} restore records
 ```
 
 - **Checkpoint** = stat-walk of the tracked set; entries whose `(size, mtime)` match the previous manifest reuse its hash (no read); changed/new entries are hashed and their blobs stored if absent. Result: a new manifest (itself content-addressed — identical states dedup to one manifest).
+- **The stat cache does not trust a fresh fingerprint.** A file written in the same clock tick as the previous checkpoint can come back with an unchanged `(size, mtime)` while its contents differ — git calls this "racily clean", and here it is not hypothetical: an agent edit and the checkpoint that follows it land milliseconds apart. Entries modified within a 2-second window are re-read unconditionally, so the cache can only ever save work, never record stale content.
 - Large-file copies attempt reflink (`copy_file_range` / FICLONE) first, falling back to plain copy — O(1) large-file snapshots on btrfs/XFS/APFS.
 - Naming note: "snapshot" is already overloaded in this codebase (`shell_snapshot` feature, insta test snapshots). The crate and feature use **`file_snapshots`** consistently.
 
@@ -159,8 +162,21 @@ alternative (a `TurnContextItem` field) would carry:
 - nothing new persists in the rollout, so the legacy `ghost_snapshot`
   stripper (`rollout/src/recorder.rs:1004-1128`) is irrelevant;
 - fork truncation cannot lose snapshot refs — they are not in the rollout;
-  restore resolves `(source thread_id, before_turn_id)` directly against
-  the snapshot store's log.
+  restore resolves `before_turn_id` directly against the snapshot store.
+
+**Resolution is keyed on the turn, not on the thread.** A turn id is
+minted once and copied verbatim into every branch that inherits the turn,
+so `turns/<turn-id> → manifest-id` answers "what did the tree look like at
+this point in the conversation" identically no matter which branch asks.
+Keying on `(thread_id, turn_id)` instead would make the answer depend on
+which branch the user happened to be standing in, and rewinding to the
+same point twice could then resolve to two different states. Likewise the
+undo target is recorded per **workspace** (`restores/<workspace-hash>`),
+not on the thread that performed the restore: `/redo` has to work from
+wherever the user ended up, including a session started after the rewind.
+The result is the property the feature actually needs — **restoring to a
+given point is idempotent**, and repeating it is a no-op rather than a
+second, different move.
 
 **Session tracking state needs no rollout field either**: with
 session-scoped binding (§9), the existence of a thread's snapshot log —
@@ -182,12 +198,16 @@ Hook: **app-server `thread_fork_inner`** (`app-server/src/request_processors/thr
 
 Restore procedure for target turn N:
 1. **Safety checkpoint** of the current tracked set → manifest S′ (this makes every subsequent step reversible, and is what enables redo).
-2. Locate turn N's manifest in the **snapshot store's own thread log** by `turn_id` (§6.4). The log lives outside the rollout, so fork truncation cannot lose it (fork-before-N truncates strictly before `TurnStarted(N)`, `core/src/thread_rollout_truncation.rs:215-221` — irrelevant to an external ref). Refs are advisory: a missing manifest aborts the restore cleanly before any mutation.
-3. For each entry in manifest N: restore content/mode if it differs (skip paths matched by the *current* ignore file).
-4. Deletion pass — delete only on **positive evidence of non-existence at N**: a file (present per the safety checkpoint, in scope, absent from manifest N) is deleted when either (a) manifest N was a **complete scope scan** (workspace mode — absence is definitive; this also lets redo remove files a prior restore recreated), or (b) its **birth was witnessed** (first observed in a manifest later than N). Bounded fallback-mode captures get only rule (b): with a 100-cap tracked set, absence from manifest N alone does not prove non-existence at N. Files the system has never seen are never deleted, and every deleted file is recoverable from the safety checkpoint by construction.
-5. Record fork metadata: `{forked_from: T, restored_to: N, safety: S′}`.
+2. Resolve turn N through the **global turn index** (§6.4). The index lives outside the rollout, so fork truncation cannot lose it (fork-before-N truncates strictly before `TurnStarted(N)`, `core/src/thread_rollout_truncation.rs:215-221` — irrelevant to an external ref). Refs are advisory: a missing manifest aborts the restore cleanly before any mutation.
+3. Compare exactly two manifests — N and S′ — and restore content/mode wherever they differ (skipping paths matched by the *current* ignore file). Deliberately no history walk: the plan is a function of where the tree is and where it is going, which is what makes step 2's idempotence survive all the way to the filesystem.
+4. Deletion pass — delete only on **positive evidence of non-existence at N**: a file present in S′, in scope, and absent from manifest N is deleted only when manifest N was a **complete scope scan** (workspace mode — absence is definitive; this also lets redo remove files a prior restore recreated). Bounded fallback-mode captures never license deletion: with a 100-cap tracked set, absence from manifest N does not prove non-existence at N. Files the system has never seen are never deleted, and every deleted file is recoverable from the safety checkpoint by construction.
+5. Append `{target: N, safety: S′}` to the workspace's restore log — the record `/redo` reads.
 
-**Redo** falls out of the fork model: the original thread T is preserved by design (source-preserving branch), so conversation redo is "go back to T"; file redo is "restore manifest S′". No soft-revert state machine needed.
+**Redo** falls out of the same machinery: file redo is "restore manifest S′", resolved from the workspace log rather than from any thread, so it works from whichever session the user is in.
+
+The workspace log is a **stack**: a rewind pushes a record, an undo pops the one it reverses. This matters as soon as the user rewinds twice. If undo simply targeted "the last restore", the second undo would reverse the *first undo* — files oscillating between two states while the conversation kept stepping backwards, which is the worst kind of divergence because each individual step looks correct. Popping makes N undos retrace N rewinds, and the conversation side does the same thing by walking the fork parents.
+
+**A rewind presents as one conversation, not as a branch.** Mechanically it is still a source-preserving fork — that is what keeps the pre-rewind rollout intact for redo — but the thread it supersedes is archived as the fork is adopted, so the session list shows a single continuing conversation instead of accumulating near-identical branches the user has to tell apart. `/redo` swaps them back. This is a client-side presentation choice built on the existing archive API; the protocol surface stays branch-shaped, so a client that *wants* to show branches still can.
 
 A second restore surface — `thread/rollback` (`core/src/session/handlers.rs:451-553`) — can reuse steps 1–4 after `apply_rollout_reconstruction`; v1 may defer this (the API is deprecated in favor of `thread/fork`).
 
@@ -204,16 +224,18 @@ A second restore surface — `thread/rollback` (`core/src/session/handlers.rs:45
 
 1. **Never touch user git state.** No exceptions.
 2. **Safety checkpoint before every restore.** Deletion is therefore always recoverable.
-3. **Definitive-absence deletion.** Delete only on positive evidence: absence from a complete-scan target manifest, or a witnessed birth. Never delete a file whose existence at target time is uncertain.
+3. **Definitive-absence deletion.** Delete only on positive evidence: absence from a target manifest that was a complete scope scan. Never delete a file whose existence at target time is uncertain.
+7. **Restoring to a point is idempotent.** The same target resolves to the same state from any branch, and applying it twice changes nothing the second time.
 4. **Symmetric ignore.** Ignored paths are never snapshotted, restored, or deleted.
 5. **Current ignore wins at restore start**; a restored ignore file governs from the next operation on.
 6. **Never-tracked files are never modified in any direction.**
 
 ## 8. Garbage collection
 
-- Manifests reference blobs; thread refs reference manifests; all refcounted.
-- **Snapshot lifetime = session lifetime**: deleting a session drops its refs; orphaned manifests/blobs are removed. No timers, no retention windows (the `shell_snapshots` 3-day sweep pattern is explicitly *not* copied — it would break restore for older forks; #29388 is the no-GC failure mode this rules out by construction).
-- Forked threads share manifests with their source via refcounts — cheap and correct.
+- Manifests reference blobs; refs reference manifests. Mark-and-sweep from three root sets: thread logs, the turn index, and the workspace restore logs.
+- **Snapshot lifetime = session lifetime**, with one deliberate exception. Deleting a session drops its refs, and the turn index is pruned to the turns some live thread still holds, so its captures become garbage as before. But a workspace's most recent restore records stay reachable, because `/redo` has to survive the session that produced it — otherwise closing codex silently disarms the undo for a rewind the user just performed. That log is capped (20 records per workspace), so the exception is bounded rather than an open-ended retention window.
+- No timers, no age-based sweeps (the `shell_snapshots` 3-day pattern is explicitly *not* copied — it would break restore for older forks; #29388 is the no-GC failure mode this rules out by construction).
+- Forked threads share manifests with their source — cheap and correct.
 
 ## 9. Configuration & UX
 
