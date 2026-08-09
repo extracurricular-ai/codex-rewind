@@ -273,7 +273,12 @@ mod tests {
         for i in 0..5 {
             touch(&dir.path().join(format!("f{i}.txt")), "x");
         }
-        let seed = seed_fallback_files(dir.path(), &SeedPolicy::default(), /*include_hidden*/ false).unwrap();
+        let seed = seed_fallback_files(
+            dir.path(),
+            &SeedPolicy::default(),
+            /*include_hidden*/ false,
+        )
+        .unwrap();
         assert_eq!(seed.len(), 5);
     }
 

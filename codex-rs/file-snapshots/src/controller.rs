@@ -125,11 +125,11 @@ impl FileSnapshotsController {
             Some(workspace_root.clone().unwrap_or_else(|| cwd.to_path_buf()));
         let (mut files, complete): (BTreeSet<PathBuf>, bool) = match workspace_root {
             Some(root) => (
-                    workspace_files(&root, self.include_hidden)?
-                        .into_iter()
-                        .collect(),
-                    true,
-                ),
+                workspace_files(&root, self.include_hidden)?
+                    .into_iter()
+                    .collect(),
+                true,
+            ),
             None => {
                 let policy = self.seed_policy.clone();
                 let mut state = self.lock_state();
@@ -334,7 +334,7 @@ mod tests {
             policy,
             /*include_hidden*/ false,
         )
-            .unwrap();
+        .unwrap();
 
         // No `.git` marker → fallback mode, where seeding applies.
         let loose = tempfile::tempdir().unwrap();

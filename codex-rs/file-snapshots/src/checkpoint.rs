@@ -9,6 +9,8 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use crate::blob::BlobStore;
 use crate::error::Result;
@@ -17,6 +19,24 @@ use crate::manifest::Manifest;
 use crate::manifest::ManifestStore;
 use crate::manifest::mode_of;
 use crate::manifest::mtime_parts;
+
+/// How recently a file may have been written before its `(size, mtime)`
+/// fingerprint stops being proof that it is unchanged.
+///
+/// Two writes inside one timestamp tick are indistinguishable by stat alone,
+/// so a file touched moments ago can differ while looking identical — git
+/// calls such entries "racily clean". Re-reading anything this fresh costs
+/// little, because a file just written is the one most likely to have
+/// changed, and it removes a failure mode where a snapshot silently records
+/// the previous contents.
+const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+fn fingerprint_is_trustworthy(meta: &fs::Metadata, now: SystemTime) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= RACY_WINDOW)
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CheckpointStats {
@@ -56,6 +76,7 @@ pub fn capture(
         ..Default::default()
     };
     let mut stats = CheckpointStats::default();
+    let now = SystemTime::now();
 
     for path in files {
         let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -71,6 +92,7 @@ pub fn capture(
 
         if let Some(prev_entry) = prev.and_then(|m| m.entries.get(&key))
             && prev_entry.stat_matches(&meta)
+            && fingerprint_is_trustworthy(&meta, now)
         {
             let mut entry = prev_entry.clone();
             // Permission changes don't necessarily bump mtime; mode is
@@ -124,6 +146,20 @@ mod tests {
         ws: PathBuf,
     }
 
+    fn set_mtime_secs_ago(path: &std::path::Path, secs: u64) {
+        let when = SystemTime::now() - Duration::from_secs(secs);
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    fn set_mtime_parts(path: &std::path::Path, secs: i64, nanos: u32) {
+        let when = SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nanos);
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
@@ -158,14 +194,58 @@ mod tests {
         let f = fixture();
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
+        // Age the file past the racy window so its fingerprint is proof.
+        set_mtime_secs_ago(&a, 60);
 
         let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
-        let cp2 = capture(&f.blobs, &f.manifests, vec![a], Some(&cp1.manifest), true).unwrap();
+        let cp2 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            Some(&cp1.manifest),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(cp2.stats.reused, 1);
         assert_eq!(cp2.stats.hashed, 0);
         // Identical state → identical (deduped) manifest.
         assert_eq!(cp1.id, cp2.id);
+    }
+
+    #[test]
+    fn a_just_written_file_is_reread_even_if_its_fingerprint_matches() {
+        // Two writes can land in one timestamp tick, so a fresh file that
+        // looks unchanged may not be. Same size on purpose: only re-reading
+        // can tell these apart.
+        let f = fixture();
+        let a = f.ws.join("a.txt");
+        fs::write(&a, b"v1").unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
+
+        // Rewrite with identical size and forge the old fingerprint, exactly
+        // what a same-tick write looks like.
+        let key = a.to_string_lossy().into_owned();
+        let stale = cp1.manifest.entries[&key].clone();
+        fs::write(&a, b"v2").unwrap();
+        set_mtime_parts(&a, stale.mtime_secs, stale.mtime_nanos);
+
+        let cp2 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            Some(&cp1.manifest),
+            true,
+        )
+        .unwrap();
+        assert_eq!(cp2.stats.hashed, 1, "a racily-clean entry must be re-read");
+        assert_eq!(
+            f.blobs
+                .load(&cp2.manifest.entries[&key].hash)
+                .unwrap()
+                .as_slice(),
+            b"v2"
+        );
     }
 
     #[test]
