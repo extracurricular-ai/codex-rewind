@@ -18,6 +18,22 @@ use pretty_assertions::assert_eq;
 const THREAD: &str = "thread-1";
 const WS_KEY: &str = "/workspace/under-test";
 
+/// A complete scan of `root`.
+fn scanned(root: &Path) -> codex_file_snapshots::CaptureScope {
+    codex_file_snapshots::CaptureScope {
+        roots: vec![root.to_path_buf()],
+        complete: true,
+    }
+}
+
+/// A bounded capture rooted at `root` (fallback mode).
+fn bounded(root: &Path) -> codex_file_snapshots::CaptureScope {
+    codex_file_snapshots::CaptureScope {
+        roots: vec![root.to_path_buf()],
+        complete: false,
+    }
+}
+
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
@@ -41,7 +57,7 @@ fn full_rewind_redo_gc_scenario() {
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
         )
         .unwrap();
     assert_eq!(
@@ -61,7 +77,7 @@ fn full_rewind_redo_gc_scenario() {
             THREAD,
             "turn-2",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
         )
         .unwrap();
     assert_eq!(
@@ -85,7 +101,7 @@ fn full_rewind_redo_gc_scenario() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind { conversation: None },
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
             &protect,
         )
         .unwrap();
@@ -121,7 +137,7 @@ fn full_rewind_redo_gc_scenario() {
             &outcome.safety,
             RestoreKind::Undo,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
             &protect2,
         )
         .unwrap();
@@ -165,7 +181,7 @@ fn restore_preserves_permissions() {
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
         )
         .unwrap();
 
@@ -176,7 +192,7 @@ fn restore_preserves_permissions() {
             THREAD,
             "turn-2",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
         )
         .unwrap();
 
@@ -187,7 +203,7 @@ fn restore_preserves_permissions() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind { conversation: None },
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -217,7 +233,7 @@ fn thread_marker_and_pre_edit_attach() {
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
         )
         .unwrap();
 
@@ -284,7 +300,11 @@ fn thread_marker_and_pre_edit_attach() {
         "the tombstone carries the pre-image forward"
     );
     assert_eq!(
-        store.target_for_turn("turn-1").unwrap().unwrap().manifest_id(),
+        store
+            .target_for_turn("turn-1")
+            .unwrap()
+            .unwrap()
+            .manifest_id(),
         tombstoned
     );
 
@@ -299,7 +319,7 @@ fn thread_marker_and_pre_edit_attach() {
                 .unwrap()
                 .into_iter()
                 .chain([outside.clone()]),
-            true,
+            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -319,7 +339,7 @@ fn turn_resolution_and_fork_inheritance() {
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
         )
         .unwrap();
     // Supplemental attach under the same turn: resolution must pick it.
@@ -334,7 +354,7 @@ fn turn_resolution_and_fork_inheritance() {
             THREAD,
             "turn-2",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            true,
+            scanned(&ws),
         )
         .unwrap();
 
@@ -382,10 +402,14 @@ fn rewinding_twice_still_restores() {
     let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
-    let turn1 = store.checkpoint(THREAD, "turn-1", scan(), true).unwrap();
+    let turn1 = store
+        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
+        .unwrap();
 
     fs::write(ws.join("a.txt"), "v2").unwrap();
-    store.checkpoint(THREAD, "turn-2", scan(), true).unwrap();
+    store
+        .checkpoint(THREAD, "turn-2", scan(), scanned(&ws))
+        .unwrap();
 
     // Rewind to turn 1.
     let turn1_target = store.target_for_turn("turn-1").unwrap().unwrap();
@@ -396,7 +420,7 @@ fn rewinding_twice_still_restores() {
             &turn1_target,
             RestoreKind::Rewind { conversation: None },
             scan(),
-            true,
+            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -411,7 +435,7 @@ fn rewinding_twice_still_restores() {
             &safety,
             RestoreKind::Undo,
             scan(),
-            true,
+            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -431,7 +455,7 @@ fn rewinding_twice_still_restores() {
             &turn1_target,
             RestoreKind::Rewind { conversation: None },
             scan(),
-            true,
+            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -455,9 +479,13 @@ fn the_conversation_an_undo_returns_to_is_kept_by_the_store() {
     let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
-    store.checkpoint(THREAD, "turn-1", scan(), true).unwrap();
+    store
+        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
+        .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
-    store.checkpoint(THREAD, "turn-2", scan(), true).unwrap();
+    store
+        .checkpoint(THREAD, "turn-2", scan(), scanned(&ws))
+        .unwrap();
 
     let rollout = b"{\"turn\":1}\n{\"turn\":2}\n".to_vec();
     store
@@ -469,7 +497,7 @@ fn the_conversation_an_undo_returns_to_is_kept_by_the_store() {
                 conversation: Some(rollout.clone()),
             },
             scan(),
-            true,
+            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -497,11 +525,65 @@ fn the_conversation_an_undo_returns_to_is_kept_by_the_store() {
             &safety,
             RestoreKind::Undo,
             scan(),
-            true,
+            scanned(&ws),
             &|_| false,
         )
         .unwrap();
     assert!(store.last_restore_conversation(WS_KEY).unwrap().is_none());
+}
+
+#[test]
+fn a_capture_covers_every_configured_root() {
+    // Scope follows the session's workspace roots, which are plural. Scoping
+    // to one guessed root would leave the others unprotected while the sandbox
+    // happily lets the agent write to them.
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("svc-a"), dir.path().join("svc-b"));
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(a.join("main.rs"), "fn a() {}").unwrap();
+    fs::write(b.join("main.rs"), "fn b() {}").unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+
+    let scope = codex_file_snapshots::CaptureScope {
+        roots: vec![a.clone(), b.clone()],
+        complete: true,
+    };
+    let scan = || {
+        let mut files = workspace_files(&a, false).unwrap();
+        files.extend(workspace_files(&b, false).unwrap());
+        files
+    };
+    let cp1 = store
+        .checkpoint(THREAD, "turn-1", scan(), scope.clone())
+        .unwrap();
+    assert_eq!(cp1.manifest.entries.len(), 2, "both roots captured");
+
+    // Work in the second root only, then rewind.
+    fs::write(b.join("main.rs"), "fn b() { changed }").unwrap();
+    fs::write(b.join("extra.rs"), "born").unwrap();
+    store
+        .restore_to(
+            THREAD,
+            WS_KEY,
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind { conversation: None },
+            scan(),
+            scope,
+            &|_| false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        read(&b.join("main.rs")),
+        "fn b() {}",
+        "second root reverted"
+    );
+    assert!(
+        !b.join("extra.rs").exists(),
+        "completeness covers every declared root, not just the first"
+    );
+    assert_eq!(read(&a.join("main.rs")), "fn a() {}");
 }
 
 #[test]
@@ -523,7 +605,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
             THREAD,
             "turn-1",
             workspace_files(&cwd, /*include_hidden*/ false).unwrap(),
-            /*complete*/ false,
+            bounded(&cwd),
         )
         .unwrap();
     assert!(cp1.manifest.entries.is_empty());
@@ -559,7 +641,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind { conversation: None },
             current,
-            /*current_complete*/ false,
+            bounded(&cwd),
             &|_| false,
         )
         .unwrap();
@@ -585,7 +667,9 @@ fn undo_walks_back_through_successive_rewinds() {
 
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2"), ("turn-3", "v3")] {
         fs::write(ws.join("a.txt"), contents).unwrap();
-        store.checkpoint(THREAD, turn, scan(), true).unwrap();
+        store
+            .checkpoint(THREAD, turn, scan(), scanned(&ws))
+            .unwrap();
     }
 
     let rewind = |turn: &str| {
@@ -597,7 +681,7 @@ fn undo_walks_back_through_successive_rewinds() {
                 &target,
                 RestoreKind::Rewind { conversation: None },
                 scan(),
-                true,
+                scanned(&ws),
                 &|_| false,
             )
             .unwrap();
@@ -611,7 +695,7 @@ fn undo_walks_back_through_successive_rewinds() {
                 &target,
                 RestoreKind::Undo,
                 scan(),
-                true,
+                scanned(&ws),
                 &|_| false,
             )
             .unwrap();

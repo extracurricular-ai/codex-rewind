@@ -18,6 +18,7 @@ mod scope;
 mod store;
 
 pub use blob::BlobStore;
+pub use checkpoint::CaptureScope;
 pub use checkpoint::Checkpoint;
 pub use checkpoint::CheckpointStats;
 pub use checkpoint::capture;

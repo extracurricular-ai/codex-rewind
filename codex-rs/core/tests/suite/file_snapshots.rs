@@ -107,9 +107,12 @@ async fn turn_start_checkpoint_captures_pre_turn_state() -> Result<()> {
         "the checkpoint must hold the pre-turn content"
     );
 
-    // A rewind resolves the target manifest through the turn id.
+    // A rewind resolves the target through the global turn index, which is
+    // what lets any branch holding that turn reach the same state.
     assert_eq!(
-        store.manifest_id_for_turn(&thread_id, &snapshot_ref.turn_id)?,
+        store
+            .target_for_turn(&snapshot_ref.turn_id)?
+            .map(|target| target.manifest_id().to_string()),
         Some(snapshot_ref.manifest_id.clone())
     );
     Ok(())

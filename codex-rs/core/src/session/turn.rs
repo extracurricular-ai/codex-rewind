@@ -267,14 +267,31 @@ pub(crate) async fn run_turn(
     // stat cache. Local environments only — the first turn environment
     // whose cwd resolves to a native path.
     if let Some(file_snapshots) = sess.file_snapshots.clone()
-        && let Some(local_cwd) = first_step_context
+        && let Some(environment) = first_step_context
             .environments
             .turn_environments()
-            .find_map(|environment| environment.cwd().to_abs_path().ok())
+            .find(|environment| environment.cwd().to_abs_path().is_ok())
+        && let Ok(local_cwd) = environment.cwd().to_abs_path()
     {
         let turn_id = turn_context.sub_id.clone();
+        // Scope the capture to the session's own workspace roots. They are
+        // what the sandbox consults to decide where the agent may write, so
+        // scoping to them is what makes "whatever can be changed can be
+        // reverted" hold by construction rather than by coincidence.
+        // Remote roots have no local path and are out of scope for capture,
+        // the same rule the cwd resolution above applies.
+        let workspace_roots: Vec<std::path::PathBuf> = environment
+            .workspace_roots()
+            .iter()
+            .filter_map(|root| root.to_abs_path().ok())
+            .map(|root| root.to_path_buf())
+            .collect();
         let _ = tokio::task::spawn_blocking(move || {
-            file_snapshots.checkpoint_turn_start_blocking(&turn_id, &local_cwd.to_path_buf());
+            file_snapshots.checkpoint_turn_start_blocking(
+                &turn_id,
+                &local_cwd.to_path_buf(),
+                &workspace_roots,
+            );
         })
         .await;
     }

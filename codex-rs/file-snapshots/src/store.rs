@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::blob::BlobStore;
+use crate::checkpoint::CaptureScope;
 use crate::checkpoint::Checkpoint;
 use crate::checkpoint::capture;
 use crate::error::Result;
@@ -90,10 +91,10 @@ impl SnapshotStore {
         thread_id: &str,
         turn_id: &str,
         files: impl IntoIterator<Item = PathBuf>,
-        complete: bool,
+        scope: CaptureScope,
     ) -> Result<Checkpoint> {
         let prev = self.latest_manifest(thread_id)?;
-        let cp = capture(&self.blobs, &self.manifests, files, prev.as_ref(), complete)?;
+        let cp = capture(&self.blobs, &self.manifests, files, prev.as_ref(), scope)?;
         self.refs.append(
             thread_id,
             SnapshotRef {
@@ -309,7 +310,7 @@ impl SnapshotStore {
         target: &RestoreTarget,
         kind: RestoreKind,
         current_files: impl IntoIterator<Item = PathBuf>,
-        current_complete: bool,
+        current_scope: CaptureScope,
         is_protected: &dyn Fn(&str) -> bool,
     ) -> Result<RestoreOutcome> {
         // 1. Capture what is about to be replaced, so this restore can be
@@ -319,7 +320,7 @@ impl SnapshotStore {
             thread_id,
             &format!("{SAFETY_TURN_PREFIX}{}", target.manifest_id),
             current_files,
-            current_complete,
+            current_scope,
         )?;
 
         // 2. Compare the two states directly. Nothing here consults a

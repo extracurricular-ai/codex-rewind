@@ -78,13 +78,23 @@ pub struct Manifest {
     /// Path → entry. Paths are stored as strings (lossy UTF-8) so
     /// manifests serialize portably; keys are absolute paths.
     pub entries: BTreeMap<String, FileEntry>,
-    /// Whether this capture enumerated its entire scope (workspace mode).
-    /// For a complete manifest, a path's absence is positive evidence the
-    /// file did not exist at capture time, so restores may delete on
-    /// absence alone. Bounded captures (fallback mode) leave this false:
-    /// there, absence only means the scan did not look.
+    /// Whether this capture enumerated its scope exhaustively. For a complete
+    /// manifest, a path's absence is positive evidence the file did not exist
+    /// at capture time — but only for paths the scan actually covered, which
+    /// is what `scope_roots` records. Bounded captures (fallback mode) leave
+    /// this false: there, absence only means the scan did not look.
     #[serde(default)]
     pub complete: bool,
+    /// Directories this capture enumerated, as absolute paths.
+    ///
+    /// `complete` alone would over-claim. A manifest also carries paths picked
+    /// up by the edit hook from anywhere on disk, and those were never scanned
+    /// — treating their absence from a later capture as proof of deletion
+    /// would remove files that plainly existed. Recording the roots keeps the
+    /// completeness claim scoped to what was actually walked, and lets the
+    /// scope change mid-session without invalidating earlier manifests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_roots: Vec<String>,
     /// Paths observed *not to exist* at capture time.
     ///
     /// Absence from `entries` is an implicit claim that only holds when the
@@ -98,6 +108,15 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Whether `path` lies under a root this capture enumerated, and so is
+    /// covered by the `complete` claim.
+    pub fn scope_covers(&self, path: &str) -> bool {
+        self.scope_roots.iter().any(|root| {
+            path.strip_prefix(root.as_str())
+                .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
+        })
+    }
+
     /// Content-addressed id: SHA-256 of the canonical JSON serialization.
     pub fn id(&self) -> Result<String> {
         let bytes = serde_json::to_vec(self)?;

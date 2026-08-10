@@ -110,46 +110,83 @@ impl FileSnapshotsController {
 
     /// Capture the turn-start checkpoint. Blocking (stat-walk + hashing of
     /// changed files) — call via `spawn_blocking`.
-    pub fn checkpoint_turn_start_blocking(&self, turn_id: &str, cwd: &Path) {
-        if let Err(err) = self.checkpoint_inner(turn_id, cwd) {
+    pub fn checkpoint_turn_start_blocking(
+        &self,
+        turn_id: &str,
+        cwd: &Path,
+        workspace_roots: &[PathBuf],
+    ) {
+        if let Err(err) = self.checkpoint_inner(turn_id, cwd, workspace_roots) {
             warn!("file_snapshots: turn-start checkpoint failed (turn {turn_id}): {err}");
         }
     }
 
-    fn checkpoint_inner(&self, turn_id: &str, cwd: &Path) -> Result<()> {
-        let markers: Vec<String> = WORKSPACE_MARKERS.iter().map(ToString::to_string).collect();
-        let workspace_root = find_workspace_root(cwd, &markers);
+    fn checkpoint_inner(
+        &self,
+        turn_id: &str,
+        cwd: &Path,
+        workspace_roots: &[PathBuf],
+    ) -> Result<()> {
+        // The session's own workspace roots come first: they are what the user
+        // configured and what the sandbox consults to decide where the agent
+        // may write, so scoping to them makes "whatever the agent can change
+        // can be reverted" structural rather than coincidental. The marker
+        // walk-up is a guess about intent and only stands in when there is
+        // nothing to go on.
+        //
+        // Roots unrelated to the turn's cwd are dropped. A configured root can
+        // describe a different environment, or simply be stale, and scanning
+        // an unrelated tree is the over-capture failure this feature exists to
+        // avoid — a root that neither contains nor sits under the directory
+        // being worked in is not this session's workspace.
+        let related: Vec<PathBuf> = workspace_roots
+            .iter()
+            .filter(|root| cwd.starts_with(root) || root.starts_with(cwd))
+            .cloned()
+            .collect();
+        let roots: Vec<PathBuf> = if related.is_empty() {
+            let markers: Vec<String> = WORKSPACE_MARKERS.iter().map(ToString::to_string).collect();
+            find_workspace_root(cwd, &markers).into_iter().collect()
+        } else {
+            related
+        };
         // Whichever directory scoped this scan also scopes the ignore rules
         // applied to edit-hook captures (see `attach_pre_edits_blocking`).
         self.lock_state().ignore_root =
-            Some(workspace_root.clone().unwrap_or_else(|| cwd.to_path_buf()));
-        let (mut files, complete): (BTreeSet<PathBuf>, bool) = match workspace_root {
-            Some(root) => (
-                workspace_files(&root, self.include_hidden)?
-                    .into_iter()
-                    .collect(),
-                true,
-            ),
-            None => {
-                let policy = self.seed_policy.clone();
-                let mut state = self.lock_state();
-                let tracked = match &mut state.fallback {
-                    Some(tracked) => tracked,
-                    None => {
-                        let seed = seed_fallback_files(cwd, &policy, self.include_hidden)?;
-                        state
-                            .fallback
-                            .get_or_insert(TrackedSet::new(seed, policy.cap))
-                    }
-                };
-                (tracked.files().cloned().collect(), false)
+            Some(roots.first().cloned().unwrap_or_else(|| cwd.to_path_buf()));
+        let (mut files, complete): (BTreeSet<PathBuf>, bool) = if !roots.is_empty() {
+            let mut all = BTreeSet::new();
+            for root in &roots {
+                all.extend(workspace_files(root, self.include_hidden)?);
             }
+            (all, true)
+        } else {
+            let policy = self.seed_policy.clone();
+            let mut state = self.lock_state();
+            let tracked = match &mut state.fallback {
+                Some(tracked) => tracked,
+                None => {
+                    let seed = seed_fallback_files(cwd, &policy, self.include_hidden)?;
+                    state
+                        .fallback
+                        .get_or_insert(TrackedSet::new(seed, policy.cap))
+                }
+            };
+            (tracked.files().cloned().collect(), false)
         };
         files.extend(self.lock_state().extras.iter().cloned());
 
+        let scope = crate::CaptureScope {
+            roots: if roots.is_empty() {
+                vec![cwd.to_path_buf()]
+            } else {
+                roots
+            },
+            complete,
+        };
         let checkpoint = self
             .store
-            .checkpoint(&self.thread_id, turn_id, files, complete)?;
+            .checkpoint(&self.thread_id, turn_id, files, scope)?;
         info!(
             "file_snapshots: turn {turn_id} checkpoint {} ({} reused, {} hashed, {} skipped)",
             checkpoint.id,
@@ -291,7 +328,7 @@ mod tests {
         std::fs::write(ws.path().join(".github/workflows/ci.yml"), "on: push").unwrap();
         std::fs::write(ws.path().join("src.rs"), "code").unwrap();
 
-        ctl.checkpoint_turn_start_blocking("turn-1", ws.path());
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[]);
         let scanned = ctl.store.tracked_paths("t1").unwrap();
         assert!(
             scanned.iter().all(|p| !p.contains("/.env")),
@@ -341,7 +378,7 @@ mod tests {
         for i in 0..5 {
             std::fs::write(loose.path().join(format!("f{i}.txt")), "x").unwrap();
         }
-        ctl.checkpoint_turn_start_blocking("turn-1", loose.path());
+        ctl.checkpoint_turn_start_blocking("turn-1", loose.path(), &[]);
 
         let history = ctl.store.thread_history("t1").unwrap();
         assert_eq!(
@@ -377,7 +414,7 @@ mod tests {
         std::fs::write(ws.path().join("src.rs"), "code").unwrap();
 
         // Turn-start scan establishes the ignore scope for the session.
-        ctl.checkpoint_turn_start_blocking("turn-1", ws.path());
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[]);
 
         let secret = ws.path().join("secrets/key.pem");
         let tracked = ws.path().join("src.rs");
@@ -388,7 +425,7 @@ mod tests {
                 (tracked.clone(), Some(b"code".to_vec())),
             ],
         );
-        ctl.checkpoint_turn_start_blocking("turn-2", ws.path());
+        ctl.checkpoint_turn_start_blocking("turn-2", ws.path(), &[]);
 
         let paths = ctl.store.tracked_paths("t1").unwrap();
         assert!(
@@ -415,7 +452,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(ws.path().join(".git")).unwrap();
         std::fs::write(ws.path().join("a.txt"), "alpha").unwrap();
-        ctl.checkpoint_turn_start_blocking("turn-1", ws.path());
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[]);
 
         let history = ctl.store.thread_history("t1").unwrap();
         assert_eq!(history.len(), 1);
@@ -435,11 +472,11 @@ mod tests {
             /*include_hidden*/ false,
         )
         .unwrap();
-        ctl2.checkpoint_turn_start_blocking("turn-1", loose.path());
+        ctl2.checkpoint_turn_start_blocking("turn-1", loose.path(), &[]);
         let outside = home.path().join("elsewhere.cfg");
         ctl2.attach_pre_edits_blocking("turn-1", vec![(outside.clone(), Some(b"pre".to_vec()))]);
         std::fs::write(&outside, "post").unwrap();
-        ctl2.checkpoint_turn_start_blocking("turn-2", loose.path());
+        ctl2.checkpoint_turn_start_blocking("turn-2", loose.path(), &[]);
 
         let history = ctl2.store.thread_history("t2").unwrap();
         // turn-1 scan + turn-1 supplemental attach + turn-2 scan.

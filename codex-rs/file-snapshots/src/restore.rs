@@ -76,7 +76,9 @@ pub fn plan_restore(
         if is_protected(path) || target.entries.contains_key(path) {
             continue;
         }
-        if target.complete || target.absent.contains(path) {
+        // A tombstone is an observation and stands alone. Completeness is a
+        // deduction, and only holds for paths the scan actually walked.
+        if target.absent.contains(path) || (target.complete && target.scope_covers(path)) {
             plan.deletes.push(path.clone());
         }
     }
@@ -147,6 +149,8 @@ mod tests {
     fn manifest(entries: &[(&str, &str)], complete: bool) -> Manifest {
         let mut m = Manifest {
             complete,
+            // The unit tests use "/"-rooted paths, so the scan claims "/".
+            scope_roots: complete.then(|| vec!["".to_string()]).unwrap_or_default(),
             ..Default::default()
         };
         for (path, hash) in entries {
@@ -188,6 +192,29 @@ mod tests {
         let plan = plan_restore(&target, &current, &|_| false);
         assert!(plan.writes.is_empty());
         assert_eq!(plan.deletes, vec!["/added"]);
+    }
+
+    #[test]
+    fn completeness_does_not_speak_for_paths_the_scan_never_walked() {
+        // A capture also carries paths the edit hook picked up from anywhere
+        // on disk. Those were never enumerated, so their absence from a later
+        // capture says nothing — deleting on it would remove a file that
+        // plainly existed.
+        let mut target = manifest(&[("/ws/kept", "h-k")], /*complete*/ true);
+        target.scope_roots = vec!["/ws".to_string()];
+        let mut current = manifest(&[("/ws/kept", "h-k"), ("/elsewhere/notes", "h-n")], true);
+        current.scope_roots = vec!["/ws".to_string()];
+
+        let plan = plan_restore(&target, &current, &|_| false);
+        assert!(
+            plan.deletes.is_empty(),
+            "an unscanned path is not evidence of anything"
+        );
+
+        // Stating it explicitly is a different matter.
+        target.absent.insert("/elsewhere/notes".to_string());
+        let plan = plan_restore(&target, &current, &|_| false);
+        assert_eq!(plan.deletes, vec!["/elsewhere/notes"]);
     }
 
     #[test]

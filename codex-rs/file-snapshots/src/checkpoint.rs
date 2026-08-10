@@ -54,6 +54,15 @@ fn settled_before(meta: &fs::Metadata, now: SystemTime) -> bool {
         .is_some_and(|age| age >= RACY_WINDOW)
 }
 
+/// What a capture claims to have covered.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CaptureScope {
+    /// Directories the scan enumerated.
+    pub roots: Vec<PathBuf>,
+    /// Whether it enumerated them exhaustively.
+    pub complete: bool,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CheckpointStats {
     /// Files whose hash was reused via the stat cache (not read).
@@ -85,9 +94,9 @@ pub fn capture(
     manifests: &ManifestStore,
     files: impl IntoIterator<Item = PathBuf>,
     prev: Option<&Manifest>,
-    complete: bool,
+    scope: CaptureScope,
 ) -> Result<Checkpoint> {
-    capture_at(blobs, manifests, files, prev, complete, SystemTime::now())
+    capture_at(blobs, manifests, files, prev, scope, SystemTime::now())
 }
 
 /// `capture` with the capture instant supplied, so that the racy-window
@@ -97,11 +106,16 @@ fn capture_at(
     manifests: &ManifestStore,
     files: impl IntoIterator<Item = PathBuf>,
     prev: Option<&Manifest>,
-    complete: bool,
+    scope: CaptureScope,
     now: SystemTime,
 ) -> Result<Checkpoint> {
     let mut manifest = Manifest {
-        complete,
+        complete: scope.complete,
+        scope_roots: scope
+            .roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
         ..Default::default()
     };
     let mut stats = CheckpointStats::default();
@@ -191,6 +205,14 @@ mod tests {
             .unwrap();
     }
 
+    /// A complete scan of the fixture workspace.
+    fn scanned(root: &std::path::Path) -> CaptureScope {
+        CaptureScope {
+            roots: vec![root.to_path_buf()],
+            complete: true,
+        }
+    }
+
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
@@ -211,7 +233,14 @@ mod tests {
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
 
-        let cp = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
+        let cp = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            None,
+            scanned(&f.ws),
+        )
+        .unwrap();
         assert_eq!(cp.stats.hashed, 1);
         assert_eq!(cp.stats.reused, 0);
 
@@ -228,13 +257,20 @@ mod tests {
         // Age the file past the racy window so its fingerprint is proof.
         set_mtime_secs_ago(&a, 60);
 
-        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
+        let cp1 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            None,
+            scanned(&f.ws),
+        )
+        .unwrap();
         let cp2 = capture(
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
             Some(&cp1.manifest),
-            true,
+            scanned(&f.ws),
         )
         .unwrap();
 
@@ -252,7 +288,14 @@ mod tests {
         let f = fixture();
         let a = f.ws.join("a.txt");
         fs::write(&a, b"v1").unwrap();
-        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
+        let cp1 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            None,
+            scanned(&f.ws),
+        )
+        .unwrap();
 
         // Rewrite with identical size and forge the old fingerprint, exactly
         // what a same-tick write looks like.
@@ -266,7 +309,7 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             Some(&cp1.manifest),
-            true,
+            scanned(&f.ws),
         )
         .unwrap();
         assert_eq!(cp2.stats.hashed, 1, "a racily-clean entry must be re-read");
@@ -297,7 +340,7 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             None,
-            true,
+            scanned(&f.ws),
             captured_at,
         )
         .unwrap();
@@ -318,7 +361,7 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             Some(&cp1.manifest),
-            true,
+            scanned(&f.ws),
             captured_at + Duration::from_secs(60),
         )
         .unwrap();
@@ -342,7 +385,7 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             Some(&cp2.manifest),
-            true,
+            scanned(&f.ws),
             captured_at + Duration::from_secs(120),
         )
         .unwrap();
@@ -354,7 +397,14 @@ mod tests {
         let f = fixture();
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
-        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
+        let cp1 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            None,
+            scanned(&f.ws),
+        )
+        .unwrap();
 
         fs::write(&a, b"alpha-2").unwrap();
         let cp2 = capture(
@@ -362,7 +412,7 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             Some(&cp1.manifest),
-            true,
+            scanned(&f.ws),
         )
         .unwrap();
 
@@ -379,7 +429,7 @@ mod tests {
     fn vanished_files_are_skipped() {
         let f = fixture();
         let ghost = f.ws.join("ghost.txt");
-        let cp = capture(&f.blobs, &f.manifests, vec![ghost], None, true).unwrap();
+        let cp = capture(&f.blobs, &f.manifests, vec![ghost], None, scanned(&f.ws)).unwrap();
         assert_eq!(cp.stats.skipped, 1);
         assert!(cp.manifest.entries.is_empty());
     }
@@ -394,7 +444,14 @@ mod tests {
         fs::write(&a, b"#!/bin/sh").unwrap();
         fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None, true).unwrap();
+        let cp1 = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![a.clone()],
+            None,
+            scanned(&f.ws),
+        )
+        .unwrap();
         // chmod alone may leave size+mtime untouched → stat-cache hit path.
         fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
         let cp2 = capture(
@@ -402,7 +459,7 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             Some(&cp1.manifest),
-            true,
+            scanned(&f.ws),
         )
         .unwrap();
 

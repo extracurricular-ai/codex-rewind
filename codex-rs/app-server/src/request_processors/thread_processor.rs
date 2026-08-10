@@ -5258,21 +5258,29 @@ fn restore_thread_files_to(
     use codex_file_snapshots::load_ignore;
     use codex_file_snapshots::workspace_files;
 
-    // Safety-checkpoint scope: the current workspace scan (when a root is
-    // found) plus every path the thread ever observed — the latter covers
-    // outside-workspace files recorded via pre-edit attach.
-    let markers = vec![".git".to_string()];
-    let root = find_workspace_root(cwd, &markers);
-    let mut files: BTreeSet<PathBuf> = match &root {
-        // Hidden entries stay out of the safety checkpoint's scan for the
-        // same reason they stay out of capture; anything actually tracked
-        // arrives through `tracked_paths` below.
-        Some(root) => workspace_files(root, /*include_hidden*/ false)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .collect(),
-        None => BTreeSet::new(),
-    };
+    // Safety-checkpoint scope: rescan whatever the thread's captures declared
+    // they covered, plus every path the thread ever observed — the latter
+    // covers paths outside those roots, recorded via pre-edit attach. Reusing
+    // the recorded roots rather than re-deriving them keeps this scan and the
+    // captures it will be compared against talking about the same scope, even
+    // if the session's roots changed along the way.
+    let mut roots: Vec<PathBuf> = store
+        .latest_manifest(thread_id)
+        .map_err(|e| e.to_string())?
+        .map(|manifest| manifest.scope_roots.iter().map(PathBuf::from).collect())
+        .unwrap_or_default();
+    if roots.is_empty() {
+        let markers = vec![".git".to_string()];
+        roots.extend(find_workspace_root(cwd, &markers));
+    }
+    // Hidden entries stay out of the safety checkpoint's scan for the same
+    // reason they stay out of capture; anything actually tracked arrives
+    // through `tracked_paths` below.
+    let mut files: BTreeSet<PathBuf> = BTreeSet::new();
+    for root in &roots {
+        files.extend(workspace_files(root, /*include_hidden*/ false).map_err(|e| e.to_string())?);
+    }
+    let root = roots.first().cloned();
     files.extend(
         store
             .tracked_paths(thread_id)
@@ -5296,7 +5304,10 @@ fn restore_thread_files_to(
             target,
             kind,
             files,
-            /*current_complete*/ root.is_some(),
+            codex_file_snapshots::CaptureScope {
+                complete: !roots.is_empty(),
+                roots,
+            },
             &is_protected,
         )
         .map_err(|e| e.to_string())
