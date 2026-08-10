@@ -143,7 +143,25 @@ impl SnapshotStore {
             return Ok(None);
         }
         let Some(content) = pre_content else {
-            return Ok(None);
+            // The edit created this file. Record that it did not exist rather
+            // than recording nothing: absence has to be *stated* to be usable
+            // as evidence outside a complete scan, which is precisely the case
+            // here — the path may well be outside the scanned scope.
+            if latest.absent.contains(path_key) {
+                return Ok(None);
+            }
+            let mut manifest = latest;
+            manifest.absent.insert(path_key.to_string());
+            let id = self.manifests.save(&manifest)?;
+            self.refs.append(
+                thread_id,
+                SnapshotRef {
+                    turn_id: turn_id.to_string(),
+                    manifest_id: id.clone(),
+                },
+            )?;
+            self.turns.set_turn(turn_id, &id)?;
+            return Ok(Some(id));
         };
 
         let hash = self.blobs.store_bytes(content)?;
@@ -218,6 +236,10 @@ impl SnapshotStore {
         let mut out = std::collections::BTreeSet::new();
         for (_, manifest) in self.thread_history(thread_id)? {
             out.extend(manifest.entries.into_keys());
+            // Tombstoned paths count as observed too. They are precisely the
+            // ones a restore may need to remove, and a path the safety scope
+            // misses is a path the plan can never delete.
+            out.extend(manifest.absent);
         }
         Ok(out)
     }
@@ -259,6 +281,11 @@ impl SnapshotStore {
             out.push((entry, manifest));
         }
         Ok(out)
+    }
+
+    /// Load a manifest by id.
+    pub fn manifest(&self, manifest_id: &str) -> Result<Manifest> {
+        self.manifests.load(manifest_id)
     }
 
     pub fn latest_manifest(&self, thread_id: &str) -> Result<Option<Manifest>> {

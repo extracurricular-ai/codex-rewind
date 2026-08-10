@@ -67,11 +67,17 @@ pub fn plan_restore(
         }
     }
 
-    if target.complete {
-        for path in current.entries.keys() {
-            if !target.entries.contains_key(path) && !is_protected(path) {
-                plan.deletes.push(path.clone());
-            }
+    // Two independent grounds for deleting, both amounting to positive
+    // evidence that the file did not exist at the target: the target scan
+    // covered everything and did not find it, or the target explicitly
+    // recorded not finding it. The second stands on its own, which is what
+    // lets a bounded capture delete at all.
+    for path in current.entries.keys() {
+        if is_protected(path) || target.entries.contains_key(path) {
+            continue;
+        }
+        if target.complete || target.absent.contains(path) {
+            plan.deletes.push(path.clone());
         }
     }
     plan

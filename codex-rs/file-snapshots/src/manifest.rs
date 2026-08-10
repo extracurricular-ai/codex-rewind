@@ -81,10 +81,20 @@ pub struct Manifest {
     /// Whether this capture enumerated its entire scope (workspace mode).
     /// For a complete manifest, a path's absence is positive evidence the
     /// file did not exist at capture time, so restores may delete on
-    /// absence alone. Bounded captures (fallback mode) leave this false
-    /// and get the conservative witnessed-birth deletion rule instead.
+    /// absence alone. Bounded captures (fallback mode) leave this false:
+    /// there, absence only means the scan did not look.
     #[serde(default)]
     pub complete: bool,
+    /// Paths observed *not to exist* at capture time.
+    ///
+    /// Absence from `entries` is an implicit claim that only holds when the
+    /// scan covered everything, which is exactly what `complete` asserts and
+    /// what a bounded capture cannot. A tombstone states the same thing
+    /// explicitly, as a recorded observation rather than a deduction from
+    /// completeness — so a file the agent created outside the scanned scope
+    /// can still be removed by a restore that predates it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub absent: BTreeSet<String>,
 }
 
 impl Manifest {

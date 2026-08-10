@@ -235,7 +235,7 @@ fn thread_marker_and_pre_edit_attach() {
         .expect("new path should attach");
     fs::write(&outside, "post-edit state").unwrap();
 
-    // Already covered by the scan → no-op. Born-by-edit (no pre-image) → no-op.
+    // Already covered by the turn-start scan → nothing to add.
     assert!(
         store
             .attach_pre_edit(
@@ -247,6 +247,22 @@ fn thread_marker_and_pre_edit_attach() {
             .unwrap()
             .is_none()
     );
+    // Born by this edit: there is no pre-image, but "it did not exist" is
+    // itself worth recording — it is the evidence a later restore needs in
+    // order to remove the file, and outside a complete scan nothing else
+    // supplies it.
+    let tombstoned = store
+        .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None)
+        .unwrap()
+        .expect("a created path is recorded as absent");
+    assert!(
+        store
+            .manifest(&tombstoned)
+            .unwrap()
+            .absent
+            .contains("/brand/new.txt")
+    );
+    // Recording it twice adds nothing.
     assert!(
         store
             .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None)
@@ -254,12 +270,23 @@ fn thread_marker_and_pre_edit_attach() {
             .is_none()
     );
 
-    // The supplemental manifest extends the turn-start one.
+    // Each supplement extends the previous one, and the turn resolves to the
+    // most complete of them.
     let history = store.thread_history(THREAD).unwrap();
-    assert_eq!(history.len(), 2);
-    assert_eq!(history[1].0.turn_id, "turn-1");
+    assert_eq!(history.len(), 3, "turn-start scan, pre-image, tombstone");
+    assert!(history.iter().all(|(r, _)| r.turn_id == "turn-1"));
     assert_eq!(history[1].0.manifest_id, attached);
-    assert!(history[1].1.entries.len() == cp1.manifest.entries.len() + 1);
+    assert_eq!(history[1].1.entries.len(), cp1.manifest.entries.len() + 1);
+    assert_eq!(history[2].0.manifest_id, tombstoned);
+    assert_eq!(
+        history[2].1.entries.len(),
+        cp1.manifest.entries.len() + 1,
+        "the tombstone carries the pre-image forward"
+    );
+    assert_eq!(
+        store.target_for_turn("turn-1").unwrap().unwrap().manifest_id(),
+        tombstoned
+    );
 
     // Restoring to the supplemental manifest recovers the pre-edit content.
     store
@@ -475,6 +502,73 @@ fn the_conversation_an_undo_returns_to_is_kept_by_the_store() {
         )
         .unwrap();
     assert!(store.last_restore_conversation(WS_KEY).unwrap().is_none());
+}
+
+#[test]
+fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
+    // The hard case for deletion: fallback mode (no project marker, so the
+    // capture is bounded) and a file the agent creates *above* the scanned
+    // directory. Absence from a bounded manifest proves nothing — the scan
+    // never looked there — so the only thing that can license removing it is
+    // the tombstone written when the edit created it.
+    let dir = tempfile::tempdir().unwrap();
+    let outer = dir.path().join("project");
+    let cwd = outer.join("inner");
+    fs::create_dir_all(&cwd).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+
+    // Turn 1 starts with an empty scope: `inner/` holds nothing.
+    let cp1 = store
+        .checkpoint(
+            THREAD,
+            "turn-1",
+            workspace_files(&cwd, /*include_hidden*/ false).unwrap(),
+            /*complete*/ false,
+        )
+        .unwrap();
+    assert!(cp1.manifest.entries.is_empty());
+    assert!(!cp1.manifest.complete, "fallback captures are bounded");
+
+    // The agent creates a file in the parent directory.
+    let created = outer.join("hello.html");
+    store
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &created.to_string_lossy(),
+            /*pre_content*/ None,
+        )
+        .unwrap()
+        .expect("creating a file records that it did not exist");
+    fs::write(&created, "generated").unwrap();
+
+    // Rewind to turn 1. The safety scope has to include what the thread has
+    // observed, or the new file is not even a candidate.
+    let mut current: Vec<_> = workspace_files(&cwd, false).unwrap();
+    current.extend(
+        store
+            .tracked_paths(THREAD)
+            .unwrap()
+            .into_iter()
+            .map(std::path::PathBuf::from),
+    );
+    let outcome = store
+        .restore_to(
+            THREAD,
+            WS_KEY,
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind { conversation: None },
+            current,
+            /*current_complete*/ false,
+            &|_| false,
+        )
+        .unwrap();
+
+    assert!(
+        !created.exists(),
+        "a tombstoned path is removed even though the capture was bounded"
+    );
+    assert_eq!(outcome.stats.deleted, 1);
 }
 
 #[test]
