@@ -397,9 +397,25 @@ impl App {
                 self.refresh_in_memory_config_from_disk_best_effort("forking the thread")
                     .await;
                 let config = self.fresh_session_config();
-                let turns = match self.thread_event_channels.get(&thread_id) {
+                let buffered = match self.thread_event_channels.get(&thread_id) {
                     Some(channel) => Some(channel.store.lock().await.turns.clone()),
                     None => None,
+                };
+                // The in-memory view is filled when a thread is attached and
+                // never grows as turns accumulate, so a session that has only
+                // ever run forward holds none of its own turns — and a rewind
+                // would report every prompt missing. Ask the server for the
+                // authoritative list instead of trusting a view that was only
+                // ever meant to describe the thread as it arrived.
+                let turns = match app_server
+                    .thread_read(thread_id, /*include_turns*/ true)
+                    .await
+                {
+                    Ok(thread) => Some(thread.turns),
+                    Err(err) => {
+                        tracing::warn!("could not load turns for the rewind: {err}");
+                        buffered
+                    }
                 };
                 let started = match turns {
                     Some(turns) => match crate::app_backtrack::backtrack_fork_before_turn_id(

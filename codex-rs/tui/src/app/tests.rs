@@ -6617,7 +6617,12 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
         )
         .await?;
-    app.enqueue_primary_thread_session(started.session, started.turns)
+    // Attach with no turns on purpose. The in-memory view is filled when a
+    // thread arrives and never grows as turns accumulate, so a session that has
+    // only ever run forward holds none of its own — the state a rewind actually
+    // has to work from, and the one that used to make it report every prompt as
+    // missing from the persisted thread.
+    app.enqueue_primary_thread_session(started.session, Vec::new())
         .await?;
     while app_event_rx.try_recv().is_ok() {}
     let source_before = std::fs::read_to_string(&source_path)?;
