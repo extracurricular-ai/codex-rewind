@@ -83,7 +83,7 @@ fn full_rewind_redo_gc_scenario() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind { conversation: None },
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &protect,
@@ -185,7 +185,7 @@ fn restore_preserves_permissions() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind { conversation: None },
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             true,
             &|_| false,
@@ -267,7 +267,7 @@ fn thread_marker_and_pre_edit_attach() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind,
+            RestoreKind::Rewind { conversation: None },
             workspace_files(&ws, /*include_hidden*/ false)
                 .unwrap()
                 .into_iter()
@@ -367,7 +367,7 @@ fn rewinding_twice_still_restores() {
             THREAD,
             WS_KEY,
             &turn1_target,
-            RestoreKind::Rewind,
+            RestoreKind::Rewind { conversation: None },
             scan(),
             true,
             &|_| false,
@@ -402,7 +402,7 @@ fn rewinding_twice_still_restores() {
             THREAD,
             WS_KEY,
             &turn1_target,
-            RestoreKind::Rewind,
+            RestoreKind::Rewind { conversation: None },
             scan(),
             true,
             &|_| false,
@@ -413,6 +413,68 @@ fn rewinding_twice_still_restores() {
         "v1",
         "second rewind must still work"
     );
+}
+
+#[test]
+fn the_conversation_an_undo_returns_to_is_kept_by_the_store() {
+    // The thread a rewind leaves behind is an ordinary session: the user can
+    // archive it, delete it, or keep talking in it. Undo therefore keeps its
+    // own copy of the conversation rather than trusting that thread to still
+    // be there, and in the state it was left in.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store.checkpoint(THREAD, "turn-1", scan(), true).unwrap();
+    fs::write(ws.join("a.txt"), "v2").unwrap();
+    store.checkpoint(THREAD, "turn-2", scan(), true).unwrap();
+
+    let rollout = b"{\"turn\":1}\n{\"turn\":2}\n".to_vec();
+    store
+        .restore_to(
+            THREAD,
+            WS_KEY,
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind {
+                conversation: Some(rollout.clone()),
+            },
+            scan(),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store.last_restore_conversation(WS_KEY).unwrap(),
+        Some(rollout),
+        "undo can rebuild the conversation from the store alone"
+    );
+
+    // GC must treat that copy as live even though no manifest mentions it.
+    let gc = store.gc().unwrap();
+    assert!(gc.blobs_removed == 0 || gc.blobs_kept > 0);
+    assert!(
+        store.last_restore_conversation(WS_KEY).unwrap().is_some(),
+        "the conversation copy survives collection"
+    );
+
+    // Spending the undo releases it.
+    let safety = store.last_restore_target(WS_KEY).unwrap().unwrap();
+    store
+        .restore_to(
+            THREAD,
+            WS_KEY,
+            &safety,
+            RestoreKind::Undo,
+            scan(),
+            true,
+            &|_| false,
+        )
+        .unwrap();
+    assert!(store.last_restore_conversation(WS_KEY).unwrap().is_none());
 }
 
 #[test]
@@ -439,7 +501,7 @@ fn undo_walks_back_through_successive_rewinds() {
                 THREAD,
                 WS_KEY,
                 &target,
-                RestoreKind::Rewind,
+                RestoreKind::Rewind { conversation: None },
                 scan(),
                 true,
                 &|_| false,

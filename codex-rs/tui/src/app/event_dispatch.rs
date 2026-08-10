@@ -298,47 +298,81 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 };
 
-                match app_server.thread_undo_file_restore(rewound_thread_id).await {
-                    Ok(Some(summary)) => {
-                        self.chat_widget.add_info_message(
-                            format!("Restored the files the rewind replaced ({summary})."),
-                            None,
-                        );
-                    }
-                    Ok(None) => {
-                        // Nothing was restored, so say so plainly instead of
-                        // moving the conversation and leaving the files behind
-                        // without explanation.
-                        self.chat_widget.add_info_message(
-                            "Nothing to undo — this session has no rewind to reverse.".to_string(),
-                            Some("nothing has been rewound in this workspace yet".to_string()),
-                        );
-                        tui.frame_requester().schedule_frame();
-                        return Ok(AppRunControl::Continue);
+                let staged_conversation =
+                    match app_server.thread_undo_file_restore(rewound_thread_id).await {
+                        Ok((Some(summary), conversation_path)) => {
+                            self.chat_widget.add_info_message(
+                                format!("Restored the files the rewind replaced ({summary})."),
+                                None,
+                            );
+                            conversation_path
+                        }
+                        Ok((None, _)) => {
+                            // Nothing was restored, so say so plainly instead of
+                            // moving the conversation and leaving the files behind
+                            // without explanation.
+                            self.chat_widget.add_info_message(
+                                "Nothing to undo — this session has no rewind to reverse."
+                                    .to_string(),
+                                Some("nothing has been rewound in this workspace yet".to_string()),
+                            );
+                            tui.frame_requester().schedule_frame();
+                            return Ok(AppRunControl::Continue);
+                        }
+                        Err(err) => {
+                            self.chat_widget
+                                .add_error_message(format!("Could not restore files: {err}"));
+                            tui.frame_requester().schedule_frame();
+                            return Ok(AppRunControl::Continue);
+                        }
+                    };
+
+                // The conversation is rebuilt from the copy the rewind put in
+                // the snapshot store, not by reopening the thread it replaced.
+                // That thread is an ordinary session the user may since have
+                // archived, deleted, or continued; an undo that depends on it
+                // is only as reliable as their filing.
+                let Some(staged_conversation) = staged_conversation else {
+                    self.chat_widget.add_info_message(
+                        "Files restored, but the conversation could not be rebuilt.".to_string(),
+                        Some("this rewind predates conversation capture".to_string()),
+                    );
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                };
+                let _ = branched_from;
+
+                self.refresh_in_memory_config_from_disk_best_effort("undoing a rewind")
+                    .await;
+                let config = self.fresh_session_config();
+                let leaving = self.chat_widget.thread_id();
+                match app_server
+                    .fork_thread_from_rollout(config, PathBuf::from(staged_conversation))
+                    .await
+                {
+                    Ok(rebuilt) => {
+                        self.shutdown_current_thread(app_server).await;
+                        if let Err(err) = self
+                            .replace_chat_widget_with_app_server_thread(
+                                tui,
+                                rebuilt,
+                                ThreadAttachPresentation::PromptEdit,
+                                /*initial_user_message*/ None,
+                            )
+                            .await
+                        {
+                            self.chat_widget.add_error_message(format!(
+                                "Files were restored, but the conversation could not be reopened: {err}"
+                            ));
+                        } else if let Some(leaving) = leaving {
+                            self.retire_rewound_thread(app_server, leaving).await;
+                        }
                     }
                     Err(err) => {
-                        self.chat_widget
-                            .add_error_message(format!("Could not restore files: {err}"));
-                        tui.frame_requester().schedule_frame();
-                        return Ok(AppRunControl::Continue);
+                        self.chat_widget.add_error_message(format!(
+                            "Files were restored, but the conversation could not be rebuilt: {err}"
+                        ));
                     }
-                }
-
-                // Only a branch has somewhere to return to; when the rewound
-                // thread is already the current one the files are enough.
-                if let Some(source_thread_id) = branched_from {
-                    // Undoing the rewind makes the pre-rewind thread current
-                    // again, so the two swap places: bring it back into the
-                    // session list and retire the branch we are leaving.
-                    if let Err(err) = app_server.thread_unarchive(source_thread_id).await {
-                        tracing::warn!("could not unarchive the thread /redo returns to: {err}");
-                    }
-                    if let Some(branch_id) = self.chat_widget.thread_id() {
-                        self.retire_rewound_thread(app_server, branch_id).await;
-                    }
-                    self.app_event_tx.send(AppEvent::ResumeSessionByIdOrName(
-                        source_thread_id.to_string(),
-                    ));
                 }
                 tui.frame_requester().schedule_frame();
             }

@@ -34,10 +34,14 @@ pub struct RestoreTarget {
 }
 
 /// Which direction a restore moves the workspace's undo history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreKind {
     /// Going back in the conversation; leaves an undo behind.
-    Rewind,
+    Rewind {
+        /// The conversation as it stands, so an undo can rebuild it without
+        /// depending on the thread it came from still being where it was.
+        conversation: Option<Vec<u8>>,
+    },
     /// Reversing the most recent rewind; consumes that undo, so undoing
     /// twice walks back through two rewinds rather than oscillating.
     Undo,
@@ -181,6 +185,19 @@ impl SnapshotStore {
             .map(|manifest_id| RestoreTarget { manifest_id }))
     }
 
+    /// The conversation recorded just before the most recent restore, if one
+    /// was captured. Undo rebuilds from this rather than reopening the thread
+    /// the rewind left behind.
+    pub fn last_restore_conversation(&self, workspace: &str) -> Result<Option<Vec<u8>>> {
+        let Some(record) = self.turns.last_restore(workspace)? else {
+            return Ok(None);
+        };
+        let Some(blob) = record.conversation_blob else {
+            return Ok(None);
+        };
+        Ok(Some(self.blobs.load(&blob)?))
+    }
+
     /// Where an undo returns to: the state captured just before the most
     /// recent restore applied to `workspace`. Bound to the workspace, not to
     /// a thread, so it answers correctly from whatever branch the user is on.
@@ -287,13 +304,20 @@ impl SnapshotStore {
         let stats = apply_plan(&self.blobs, &plan)?;
 
         match kind {
-            RestoreKind::Rewind => self.turns.push_restore(
-                workspace,
-                RestoreRecord {
-                    target_manifest_id: target.manifest_id.clone(),
-                    safety_manifest_id: safety.id.clone(),
-                },
-            )?,
+            RestoreKind::Rewind { conversation } => {
+                let conversation_blob = match conversation {
+                    Some(bytes) => Some(self.blobs.store_bytes(&bytes)?),
+                    None => None,
+                };
+                self.turns.push_restore(
+                    workspace,
+                    RestoreRecord {
+                        target_manifest_id: target.manifest_id.clone(),
+                        safety_manifest_id: safety.id.clone(),
+                        conversation_blob,
+                    },
+                )?
+            }
             RestoreKind::Undo => {
                 self.turns.pop_restore(workspace)?;
             }

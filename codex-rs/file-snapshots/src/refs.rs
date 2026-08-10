@@ -137,6 +137,15 @@ pub struct RestoreRecord {
     pub target_manifest_id: String,
     /// What it looked like just before — where an undo returns to.
     pub safety_manifest_id: String,
+    /// Blob holding the conversation as it stood before the restore.
+    ///
+    /// Undo rebuilds the conversation from this copy rather than reaching for
+    /// the thread it came from: that thread is an ordinary session the user
+    /// may archive, delete, or continue, and an undo that depends on it is
+    /// only as reliable as their filing habits. Optional so records written
+    /// before this existed still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_blob: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +190,23 @@ impl TurnIndex {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(SnapshotError::io(&path, e)),
         }
+    }
+
+    /// Every workspace's restore history, for GC marking.
+    pub fn restore_logs(&self) -> Result<Vec<RestoreLog>> {
+        let mut out = Vec::new();
+        let entries = fs::read_dir(&self.restores_root)
+            .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).map_err(|e| SnapshotError::io(entry.path(), e))?;
+            out.push(serde_json::from_slice(&bytes)?);
+        }
+        Ok(out)
     }
 
     pub fn all_manifest_ids(&self) -> Result<BTreeSet<String>> {
@@ -334,6 +360,15 @@ pub fn collect_garbage(
 
     let mut stats = GcStats::default();
     let mut live_blobs = BTreeSet::new();
+    // Conversation copies hang off restore records rather than manifests, so
+    // they have to be marked from the restore logs directly.
+    for log in turns.restore_logs()? {
+        for record in log.entries {
+            if let Some(blob) = record.conversation_blob {
+                live_blobs.insert(blob);
+            }
+        }
+    }
     for id in manifests.ids()? {
         if live_manifests.contains(&id) {
             stats.manifests_kept += 1;

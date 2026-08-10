@@ -33,6 +33,7 @@ impl ChatWidget {
         self.current_goal_status = None;
         self.update_collaboration_mode_indicator();
         self.forked_from = session.forked_from_id;
+        self.turns_since_rewind = 0;
         self.current_rollout_path = session.rollout_path.clone();
         self.current_cwd = Some(session.cwd.to_path_buf());
         self.config.cwd = session.cwd.clone();

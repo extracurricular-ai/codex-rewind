@@ -63,6 +63,10 @@ impl ChatWidget {
                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
                     self.on_task_started();
                 }
+                // Replayed turns are history being re-read, not new work.
+                if replay_kind.is_none() {
+                    self.note_turn_after_rewind();
+                }
             }
             ServerNotification::TurnCompleted(notification) => {
                 self.handle_turn_completed_notification(notification, replay_kind);

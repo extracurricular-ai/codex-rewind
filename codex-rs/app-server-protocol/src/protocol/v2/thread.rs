@@ -677,6 +677,14 @@ pub struct ThreadUndoFileRestoreResponse {
     /// Null when the thread has no restore to undo, which callers should
     /// report rather than treat as success.
     pub summary: Option<String>,
+    /// Rollout file holding the conversation as it stood before the rewind,
+    /// written out so the caller can fork from it (`thread/fork.path`).
+    ///
+    /// The copy is taken at rewind time and kept by the snapshot store, so it
+    /// does not depend on the superseded thread still existing or still being
+    /// where it was. Null when the rewind predates conversation capture or the
+    /// copy could not be written; the file restore above still stands.
+    pub conversation_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

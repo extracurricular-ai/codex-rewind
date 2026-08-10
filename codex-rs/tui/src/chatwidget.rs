@@ -672,6 +672,8 @@ pub(crate) struct ChatWidget {
     normal_placeholder_text: String,
     side_placeholder_text: String,
     forked_from: Option<ThreadId>,
+    /// Turns taken since a rewind landed here; see `note_turn_after_rewind`.
+    turns_since_rewind: usize,
     interrupted_turn_notice_mode: InterruptedTurnNoticeMode,
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
@@ -1099,6 +1101,52 @@ impl ChatWidget {
             self.bottom_pane.list_keymap(),
         );
         self.bottom_pane.show_view(Box::new(view));
+    }
+
+    /// Turns this conversation has taken since it was reached by a rewind.
+    ///
+    /// `/redo` returns the workspace to the moment of that rewind, so anything
+    /// done afterwards is undone with it. That is fine when redo follows the
+    /// rewind directly — the usual case — and destructive once real work has
+    /// happened, which is worth saying out loud rather than discovering after.
+    pub(crate) fn note_turn_after_rewind(&mut self) {
+        if self.forked_from.is_some() {
+            self.turns_since_rewind = self.turns_since_rewind.saturating_add(1);
+        }
+    }
+
+    fn confirm_redo_discards_work(&mut self) {
+        let turns = self.turns_since_rewind;
+        let noun = if turns == 1 { "turn" } else { "turns" };
+        let items = vec![
+            SelectionItem {
+                name: "Undo the rewind anyway".to_string(),
+                description: Some(format!(
+                    "Discards the {turns} {noun} of work done since. The conversation is archived, not deleted."
+                )),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::UndoLastRewind);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Keep things as they are".to_string(),
+                description: Some("Leave the files and the conversation alone.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Undo this rewind?".to_string()),
+            subtitle: Some(format!(
+                "You have worked for {turns} {noun} since rewinding. /redo goes back to the moment of the rewind, so that work goes with it."
+            )),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
     }
 
     pub(crate) fn open_memories_enable_prompt(&mut self) {

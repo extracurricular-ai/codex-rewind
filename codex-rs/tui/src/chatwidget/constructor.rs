@@ -208,6 +208,7 @@ impl ChatWidget {
             normal_placeholder_text: placeholder,
             side_placeholder_text: side_placeholder,
             forked_from: None,
+            turns_since_rewind: 0,
             interrupted_turn_notice_mode: InterruptedTurnNoticeMode::Default,
             input_queue: InputQueueState::default(),
             safety_buffering_prompt: None,

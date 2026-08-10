@@ -249,7 +249,11 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenBacktrackPicker);
             }
             SlashCommand::Redo => {
-                self.app_event_tx.send(AppEvent::UndoLastRewind);
+                if self.turns_since_rewind > 0 {
+                    self.confirm_redo_discards_work();
+                } else {
+                    self.app_event_tx.send(AppEvent::UndoLastRewind);
+                }
             }
             SlashCommand::App => {
                 let Some(thread_id) = self.thread_id else {

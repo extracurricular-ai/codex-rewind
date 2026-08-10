@@ -534,14 +534,27 @@ impl ThreadRequestProcessor {
         let codex_home = self.config.codex_home.to_path_buf();
         let thread_id = params.thread_id.clone();
         let cwd = stored.cwd.clone();
-        let summary =
+        let undone =
             tokio::task::spawn_blocking(move || undo_files_restore(&codex_home, &thread_id, &cwd))
                 .await
                 .map_err(|err| internal_error(format!("undo file restore task failed: {err}")))?
                 .map_err(internal_error)?;
+        let (summary, conversation_path) = match undone {
+            Some((summary, path)) => (
+                Some(summary),
+                path.map(|path| path.to_string_lossy().into_owned()),
+            ),
+            None => (None, None),
+        };
 
         self.outgoing
-            .send_response(request_id, ThreadUndoFileRestoreResponse { summary })
+            .send_response(
+                request_id,
+                ThreadUndoFileRestoreResponse {
+                    summary,
+                    conversation_path,
+                },
+            )
             .await;
         Ok(None)
     }
@@ -4338,8 +4351,18 @@ impl ThreadRequestProcessor {
             let forked = thread_id.to_string();
             let turn = before_turn_id.to_string();
             let cwd = source_thread.cwd.clone();
+            // The conversation as it stands right now, copied so that undoing
+            // this rewind never has to go looking for the thread it replaced.
+            let source_rollout = source_thread.rollout_path.clone();
             match tokio::task::spawn_blocking(move || {
-                restore_files_for_fork(&codex_home, &source, &forked, &turn, &cwd)
+                restore_files_for_fork(
+                    &codex_home,
+                    &source,
+                    &forked,
+                    &turn,
+                    &cwd,
+                    source_rollout.as_deref(),
+                )
             })
             .await
             {
@@ -5297,7 +5320,7 @@ fn undo_files_restore(
     codex_home: &Path,
     thread_id: &str,
     cwd: &Path,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, Option<PathBuf>)>, String> {
     use codex_file_snapshots::SnapshotStore;
 
     let store =
@@ -5305,12 +5328,20 @@ fn undo_files_restore(
     if !store.thread_exists(thread_id) {
         return Ok(None);
     }
+    let workspace = workspace_key(cwd);
     let Some(target) = store
-        .last_restore_target(&workspace_key(cwd))
+        .last_restore_target(&workspace)
         .map_err(|e| e.to_string())?
     else {
         return Ok(None);
     };
+
+    // Read the conversation copy out before restoring: the restore below
+    // spends this undo, and spending it releases the copy.
+    let conversation = store
+        .last_restore_conversation(&workspace)
+        .map_err(|e| e.to_string())?;
+
     let outcome = restore_thread_files_to(
         &store,
         thread_id,
@@ -5318,9 +5349,24 @@ fn undo_files_restore(
         codex_file_snapshots::RestoreKind::Undo,
         cwd,
     )?;
-    Ok(Some(format!(
-        "{} written, {} deleted",
-        outcome.stats.written, outcome.stats.deleted
+
+    // Staged rather than handed over as bytes: `thread/fork` takes a path, and
+    // a rollout can be large enough that routing it through the protocol would
+    // be wasteful. Failure here is advisory — files are already restored.
+    let conversation_path = conversation.and_then(|bytes| {
+        let staging = codex_home.join("file_snapshots").join("redo-staging");
+        std::fs::create_dir_all(&staging).ok()?;
+        let path = staging.join(format!("{thread_id}.jsonl"));
+        std::fs::write(&path, bytes).ok()?;
+        Some(path)
+    });
+
+    Ok(Some((
+        format!(
+            "{} written, {} deleted",
+            outcome.stats.written, outcome.stats.deleted
+        ),
+        conversation_path,
     )))
 }
 
@@ -5330,6 +5376,7 @@ fn restore_files_for_fork(
     new_thread_id: &str,
     before_turn_id: &str,
     source_cwd: &Path,
+    source_rollout_path: Option<&Path>,
 ) -> Result<String, String> {
     use codex_file_snapshots::SnapshotStore;
 
@@ -5353,11 +5400,14 @@ fn restore_files_for_fork(
         ));
     };
 
+    // Advisory: a conversation we cannot read just means undo restores files
+    // only, which is still better than failing the rewind.
+    let conversation = source_rollout_path.and_then(|path| std::fs::read(path).ok());
     let outcome = restore_thread_files_to(
         &store,
         source_thread_id,
         &target,
-        codex_file_snapshots::RestoreKind::Rewind,
+        codex_file_snapshots::RestoreKind::Rewind { conversation },
         source_cwd,
     )?;
     Ok(format!(
