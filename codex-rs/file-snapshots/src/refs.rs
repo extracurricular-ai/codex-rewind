@@ -136,16 +136,16 @@ pub struct RestoreRecord {
     /// What the workspace was restored to.
     pub target_manifest_id: String,
     /// What it looked like just before — where an undo returns to.
-    pub safety_manifest_id: String,
-    /// Blob holding the conversation as it stood before the restore.
     ///
-    /// Undo rebuilds the conversation from this copy rather than reaching for
-    /// the thread it came from: that thread is an ordinary session the user
-    /// may archive, delete, or continue, and an undo that depends on it is
-    /// only as reliable as their filing habits. Optional so records written
-    /// before this existed still load.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_blob: Option<String>,
+    /// Only the files are recorded here. The conversation an undo returns to
+    /// is the thread the rewind superseded, which is archived rather than
+    /// copied: archiving moves a rollout out of the sessions directory, and
+    /// thread lookup only searches that directory, so an archived thread
+    /// cannot be resumed or continued behind our back. Keeping the identity
+    /// rather than a copy also preserves the turn ids the snapshot store is
+    /// keyed on — a rebuilt conversation gets fresh ones, which would sever
+    /// every later rewind on that line from its snapshots.
+    pub safety_manifest_id: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,15 +360,6 @@ pub fn collect_garbage(
 
     let mut stats = GcStats::default();
     let mut live_blobs = BTreeSet::new();
-    // Conversation copies hang off restore records rather than manifests, so
-    // they have to be marked from the restore logs directly.
-    for log in turns.restore_logs()? {
-        for record in log.entries {
-            if let Some(blob) = record.conversation_blob {
-                live_blobs.insert(blob);
-            }
-        }
-    }
     for id in manifests.ids()? {
         if live_manifests.contains(&id) {
             stats.manifests_kept += 1;

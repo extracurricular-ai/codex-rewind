@@ -99,7 +99,7 @@ fn full_rewind_redo_gc_scenario() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind { conversation: None },
+            RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             scanned(&ws),
             &protect,
@@ -201,7 +201,7 @@ fn restore_preserves_permissions() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind { conversation: None },
+            RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
             scanned(&ws),
             &|_| false,
@@ -314,7 +314,7 @@ fn thread_marker_and_pre_edit_attach() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind { conversation: None },
+            RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false)
                 .unwrap()
                 .into_iter()
@@ -418,7 +418,7 @@ fn rewinding_twice_still_restores() {
             THREAD,
             WS_KEY,
             &turn1_target,
-            RestoreKind::Rewind { conversation: None },
+            RestoreKind::Rewind,
             scan(),
             scanned(&ws),
             &|_| false,
@@ -453,7 +453,7 @@ fn rewinding_twice_still_restores() {
             THREAD,
             WS_KEY,
             &turn1_target,
-            RestoreKind::Rewind { conversation: None },
+            RestoreKind::Rewind,
             scan(),
             scanned(&ws),
             &|_| false,
@@ -467,69 +467,75 @@ fn rewinding_twice_still_restores() {
 }
 
 #[test]
-fn the_conversation_an_undo_returns_to_is_kept_by_the_store() {
-    // The thread a rewind leaves behind is an ordinary session: the user can
-    // archive it, delete it, or keep talking in it. Undo therefore keeps its
-    // own copy of the conversation rather than trusting that thread to still
-    // be there, and in the state it was left in.
+fn nested_rewinds_unwind_in_the_order_they_were_made() {
+    // The case worth being sure about: rewind, keep working on the branch,
+    // rewind again, then undo twice. Each undo has to land on the state that
+    // existed just before the rewind it reverses — including the work done on
+    // the branch in between, which the second undo must not skip past.
     let dir = tempfile::tempdir().unwrap();
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
     let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
 
-    fs::write(ws.join("a.txt"), "v1").unwrap();
-    store
-        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
-        .unwrap();
-    fs::write(ws.join("a.txt"), "v2").unwrap();
-    store
-        .checkpoint(THREAD, "turn-2", scan(), scanned(&ws))
-        .unwrap();
+    for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2")] {
+        fs::write(ws.join("a.txt"), contents).unwrap();
+        store
+            .checkpoint(THREAD, turn, scan(), scanned(&ws))
+            .unwrap();
+    }
+    fs::write(ws.join("a.txt"), "v3 (unsaved)").unwrap();
 
-    let rollout = b"{\"turn\":1}\n{\"turn\":2}\n".to_vec();
-    store
-        .restore_to(
-            THREAD,
-            WS_KEY,
-            &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind {
-                conversation: Some(rollout.clone()),
-            },
-            scan(),
-            scanned(&ws),
-            &|_| false,
-        )
-        .unwrap();
+    let rewind = |turn: &str| {
+        let target = store.target_for_turn(turn).unwrap().unwrap();
+        store
+            .restore_to(
+                THREAD,
+                WS_KEY,
+                &target,
+                RestoreKind::Rewind,
+                scan(),
+                scanned(&ws),
+                &|_| false,
+            )
+            .unwrap();
+    };
+    let undo = || {
+        let target = store.last_restore_target(WS_KEY).unwrap().unwrap();
+        store
+            .restore_to(
+                THREAD,
+                WS_KEY,
+                &target,
+                RestoreKind::Undo,
+                scan(),
+                scanned(&ws),
+                &|_| false,
+            )
+            .unwrap();
+    };
 
+    rewind("turn-2");
+    assert_eq!(read(&ws.join("a.txt")), "v2");
+
+    // Work on the branch, then rewind again from there.
+    fs::write(ws.join("a.txt"), "branch work").unwrap();
+    rewind("turn-1");
+    assert_eq!(read(&ws.join("a.txt")), "v1");
+
+    undo();
     assert_eq!(
-        store.last_restore_conversation(WS_KEY).unwrap(),
-        Some(rollout),
-        "undo can rebuild the conversation from the store alone"
+        read(&ws.join("a.txt")),
+        "branch work",
+        "the first undo returns the branch's own work, not turn 2"
     );
-
-    // GC must treat that copy as live even though no manifest mentions it.
-    let gc = store.gc().unwrap();
-    assert!(gc.blobs_removed == 0 || gc.blobs_kept > 0);
-    assert!(
-        store.last_restore_conversation(WS_KEY).unwrap().is_some(),
-        "the conversation copy survives collection"
+    undo();
+    assert_eq!(
+        read(&ws.join("a.txt")),
+        "v3 (unsaved)",
+        "the second undo reaches back past the first rewind"
     );
-
-    // Spending the undo releases it.
-    let safety = store.last_restore_target(WS_KEY).unwrap().unwrap();
-    store
-        .restore_to(
-            THREAD,
-            WS_KEY,
-            &safety,
-            RestoreKind::Undo,
-            scan(),
-            scanned(&ws),
-            &|_| false,
-        )
-        .unwrap();
-    assert!(store.last_restore_conversation(WS_KEY).unwrap().is_none());
+    assert!(store.last_restore_target(WS_KEY).unwrap().is_none());
 }
 
 #[test]
@@ -567,7 +573,7 @@ fn a_capture_covers_every_configured_root() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind { conversation: None },
+            RestoreKind::Rewind,
             scan(),
             scope,
             &|_| false,
@@ -639,7 +645,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
             THREAD,
             WS_KEY,
             &store.target_for_turn("turn-1").unwrap().unwrap(),
-            RestoreKind::Rewind { conversation: None },
+            RestoreKind::Rewind,
             current,
             bounded(&cwd),
             &|_| false,
@@ -679,7 +685,7 @@ fn undo_walks_back_through_successive_rewinds() {
                 THREAD,
                 WS_KEY,
                 &target,
-                RestoreKind::Rewind { conversation: None },
+                RestoreKind::Rewind,
                 scan(),
                 scanned(&ws),
                 &|_| false,

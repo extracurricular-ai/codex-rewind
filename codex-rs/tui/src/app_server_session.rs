@@ -725,34 +725,6 @@ impl AppServerSession {
         .await
     }
 
-    /// Fork from a rollout file rather than from a loaded thread. Used by
-    /// `/redo`: the conversation it returns to is a copy kept by the snapshot
-    /// store, so there is no thread to name.
-    pub(crate) async fn fork_thread_from_rollout(
-        &mut self,
-        config: Config,
-        rollout_path: PathBuf,
-    ) -> Result<AppServerStartedThread> {
-        let request_id = self.next_request_id();
-        let session_config = self.session_config_with_effective_service_tier(&config);
-        let params = ThreadForkParams {
-            path: Some(rollout_path),
-            ..thread_fork_params_from_config(
-                session_config,
-                // Ignored when `path` is set, but the field is required.
-                ThreadId::default(),
-                self.thread_params_mode(),
-                self.remote_cwd_override.as_deref(),
-            )
-        };
-        let response: ThreadForkResponse = self
-            .client
-            .request_typed(ClientRequest::ThreadFork { request_id, params })
-            .await
-            .wrap_err("failed to rebuild the conversation this rewind replaced")?;
-        started_thread_from_fork_response(response, &config, self.thread_params_mode()).await
-    }
-
     pub(crate) async fn fork_side_thread(
         &mut self,
         config: Config,
@@ -996,13 +968,10 @@ impl AppServerSession {
 
     /// Undo `thread_id`'s last file restore. `None` means there was no
     /// restore to undo.
-    /// Returns the human-readable summary of what was restored, plus the
-    /// rollout the rewind replaced, staged on disk so the conversation can be
-    /// rebuilt from it.
     pub(crate) async fn thread_undo_file_restore(
         &mut self,
         thread_id: ThreadId,
-    ) -> Result<(Option<String>, Option<String>)> {
+    ) -> Result<Option<String>> {
         let request_id = self.next_request_id();
         let response: ThreadUndoFileRestoreResponse = self
             .client
@@ -1014,7 +983,7 @@ impl AppServerSession {
             })
             .await
             .wrap_err("failed to undo the file restore")?;
-        Ok((response.summary, response.conversation_path))
+        Ok(response.summary)
     }
 
     pub(crate) async fn thread_archive(&mut self, thread_id: ThreadId) -> Result<()> {
