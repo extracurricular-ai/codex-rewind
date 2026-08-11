@@ -184,26 +184,14 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
 
-/// Resolved `[file_snapshots]` tuning. Only consulted in fallback mode: with
-/// a project marker the whole workspace is tracked, so no seeding is needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Resolved `[file_snapshots]` tuning.
+///
+/// The seeding knobs this once carried are gone with the mode that used
+/// them: tracking is now three partitions, each bounded by its own nature
+/// rather than by a number the user has to pick.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileSnapshotsConfig {
-    pub seed_full_limit: usize,
-    pub seed_recent: usize,
-    pub max_tracked_files: usize,
     pub track_hidden_files: bool,
-}
-
-impl Default for FileSnapshotsConfig {
-    fn default() -> Self {
-        let defaults = codex_file_snapshots::SeedPolicy::default();
-        Self {
-            seed_full_limit: defaults.full_limit,
-            seed_recent: defaults.recent_seed,
-            max_tracked_files: defaults.cap,
-            track_hidden_files: false,
-        }
-    }
 }
 
 /// Compatibility-only config retained so legacy `ghost_snapshot` settings
@@ -3839,19 +3827,10 @@ impl Config {
 
         let file_snapshots = {
             let mut config = FileSnapshotsConfig::default();
-            if let Some(toml) = cfg.file_snapshots.as_ref() {
-                if let Some(limit) = toml.seed_full_limit {
-                    config.seed_full_limit = limit;
-                }
-                if let Some(recent) = toml.seed_recent {
-                    config.seed_recent = recent;
-                }
-                if let Some(cap) = toml.max_tracked_files {
-                    config.max_tracked_files = cap;
-                }
-                if let Some(hidden) = toml.track_hidden_files {
-                    config.track_hidden_files = hidden;
-                }
+            if let Some(toml) = cfg.file_snapshots.as_ref()
+                && let Some(hidden) = toml.track_hidden_files
+            {
+                config.track_hidden_files = hidden;
             }
             config
         };

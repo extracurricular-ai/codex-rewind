@@ -8,11 +8,10 @@
 //!   session start — new sessions follow `Feature::FileSnapshots`; resumed
 //!   sessions follow the persisted marker (snapshot-log existence). The
 //!   state never changes mid-session.
-//! - **Scope**: workspace mode when a marker directory is found by walk-up
-//!   from the turn cwd (complete scans); otherwise fallback mode with a
-//!   seeded, capped tracked set (bounded scans). Files the agent edits are
-//!   registered as extras so later checkpoints observe them, wherever they
-//!   live.
+//! - **Scope**: the union of three partitions (see `scope`) — what the
+//!   project's index lists, what the agent has edited this session, and what
+//!   changed most recently. Rooted at the session's own workspace roots,
+//!   falling back to the turn cwd when none of them relate to it.
 //! - Capture failures degrade to "no snapshot for this turn" — they are
 //!   logged and never fail the turn.
 
@@ -23,20 +22,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::error::Result;
-use crate::scope::SeedPolicy;
-use crate::scope::TrackedSet;
-use crate::scope::find_workspace_root;
 use crate::scope::is_ignored;
 use crate::scope::load_ignore;
-use crate::scope::seed_fallback_files;
-use crate::scope::workspace_files;
+use crate::scope::tracked_files;
 use crate::store::SnapshotStore;
 use tracing::info;
 use tracing::warn;
-
-/// Workspace root markers for v1, matching the turn-diff display-root probe
-/// (`turn_diff_display_roots`). A dedicated project marker can join later.
-const WORKSPACE_MARKERS: &[&str] = &[".git"];
 
 /// Directory under `CODEX_HOME` holding the snapshot store.
 const STORE_DIR_NAME: &str = "file_snapshots";
@@ -44,18 +35,13 @@ const STORE_DIR_NAME: &str = "file_snapshots";
 pub struct FileSnapshotsController {
     store: SnapshotStore,
     thread_id: String,
-    /// Seeding limits for fallback mode, from `[file_snapshots]`.
-    seed_policy: SeedPolicy,
-    /// Whether scans descend into dot-files and dot-directories.
+    /// Whether captures descend into dot-files and dot-directories.
     include_hidden: bool,
     state: Mutex<TrackState>,
 }
 
 #[derive(Default)]
 struct TrackState {
-    /// Fallback-mode tracked set, seeded on first checkpoint outside any
-    /// workspace root.
-    fallback: Option<TrackedSet>,
     /// Agent-edited paths registered via pre-edit attach; unioned into
     /// every checkpoint scan so post-edit states keep being observed.
     /// In-memory for v1: lost on resume (recorded manifests stay valid).
@@ -76,7 +62,6 @@ impl FileSnapshotsController {
         feature_enabled: bool,
         is_new_thread: bool,
         thread_id: String,
-        seed_policy: SeedPolicy,
         include_hidden: bool,
     ) -> Option<Arc<Self>> {
         let store = match SnapshotStore::open(codex_home.join(STORE_DIR_NAME)) {
@@ -110,7 +95,6 @@ impl FileSnapshotsController {
         Some(Arc::new(Self {
             store,
             thread_id,
-            seed_policy,
             include_hidden,
             state: Mutex::new(TrackState::default()),
         }))
@@ -153,48 +137,23 @@ impl FileSnapshotsController {
             .cloned()
             .collect();
         let roots: Vec<PathBuf> = if related.is_empty() {
-            let markers: Vec<String> = WORKSPACE_MARKERS.iter().map(ToString::to_string).collect();
-            find_workspace_root(cwd, &markers).into_iter().collect()
+            vec![cwd.to_path_buf()]
         } else {
             related
         };
-        // Whichever directory scoped this scan also scopes the ignore rules
+        // Whichever directory scoped this capture also scopes the ignore rules
         // applied to edit-hook captures (see `attach_pre_edits_blocking`).
-        self.lock_state().ignore_root =
-            Some(roots.first().cloned().unwrap_or_else(|| cwd.to_path_buf()));
-        let (mut files, complete): (BTreeSet<PathBuf>, bool) = if !roots.is_empty() {
-            let mut all = BTreeSet::new();
-            for root in &roots {
-                all.extend(workspace_files(root, self.include_hidden)?);
-            }
-            (all, true)
-        } else {
-            let policy = self.seed_policy.clone();
-            let mut state = self.lock_state();
-            let tracked = match &mut state.fallback {
-                Some(tracked) => tracked,
-                None => {
-                    let seed = seed_fallback_files(cwd, &policy, self.include_hidden)?;
-                    state
-                        .fallback
-                        .get_or_insert(TrackedSet::new(seed, policy.cap))
-                }
-            };
-            (tracked.files().cloned().collect(), false)
-        };
-        files.extend(self.lock_state().extras.iter().cloned());
+        let primary = roots.first().cloned().unwrap_or_else(|| cwd.to_path_buf());
+        self.lock_state().ignore_root = Some(primary);
 
-        let scope = crate::CaptureScope {
-            roots: if roots.is_empty() {
-                vec![cwd.to_path_buf()]
-            } else {
-                roots
-            },
-            complete,
-        };
-        let checkpoint = self
-            .store
-            .checkpoint(&self.thread_id, turn_id, files, scope)?;
+        // Three partitions, unioned (see `scope`), plus what the agent has
+        // written this session — wherever it lives. Walking the subtree
+        // instead was unbounded by construction: on a repository of any age
+        // most of what is on disk is build output, which is both the bulk of
+        // the cost and the least worth keeping.
+        let extras: Vec<PathBuf> = self.lock_state().extras.iter().cloned().collect();
+        let files = tracked_files(&roots, extras, self.include_hidden);
+        let checkpoint = self.store.checkpoint(&self.thread_id, turn_id, files)?;
         info!(
             "file_snapshots: turn {turn_id} checkpoint {} ({} reused, {} hashed, {} skipped)",
             checkpoint.id,
@@ -229,16 +188,9 @@ impl FileSnapshotsController {
             {
                 continue;
             }
-            {
-                let mut state = self.lock_state();
-                if let Some(tracked) = &mut state.fallback
-                    && tracked.track_edit(path.clone())
-                {
-                    // Fallback mode owns the path now; extras not needed.
-                } else {
-                    state.extras.insert(path.clone());
-                }
-            }
+            // The edit-touched partition: unbounded on purpose, since its size
+            // follows what the agent did rather than what is on disk.
+            self.lock_state().extras.insert(path.clone());
             let key = path.to_string_lossy().into_owned();
             if let Err(err) =
                 self.store
@@ -273,7 +225,6 @@ mod tests {
                 false,
                 true,
                 "t1".into(),
-                SeedPolicy::default(),
                 /*include_hidden*/ false,
             )
             .is_none()
@@ -285,7 +236,6 @@ mod tests {
             true,
             true,
             "t1".into(),
-            SeedPolicy::default(),
             /*include_hidden*/ false,
         )
         .expect("feature on for a new session");
@@ -308,7 +258,6 @@ mod tests {
                 false,
                 false,
                 "t1".into(),
-                SeedPolicy::default(),
                 /*include_hidden*/ false,
             )
             .is_some()
@@ -320,7 +269,6 @@ mod tests {
                 true,
                 false,
                 "t2".into(),
-                SeedPolicy::default(),
                 /*include_hidden*/ false,
             )
             .is_none()
@@ -335,7 +283,6 @@ mod tests {
             true,
             true,
             "t1".into(),
-            SeedPolicy::default(),
             /*include_hidden*/ false,
         )
         .unwrap();
@@ -373,28 +320,22 @@ mod tests {
     }
 
     #[test]
-    fn seed_policy_from_config_bounds_fallback_tracking() {
+    fn a_large_directory_cannot_flood_a_capture() {
+        // The property a plain subtree walk lacked. Without a bound, a capture
+        // costs whatever happens to be on disk — on a real repository that was
+        // 57k files and 100 GB, nearly all of it build output.
         let home = tempfile::tempdir().unwrap();
-        // Deliberately tiny limits: a directory of 5 files exceeds
-        // `full_limit`, so only `recent_seed` files may be tracked.
-        let policy = SeedPolicy {
-            full_limit: 2,
-            recent_seed: 3,
-            cap: 4,
-        };
         let ctl = FileSnapshotsController::maybe_new(
             home.path(),
             true,
             true,
             "t1".into(),
-            policy,
             /*include_hidden*/ false,
         )
         .unwrap();
 
-        // No `.git` marker → fallback mode, where seeding applies.
         let loose = tempfile::tempdir().unwrap();
-        for i in 0..5 {
+        for i in 0..(crate::scope::RECENT_LIMIT + 50) {
             std::fs::write(loose.path().join(format!("f{i}.txt")), "x").unwrap();
         }
         ctl.checkpoint_turn_start_blocking("turn-1", loose.path(), &[]);
@@ -402,10 +343,9 @@ mod tests {
         let history = ctl.store.thread_history("t1").unwrap();
         assert_eq!(
             history[0].1.entries.len(),
-            3,
-            "configured seed_recent must bound the tracked set"
+            crate::scope::RECENT_LIMIT,
+            "no repository here, so only the recency partition contributes"
         );
-        assert!(!history[0].1.complete, "fallback captures are partial");
     }
 
     #[test]
@@ -416,7 +356,6 @@ mod tests {
             true,
             true,
             "t1".into(),
-            SeedPolicy::default(),
             /*include_hidden*/ false,
         )
         .unwrap();
@@ -462,24 +401,20 @@ mod tests {
             true,
             true,
             "t1".into(),
-            SeedPolicy::default(),
             /*include_hidden*/ false,
         )
         .unwrap();
 
-        // Workspace mode: .git marker present → complete scan.
         let ws = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(ws.path().join(".git")).unwrap();
         std::fs::write(ws.path().join("a.txt"), "alpha").unwrap();
         ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[]);
 
         let history = ctl.store.thread_history("t1").unwrap();
         assert_eq!(history.len(), 1);
-        assert!(history[0].1.complete);
         assert_eq!(history[0].1.entries.len(), 1);
 
-        // Fallback mode: no marker → bounded scan, extras registered via
-        // pre-edit attach are observed by later checkpoints.
+        // Paths registered via pre-edit attach are observed by later
+        // checkpoints, wherever they live.
         let loose = tempfile::tempdir().unwrap();
         std::fs::write(loose.path().join("note.md"), "n1").unwrap();
         let ctl2 = FileSnapshotsController::maybe_new(
@@ -487,7 +422,6 @@ mod tests {
             true,
             true,
             "t2".into(),
-            SeedPolicy::default(),
             /*include_hidden*/ false,
         )
         .unwrap();
@@ -500,7 +434,11 @@ mod tests {
         let history = ctl2.store.thread_history("t2").unwrap();
         // turn-1 scan + turn-1 supplemental attach + turn-2 scan.
         assert_eq!(history.len(), 3);
-        assert!(!history[0].1.complete);
+        let outside_key = outside.to_string_lossy().into_owned();
+        assert!(
+            !history[0].1.entries.contains_key(&outside_key),
+            "a path nothing had pointed at yet is simply not observed"
+        );
         let last = &history[2].1;
         assert!(
             last.entries

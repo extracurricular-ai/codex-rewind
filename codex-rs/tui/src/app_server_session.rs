@@ -744,6 +744,7 @@ impl AppServerSession {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fork_thread_at_with_presentation(
         &mut self,
         config: Config,

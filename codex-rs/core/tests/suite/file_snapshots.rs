@@ -87,10 +87,6 @@ async fn turn_start_checkpoint_captures_pre_turn_state() -> Result<()> {
     let history = store.thread_history(&thread_id)?;
     assert_eq!(history.len(), 1, "one turn, one checkpoint: {history:?}");
     let (snapshot_ref, manifest) = &history[0];
-    assert!(
-        manifest.complete,
-        "a workspace-root scan is a complete capture"
-    );
 
     let notes_key = test
         .workspace_path("notes.txt")

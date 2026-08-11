@@ -7,7 +7,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::blob::BlobStore;
-use crate::checkpoint::CaptureScope;
 use crate::checkpoint::Checkpoint;
 use crate::checkpoint::capture;
 use crate::error::Result;
@@ -80,17 +79,17 @@ impl SnapshotStore {
 
     /// Capture a checkpoint of `files` for `thread_id` and append it to
     /// the thread's snapshot log. The previous checkpoint (if any) serves
-    /// as the stat cache. `complete` declares whether `files` covers the
-    /// entire tracking scope (workspace scan) or a bounded subset.
+    /// as the stat cache. Every path in `files` is either recorded or noted
+    /// as absent, and absence is the only evidence a later restore has for
+    /// deleting anything — so what is passed here bounds what can be undone.
     pub fn checkpoint(
         &self,
         thread_id: &str,
         turn_id: &str,
         files: impl IntoIterator<Item = PathBuf>,
-        scope: CaptureScope,
     ) -> Result<Checkpoint> {
         let prev = self.latest_manifest(thread_id)?;
-        let cp = capture(&self.blobs, &self.manifests, files, prev.as_ref(), scope)?;
+        let cp = capture(&self.blobs, &self.manifests, files, prev.as_ref())?;
         self.refs.append(
             thread_id,
             SnapshotRef {
@@ -343,7 +342,6 @@ impl SnapshotStore {
         target: &RestoreTarget,
         kind: RestoreKind,
         current_files: impl IntoIterator<Item = PathBuf>,
-        current_scope: CaptureScope,
         is_protected: &dyn Fn(&str) -> bool,
     ) -> Result<RestoreOutcome> {
         // 1. Capture what is about to be replaced, so this restore can be
@@ -354,7 +352,6 @@ impl SnapshotStore {
             thread_id,
             &format!("{SAFETY_TURN_PREFIX}{}", target.manifest_id),
             current_files,
-            current_scope,
         )?;
 
         // 2. Compare the two states directly. Nothing here consults a

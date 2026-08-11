@@ -9,6 +9,9 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
+# `index` reads the repository index directly, which is what the git-tracked
+# partition needs; the workspace default turns every optional feature off.
+gix = { workspace = true, features = ["index"] }
 ignore = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -1,6 +1,6 @@
 //! End-to-end scenario from the RFC: checkpoint → agent edits →
 //! checkpoint → user edits → rewind (with safety checkpoint,
-//! complete-scan deletion, symmetric ignore) → redo → GC.
+//! tombstone-licensed deletion, symmetric ignore) → redo → GC.
 
 #![allow(clippy::unwrap_used)]
 
@@ -12,6 +12,7 @@ use codex_file_snapshots::SNAPSHOT_IGNORE_FILENAME;
 use codex_file_snapshots::SnapshotStore;
 use codex_file_snapshots::is_ignored;
 use codex_file_snapshots::load_ignore;
+use codex_file_snapshots::tracked_files;
 use codex_file_snapshots::workspace_files;
 use pretty_assertions::assert_eq;
 
@@ -19,22 +20,6 @@ const THREAD: &str = "thread-1";
 /// The thread a rewind hands the workspace to, and therefore the one its undo
 /// record is filed under. Distinct from `THREAD`, which performs the restore.
 const BRANCH: &str = "branch-thread";
-
-/// A complete scan of `root`.
-fn scanned(root: &Path) -> codex_file_snapshots::CaptureScope {
-    codex_file_snapshots::CaptureScope {
-        roots: vec![root.to_path_buf()],
-        complete: true,
-    }
-}
-
-/// A bounded capture rooted at `root` (fallback mode).
-fn bounded(root: &Path) -> codex_file_snapshots::CaptureScope {
-    codex_file_snapshots::CaptureScope {
-        roots: vec![root.to_path_buf()],
-        complete: false,
-    }
-}
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
@@ -59,7 +44,6 @@ fn full_rewind_redo_gc_scenario() {
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
         )
         .unwrap();
     assert_eq!(
@@ -68,9 +52,20 @@ fn full_rewind_redo_gc_scenario() {
         "the ignored log and the (hidden) ignore file are both out of scope"
     );
 
-    // Agent work during turn 1: modify a, delete b, create c.
+    // Agent work during turn 1: modify a, delete b, create c. Creating c goes
+    // through the edit hook, as it does in the running system — that is what
+    // records "this path did not exist at turn 1", and nothing else can.
     fs::write(ws.join("a.txt"), "alpha v2 (agent)").unwrap();
     fs::remove_file(ws.join("b.txt")).unwrap();
+    store
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &ws.join("c.txt").to_string_lossy(),
+            /*pre_content*/ None,
+        )
+        .unwrap()
+        .expect("creating a file records that it did not exist");
     fs::write(ws.join("c.txt"), "charlie (agent)").unwrap();
 
     // Turn 2 checkpoint observes the agent's changes.
@@ -79,7 +74,6 @@ fn full_rewind_redo_gc_scenario() {
             THREAD,
             "turn-2",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
         )
         .unwrap();
     assert_eq!(
@@ -93,6 +87,17 @@ fn full_rewind_redo_gc_scenario() {
     fs::write(ws.join("user-note.txt"), "user data").unwrap();
     fs::write(ws.join("build.log"), "log v2 (user)").unwrap();
 
+    // What a restore looks at: the workspace as it stands now, plus every path
+    // this thread has ever observed. The second half is not optional — a file
+    // the agent deleted is on no walk of the directory, so without it the
+    // safety checkpoint could not record that it was gone, and the redo could
+    // never take it away again.
+    let current = || {
+        let mut files = workspace_files(&ws, /*include_hidden*/ false).unwrap();
+        files.extend(store.tracked_paths(THREAD).unwrap().into_iter().map(Into::into));
+        files
+    };
+
     // Rewind to turn 1. Protection = current ignore rules.
     let ignore = load_ignore(&ws);
     let protect = move |path: &str| is_ignored(&ignore, Path::new(path));
@@ -102,8 +107,7 @@ fn full_rewind_redo_gc_scenario() {
             Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
+            current(),
             &protect,
         )
         .unwrap();
@@ -116,14 +120,17 @@ fn full_rewind_redo_gc_scenario() {
         "deleted file recreated"
     );
     assert!(!ws.join("c.txt").exists(), "agent-born file deleted");
-    assert!(
-        !ws.join("user-note.txt").exists(),
-        "user file born after turn 1 is deleted — but recoverable (safety checkpoint)"
+    assert_eq!(
+        read(&ws.join("user-note.txt")),
+        "user data",
+        "a file nothing ever looked at is left alone: the rewind has no \
+         evidence it was absent at turn 1, and guessing costs the user data \
+         that was never the agent's to remove"
     );
     // …while ignored paths were untouched in every direction.
     assert_eq!(read(&ws.join("build.log")), "log v2 (user)");
     assert_eq!(outcome.stats.written, 2);
-    assert_eq!(outcome.stats.deleted, 2);
+    assert_eq!(outcome.stats.deleted, 1);
     assert!(
         store.last_restore_target(BRANCH).unwrap().is_some(),
         "the rewind left an undo behind"
@@ -138,8 +145,7 @@ fn full_rewind_redo_gc_scenario() {
             Some(BRANCH),
             &outcome.safety,
             RestoreKind::Undo,
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
+            current(),
             &protect2,
         )
         .unwrap();
@@ -178,12 +184,11 @@ fn restore_preserves_permissions() {
     fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let cp1 = store
+    store
         .checkpoint(
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
         )
         .unwrap();
 
@@ -194,7 +199,6 @@ fn restore_preserves_permissions() {
             THREAD,
             "turn-2",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
         )
         .unwrap();
 
@@ -205,7 +209,6 @@ fn restore_preserves_permissions() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -235,7 +238,6 @@ fn thread_marker_and_pre_edit_attach() {
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
         )
         .unwrap();
 
@@ -321,7 +323,6 @@ fn thread_marker_and_pre_edit_attach() {
                 .unwrap()
                 .into_iter()
                 .chain([outside.clone()]),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -341,7 +342,6 @@ fn turn_resolution_and_fork_inheritance() {
             THREAD,
             "turn-1",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
         )
         .unwrap();
     // Supplemental attach under the same turn: resolution must pick it.
@@ -356,7 +356,6 @@ fn turn_resolution_and_fork_inheritance() {
             THREAD,
             "turn-2",
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-            scanned(&ws),
         )
         .unwrap();
 
@@ -404,13 +403,11 @@ fn rewinding_twice_still_restores() {
     let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
-    let turn1 = store
-        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
-        .unwrap();
+    store.checkpoint(THREAD, "turn-1", scan()).unwrap();
 
     fs::write(ws.join("a.txt"), "v2").unwrap();
     store
-        .checkpoint(THREAD, "turn-2", scan(), scanned(&ws))
+        .checkpoint(THREAD, "turn-2", scan())
         .unwrap();
 
     // Rewind to turn 1.
@@ -422,7 +419,6 @@ fn rewinding_twice_still_restores() {
             &turn1_target,
             RestoreKind::Rewind,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -430,14 +426,13 @@ fn rewinding_twice_still_restores() {
 
     // Undo that rewind.
     let safety = store.last_restore_target(BRANCH).unwrap().unwrap();
-    let out = store
+    store
         .restore_to(
             THREAD,
             Some(BRANCH),
             &safety,
             RestoreKind::Undo,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -457,7 +452,6 @@ fn rewinding_twice_still_restores() {
             &turn1_target,
             RestoreKind::Rewind,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -483,11 +477,11 @@ fn an_undo_reports_what_moved_since_the_rewind() {
     fs::write(ws.join("kept.txt"), "v1").unwrap();
     fs::write(ws.join("build.log"), "noise").unwrap();
     store
-        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
+        .checkpoint(THREAD, "turn-1", scan())
         .unwrap();
     fs::write(ws.join("kept.txt"), "v2").unwrap();
     store
-        .checkpoint(THREAD, "turn-2", scan(), scanned(&ws))
+        .checkpoint(THREAD, "turn-2", scan())
         .unwrap();
 
     store
@@ -497,7 +491,6 @@ fn an_undo_reports_what_moved_since_the_rewind() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -539,7 +532,7 @@ fn a_restore_with_no_destination_leaves_no_undo() {
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store
-        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
+        .checkpoint(THREAD, "turn-1", scan())
         .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
 
@@ -550,7 +543,6 @@ fn a_restore_with_no_destination_leaves_no_undo() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -574,11 +566,11 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store
-        .checkpoint("session-a", "a-turn-1", scan(), scanned(&ws))
+        .checkpoint("session-a", "a-turn-1", scan())
         .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
     store
-        .checkpoint("session-b", "b-turn-1", scan(), scanned(&ws))
+        .checkpoint("session-b", "b-turn-1", scan())
         .unwrap();
 
     // Session A rewinds, handing the workspace to its branch.
@@ -589,7 +581,6 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
             &store.target_for_turn("a-turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -602,7 +593,6 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
             &store.target_for_turn("b-turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -621,7 +611,6 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
             &b.unwrap(),
             RestoreKind::Undo,
             scan(),
-            scanned(&ws),
             &|_| false,
         )
         .unwrap();
@@ -648,7 +637,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2")] {
         fs::write(ws.join("a.txt"), contents).unwrap();
         store
-            .checkpoint(THREAD, turn, scan(), scanned(&ws))
+            .checkpoint(THREAD, turn, scan())
             .unwrap();
     }
     fs::write(ws.join("a.txt"), "v3 (unsaved)").unwrap();
@@ -662,7 +651,6 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
                 &target,
                 RestoreKind::Rewind,
                 scan(),
-                scanned(&ws),
                 &|_| false,
             )
             .unwrap();
@@ -676,7 +664,6 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
                 &target,
                 RestoreKind::Undo,
                 scan(),
-                scanned(&ws),
                 &|_| false,
             )
             .unwrap();
@@ -718,23 +705,24 @@ fn a_capture_covers_every_configured_root() {
     fs::write(b.join("main.rs"), "fn b() {}").unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
 
-    let scope = codex_file_snapshots::CaptureScope {
-        roots: vec![a.clone(), b.clone()],
-        complete: true,
-    };
+    let roots = vec![a.clone(), b.clone()];
     let scan = || {
-        let mut files = workspace_files(&a, false).unwrap();
-        files.extend(workspace_files(&b, false).unwrap());
-        files
+        tracked_files(&roots, [], /*include_hidden*/ false)
+            .into_iter()
+            .collect::<Vec<_>>()
     };
-    let cp1 = store
-        .checkpoint(THREAD, "turn-1", scan(), scope.clone())
-        .unwrap();
+    let cp1 = store.checkpoint(THREAD, "turn-1", scan()).unwrap();
     assert_eq!(cp1.manifest.entries.len(), 2, "both roots captured");
 
-    // Work in the second root only, then rewind.
+    // Work in the second root only, then rewind. The new file goes through the
+    // edit hook, which is what records the tombstone licensing its removal.
     fs::write(b.join("main.rs"), "fn b() { changed }").unwrap();
-    fs::write(b.join("extra.rs"), "born").unwrap();
+    let born = b.join("extra.rs");
+    store
+        .attach_pre_edit(THREAD, "turn-1", &born.to_string_lossy(), None)
+        .unwrap()
+        .expect("creating a file records that it did not exist");
+    fs::write(&born, "born").unwrap();
     store
         .restore_to(
             THREAD,
@@ -742,7 +730,6 @@ fn a_capture_covers_every_configured_root() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             scan(),
-            scope,
             &|_| false,
         )
         .unwrap();
@@ -753,8 +740,8 @@ fn a_capture_covers_every_configured_root() {
         "second root reverted"
     );
     assert!(
-        !b.join("extra.rs").exists(),
-        "completeness covers every declared root, not just the first"
+        !born.exists(),
+        "the tombstone works in every declared root, not just the first"
     );
     assert_eq!(read(&a.join("main.rs")), "fn a() {}");
 }
@@ -778,11 +765,9 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
             THREAD,
             "turn-1",
             workspace_files(&cwd, /*include_hidden*/ false).unwrap(),
-            bounded(&cwd),
         )
         .unwrap();
     assert!(cp1.manifest.entries.is_empty());
-    assert!(!cp1.manifest.complete, "fallback captures are bounded");
 
     // The agent creates a file in the parent directory.
     let created = outer.join("hello.html");
@@ -814,7 +799,6 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             current,
-            bounded(&cwd),
             &|_| false,
         )
         .unwrap();
@@ -841,7 +825,7 @@ fn undo_walks_back_through_successive_rewinds() {
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2"), ("turn-3", "v3")] {
         fs::write(ws.join("a.txt"), contents).unwrap();
         store
-            .checkpoint(THREAD, turn, scan(), scanned(&ws))
+            .checkpoint(THREAD, turn, scan())
             .unwrap();
     }
 
@@ -854,7 +838,6 @@ fn undo_walks_back_through_successive_rewinds() {
                 &target,
                 RestoreKind::Rewind,
                 scan(),
-                scanned(&ws),
                 &|_| false,
             )
             .unwrap();
@@ -868,7 +851,6 @@ fn undo_walks_back_through_successive_rewinds() {
                 &target,
                 RestoreKind::Undo,
                 scan(),
-                scanned(&ws),
                 &|_| false,
             )
             .unwrap();

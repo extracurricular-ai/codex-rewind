@@ -14,7 +14,6 @@ use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::protocol::ThreadHistoryMode;
-use std::collections::BTreeSet;
 use std::path::Path;
 
 pub(super) const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
@@ -5261,49 +5260,27 @@ fn restore_thread_files_to(
     kind: codex_file_snapshots::RestoreKind,
     cwd: &Path,
 ) -> Result<codex_file_snapshots::RestoreOutcome, String> {
-    use codex_file_snapshots::find_workspace_root;
     use codex_file_snapshots::is_ignored;
     use codex_file_snapshots::load_ignore;
-    use codex_file_snapshots::workspace_files;
+    use codex_file_snapshots::tracked_files;
 
-    // Safety-checkpoint scope: rescan whatever the thread's captures declared
-    // they covered, plus every path the thread ever observed — the latter
-    // covers paths outside those roots, recorded via pre-edit attach. Reusing
-    // the recorded roots rather than re-deriving them keeps this scan and the
-    // captures it will be compared against talking about the same scope, even
-    // if the session's roots changed along the way.
-    let mut roots: Vec<PathBuf> = store
-        .latest_manifest(thread_id)
+    // The safety checkpoint has to see everything the turn-start checkpoints
+    // saw, or a path would be restorable and then not undoable. It goes
+    // through the same partitioning as the capture side for that reason,
+    // with `tracked_paths` standing in for the session's in-memory record of
+    // what the agent edited — this process does not have that state, but the
+    // store does.
+    let roots = vec![cwd.to_path_buf()];
+    let already_known = store
+        .tracked_paths(thread_id)
         .map_err(|e| e.to_string())?
-        .map(|manifest| manifest.scope_roots.iter().map(PathBuf::from).collect())
-        .unwrap_or_default();
-    if roots.is_empty() {
-        let markers = vec![".git".to_string()];
-        roots.extend(find_workspace_root(cwd, &markers));
-    }
-    // Hidden entries stay out of the safety checkpoint's scan for the same
-    // reason they stay out of capture; anything actually tracked arrives
-    // through `tracked_paths` below.
-    let mut files: BTreeSet<PathBuf> = BTreeSet::new();
-    for root in &roots {
-        files.extend(workspace_files(root, /*include_hidden*/ false).map_err(|e| e.to_string())?);
-    }
-    let root = roots.first().cloned();
-    files.extend(
-        store
-            .tracked_paths(thread_id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(PathBuf::from),
-    );
+        .into_iter()
+        .map(PathBuf::from);
+    let files = tracked_files(&roots, already_known, /*include_hidden*/ false);
 
     // Protection follows the *current* ignore rules (RFC correctness rule 5).
-    let ignore = root.as_ref().map(|root| load_ignore(root));
-    let is_protected = move |key: &str| {
-        ignore
-            .as_ref()
-            .is_some_and(|ig| is_ignored(ig, Path::new(key)))
-    };
+    let ignore = load_ignore(cwd);
+    let is_protected = move |key: &str| is_ignored(&ignore, Path::new(key));
 
     store
         .restore_to(
@@ -5312,10 +5289,6 @@ fn restore_thread_files_to(
             target,
             kind,
             files,
-            codex_file_snapshots::CaptureScope {
-                complete: !roots.is_empty(),
-                roots,
-            },
             &is_protected,
         )
         .map_err(|e| e.to_string())

@@ -54,15 +54,6 @@ fn settled_before(meta: &fs::Metadata, now: SystemTime) -> bool {
         .is_some_and(|age| age >= RACY_WINDOW)
 }
 
-/// What a capture claims to have covered.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct CaptureScope {
-    /// Directories the scan enumerated.
-    pub roots: Vec<PathBuf>,
-    /// Whether it enumerated them exhaustively.
-    pub complete: bool,
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CheckpointStats {
     /// Files whose hash was reused via the stat cache (not read).
@@ -83,20 +74,19 @@ pub struct Checkpoint {
 /// Capture the state of `files` into a new persisted manifest.
 ///
 /// `prev` is the previous checkpoint of the same tracked set (if any) and
-/// serves as the stat cache. `complete` records whether `files` covers
-/// the entire scope (workspace scan) or a bounded subset (fallback mode);
-/// it determines how restores may interpret absence (see `Manifest`).
-/// Paths that cannot be read (deleted between enumeration and capture,
-/// unreadable, non-regular) are skipped — a checkpoint records what
-/// verifiably exists at capture time.
+/// serves as the stat cache. `files` is what the capture is asked about:
+/// each one either gets an entry or is recorded as absent, and that record
+/// is the only thing a later restore may delete on. Paths that exist but
+/// cannot be read (unreadable, non-regular) are skipped rather than declared
+/// absent — a checkpoint records what it verified, and a read failure
+/// verifies nothing.
 pub fn capture(
     blobs: &BlobStore,
     manifests: &ManifestStore,
     files: impl IntoIterator<Item = PathBuf>,
     prev: Option<&Manifest>,
-    scope: CaptureScope,
 ) -> Result<Checkpoint> {
-    capture_at(blobs, manifests, files, prev, scope, SystemTime::now())
+    capture_at(blobs, manifests, files, prev, SystemTime::now())
 }
 
 /// `capture` with the capture instant supplied, so that the racy-window
@@ -106,24 +96,27 @@ fn capture_at(
     manifests: &ManifestStore,
     files: impl IntoIterator<Item = PathBuf>,
     prev: Option<&Manifest>,
-    scope: CaptureScope,
     now: SystemTime,
 ) -> Result<Checkpoint> {
-    let mut manifest = Manifest {
-        complete: scope.complete,
-        scope_roots: scope
-            .roots
-            .iter()
-            .map(|root| root.to_string_lossy().into_owned())
-            .collect(),
-        ..Default::default()
-    };
+    let mut manifest = Manifest::default();
     let mut stats = CheckpointStats::default();
 
     for path in files {
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            stats.skipped += 1;
-            continue;
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Asked about, and not there. Recorded rather than skipped:
+                // this is the whole of a restore's licence to delete, and the
+                // only alternative is inferring absence from the scan having
+                // been exhaustive — a premise that costs a full tree walk and
+                // still does not cover paths the edit hook contributed.
+                manifest.absent.insert(path.to_string_lossy().into_owned());
+                continue;
+            }
+            Err(_) => {
+                stats.skipped += 1;
+                continue;
+            }
         };
         if !meta.is_file() {
             // Symlinks and other non-regular files are out of scope for v1.
@@ -205,15 +198,7 @@ mod tests {
             .unwrap();
     }
 
-    /// A complete scan of the fixture workspace.
-    fn scanned(root: &std::path::Path) -> CaptureScope {
-        CaptureScope {
-            roots: vec![root.to_path_buf()],
-            complete: true,
-        }
-    }
-
-    fn fixture() -> Fixture {
+        fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
         let manifests = ManifestStore::open(dir.path().join("manifests")).unwrap();
@@ -237,9 +222,8 @@ mod tests {
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
-            None,
-            scanned(&f.ws),
-        )
+            None
+                )
         .unwrap();
         assert_eq!(cp.stats.hashed, 1);
         assert_eq!(cp.stats.reused, 0);
@@ -261,17 +245,15 @@ mod tests {
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
-            None,
-            scanned(&f.ws),
-        )
+            None
+                )
         .unwrap();
         let cp2 = capture(
             &f.blobs,
             &f.manifests,
-            vec![a.clone()],
-            Some(&cp1.manifest),
-            scanned(&f.ws),
-        )
+            vec![a],
+            Some(&cp1.manifest)
+                )
         .unwrap();
 
         assert_eq!(cp2.stats.reused, 1);
@@ -292,9 +274,8 @@ mod tests {
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
-            None,
-            scanned(&f.ws),
-        )
+            None
+                )
         .unwrap();
 
         // Rewrite with identical size and forge the old fingerprint, exactly
@@ -307,10 +288,9 @@ mod tests {
         let cp2 = capture(
             &f.blobs,
             &f.manifests,
-            vec![a.clone()],
-            Some(&cp1.manifest),
-            scanned(&f.ws),
-        )
+            vec![a],
+            Some(&cp1.manifest)
+                )
         .unwrap();
         assert_eq!(cp2.stats.hashed, 1, "a racily-clean entry must be re-read");
         assert_eq!(
@@ -340,7 +320,6 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             None,
-            scanned(&f.ws),
             captured_at,
         )
         .unwrap();
@@ -361,7 +340,6 @@ mod tests {
             &f.manifests,
             vec![a.clone()],
             Some(&cp1.manifest),
-            scanned(&f.ws),
             captured_at + Duration::from_secs(60),
         )
         .unwrap();
@@ -383,9 +361,8 @@ mod tests {
         let cp3 = capture_at(
             &f.blobs,
             &f.manifests,
-            vec![a.clone()],
+            vec![a],
             Some(&cp2.manifest),
-            scanned(&f.ws),
             captured_at + Duration::from_secs(120),
         )
         .unwrap();
@@ -401,9 +378,8 @@ mod tests {
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
-            None,
-            scanned(&f.ws),
-        )
+            None
+                )
         .unwrap();
 
         fs::write(&a, b"alpha-2").unwrap();
@@ -411,9 +387,8 @@ mod tests {
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
-            Some(&cp1.manifest),
-            scanned(&f.ws),
-        )
+            Some(&cp1.manifest)
+                )
         .unwrap();
 
         assert_eq!(cp2.stats.hashed, 1);
@@ -426,12 +401,20 @@ mod tests {
     }
 
     #[test]
-    fn vanished_files_are_skipped() {
+    fn a_path_that_is_not_there_is_recorded_as_not_there() {
+        // The distinction the whole deletion rule rests on: a capture that
+        // looked and found nothing says something, and it is the only thing
+        // that ever licenses a restore to delete. Skipping it silently — the
+        // old behaviour — threw that evidence away.
         let f = fixture();
         let ghost = f.ws.join("ghost.txt");
-        let cp = capture(&f.blobs, &f.manifests, vec![ghost], None, scanned(&f.ws)).unwrap();
-        assert_eq!(cp.stats.skipped, 1);
+        let cp = capture(&f.blobs, &f.manifests, vec![ghost.clone()], None).unwrap();
         assert!(cp.manifest.entries.is_empty());
+        assert!(
+            cp.manifest
+                .absent
+                .contains(&ghost.to_string_lossy().into_owned())
+        );
     }
 
     #[cfg(unix)]
@@ -448,9 +431,8 @@ mod tests {
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
-            None,
-            scanned(&f.ws),
-        )
+            None
+                )
         .unwrap();
         // chmod alone may leave size+mtime untouched → stat-cache hit path.
         fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
@@ -458,9 +440,8 @@ mod tests {
             &f.blobs,
             &f.manifests,
             vec![a.clone()],
-            Some(&cp1.manifest),
-            scanned(&f.ws),
-        )
+            Some(&cp1.manifest)
+                )
         .unwrap();
 
         let key = a.to_string_lossy().into_owned();

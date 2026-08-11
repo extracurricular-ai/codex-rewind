@@ -5,10 +5,11 @@
 //! immediately before any restore, which makes every restore reversible
 //! (redo = restore the safety manifest).
 //!
-//! Deletion requires positive evidence of absence: only a complete capture
-//! (a full scope scan) licenses removing a file that is missing from the
-//! target. Bounded captures never delete. Paths matched by the protection
-//! predicate (the symmetric ignore rule) are untouched in both directions.
+//! Deletion requires positive evidence of absence, and the only thing that
+//! counts is the target having looked: a path it was asked about and did not
+//! find. Nothing is inferred from a path merely being missing. Paths matched
+//! by the protection predicate (the symmetric ignore rule) are untouched in
+//! both directions.
 
 use std::fs;
 use std::path::Path;
@@ -34,11 +35,10 @@ pub struct RestorePlan {
 
 /// Plan the move from `current` to `target`.
 ///
-/// Deletion needs positive evidence that a file did not exist at the target.
-/// A complete capture provides it — the scan covered the whole scope, so
-/// absence means absence. A bounded capture (fallback mode) does not, so
-/// nothing is deleted from it: leaving an extra file behind is recoverable,
-/// deleting one the system never saw is not.
+/// Deletion needs positive evidence that a file did not exist at the target,
+/// which only `target.absent` supplies: the capture looked for that path and
+/// found nothing. Leaving an extra file behind is recoverable; deleting one
+/// the system never observed is not.
 ///
 /// `is_protected` is the symmetric-ignore predicate over manifest path keys.
 /// Both directions honour it, so an ignored path is neither written nor
@@ -67,18 +67,12 @@ pub fn plan_restore(
         }
     }
 
-    // Two independent grounds for deleting, both amounting to positive
-    // evidence that the file did not exist at the target: the target scan
-    // covered everything and did not find it, or the target explicitly
-    // recorded not finding it. The second stands on its own, which is what
-    // lets a bounded capture delete at all.
+    // One ground for deleting: the target looked for this path and did not
+    // find it. Nothing is inferred from a path simply being missing from the
+    // target — a capture only ever sees what it was asked about, so absence
+    // from `entries` alone says nothing about whether the file existed.
     for path in current.entries.keys() {
-        if is_protected(path) || target.entries.contains_key(path) {
-            continue;
-        }
-        // A tombstone is an observation and stands alone. Completeness is a
-        // deduction, and only holds for paths the scan actually walked.
-        if target.absent.contains(path) || (target.complete && target.scope_covers(path)) {
+        if !is_protected(path) && target.absent.contains(path) {
             plan.deletes.push(path.clone());
         }
     }
@@ -92,7 +86,7 @@ pub struct ApplyStats {
 }
 
 /// Apply a plan: write blob contents (atomically, restoring permissions)
-/// and delete witnessed-birth files. Missing delete targets are fine.
+/// and remove paths the target recorded as absent. Missing targets are fine.
 pub fn apply_plan(blobs: &BlobStore, plan: &RestorePlan) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
     for write in &plan.writes {
@@ -146,13 +140,8 @@ mod tests {
     use crate::manifest::FileEntry;
     use pretty_assertions::assert_eq;
 
-    fn manifest(entries: &[(&str, &str)], complete: bool) -> Manifest {
-        let mut m = Manifest {
-            complete,
-            // The unit tests use "/"-rooted paths, so the scan claims "/".
-            scope_roots: complete.then(|| vec!["".to_string()]).unwrap_or_default(),
-            ..Default::default()
-        };
+    fn manifest(entries: &[(&str, &str)]) -> Manifest {
+        let mut m = Manifest::default();
         for (path, hash) in entries {
             m.entries.insert(
                 (*path).to_string(),
@@ -170,8 +159,8 @@ mod tests {
 
     #[test]
     fn writes_files_that_differ_or_are_missing() {
-        let target = manifest(&[("/a", "h-old"), ("/b", "h-b")], true);
-        let current = manifest(&[("/a", "h-new")], true);
+        let target = manifest(&[("/a", "h-old"), ("/b", "h-b")]);
+        let current = manifest(&[("/a", "h-new")]);
 
         let plan = plan_restore(&target, &current, &|_| false);
         let paths: Vec<&str> = plan.writes.iter().map(|w| w.path.as_str()).collect();
@@ -180,57 +169,37 @@ mod tests {
 
     #[test]
     fn identical_states_need_no_work() {
-        let m = manifest(&[("/a", "h")], true);
+        let m = manifest(&[("/a", "h")]);
         assert_eq!(plan_restore(&m, &m, &|_| false), RestorePlan::default());
     }
 
     #[test]
-    fn a_complete_target_licenses_deleting_what_it_lacks() {
-        let target = manifest(&[("/kept", "h-k")], /*complete*/ true);
-        let current = manifest(&[("/kept", "h-k"), ("/added", "h-a")], true);
-
-        let plan = plan_restore(&target, &current, &|_| false);
-        assert!(plan.writes.is_empty());
-        assert_eq!(plan.deletes, vec!["/added"]);
-    }
-
-    #[test]
-    fn completeness_does_not_speak_for_paths_the_scan_never_walked() {
-        // A capture also carries paths the edit hook picked up from anywhere
-        // on disk. Those were never enumerated, so their absence from a later
-        // capture says nothing — deleting on it would remove a file that
-        // plainly existed.
-        let mut target = manifest(&[("/ws/kept", "h-k")], /*complete*/ true);
-        target.scope_roots = vec!["/ws".to_string()];
-        let mut current = manifest(&[("/ws/kept", "h-k"), ("/elsewhere/notes", "h-n")], true);
-        current.scope_roots = vec!["/ws".to_string()];
+    fn deletion_needs_the_target_to_have_looked() {
+        // The single rule. Earlier designs inferred absence from a scan having
+        // been exhaustive, which made every deletion depend on a premise that
+        // cost a full tree walk — and still did not hold for paths the edit
+        // hook contributed from outside any scan.
+        let target = manifest(&[("/kept", "h-k")]);
+        let current = manifest(&[("/kept", "h-k"), ("/added", "h-a")]);
 
         let plan = plan_restore(&target, &current, &|_| false);
         assert!(
             plan.deletes.is_empty(),
-            "an unscanned path is not evidence of anything"
+            "missing from the target says nothing on its own"
         );
 
-        // Stating it explicitly is a different matter.
-        target.absent.insert("/elsewhere/notes".to_string());
+        // Recorded as looked-for-and-absent, it says everything.
+        let mut target = target;
+        target.absent.insert("/added".to_string());
         let plan = plan_restore(&target, &current, &|_| false);
-        assert_eq!(plan.deletes, vec!["/elsewhere/notes"]);
-    }
-
-    #[test]
-    fn a_bounded_target_never_deletes() {
-        // Absence from a partial capture is not evidence of absence.
-        let target = manifest(&[("/kept", "h-k")], /*complete*/ false);
-        let current = manifest(&[("/kept", "h-k"), ("/unknown", "h-u")], false);
-
-        let plan = plan_restore(&target, &current, &|_| false);
-        assert!(plan.deletes.is_empty());
+        assert_eq!(plan.deletes, vec!["/added"]);
+        assert!(plan.writes.is_empty());
     }
 
     #[test]
     fn protected_paths_are_untouched_in_both_directions() {
-        let target = manifest(&[("/secret/a", "h-1"), ("/ok", "h-ok")], true);
-        let current = manifest(&[("/secret/b", "h-2")], true);
+        let target = manifest(&[("/secret/a", "h-1"), ("/ok", "h-ok")]);
+        let current = manifest(&[("/secret/b", "h-2")]);
 
         let protect = |p: &str| p.starts_with("/secret/");
         let plan = plan_restore(&target, &current, &protect);
@@ -251,8 +220,8 @@ mod tests {
         // The same target must plan the same way no matter what happened in
         // between — the property that broke when targets were located by
         // content and a redo made an older state recur.
-        let target = manifest(&[("/a", "h-old")], true);
-        let current = manifest(&[("/a", "h-new")], true);
+        let target = manifest(&[("/a", "h-old")]);
+        let current = manifest(&[("/a", "h-new")]);
 
         let first = plan_restore(&target, &current, &|_| false);
         let after_undo = plan_restore(&target, &current, &|_| false);

@@ -3194,6 +3194,7 @@ dependencies = [
 name = "codex-file-snapshots"
 version = "0.0.0"
 dependencies = [
+ "gix",
  "ignore",
  "pretty_assertions",
  "serde",

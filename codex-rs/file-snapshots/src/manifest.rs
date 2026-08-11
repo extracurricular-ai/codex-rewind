@@ -78,44 +78,25 @@ pub struct Manifest {
     /// Path → entry. Paths are stored as strings (lossy UTF-8) so
     /// manifests serialize portably; keys are absolute paths.
     pub entries: BTreeMap<String, FileEntry>,
-    /// Whether this capture enumerated its scope exhaustively. For a complete
-    /// manifest, a path's absence is positive evidence the file did not exist
-    /// at capture time — but only for paths the scan actually covered, which
-    /// is what `scope_roots` records. Bounded captures (fallback mode) leave
-    /// this false: there, absence only means the scan did not look.
-    #[serde(default)]
-    pub complete: bool,
-    /// Directories this capture enumerated, as absolute paths.
+    /// Paths this capture looked for and did not find.
     ///
-    /// `complete` alone would over-claim. A manifest also carries paths picked
-    /// up by the edit hook from anywhere on disk, and those were never scanned
-    /// — treating their absence from a later capture as proof of deletion
-    /// would remove files that plainly existed. Recording the roots keeps the
-    /// completeness claim scoped to what was actually walked, and lets the
-    /// scope change mid-session without invalidating earlier manifests.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scope_roots: Vec<String>,
-    /// Paths observed *not to exist* at capture time.
+    /// The only evidence a restore may delete on. Earlier designs inferred it
+    /// instead — "the scan covered this directory exhaustively, so absence
+    /// proves non-existence" — which made the inference only as sound as the
+    /// scan was exhaustive, and therefore required scanning everything. That
+    /// cost was unbounded and the claim was fragile: a manifest also carries
+    /// paths the edit hook picked up from anywhere on disk, which no scan ever
+    /// covered.
     ///
-    /// Absence from `entries` is an implicit claim that only holds when the
-    /// scan covered everything, which is exactly what `complete` asserts and
-    /// what a bounded capture cannot. A tombstone states the same thing
-    /// explicitly, as a recorded observation rather than a deduction from
-    /// completeness — so a file the agent created outside the scanned scope
-    /// can still be removed by a restore that predates it.
+    /// Recording the observation directly costs one set and needs no premise.
+    /// Every path the capture was asked about either has an entry or appears
+    /// here, whether it came from the index, from recency, or from an edit
+    /// that created a file where none was.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub absent: BTreeSet<String>,
 }
 
 impl Manifest {
-    /// Whether `path` lies under a root this capture enumerated, and so is
-    /// covered by the `complete` claim.
-    pub fn scope_covers(&self, path: &str) -> bool {
-        self.scope_roots.iter().any(|root| {
-            path.strip_prefix(root.as_str())
-                .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
-        })
-    }
 
     /// Content-addressed id: SHA-256 of the canonical JSON serialization.
     pub fn id(&self) -> Result<String> {
