@@ -469,6 +469,63 @@ fn rewinding_twice_still_restores() {
 }
 
 #[test]
+fn an_undo_reports_what_moved_since_the_rewind() {
+    // Undo records are private per thread, but the files are not. Anything
+    // that changed after the rewind — another session, or the user's own
+    // editor — would be overwritten without a word, so the undo has to be
+    // able to say what it is about to clobber.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    fs::write(ws.join("kept.txt"), "v1").unwrap();
+    fs::write(ws.join("build.log"), "noise").unwrap();
+    store
+        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
+        .unwrap();
+    fs::write(ws.join("kept.txt"), "v2").unwrap();
+    store
+        .checkpoint(THREAD, "turn-2", scan(), scanned(&ws))
+        .unwrap();
+
+    store
+        .restore_to(
+            THREAD,
+            Some(BRANCH),
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            scan(),
+            scanned(&ws),
+            &|_| false,
+        )
+        .unwrap();
+
+    // Nothing has moved yet.
+    assert!(
+        store.undo_conflicts(BRANCH, &|_| false).unwrap().is_empty(),
+        "the workspace still looks like what the rewind left"
+    );
+
+    // Someone else edits a file the undo would overwrite.
+    fs::write(ws.join("kept.txt"), "theirs").unwrap();
+    let conflicts = store.undo_conflicts(BRANCH, &|_| false).unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].ends_with("kept.txt"));
+
+    // Ignored paths are not reported: the restore would not touch them.
+    let noisy = ws.join("build.log").to_string_lossy().into_owned();
+    fs::write(ws.join("build.log"), "changed too").unwrap();
+    let protect = move |path: &str| path == noisy;
+    let conflicts = store.undo_conflicts(BRANCH, &protect).unwrap();
+    assert_eq!(conflicts.len(), 1, "only the path the undo would write");
+
+    // A thread with nothing to undo has nothing to report.
+    assert!(store.undo_conflicts(THREAD, &|_| false).unwrap().is_empty());
+}
+
+#[test]
 fn a_restore_with_no_destination_leaves_no_undo() {
     // Rewinding to the first prompt restarts the conversation instead of
     // branching, so there is no thread for an undo record to live under and

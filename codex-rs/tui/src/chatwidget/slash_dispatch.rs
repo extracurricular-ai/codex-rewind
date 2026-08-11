@@ -249,10 +249,19 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenBacktrackPicker);
             }
             SlashCommand::Redo => {
-                if self.turns_since_rewind > 0 {
-                    self.confirm_redo_discards_work();
-                } else {
-                    self.app_event_tx.send(AppEvent::UndoLastRewind);
+                match crate::chatwidget::redo_prompt(
+                    self.files_an_undo_would_overwrite(),
+                    self.turns_since_rewind,
+                ) {
+                    crate::chatwidget::RedoPrompt::OverwritesFiles(disturbed) => {
+                        self.confirm_redo_overwrites_changes(disturbed);
+                    }
+                    crate::chatwidget::RedoPrompt::DiscardsWork => {
+                        self.confirm_redo_discards_work();
+                    }
+                    crate::chatwidget::RedoPrompt::None => {
+                        self.app_event_tx.send(AppEvent::UndoLastRewind);
+                    }
                 }
             }
             SlashCommand::App => {

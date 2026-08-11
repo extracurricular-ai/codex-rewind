@@ -262,6 +262,26 @@ pub(crate) use helpers::set_chatgpt_auth;
 pub(crate) use helpers::set_fast_mode_test_catalog;
 pub(super) use helpers::*;
 
+mod redo_prompt {
+    use crate::chatwidget::RedoPrompt;
+    use crate::chatwidget::redo_prompt;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn disturbed_files_are_asked_about_before_discarded_turns() {
+        // Both can apply at once. Overwriting a change someone else made is
+        // the one worth naming: it is invisible and unrecoverable, while
+        // discarded turns are at least sitting in the transcript.
+        let files = vec!["/ws/a.txt".to_string()];
+        assert_eq!(
+            redo_prompt(files.clone(), /*turns_since_rewind*/ 3),
+            RedoPrompt::OverwritesFiles(files)
+        );
+        assert_eq!(redo_prompt(Vec::new(), 3), RedoPrompt::DiscardsWork);
+        assert_eq!(redo_prompt(Vec::new(), 0), RedoPrompt::None);
+    }
+}
+
 mod rewind_picker {
     use super::unbounded_channel;
     use crate::app_event::AppEvent;

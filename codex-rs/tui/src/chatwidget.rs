@@ -1551,6 +1551,87 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    /// Paths an undo would write over that no longer look the way the rewind
+    /// left them.
+    ///
+    /// Read straight from the snapshot store rather than asked for over the
+    /// protocol, the way the other two confirmations decide locally. The
+    /// store is on this machine and already a dependency (`/status` reads it
+    /// for disk usage), so a request would buy nothing but a round trip and a
+    /// third method on a protocol surface that has no extension point for
+    /// them. Remote environments have no snapshots at all, so nothing is lost
+    /// by reading locally.
+    fn files_an_undo_would_overwrite(&self) -> Vec<String> {
+        let Some(thread_id) = self.thread_id else {
+            return Vec::new();
+        };
+        let root = self.config.codex_home.as_path().join("file_snapshots");
+        let Ok(store) = codex_file_snapshots::SnapshotStore::open(&root) else {
+            return Vec::new();
+        };
+        // Ignored paths are never restored, so a change to one is not a
+        // conflict — reporting it would be noise.
+        let ignore = codex_file_snapshots::load_ignore(self.config.cwd.as_path());
+        let is_protected =
+            |path: &str| codex_file_snapshots::is_ignored(&ignore, std::path::Path::new(path));
+        store
+            .undo_conflicts(&thread_id.to_string(), &is_protected)
+            .unwrap_or_default()
+    }
+
+    /// Confirm an undo that would overwrite changes made after the rewind.
+    fn confirm_redo_overwrites_changes(&mut self, disturbed: Vec<String>) {
+        const SHOWN: usize = 5;
+        let total = disturbed.len();
+        let mut listed: Vec<String> = disturbed
+            .iter()
+            .take(SHOWN)
+            .map(|path| {
+                std::path::Path::new(path)
+                    .strip_prefix(self.config.cwd.as_path())
+                    .unwrap_or_else(|_| std::path::Path::new(path))
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        if total > SHOWN {
+            listed.push(format!("and {} more", total - SHOWN));
+        }
+
+        let items = vec![
+            SelectionItem {
+                name: "Undo anyway".to_string(),
+                description: Some(format!(
+                    "Overwrites {total} changed file{}.",
+                    if total == 1 { "" } else { "s" }
+                )),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::UndoLastRewind);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Leave them alone".to_string(),
+                description: Some("Nothing is restored.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("These files changed after the rewind".to_string()),
+            subtitle: Some(format!(
+                "Undoing restores the state from before it, replacing them: {}",
+                listed.join(", ")
+            )),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
     /// Confirm a rewind to the very first prompt.
     ///
     ///
@@ -2144,6 +2225,33 @@ fn extract_first_bold(s: &str) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// What, if anything, `/redo` should ask before running.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RedoPrompt {
+    /// Files changed after the rewind and would be replaced.
+    OverwritesFiles(Vec<String>),
+    /// Turns happened since the rewind and would be undone with it.
+    DiscardsWork,
+    /// Nothing at stake beyond the rewind itself.
+    None,
+}
+
+/// Decide which question `/redo` owes the user.
+///
+/// Order matters and is the reason this is a function rather than an inline
+/// chain: overwriting a change someone else made is both more surprising and
+/// less recoverable than discarding turns of one's own work, which is at
+/// least visible in the transcript. When both apply, the files win.
+pub(crate) fn redo_prompt(disturbed: Vec<String>, turns_since_rewind: usize) -> RedoPrompt {
+    if !disturbed.is_empty() {
+        RedoPrompt::OverwritesFiles(disturbed)
+    } else if turns_since_rewind > 0 {
+        RedoPrompt::DiscardsWork
+    } else {
+        RedoPrompt::None
+    }
+}
 
 /// Build the `/rewind` prompt list. Split out so the routing below can be
 /// tested without a bottom pane: selecting the first prompt asks for

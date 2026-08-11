@@ -214,6 +214,54 @@ impl SnapshotStore {
             }))
     }
 
+    /// Paths that have moved since the restore `thread_id` would undo.
+    ///
+    /// A rewind records the state it left the workspace in. If a path no
+    /// longer matches that state, something else changed it after the fact —
+    /// another session sharing the directory, or the user's own editor — and
+    /// undoing would overwrite that change without ever mentioning it. The
+    /// files are shared even though the undo records are not, so this is the
+    /// only thing standing between a concurrent edit and silent loss.
+    ///
+    /// Contents are hashed rather than compared by stat fingerprint. The fast
+    /// path can miss a same-length rewrite inside one timestamp tick, and here
+    /// a false "unchanged" means overwriting someone's work — the opposite of
+    /// what this is for. The set being checked is small: only what the restore
+    /// would touch.
+    ///
+    /// Empty when there is nothing to undo, or when nothing has moved.
+    pub fn undo_conflicts(
+        &self,
+        thread_id: &str,
+        is_protected: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<String>> {
+        let Some(record) = self.turns.last_restore(thread_id)? else {
+            return Ok(Vec::new());
+        };
+        let expected = self.manifests.load(&record.target_manifest_id)?;
+
+        let mut moved = Vec::new();
+        for (path, entry) in &expected.entries {
+            if is_protected(path) {
+                continue;
+            }
+            let matches = fs::read(path)
+                .map(|bytes| BlobStore::hash_bytes(&bytes) == entry.hash)
+                .unwrap_or(false);
+            if !matches {
+                moved.push(path.clone());
+            }
+        }
+        // A path the rewind removed, which is back: someone recreated it.
+        for path in &expected.absent {
+            if !is_protected(path) && Path::new(path).exists() {
+                moved.push(path.clone());
+            }
+        }
+        moved.sort();
+        Ok(moved)
+    }
+
     /// Union of every path key observed across the thread's manifests.
     /// Used to build the safety-checkpoint scope for a restore: it covers
     /// outside-workspace paths recorded via pre-edit attach that a plain
