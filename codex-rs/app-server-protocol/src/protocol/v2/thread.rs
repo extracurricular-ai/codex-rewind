@@ -673,6 +673,24 @@ pub struct ThreadUndoFileRestoreParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct ThreadRestoreFilesToTurnParams {
+    pub thread_id: String,
+    /// Turn whose start state the workspace should be returned to.
+    pub turn_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadRestoreFilesToTurnResponse {
+    /// Null when the thread is not tracking snapshots or the turn has none,
+    /// which callers should report rather than treat as success.
+    pub summary: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct ThreadUndoFileRestoreResponse {
     /// Null when the thread has no restore to undo, which callers should
     /// report rather than treat as success.

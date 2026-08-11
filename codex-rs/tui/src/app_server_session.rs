@@ -91,6 +91,8 @@ use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadRestoreFilesToTurnParams;
+use codex_app_server_protocol::ThreadRestoreFilesToTurnResponse;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
@@ -968,6 +970,29 @@ impl AppServerSession {
 
     /// Undo `thread_id`'s last file restore. `None` means there was no
     /// restore to undo.
+    /// Put the workspace back to `turn_id`'s start without touching the
+    /// conversation. Used when a rewind restarts the conversation rather than
+    /// branching it, which is what happens at the very first prompt.
+    pub(crate) async fn thread_restore_files_to_turn(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: String,
+    ) -> Result<Option<String>> {
+        let request_id = self.next_request_id();
+        let response: ThreadRestoreFilesToTurnResponse = self
+            .client
+            .request_typed(ClientRequest::ThreadRestoreFilesToTurn {
+                request_id,
+                params: ThreadRestoreFilesToTurnParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id,
+                },
+            })
+            .await
+            .wrap_err("failed to restore files for the rewind")?;
+        Ok(response.summary)
+    }
+
     pub(crate) async fn thread_undo_file_restore(
         &mut self,
         thread_id: ThreadId,

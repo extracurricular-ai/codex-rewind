@@ -1073,6 +1073,11 @@ impl MessageProcessor {
                     )
                     .await
             }
+            ClientRequest::ThreadRestoreFilesToTurn { params, .. } => {
+                self.thread_processor
+                    .thread_restore_files_to_turn(request_id.clone(), params)
+                    .await
+            }
             ClientRequest::ThreadUndoFileRestore { params, .. } => {
                 self.thread_processor
                     .thread_undo_file_restore(request_id.clone(), params)

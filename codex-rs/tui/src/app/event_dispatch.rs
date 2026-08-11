@@ -416,6 +416,31 @@ impl App {
                                 .await
                         }
                         Ok(_) => {
+                            // Rewinding to the very first prompt: there is no
+                            // earlier turn to branch from, so the conversation
+                            // restarts rather than forking. The files still
+                            // have somewhere to go — the first turn's own
+                            // checkpoint is the state before the agent acted,
+                            // which is exactly what the user asked for. Left
+                            // out, the conversation resets while the workspace
+                            // keeps every change, which is the mismatch this
+                            // feature exists to remove.
+                            if restore_files
+                                && let Some(first_turn) = turns.first().map(|turn| turn.id.clone())
+                            {
+                                match app_server
+                                    .thread_restore_files_to_turn(thread_id, first_turn)
+                                    .await
+                                {
+                                    Ok(Some(summary)) => tracing::info!(
+                                        "rewind to first prompt restored files: {summary}"
+                                    ),
+                                    Ok(None) => {}
+                                    Err(err) => tracing::warn!(
+                                        "rewind to first prompt could not restore files: {err}"
+                                    ),
+                                }
+                            }
                             app_server
                                 .start_thread_with_session_start_source(
                                     &config, /*session_start_source*/ None,

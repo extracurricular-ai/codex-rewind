@@ -89,15 +89,23 @@ impl FileSnapshotsController {
         let active = if is_new_thread {
             feature_enabled
         } else {
+            // A resumed thread keeps tracking if it has snapshots. One that
+            // never captured any has nothing to resume tracking *from*, so
+            // whether it once had the feature on makes no observable
+            // difference — see the lazy marker below.
             store.thread_exists(&thread_id)
         };
         if !active {
             return None;
         }
-        if let Err(err) = store.ensure_thread(&thread_id) {
-            warn!("file_snapshots: failed to create thread marker, tracking disabled: {err}");
-            return None;
-        }
+        // The log is written by the first checkpoint, not here. Codex creates
+        // a thread id whenever the TUI starts and abandons it if the user
+        // immediately resumes something else or quits, and it writes the
+        // rollout lazily for exactly that reason — a session that never ran
+        // leaves nothing behind. Marking eagerly made this subsystem the one
+        // component that littered: better than half the logs on this machine
+        // were empty. Deferring costs nothing, because the marker's only
+        // consumer asks whether snapshots exist.
         info!("file_snapshots: tracking enabled for thread {thread_id}");
         Some(Arc::new(Self {
             store,
@@ -270,18 +278,29 @@ mod tests {
             )
             .is_none()
         );
-        // New session, feature on → active, marker created.
+        // New session, feature on → active. The marker is not written yet:
+        // a session that never captures anything must leave nothing behind.
+        let controller = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            SeedPolicy::default(),
+            /*include_hidden*/ false,
+        )
+        .expect("feature on for a new session");
         assert!(
-            FileSnapshotsController::maybe_new(
-                home.path(),
-                true,
-                true,
-                "t1".into(),
-                SeedPolicy::default(),
-                /*include_hidden*/ false,
-            )
-            .is_some()
+            !home.path().join("file_snapshots/refs/t1.json").exists(),
+            "no snapshots yet, so no marker"
         );
+
+        // Capturing one writes it.
+        let ws = home.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("a.txt"), "x").unwrap();
+        controller.checkpoint_turn_start_blocking("turn-1", &ws, &[]);
+        assert!(home.path().join("file_snapshots/refs/t1.json").exists());
+
         // Resume with feature now OFF → marker wins, still tracking.
         assert!(
             FileSnapshotsController::maybe_new(

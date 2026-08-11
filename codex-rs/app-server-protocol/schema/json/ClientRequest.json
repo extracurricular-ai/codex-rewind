@@ -4446,6 +4446,22 @@
         }
       ]
     },
+    "ThreadRestoreFilesToTurnParams": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "description": "Turn whose start state the workspace should be returned to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
+    },
     "ThreadResumeInitialTurnsPageParams": {
       "properties": {
         "itemsView": {
@@ -5437,6 +5453,30 @@
         "params"
       ],
       "title": "Thread/forkRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/restoreFilesToTurn"
+          ],
+          "title": "Thread/restoreFilesToTurnRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadRestoreFilesToTurnParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/restoreFilesToTurnRequest",
       "type": "object"
     },
     {

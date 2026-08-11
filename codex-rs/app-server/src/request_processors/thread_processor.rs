@@ -523,6 +523,35 @@ impl ThreadRequestProcessor {
     /// checkpoint taken before this thread's last file restore. Returns a
     /// summary, or `None` when there is nothing to undo — callers surface
     /// that rather than reporting success.
+    /// Put the workspace back to the state captured at `turn_id`'s start,
+    /// recording an undo. The conversation is left alone: this is the file
+    /// half of a rewind, for the case where the client is not forking — most
+    /// notably rewinding to the very first prompt, where there is no earlier
+    /// turn to branch from and the conversation restarts instead.
+    pub(crate) async fn thread_restore_files_to_turn(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadRestoreFilesToTurnParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let stored = self
+            .read_stored_thread_for_resume(&params.thread_id, /*path*/ None, false)
+            .await?;
+        let codex_home = self.config.codex_home.to_path_buf();
+        let thread_id = params.thread_id.clone();
+        let turn_id = params.turn_id.clone();
+        let cwd = stored.cwd.clone();
+        let summary = tokio::task::spawn_blocking(move || {
+            restore_files_to_turn(&codex_home, &thread_id, &turn_id, &cwd)
+        })
+        .await
+        .map_err(|err| internal_error(format!("restore files task failed: {err}")))?
+        .map_err(internal_error)?;
+        self.outgoing
+            .send_response(request_id, ThreadRestoreFilesToTurnResponse { summary })
+            .await;
+        Ok(None)
+    }
+
     pub(crate) async fn thread_undo_file_restore(
         &self,
         request_id: ConnectionRequestId,
@@ -5334,6 +5363,38 @@ fn undo_files_restore(
         cwd,
     )?;
 
+    Ok(Some(format!(
+        "{} written, {} deleted",
+        outcome.stats.written, outcome.stats.deleted
+    )))
+}
+
+/// Restore to a turn without forking. Shares every rule with the fork path —
+/// same target resolution, same safety checkpoint, same undo record — so the
+/// two produce identical workspace state for the same turn.
+fn restore_files_to_turn(
+    codex_home: &Path,
+    thread_id: &str,
+    turn_id: &str,
+    cwd: &Path,
+) -> Result<Option<String>, String> {
+    use codex_file_snapshots::SnapshotStore;
+
+    let store =
+        SnapshotStore::open(codex_home.join("file_snapshots")).map_err(|e| e.to_string())?;
+    if !store.thread_exists(thread_id) {
+        return Ok(None);
+    }
+    let Some(target) = store.target_for_turn(turn_id).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let outcome = restore_thread_files_to(
+        &store,
+        thread_id,
+        &target,
+        codex_file_snapshots::RestoreKind::Rewind,
+        cwd,
+    )?;
     Ok(Some(format!(
         "{} written, {} deleted",
         outcome.stats.written, outcome.stats.deleted

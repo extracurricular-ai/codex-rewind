@@ -499,6 +499,11 @@ client_request_definitions! {
         serialization: thread_or_path(params.thread_id, params.path),
         response: v2::ThreadForkResponse,
     },
+    ThreadRestoreFilesToTurn => "thread/restoreFilesToTurn" {
+        params: v2::ThreadRestoreFilesToTurnParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadRestoreFilesToTurnResponse,
+    },
     ThreadUndoFileRestore => "thread/undoFileRestore" {
         params: v2::ThreadUndoFileRestoreParams,
         serialization: thread_id(params.thread_id),

@@ -185,9 +185,16 @@ given point is idempotent**, and repeating it is a no-op rather than a
 second, different move.
 
 **Session tracking state needs no rollout field either**: with
-session-scoped binding (§9), the existence of a thread's snapshot log —
-created empty at session start when the feature is on — *is* the
-persisted "tracking enabled" marker. `resume` and fork consult the store.
+session-scoped binding (§9), the existence of a thread's snapshot log *is*
+the persisted "tracking enabled" marker. It is written by the **first
+checkpoint**, not at session start. Codex mints a thread id whenever the TUI
+launches and abandons it if the user immediately resumes something else or
+quits, which is why it writes the rollout lazily too — a session that never
+ran leaves nothing behind. Marking eagerly made this subsystem the one
+component that littered: on a development machine more than half the logs
+were empty. Deferring costs no information, because the only question the
+marker answers is whether snapshots exist, and a session with none has
+nothing to resume tracking from either way. `resume` and fork consult the store.
 (If other surfaces later need to see tracking state, expose a read-only
 app-server query; still no rollout change.)
 
@@ -208,6 +215,8 @@ Restore procedure for target turn N:
 3. Compare exactly two manifests — N and S′ — and restore content/mode wherever they differ (skipping paths matched by the *current* ignore file). Deliberately no history walk: the plan is a function of where the tree is and where it is going, which is what makes step 2's idempotence survive all the way to the filesystem.
 4. Deletion pass — delete only on **positive evidence of non-existence at N**, of which there are two independent kinds. Manifest N was a **complete scope scan**, so absence is definitive; or manifest N carries an explicit **tombstone** for the path. The distinction matters because the first is a deduction from completeness and the second is a recorded observation: when the edit hook sees a path created (no pre-image to save), it writes down that the file did not exist, which is the only thing that can license removing it later outside the scanned scope. Without tombstones a bounded capture could never delete anything, so a fallback-mode rewind would undo edits but leave every created file behind — a half-rewind of exactly the kind §3 sets out to avoid. Files the system has never observed are still never deleted, and every deleted file is recoverable from the safety checkpoint by construction.
 5. Append `{target: N, safety: S′}` to the workspace's restore log — the record `/redo` reads.
+
+**Rewinding to the very first prompt** has no earlier turn to branch from, so the conversation restarts rather than forking (existing TUI behaviour, #33201). The files still have somewhere to go: the first turn's own checkpoint is the state before the agent acted, which is precisely what the user asked for. A separate `thread/restoreFilesToTurn` request covers this — the file half of a rewind, for clients that are not forking. It shares target resolution, safety checkpoint, and undo record with the fork path, so both produce identical workspace state for the same turn. Without it the conversation resets while the workspace keeps every change: the old-context/new-files mismatch of §2.2, reintroduced at the one point where a user is most explicitly asking to start over.
 
 **Redo** falls out of the same machinery: file redo is "restore manifest S′", resolved from the workspace log rather than from any thread, so it works from whichever session the user is in.
 
