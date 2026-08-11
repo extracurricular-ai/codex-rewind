@@ -13,7 +13,7 @@ fn main() {
         let p = std::path::Path::new(&root);
         let ignore = codex_file_snapshots::load_ignore(p);
 
-        let report = |label: &str, files: Vec<std::path::PathBuf>, elapsed: std::time::Duration| {
+        let report = |label: &str, files: &[std::path::PathBuf], elapsed: std::time::Duration| {
             let bytes: u64 = files
                 .iter()
                 .filter_map(|f| std::fs::metadata(f).ok())
@@ -29,14 +29,31 @@ fn main() {
         println!("{root}");
         let t = std::time::Instant::now();
         let all = codex_file_snapshots::workspace_files(p, false).unwrap_or_default();
-        report("subtree walk", all, t.elapsed());
+        report("subtree walk", &all, t.elapsed());
 
         let t = std::time::Instant::now();
         let git = codex_file_snapshots::git_tracked_files(p, &ignore);
-        report("git-tracked", git, t.elapsed());
+        report("git-tracked", &git, t.elapsed());
 
+        // The residue partition is told what git already covers, so its budget
+        // buys only paths nothing else contributed. Run it both ways to show
+        // what the exclusion is worth on this tree.
+        let covered: std::collections::BTreeSet<_> = git.iter().cloned().collect();
         let t = std::time::Instant::now();
-        let recent = codex_file_snapshots::recent_files(p, &ignore, false);
-        report("recent", recent, t.elapsed());
+        let recent = codex_file_snapshots::recent_files(p, &ignore, false, &covered);
+        report("recent (residue)", &recent, t.elapsed());
+
+        let blind = codex_file_snapshots::recent_files(
+            p,
+            &ignore,
+            false,
+            &std::collections::BTreeSet::new(),
+        );
+        let wasted = blind.iter().filter(|f| covered.contains(*f)).count();
+        println!(
+            "  {:<16} {wasted:>7} of {} slots would go to files git already covers",
+            "without it:",
+            blind.len()
+        );
     }
 }
