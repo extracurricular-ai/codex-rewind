@@ -127,16 +127,45 @@ pub const RECENT_LIMIT: usize = 100;
 /// selects them ahead of everything else and the partition fills with build
 /// output before reaching a single source file. Excluding them is what makes
 /// the activity signal usable, not a replacement for it.
+///
+/// **This list only affects the recency partition.** Anything git tracks
+/// arrives through the index regardless of what is named here, so adding a
+/// name costs exactly one thing: *untracked* files underneath it stop being
+/// tracked. That is the whole test for whether a name belongs. Under
+/// `node_modules/` or `Pods/` everything untracked is machine-generated and
+/// excluding it is pure gain; under `packages/` — the standard source layout
+/// for pnpm and yarn workspaces, present in four checkouts on this machine
+/// alone — an untracked file is usually something a person just wrote. So
+/// `packages` must never be added, and neither may `bin`, `obj`, `Library`,
+/// `Temp` or `env`: each is a real directory name in some ecosystem and a
+/// perfectly ordinary source directory in others, and the cost of guessing
+/// wrong is silent.
+///
+/// Most modern tooling hides its state behind a dot — `.next`, `.gradle`,
+/// `.tox`, `.mypy_cache`, `.terraform`, `.dart_tool`, `.stack-work`,
+/// `.bundle`, `.parcel-cache` — and hidden entries are already excluded by
+/// default, which is why this list stays short. What is left is the
+/// ecosystems that, like node, vendor their dependencies into the project in
+/// plain sight.
 const RECENT_SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "out",
-    "vendor",
-    "__pycache__",
+    // Dependencies installed in-tree.
+    "node_modules",     // npm / yarn / pnpm
+    "bower_components", // bower
+    "vendor",           // go, php composer, ruby bundler
+    "Pods",             // cocoapods — a full source copy of every pod
+    "Carthage",         // carthage
+    "deps",             // elixir mix
     ".venv",
-    "venv",
+    "venv", // python — `.venv` is redundant under the hidden rule, `venv` is not
+    // Build output, which churns hardest of all.
+    "target",        // rust, maven
+    "build",         // gradle, cmake, many others
+    "_build",        // elixir mix, ocaml dune
+    "dist",          // python, javascript
+    "dist-newstyle", // haskell cabal
+    "out",
+    "DerivedData", // xcode
+    "__pycache__",
 ];
 
 /// Everything a capture should look at: the three partitions over `roots`,
@@ -144,10 +173,23 @@ const RECENT_SKIP_DIRS: &[&str] = &[
 /// partition first brought them in.
 ///
 /// Both the turn-start checkpoint and the safety checkpoint a restore takes
-/// go through here. They have to agree: a path the turn captured but the
-/// safety checkpoint missed would be restorable and then not undoable, which
-/// is worse than not having captured it at all. Sharing the function is the
-/// only way that symmetry survives future edits to either side.
+/// go through here, but **they do not agree on a single argument** — not the
+/// roots, not `already_known`, not `include_hidden`. Sharing this function
+/// therefore guarantees nothing on its own, and an earlier version of this
+/// comment claimed otherwise, which would have sent anyone checking the
+/// property off to compare the wrong things.
+///
+/// What actually makes the safety checkpoint sufficient is a coverage
+/// property: a restore can only write `target.entries` and only delete
+/// `target.absent`, and the safety scan is handed the thread's entire
+/// observed history — which is the union of exactly those two sets over
+/// every manifest in its log. So it is always asked about a superset of what
+/// the restore can touch, whatever the other arguments say.
+///
+/// The consequence worth guarding: narrowing that history breaks
+/// undoability without touching a line of restore code. Passing only recent
+/// turns would look like a harmless optimization — loading every manifest is
+/// not free — and would leave files restorable but not undoable.
 ///
 /// The order is load-bearing. Recency is the *residue* partition, so it runs
 /// last and is told what the other two already hold: its budget is small and

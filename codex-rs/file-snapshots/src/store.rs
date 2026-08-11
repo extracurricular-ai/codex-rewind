@@ -410,7 +410,13 @@ impl SnapshotStore {
     /// Sweep just the manifests named by threads that have been removed.
     /// Unlike `gc`, this reclaims immediately — see `collect_garbage_for`.
     pub fn gc_for(&self, doomed: &std::collections::BTreeSet<String>) -> Result<GcStats> {
-        collect_garbage_for(&self.refs, &self.turns, &self.manifests, &self.blobs, doomed)
+        collect_garbage_for(
+            &self.refs,
+            &self.turns,
+            &self.manifests,
+            &self.blobs,
+            doomed,
+        )
     }
 
     /// Also delete the undo records filed under `thread_id`, which
