@@ -200,13 +200,15 @@ impl SnapshotStore {
             .map(|manifest_id| RestoreTarget { manifest_id }))
     }
 
-    /// Where an undo returns to: the state captured just before the most
-    /// recent restore applied to `workspace`. Bound to the workspace, not to
-    /// a thread, so it answers correctly from whatever branch the user is on.
-    pub fn last_restore_target(&self, workspace: &str) -> Result<Option<RestoreTarget>> {
+    /// Where an undo returns to: the state captured just before the restore
+    /// that produced `thread_id`. Filed under the thread a rewind switched
+    /// **to**, which is where the user is when they ask to undo — and which
+    /// no other session can reach, so concurrent sessions in one directory
+    /// cannot consume each other's undos.
+    pub fn last_restore_target(&self, thread_id: &str) -> Result<Option<RestoreTarget>> {
         Ok(self
             .turns
-            .last_restore(workspace)?
+            .last_restore(thread_id)?
             .map(|record| RestoreTarget {
                 manifest_id: record.safety_manifest_id,
             }))
@@ -289,7 +291,7 @@ impl SnapshotStore {
     pub fn restore_to(
         &self,
         thread_id: &str,
-        workspace: &str,
+        record_under: Option<&str>,
         target: &RestoreTarget,
         kind: RestoreKind,
         current_files: impl IntoIterator<Item = PathBuf>,
@@ -297,8 +299,9 @@ impl SnapshotStore {
         is_protected: &dyn Fn(&str) -> bool,
     ) -> Result<RestoreOutcome> {
         // 1. Capture what is about to be replaced, so this restore can be
-        // undone. It is recorded on the thread doing the restoring, but the
-        // undo path finds it through the workspace's restore log below.
+        // undone. The checkpoint is appended to the thread doing the work;
+        // where the *undo record* is filed is a separate question, answered
+        // by `record_under` below.
         let safety = self.checkpoint(
             thread_id,
             &format!("{SAFETY_TURN_PREFIX}{}", target.manifest_id),
@@ -314,16 +317,24 @@ impl SnapshotStore {
         let plan = plan_restore(&target_manifest, &current, is_protected);
         let stats = apply_plan(&self.blobs, &plan)?;
 
-        match kind {
-            RestoreKind::Rewind => self.turns.push_restore(
-                workspace,
-                RestoreRecord {
-                    target_manifest_id: target.manifest_id.clone(),
-                    safety_manifest_id: safety.id.clone(),
-                },
-            )?,
-            RestoreKind::Undo => {
-                self.turns.pop_restore(workspace)?;
+        // `record_under` is the thread this restore hands the workspace to.
+        // A rewind names the branch it creates; an undo names itself, since
+        // that is where the record it spends was filed. A restore with no
+        // destination — rewinding to the first prompt, which restarts the
+        // conversation rather than branching — records nothing, and is
+        // therefore not undoable. That is stated to the user up front.
+        if let Some(owner) = record_under {
+            match kind {
+                RestoreKind::Rewind => self.turns.push_restore(
+                    owner,
+                    RestoreRecord {
+                        target_manifest_id: target.manifest_id.clone(),
+                        safety_manifest_id: safety.id.clone(),
+                    },
+                )?,
+                RestoreKind::Undo => {
+                    self.turns.pop_restore(owner)?;
+                }
             }
         }
 

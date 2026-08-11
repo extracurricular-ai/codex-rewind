@@ -5256,11 +5256,11 @@ fn thread_store_archive_error(operation: &str, err: ThreadStoreError) -> JSONRPC
 fn restore_thread_files_to(
     store: &codex_file_snapshots::SnapshotStore,
     thread_id: &str,
+    record_under: Option<&str>,
     target: &codex_file_snapshots::RestoreTarget,
     kind: codex_file_snapshots::RestoreKind,
     cwd: &Path,
 ) -> Result<codex_file_snapshots::RestoreOutcome, String> {
-    let workspace = workspace_key(cwd);
     use codex_file_snapshots::find_workspace_root;
     use codex_file_snapshots::is_ignored;
     use codex_file_snapshots::load_ignore;
@@ -5308,7 +5308,7 @@ fn restore_thread_files_to(
     store
         .restore_to(
             thread_id,
-            &workspace,
+            record_under,
             target,
             kind,
             files,
@@ -5319,18 +5319,6 @@ fn restore_thread_files_to(
             &is_protected,
         )
         .map_err(|e| e.to_string())
-}
-
-/// Identifies the tree a restore applies to. Undo has to agree with the
-/// restore it reverses, so both sides derive the key the same way.
-fn workspace_key(cwd: &Path) -> String {
-    use codex_file_snapshots::find_workspace_root;
-
-    let markers = vec![".git".to_string()];
-    find_workspace_root(cwd, &markers)
-        .unwrap_or_else(|| cwd.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// Undo this thread's most recent restore by returning to the safety
@@ -5344,12 +5332,10 @@ fn undo_files_restore(
 
     let store =
         SnapshotStore::open(codex_home.join("file_snapshots")).map_err(|e| e.to_string())?;
-    if !store.thread_exists(thread_id) {
-        return Ok(None);
-    }
-    let workspace = workspace_key(cwd);
+    // No `thread_exists` gate: the record filed under this thread is the only
+    // thing that means anything here, and it is private to it.
     let Some(target) = store
-        .last_restore_target(&workspace)
+        .last_restore_target(thread_id)
         .map_err(|e| e.to_string())?
     else {
         return Ok(None);
@@ -5358,6 +5344,7 @@ fn undo_files_restore(
     let outcome = restore_thread_files_to(
         &store,
         thread_id,
+        Some(thread_id),
         &target,
         codex_file_snapshots::RestoreKind::Undo,
         cwd,
@@ -5391,6 +5378,11 @@ fn restore_files_to_turn(
     let outcome = restore_thread_files_to(
         &store,
         thread_id,
+        // The conversation restarts rather than branching, so there is no
+        // thread for an undo to be reachable from. Recorded nowhere, and the
+        // TUI says so before running it.
+        /*record_under*/
+        None,
         &target,
         codex_file_snapshots::RestoreKind::Rewind,
         cwd,
@@ -5433,6 +5425,7 @@ fn restore_files_for_fork(
     let outcome = restore_thread_files_to(
         &store,
         source_thread_id,
+        Some(new_thread_id),
         &target,
         codex_file_snapshots::RestoreKind::Rewind,
         source_cwd,

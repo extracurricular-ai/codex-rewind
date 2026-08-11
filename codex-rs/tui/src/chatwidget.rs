@@ -1559,10 +1559,12 @@ impl ChatWidget {
     /// branch from, so the conversation restarts instead — and a fresh
     /// conversation has no parent to return to. The files are still restored
     /// and the old conversation is still archived, but the pairing that makes
-    /// `/redo` work is gone. The files remain recoverable — the restore is
-    /// recorded against the workspace, not the conversation — but the
-    /// conversation itself is only reachable by resuming it from the archive
-    /// by hand, so it is worth saying before rather than after.
+    /// `/redo` work is gone, and with it the undo: a restore records itself
+    /// under the thread it hands the workspace to, and a restarted
+    /// conversation is not that thread. Nothing is destroyed — the old
+    /// conversation is archived and its snapshots stay reachable — but
+    /// getting back means resuming it by hand, so it is worth saying before
+    /// rather than after.
     pub(crate) fn confirm_rewind_to_first_prompt(&mut self) {
         let items = vec![
             SelectionItem {
@@ -1588,7 +1590,7 @@ impl ChatWidget {
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Rewind to the very beginning?".to_string()),
             subtitle: Some(
-                "The conversation cannot be brought back — a new one has nothing to return to. It is archived rather than deleted, and /redo still restores the files."
+                "/redo cannot undo this one. The old conversation is archived rather than deleted, so it can still be resumed by hand."
                     .to_string(),
             ),
             footer_hint: Some(standard_popup_hint_line()),

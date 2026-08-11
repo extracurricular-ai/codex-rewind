@@ -16,7 +16,9 @@ use codex_file_snapshots::workspace_files;
 use pretty_assertions::assert_eq;
 
 const THREAD: &str = "thread-1";
-const WS_KEY: &str = "/workspace/under-test";
+/// The thread a rewind hands the workspace to, and therefore the one its undo
+/// record is filed under. Distinct from `THREAD`, which performs the restore.
+const BRANCH: &str = "branch-thread";
 
 /// A complete scan of `root`.
 fn scanned(root: &Path) -> codex_file_snapshots::CaptureScope {
@@ -97,7 +99,7 @@ fn full_rewind_redo_gc_scenario() {
     let outcome = store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
@@ -123,7 +125,7 @@ fn full_rewind_redo_gc_scenario() {
     assert_eq!(outcome.stats.written, 2);
     assert_eq!(outcome.stats.deleted, 2);
     assert!(
-        store.last_restore_target(WS_KEY).unwrap().is_some(),
+        store.last_restore_target(BRANCH).unwrap().is_some(),
         "the rewind left an undo behind"
     );
 
@@ -133,7 +135,7 @@ fn full_rewind_redo_gc_scenario() {
     store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &outcome.safety,
             RestoreKind::Undo,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
@@ -147,7 +149,7 @@ fn full_rewind_redo_gc_scenario() {
     assert_eq!(read(&ws.join("user-note.txt")), "user data");
     assert_eq!(read(&ws.join("build.log")), "log v2 (user)");
     assert!(
-        store.last_restore_target(WS_KEY).unwrap().is_none(),
+        store.last_restore_target(BRANCH).unwrap().is_none(),
         "the undo consumed the rewind it reversed, so there is nothing left to undo"
     );
 
@@ -199,7 +201,7 @@ fn restore_preserves_permissions() {
     store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false).unwrap(),
@@ -312,7 +314,7 @@ fn thread_marker_and_pre_edit_attach() {
     store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             workspace_files(&ws, /*include_hidden*/ false)
@@ -416,7 +418,7 @@ fn rewinding_twice_still_restores() {
     store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &turn1_target,
             RestoreKind::Rewind,
             scan(),
@@ -427,11 +429,11 @@ fn rewinding_twice_still_restores() {
     assert_eq!(read(&ws.join("a.txt")), "v1", "first rewind");
 
     // Undo that rewind.
-    let safety = store.last_restore_target(WS_KEY).unwrap().unwrap();
+    let safety = store.last_restore_target(BRANCH).unwrap().unwrap();
     let out = store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &safety,
             RestoreKind::Undo,
             scan(),
@@ -451,7 +453,7 @@ fn rewinding_twice_still_restores() {
     store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &turn1_target,
             RestoreKind::Rewind,
             scan(),
@@ -463,6 +465,114 @@ fn rewinding_twice_still_restores() {
         read(&ws.join("a.txt")),
         "v1",
         "second rewind must still work"
+    );
+}
+
+#[test]
+fn a_restore_with_no_destination_leaves_no_undo() {
+    // Rewinding to the first prompt restarts the conversation instead of
+    // branching, so there is no thread for an undo record to live under and
+    // be reached from. It records nothing rather than filing an orphan, and
+    // the TUI says so before running it.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store
+        .checkpoint(THREAD, "turn-1", scan(), scanned(&ws))
+        .unwrap();
+    fs::write(ws.join("a.txt"), "v2").unwrap();
+
+    store
+        .restore_to(
+            THREAD,
+            /*record_under*/ None,
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            scan(),
+            scanned(&ws),
+            &|_| false,
+        )
+        .unwrap();
+
+    assert_eq!(read(&ws.join("a.txt")), "v1", "the files still go back");
+    assert!(store.last_restore_target(THREAD).unwrap().is_none());
+    assert!(store.last_restore_target(BRANCH).unwrap().is_none());
+}
+
+#[test]
+fn two_sessions_in_one_workspace_do_not_share_undos() {
+    // Undo records are filed under the thread a rewind hands the workspace
+    // to, not under the workspace itself. Keyed by workspace, two sessions
+    // working in one directory push onto the same stack, and whichever undoes
+    // first spends the other's record — silently reverting work it never saw.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store
+        .checkpoint("session-a", "a-turn-1", scan(), scanned(&ws))
+        .unwrap();
+    fs::write(ws.join("a.txt"), "v2").unwrap();
+    store
+        .checkpoint("session-b", "b-turn-1", scan(), scanned(&ws))
+        .unwrap();
+
+    // Session A rewinds, handing the workspace to its branch.
+    store
+        .restore_to(
+            "session-a",
+            Some("branch-a"),
+            &store.target_for_turn("a-turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            scan(),
+            scanned(&ws),
+            &|_| false,
+        )
+        .unwrap();
+
+    // Session B rewinds too. Same directory, same files.
+    store
+        .restore_to(
+            "session-b",
+            Some("branch-b"),
+            &store.target_for_turn("b-turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            scan(),
+            scanned(&ws),
+            &|_| false,
+        )
+        .unwrap();
+
+    // Each branch sees exactly one undo: its own.
+    let a = store.last_restore_target("branch-a").unwrap();
+    let b = store.last_restore_target("branch-b").unwrap();
+    assert!(a.is_some() && b.is_some());
+    assert_ne!(a, b, "each branch undoes its own rewind, not the other's");
+
+    // And spending one leaves the other untouched.
+    store
+        .restore_to(
+            "branch-b",
+            Some("branch-b"),
+            &b.unwrap(),
+            RestoreKind::Undo,
+            scan(),
+            scanned(&ws),
+            &|_| false,
+        )
+        .unwrap();
+    assert!(store.last_restore_target("branch-b").unwrap().is_none());
+    assert_eq!(
+        store.last_restore_target("branch-a").unwrap(),
+        a,
+        "one session's undo does not consume another's"
     );
 }
 
@@ -491,7 +601,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
         store
             .restore_to(
                 THREAD,
-                WS_KEY,
+                Some(BRANCH),
                 &target,
                 RestoreKind::Rewind,
                 scan(),
@@ -501,11 +611,11 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
             .unwrap();
     };
     let undo = || {
-        let target = store.last_restore_target(WS_KEY).unwrap().unwrap();
+        let target = store.last_restore_target(BRANCH).unwrap().unwrap();
         store
             .restore_to(
                 THREAD,
-                WS_KEY,
+                Some(BRANCH),
                 &target,
                 RestoreKind::Undo,
                 scan(),
@@ -535,7 +645,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
         "v3 (unsaved)",
         "the second undo reaches back past the first rewind"
     );
-    assert!(store.last_restore_target(WS_KEY).unwrap().is_none());
+    assert!(store.last_restore_target(BRANCH).unwrap().is_none());
 }
 
 #[test]
@@ -571,7 +681,7 @@ fn a_capture_covers_every_configured_root() {
     store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             scan(),
@@ -643,7 +753,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
     let outcome = store
         .restore_to(
             THREAD,
-            WS_KEY,
+            Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
             current,
@@ -683,7 +793,7 @@ fn undo_walks_back_through_successive_rewinds() {
         store
             .restore_to(
                 THREAD,
-                WS_KEY,
+                Some(BRANCH),
                 &target,
                 RestoreKind::Rewind,
                 scan(),
@@ -693,11 +803,11 @@ fn undo_walks_back_through_successive_rewinds() {
             .unwrap();
     };
     let undo = || {
-        let target = store.last_restore_target(WS_KEY).unwrap().unwrap();
+        let target = store.last_restore_target(BRANCH).unwrap().unwrap();
         store
             .restore_to(
                 THREAD,
-                WS_KEY,
+                Some(BRANCH),
                 &target,
                 RestoreKind::Undo,
                 scan(),
@@ -725,7 +835,7 @@ fn undo_walks_back_through_successive_rewinds() {
         "second undo retraces the earlier rewind, back to where we started"
     );
     assert!(
-        store.last_restore_target(WS_KEY).unwrap().is_none(),
+        store.last_restore_target(BRANCH).unwrap().is_none(),
         "both rewinds have been spent"
     );
 }

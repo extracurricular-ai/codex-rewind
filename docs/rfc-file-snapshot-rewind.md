@@ -110,7 +110,7 @@ CODEX_HOME/file_snapshots/
   manifests/<manifest-id>    # one per checkpoint: [(path, mode, size, mtime, hash)]
   refs/<thread-id>           # thread → list of (turn_id, manifest-id) + refcounts
   turns/<turn-id>            # turn → manifest-id, global and branch-independent
-  restores/<workspace-hash>  # workspace → recent {target, safety} restore records
+  restores/<thread-id>       # thread → the undo records it may spend
 ```
 
 - **Checkpoint** = stat-walk of the tracked set; entries whose `(size, mtime)` match the previous manifest reuse its hash (no read); changed/new entries are hashed and their blobs stored if absent. Result: a new manifest (itself content-addressed — identical states dedup to one manifest).
@@ -176,10 +176,15 @@ so `turns/<turn-id> → manifest-id` answers "what did the tree look like at
 this point in the conversation" identically no matter which branch asks.
 Keying on `(thread_id, turn_id)` instead would make the answer depend on
 which branch the user happened to be standing in, and rewinding to the
-same point twice could then resolve to two different states. Likewise the
-undo target is recorded per **workspace** (`restores/<workspace-hash>`),
-not on the thread that performed the restore: `/redo` has to work from
-wherever the user ended up, including a session started after the rewind.
+same point twice could then resolve to two different states. The undo
+record is keyed by thread, but by the **destination** — the branch a rewind
+hands the workspace to — rather than by the thread that performed it. The
+performer is the wrong key because a rewind leaves it behind; the user is
+in the destination when they ask to undo. A workspace key is the other
+wrong answer: it is reachable, but it is *shared*, so two sessions working
+in one directory push onto the same stack and whichever undoes first spends
+the other's record. The destination is the only key that is both reachable
+and private.
 The result is the property the feature actually needs — **restoring to a
 given point is idempotent**, and repeating it is a no-op rather than a
 second, different move.
@@ -214,11 +219,11 @@ Restore procedure for target turn N:
 2. Resolve turn N through the **global turn index** (§6.4). The index lives outside the rollout, so fork truncation cannot lose it (fork-before-N truncates strictly before `TurnStarted(N)`, `core/src/thread_rollout_truncation.rs:215-221` — irrelevant to an external ref). Refs are advisory: a missing manifest aborts the restore cleanly before any mutation.
 3. Compare exactly two manifests — N and S′ — and restore content/mode wherever they differ (skipping paths matched by the *current* ignore file). Deliberately no history walk: the plan is a function of where the tree is and where it is going, which is what makes step 2's idempotence survive all the way to the filesystem.
 4. Deletion pass — delete only on **positive evidence of non-existence at N**, of which there are two independent kinds. Manifest N was a **complete scope scan**, so absence is definitive; or manifest N carries an explicit **tombstone** for the path. The distinction matters because the first is a deduction from completeness and the second is a recorded observation: when the edit hook sees a path created (no pre-image to save), it writes down that the file did not exist, which is the only thing that can license removing it later outside the scanned scope. Without tombstones a bounded capture could never delete anything, so a fallback-mode rewind would undo edits but leave every created file behind — a half-rewind of exactly the kind §3 sets out to avoid. Files the system has never observed are still never deleted, and every deleted file is recoverable from the safety checkpoint by construction.
-5. Append `{target: N, safety: S′}` to the workspace's restore log — the record `/redo` reads.
+5. Append `{target: N, safety: S′}` to the restore log of the thread this hands the workspace to — the record `/redo` reads. A restore with no destination records nothing and is therefore not undoable; that case is confirmed with the user first (§6.5, first prompt).
 
 **Rewinding to the very first prompt** has no earlier turn to branch from, so the conversation restarts rather than forking (existing TUI behaviour, #33201). The files still have somewhere to go: the first turn's own checkpoint is the state before the agent acted, which is precisely what the user asked for. A separate `thread/restoreFilesToTurn` request covers this — the file half of a rewind, for clients that are not forking. It shares target resolution, safety checkpoint, and undo record with the fork path, so both produce identical workspace state for the same turn. Without it the conversation resets while the workspace keeps every change: the old-context/new-files mismatch of §2.2, reintroduced at the one point where a user is most explicitly asking to start over.
 
-This one case is **asymmetric, and is confirmed before it runs**. Every other rewind branches, and the branch is what `/redo` walks back along; a restarted conversation has no parent, so the conversation cannot be brought back automatically — only resumed from the archive by hand. The files are unaffected by this, since the undo record belongs to the workspace rather than the conversation. Rather than engineer around the asymmetry, the TUI states it: choosing the first prompt opens a confirmation naming exactly what is and is not recoverable. Making undo work here would mean an undo whose calling thread has no snapshots of its own, which turns out to raise a second question the design has not answered — see §11.
+This one case is **asymmetric, and is confirmed before it runs**. Every other rewind branches, and the branch is what `/redo` walks back along; a restarted conversation has no parent, so the conversation cannot be brought back automatically — only resumed from the archive by hand. The files are unaffected by this, since the undo record belongs to the workspace rather than the conversation. Rather than engineer around the asymmetry, the TUI states it: choosing the first prompt opens a confirmation naming exactly what is and is not recoverable. Making undo work here would mean an undo whose calling thread has no snapshots of its own — reachable, but it removes the one thing that currently keeps a snapshot-less thread away from a shared stack, at a point where that stack has no other attribution (§11). Stating the cost is the smaller change.
 
 **Redo** falls out of the same machinery: file redo is "restore manifest S′", resolved from the workspace log rather than from any thread, so it works from whichever session the user is in.
 
@@ -284,7 +289,7 @@ Total ≈ 4–6 engineer-weeks for a solid v1 behind an experimental flag. A lat
 
 ## 11. Open questions
 
-- **Concurrent sessions in one workspace share an undo stack.** The restore log is keyed by workspace, which is what makes an undo reachable from any branch (§6.4). It also means two sessions working in the same directory push onto the same stack, so one session's `/redo` can pop the other's rewind — silently changing files the other is working on, and consuming an undo it expected to have. Recording which thread performed each restore fixes the attribution, but not the outcome: the files are genuinely shared, so restoring a snapshot taken before the other session's work still overwrites it. The check that would actually help is cheap and unbuilt — a restore record already names the state its rewind produced, so an undo can compare the workspace against it and refuse, or ask, when something else has moved in between.
+- **Concurrent sessions in one workspace still share the files.** Keying undo records by destination thread (§6.4) makes them private, so sessions can no longer spend each other's — but the workspace itself is not partitioned. If two sessions edit the same directory and one undoes, it restores a snapshot taken before the other's work and overwrites it. No amount of bookkeeping fixes that; the resource is genuinely shared. What is missing is a *check*: a restore record already names the state its rewind produced, so an undo can compare the workspace against it and ask, rather than proceed, when something else has moved in between. Cheap, and worth doing before this feature is used by more than one session at a time.
 
 1. Eviction policy when the 100-file cap is hit in fallback mode (proposal: evict least-recently-changed; never evict files touched by the agent's own edits).
 2. Should turn-start checkpoints be per-user-message only, or also before every shell execution by default (finer intra-turn granularity at slightly higher stat-walk cost)?

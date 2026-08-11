@@ -123,17 +123,22 @@ impl RefStore {
     }
 }
 
-/// How many restores a workspace remembers. Undo only needs the most recent
+/// How many restores a thread remembers. Undo only needs the most recent
 /// one; the rest is history that would otherwise keep manifests alive.
 const MAX_RESTORE_HISTORY: usize = 20;
 
-/// A restore that has been applied to a workspace, recorded so it can be
-/// undone. Bound to the workspace rather than to a thread: a restore changes
-/// files, which belong to the workspace, and the user who wants it undone
-/// may well be on a different branch by then.
+/// A restore that has been applied, recorded so it can be undone.
+///
+/// Filed under the thread the rewind switched **to** — the one the user is
+/// sitting in when they ask to undo. Filing it under the thread that
+/// *performed* the rewind would lose it immediately, since a rewind leaves
+/// that thread behind; filing it per workspace makes concurrent sessions in
+/// one directory share a stack, where one session's undo pops another's
+/// record. The destination is the only key that is both reachable and
+/// private.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreRecord {
-    /// What the workspace was restored to.
+    /// The state the rewind put the workspace into.
     pub target_manifest_id: String,
     /// What it looked like just before — where an undo returns to.
     ///
@@ -153,7 +158,7 @@ pub struct RestoreLog {
     pub entries: Vec<RestoreRecord>,
 }
 
-/// Maps turn ids to the state captured at their start, and workspaces to
+/// Maps turn ids to the state captured at their start, and threads to
 /// their restore history. Both are deliberately independent of any thread:
 /// a fork inherits its parent's turn ids, so a turn resolves to the same
 /// snapshot from every branch, and an undo works wherever the user happens
@@ -192,7 +197,7 @@ impl TurnIndex {
         }
     }
 
-    /// Every workspace's restore history, for GC marking.
+    /// Every thread's restore history, for GC marking.
     pub fn restore_logs(&self) -> Result<Vec<RestoreLog>> {
         let mut out = Vec::new();
         let entries = fs::read_dir(&self.restores_root)
@@ -228,39 +233,39 @@ impl TurnIndex {
         Ok(out)
     }
 
-    pub fn push_restore(&self, workspace: &str, record: RestoreRecord) -> Result<()> {
-        let mut log = self.restore_log(workspace)?;
+    pub fn push_restore(&self, thread_id: &str, record: RestoreRecord) -> Result<()> {
+        let mut log = self.restore_log(thread_id)?;
         log.entries.push(record);
         // Undo reaches back one step, so a long tail only pins storage.
         if log.entries.len() > MAX_RESTORE_HISTORY {
             let excess = log.entries.len() - MAX_RESTORE_HISTORY;
             log.entries.drain(..excess);
         }
-        let path = self.restore_path(workspace);
+        let path = self.restore_path(thread_id);
         write_atomic(&path, &serde_json::to_vec_pretty(&log)?)
     }
 
-    /// The most recent restore applied to this workspace, if any.
-    pub fn last_restore(&self, workspace: &str) -> Result<Option<RestoreRecord>> {
-        Ok(self.restore_log(workspace)?.entries.pop())
+    /// The most recent restore this thread has to undo, if any.
+    pub fn last_restore(&self, thread_id: &str) -> Result<Option<RestoreRecord>> {
+        Ok(self.restore_log(thread_id)?.entries.pop())
     }
 
     /// Discard the most recent restore record, because it has just been
     /// reversed. The log is a stack: rewinds push, undos pop, so repeated
     /// undos walk back through repeated rewinds instead of oscillating
     /// between the last two states.
-    pub fn pop_restore(&self, workspace: &str) -> Result<Option<RestoreRecord>> {
-        let mut log = self.restore_log(workspace)?;
+    pub fn pop_restore(&self, thread_id: &str) -> Result<Option<RestoreRecord>> {
+        let mut log = self.restore_log(thread_id)?;
         let popped = log.entries.pop();
         if popped.is_some() {
-            let path = self.restore_path(workspace);
+            let path = self.restore_path(thread_id);
             write_atomic(&path, &serde_json::to_vec_pretty(&log)?)?;
         }
         Ok(popped)
     }
 
-    fn restore_log(&self, workspace: &str) -> Result<RestoreLog> {
-        let path = self.restore_path(workspace);
+    fn restore_log(&self, thread_id: &str) -> Result<RestoreLog> {
+        let path = self.restore_path(thread_id);
         match fs::read(&path) {
             Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RestoreLog::default()),
@@ -302,11 +307,9 @@ impl TurnIndex {
         self.turns_root.join(safe_file_name(turn_id))
     }
 
-    fn restore_path(&self, workspace: &str) -> PathBuf {
-        self.restores_root.join(format!(
-            "{}.json",
-            crate::blob::BlobStore::hash_bytes(workspace.as_bytes())
-        ))
+    fn restore_path(&self, thread_id: &str) -> PathBuf {
+        self.restores_root
+            .join(format!("{}.json", safe_file_name(thread_id)))
     }
 }
 
