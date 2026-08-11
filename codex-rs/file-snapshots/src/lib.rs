@@ -52,3 +52,4 @@ pub use store::RestoreOutcome;
 pub use store::RestoreTarget;
 pub use store::SAFETY_TURN_PREFIX;
 pub use store::SnapshotStore;
+pub use store::forget_threads;

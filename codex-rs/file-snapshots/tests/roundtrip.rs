@@ -94,7 +94,13 @@ fn full_rewind_redo_gc_scenario() {
     // never take it away again.
     let current = || {
         let mut files = workspace_files(&ws, /*include_hidden*/ false).unwrap();
-        files.extend(store.tracked_paths(THREAD).unwrap().into_iter().map(Into::into));
+        files.extend(
+            store
+                .tracked_paths(THREAD)
+                .unwrap()
+                .into_iter()
+                .map(Into::into),
+        );
         files
     };
 
@@ -159,15 +165,20 @@ fn full_rewind_redo_gc_scenario() {
         "the undo consumed the rewind it reversed, so there is nothing left to undo"
     );
 
-    // Session lifetime GC: with the undo spent, dropping the thread leaves
-    // nothing reachable and the store empties.
+    // Session lifetime GC: with the undo spent, deleting the conversations
+    // leaves nothing reachable and the store empties. This goes through
+    // `forget_threads` rather than `gc` because that is what deletion
+    // actually calls, and it is the path that reclaims immediately — the
+    // general sweep deliberately spares anything written in the last few
+    // minutes, which in a test is everything.
     assert!(store.disk_usage().unwrap() > 0);
-    store.remove_thread(THREAD).unwrap();
-    let gc = store.gc().unwrap();
-    assert!(gc.manifests_removed > 0);
-    assert!(gc.blobs_removed > 0);
-    assert_eq!(gc.manifests_kept, 0);
-    assert_eq!(gc.blobs_kept, 0);
+    codex_file_snapshots::forget_threads(dir.path(), &[THREAD.to_string(), BRANCH.to_string()]);
+    assert!(!store.thread_exists(THREAD));
+    assert_eq!(
+        store.gc().unwrap().manifests_kept,
+        0,
+        "nothing survives the conversations that produced it"
+    );
 }
 
 #[cfg(unix)]
@@ -406,9 +417,7 @@ fn rewinding_twice_still_restores() {
     store.checkpoint(THREAD, "turn-1", scan()).unwrap();
 
     fs::write(ws.join("a.txt"), "v2").unwrap();
-    store
-        .checkpoint(THREAD, "turn-2", scan())
-        .unwrap();
+    store.checkpoint(THREAD, "turn-2", scan()).unwrap();
 
     // Rewind to turn 1.
     let turn1_target = store.target_for_turn("turn-1").unwrap().unwrap();
@@ -476,13 +485,9 @@ fn an_undo_reports_what_moved_since_the_rewind() {
 
     fs::write(ws.join("kept.txt"), "v1").unwrap();
     fs::write(ws.join("build.log"), "noise").unwrap();
-    store
-        .checkpoint(THREAD, "turn-1", scan())
-        .unwrap();
+    store.checkpoint(THREAD, "turn-1", scan()).unwrap();
     fs::write(ws.join("kept.txt"), "v2").unwrap();
-    store
-        .checkpoint(THREAD, "turn-2", scan())
-        .unwrap();
+    store.checkpoint(THREAD, "turn-2", scan()).unwrap();
 
     store
         .restore_to(
@@ -531,9 +536,7 @@ fn a_restore_with_no_destination_leaves_no_undo() {
     let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
-    store
-        .checkpoint(THREAD, "turn-1", scan())
-        .unwrap();
+    store.checkpoint(THREAD, "turn-1", scan()).unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
 
     store
@@ -565,13 +568,9 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
     let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
-    store
-        .checkpoint("session-a", "a-turn-1", scan())
-        .unwrap();
+    store.checkpoint("session-a", "a-turn-1", scan()).unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
-    store
-        .checkpoint("session-b", "b-turn-1", scan())
-        .unwrap();
+    store.checkpoint("session-b", "b-turn-1", scan()).unwrap();
 
     // Session A rewinds, handing the workspace to its branch.
     store
@@ -636,9 +635,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
 
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2")] {
         fs::write(ws.join("a.txt"), contents).unwrap();
-        store
-            .checkpoint(THREAD, turn, scan())
-            .unwrap();
+        store.checkpoint(THREAD, turn, scan()).unwrap();
     }
     fs::write(ws.join("a.txt"), "v3 (unsaved)").unwrap();
 
@@ -824,9 +821,7 @@ fn undo_walks_back_through_successive_rewinds() {
 
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2"), ("turn-3", "v3")] {
         fs::write(ws.join("a.txt"), contents).unwrap();
-        store
-            .checkpoint(THREAD, turn, scan())
-            .unwrap();
+        store.checkpoint(THREAD, turn, scan()).unwrap();
     }
 
     let rewind = |turn: &str| {
@@ -877,4 +872,76 @@ fn undo_walks_back_through_successive_rewinds() {
         store.last_restore_target(BRANCH).unwrap().is_none(),
         "both rewinds have been spent"
     );
+}
+
+#[test]
+fn deleting_a_conversation_takes_its_snapshots_with_it() {
+    // The whole of "snapshot lifetime = session lifetime". Until this ran,
+    // deleting a conversation removed the rollout and left every file it had
+    // captured on disk forever — contents included, which is not what someone
+    // deleting a conversation is asking for.
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let ws = home.join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(home.join("file_snapshots")).unwrap();
+
+    fs::write(ws.join("secret.txt"), "sensitive").unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    store.checkpoint(THREAD, "turn-1", scan()).unwrap();
+
+    // A rewind, so the thread also owns an undo record — a second file, under
+    // a second lifetime, that dropping the log alone would strand as a GC root.
+    store
+        .restore_to(
+            THREAD,
+            Some(BRANCH),
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            scan(),
+            &|_| false,
+        )
+        .unwrap();
+    assert!(store.last_restore_target(BRANCH).unwrap().is_some());
+
+    let blobs = home.join("file_snapshots").join("blobs");
+    let count = |root: &Path| -> usize {
+        fn walk(path: &Path, seen: &mut usize) {
+            let Ok(entries) = fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    walk(&entry.path(), seen);
+                } else {
+                    *seen += 1;
+                }
+            }
+        }
+        let mut seen = 0;
+        walk(root, &mut seen);
+        seen
+    };
+    assert!(count(&blobs) > 0, "the file's content is on disk");
+
+    // Delete both threads, the way deleting a conversation deletes its subtree.
+    codex_file_snapshots::forget_threads(home, &[THREAD.to_string(), BRANCH.to_string()]);
+
+    assert!(!store.thread_exists(THREAD));
+    assert!(
+        store.last_restore_target(BRANCH).unwrap().is_none(),
+        "the undo record goes too — it is a GC root, and left behind it would \
+         pin the manifests it names for good"
+    );
+    assert_eq!(count(&blobs), 0, "and the captured contents are gone");
+}
+
+#[test]
+fn forgetting_threads_is_best_effort() {
+    // Deleting a conversation must never fail because the snapshot store was
+    // missing, unreadable, or never used. Callers get one line and no error
+    // handling, so this cannot be allowed to panic or propagate.
+    let dir = tempfile::tempdir().unwrap();
+    codex_file_snapshots::forget_threads(dir.path(), &["never-tracked".to_string()]);
+    codex_file_snapshots::forget_threads(dir.path(), &[]);
 }

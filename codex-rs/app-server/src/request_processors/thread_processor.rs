@@ -5283,14 +5283,7 @@ fn restore_thread_files_to(
     let is_protected = move |key: &str| is_ignored(&ignore, Path::new(key));
 
     store
-        .restore_to(
-            thread_id,
-            record_under,
-            target,
-            kind,
-            files,
-            &is_protected,
-        )
+        .restore_to(thread_id, record_under, target, kind, files, &is_protected)
         .map_err(|e| e.to_string())
 }
 

@@ -76,6 +76,11 @@ impl BlobStore {
         })
     }
 
+    /// Where `hash` lives, so the sweep can ask how old it is.
+    pub(crate) fn path_for(&self, hash: &str) -> PathBuf {
+        self.blob_path(hash)
+    }
+
     pub fn remove(&self, hash: &str) -> Result<()> {
         let path = self.blob_path(hash);
         match fs::remove_file(&path) {

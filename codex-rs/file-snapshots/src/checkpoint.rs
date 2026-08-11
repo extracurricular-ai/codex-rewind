@@ -198,7 +198,7 @@ mod tests {
             .unwrap();
     }
 
-        fn fixture() -> Fixture {
+    fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
         let manifests = ManifestStore::open(dir.path().join("manifests")).unwrap();
@@ -218,13 +218,7 @@ mod tests {
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
 
-        let cp = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            None
-                )
-        .unwrap();
+        let cp = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
         assert_eq!(cp.stats.hashed, 1);
         assert_eq!(cp.stats.reused, 0);
 
@@ -241,20 +235,8 @@ mod tests {
         // Age the file past the racy window so its fingerprint is proof.
         set_mtime_secs_ago(&a, 60);
 
-        let cp1 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            None
-                )
-        .unwrap();
-        let cp2 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a],
-            Some(&cp1.manifest)
-                )
-        .unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
+        let cp2 = capture(&f.blobs, &f.manifests, vec![a], Some(&cp1.manifest)).unwrap();
 
         assert_eq!(cp2.stats.reused, 1);
         assert_eq!(cp2.stats.hashed, 0);
@@ -270,13 +252,7 @@ mod tests {
         let f = fixture();
         let a = f.ws.join("a.txt");
         fs::write(&a, b"v1").unwrap();
-        let cp1 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            None
-                )
-        .unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
 
         // Rewrite with identical size and forge the old fingerprint, exactly
         // what a same-tick write looks like.
@@ -285,13 +261,7 @@ mod tests {
         fs::write(&a, b"v2").unwrap();
         set_mtime_parts(&a, stale.mtime_secs, stale.mtime_nanos);
 
-        let cp2 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a],
-            Some(&cp1.manifest)
-                )
-        .unwrap();
+        let cp2 = capture(&f.blobs, &f.manifests, vec![a], Some(&cp1.manifest)).unwrap();
         assert_eq!(cp2.stats.hashed, 1, "a racily-clean entry must be re-read");
         assert_eq!(
             f.blobs
@@ -315,14 +285,7 @@ mod tests {
         fs::write(&a, b"v1").unwrap();
 
         let captured_at = fs::symlink_metadata(&a).unwrap().modified().unwrap();
-        let cp1 = capture_at(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            None,
-            captured_at,
-        )
-        .unwrap();
+        let cp1 = capture_at(&f.blobs, &f.manifests, vec![a.clone()], None, captured_at).unwrap();
 
         // Second write inside the tick: same length, and the stat restored to
         // exactly what the capture above saw.
@@ -374,22 +337,10 @@ mod tests {
         let f = fixture();
         let a = f.ws.join("a.txt");
         fs::write(&a, b"alpha").unwrap();
-        let cp1 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            None
-                )
-        .unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
 
         fs::write(&a, b"alpha-2").unwrap();
-        let cp2 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            Some(&cp1.manifest)
-                )
-        .unwrap();
+        let cp2 = capture(&f.blobs, &f.manifests, vec![a.clone()], Some(&cp1.manifest)).unwrap();
 
         assert_eq!(cp2.stats.hashed, 1);
         assert_ne!(cp1.id, cp2.id);
@@ -427,22 +378,10 @@ mod tests {
         fs::write(&a, b"#!/bin/sh").unwrap();
         fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let cp1 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            None
-                )
-        .unwrap();
+        let cp1 = capture(&f.blobs, &f.manifests, vec![a.clone()], None).unwrap();
         // chmod alone may leave size+mtime untouched → stat-cache hit path.
         fs::set_permissions(&a, fs::Permissions::from_mode(0o755)).unwrap();
-        let cp2 = capture(
-            &f.blobs,
-            &f.manifests,
-            vec![a.clone()],
-            Some(&cp1.manifest)
-                )
-        .unwrap();
+        let cp2 = capture(&f.blobs, &f.manifests, vec![a.clone()], Some(&cp1.manifest)).unwrap();
 
         let key = a.to_string_lossy().into_owned();
         assert_eq!(cp2.manifest.entries[&key].mode, 0o755);

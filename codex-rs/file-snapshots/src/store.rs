@@ -19,10 +19,13 @@ use crate::refs::RestoreRecord;
 use crate::refs::SnapshotRef;
 use crate::refs::TurnIndex;
 use crate::refs::collect_garbage;
+use crate::refs::collect_garbage_for;
 use crate::restore::ApplyStats;
 use crate::restore::RestorePlan;
 use crate::restore::apply_plan;
 use crate::restore::plan_restore;
+use tracing::info;
+use tracing::warn;
 
 /// Turn-id prefix used for the safety checkpoint recorded before a restore.
 pub const SAFETY_TURN_PREFIX: &str = "safety-restore:";
@@ -404,6 +407,20 @@ impl SnapshotStore {
         collect_garbage(&self.refs, &self.turns, &self.manifests, &self.blobs)
     }
 
+    /// Sweep just the manifests named by threads that have been removed.
+    /// Unlike `gc`, this reclaims immediately — see `collect_garbage_for`.
+    pub fn gc_for(&self, doomed: &std::collections::BTreeSet<String>) -> Result<GcStats> {
+        collect_garbage_for(&self.refs, &self.turns, &self.manifests, &self.blobs, doomed)
+    }
+
+    /// Also delete the undo records filed under `thread_id`, which
+    /// `remove_thread` deliberately leaves alone — a thread's log and the
+    /// restores handed *to* it are separate lifetimes, and only deleting the
+    /// conversation ends both.
+    pub fn remove_restores(&self, thread_id: &str) -> Result<()> {
+        self.turns.remove_restores(thread_id)
+    }
+
     /// Total bytes on disk under the store root (for `/status` display).
     pub fn disk_usage(&self) -> Result<u64> {
         fn dir_size(path: &Path) -> std::io::Result<u64> {
@@ -420,5 +437,69 @@ impl SnapshotStore {
             Ok(total)
         }
         dir_size(&self.root).map_err(|e| SnapshotError::io(&self.root, e))
+    }
+}
+
+/// Forget everything the snapshot store holds for `thread_ids`, then sweep.
+///
+/// This is what makes "snapshot lifetime = session lifetime" (RFC §8) true.
+/// Deleting a conversation removes its rollout, and until this ran, every
+/// file captured during that conversation stayed on disk indefinitely —
+/// contents included. That is a disk leak, but more importantly it is not
+/// what a user deleting a conversation is asking for: they get the index
+/// removed and the data kept.
+///
+/// Deliberately infallible and best-effort. Deleting a conversation must not
+/// fail because its snapshots could not be tidied up, and a partial sweep is
+/// not a corrupt store — the next one finishes the job. Failures are logged
+/// rather than propagated, so callers need one line and no error handling.
+///
+/// Takes the whole set at once because deletion is by subtree: sweeping once
+/// after the last thread beats sweeping once per thread, and a thread's
+/// manifests are routinely shared with the siblings being deleted alongside
+/// it — swept individually, each would still be pinned by the next.
+pub fn forget_threads(codex_home: &Path, thread_ids: &[String]) {
+    if thread_ids.is_empty() {
+        return;
+    }
+    let root = codex_home.join("file_snapshots");
+    if !root.exists() {
+        return;
+    }
+    let store = match SnapshotStore::open(&root) {
+        Ok(store) => store,
+        Err(err) => {
+            warn!("could not open the snapshot store to forget deleted threads: {err}");
+            return;
+        }
+    };
+
+    // Read what these threads named *before* dropping their logs, so the
+    // sweep afterwards has an exact candidate set instead of having to
+    // re-derive one by elimination.
+    let mut doomed = std::collections::BTreeSet::new();
+    for thread_id in thread_ids {
+        if let Ok(log) = store.refs.load(thread_id) {
+            doomed.extend(log.entries.into_iter().map(|entry| entry.manifest_id));
+        }
+        if let Ok(records) = store.turns.all_restores_for(thread_id) {
+            doomed.extend(records);
+        }
+        if let Err(err) = store.remove_thread(thread_id) {
+            warn!("could not drop the snapshot log for {thread_id}: {err}");
+        }
+        if let Err(err) = store.remove_restores(thread_id) {
+            warn!("could not drop the undo records for {thread_id}: {err}");
+        }
+    }
+
+    match store.gc_for(&doomed) {
+        Ok(stats) => info!(
+            "swept snapshots for {} deleted thread(s): {} manifests, {} blobs",
+            thread_ids.len(),
+            stats.manifests_removed,
+            stats.blobs_removed
+        ),
+        Err(err) => warn!("could not sweep snapshots after deleting threads: {err}"),
     }
 }

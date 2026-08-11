@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -264,6 +266,35 @@ impl TurnIndex {
         Ok(popped)
     }
 
+    /// The manifests a thread's undo records name, for a sweep to consider
+    /// once those records are dropped.
+    pub fn all_restores_for(&self, thread_id: &str) -> Result<Vec<String>> {
+        let log = self.restore_log(thread_id)?;
+        Ok(log
+            .entries
+            .into_iter()
+            .flat_map(|record| [record.target_manifest_id, record.safety_manifest_id])
+            .collect())
+    }
+
+    /// Drop a thread's undo records outright, for when the conversation they
+    /// belong to is deleted.
+    ///
+    /// Separate from `RefStore::remove` because the two files answer to
+    /// different lifetimes: a thread's log is what it captured, its restore
+    /// log is what was handed *to* it, and a rewind writes the second under a
+    /// thread that may have no log of its own yet. Only deleting the
+    /// conversation ends both — and leaving this behind would strand a GC
+    /// root, pinning the manifests it names for good.
+    pub fn remove_restores(&self, thread_id: &str) -> Result<()> {
+        let path = self.restore_path(thread_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(SnapshotError::io(&path, e)),
+        }
+    }
+
     fn restore_log(&self, thread_id: &str) -> Result<RestoreLog> {
         let path = self.restore_path(thread_id);
         match fs::read(&path) {
@@ -341,14 +372,108 @@ pub struct GcStats {
     pub blobs_removed: usize,
 }
 
+/// How new a file has to be for the sweep to leave it alone regardless.
+///
+/// A capture publishes in three steps — blobs, then the manifest, then the
+/// log entry — and none of it is atomic across processes. A sweep that reads
+/// the logs before that last step but lists the files after it would delete a
+/// snapshot a live session believes it holds, which is worse than any amount
+/// of retained garbage. Nothing coordinates the two: this workspace is
+/// explicitly multi-session, and the sweep runs from whichever process
+/// deleted a conversation.
+///
+/// Git answers the same race the same way rather than by locking
+/// (`gc.pruneExpire`): fresh objects are simply never pruned, and whatever
+/// garbage is among them waits for the next sweep. Reclamation is delayed;
+/// nothing is lost.
+const GC_GRACE: Duration = Duration::from_secs(300);
+
+/// Sweep only `doomed` — manifests that belonged to threads just deleted.
+///
+/// The grace window does not apply here, and must not: a candidate is only
+/// considered because a thread that has just been removed named it, so no
+/// live session can be in the middle of publishing it. Waiting would defeat
+/// the point, since someone deleting a conversation is asking for its
+/// contents to be gone now, not in five minutes — and with the sweep only
+/// running on deletion, "later" can mean never.
+///
+/// Anything still reachable from a surviving thread stays: manifests are
+/// shared across forks, and the deleted thread naming one says nothing about
+/// whether its siblings still do.
+pub fn collect_garbage_for(
+    refs: &RefStore,
+    turns: &TurnIndex,
+    manifests: &ManifestStore,
+    blobs: &BlobStore,
+    doomed: &BTreeSet<String>,
+) -> Result<GcStats> {
+    let live_manifests = live_manifest_ids(refs, turns)?;
+    let mut stats = GcStats::default();
+
+    // Blobs are only candidates if a manifest being removed named them.
+    let mut orphan_blobs = BTreeSet::new();
+    for id in doomed {
+        if live_manifests.contains(id) {
+            stats.manifests_kept += 1;
+            continue;
+        }
+        let Ok(manifest) = manifests.load(id) else {
+            continue;
+        };
+        for entry in manifest.entries.values() {
+            orphan_blobs.insert(entry.hash.clone());
+        }
+        manifests.remove(id)?;
+        stats.manifests_removed += 1;
+    }
+
+    // A blob survives if any manifest still on disk references it.
+    for id in manifests.ids()? {
+        for entry in manifests.load(&id)?.entries.values() {
+            orphan_blobs.remove(&entry.hash);
+        }
+    }
+    for hash in orphan_blobs {
+        blobs.remove(&hash)?;
+        stats.blobs_removed += 1;
+    }
+    Ok(stats)
+}
+
+/// Manifests some surviving thread log or turn still points at.
+fn live_manifest_ids(refs: &RefStore, turns: &TurnIndex) -> Result<BTreeSet<String>> {
+    let mut live_manifests = BTreeSet::new();
+    let mut live_turn_ids = BTreeSet::new();
+    for log in refs.thread_logs()? {
+        for entry in log.entries {
+            live_turn_ids.insert(safe_file_name(&entry.turn_id));
+            live_manifests.insert(entry.manifest_id);
+        }
+    }
+    turns.retain_turns(&live_turn_ids)?;
+    live_manifests.extend(turns.all_manifest_ids()?);
+    Ok(live_manifests)
+}
+
 /// Mark-and-sweep: manifests referenced by any thread log are live; blobs
-/// referenced by any live manifest are live; everything else is removed.
+/// referenced by any live manifest are live; everything else is removed —
+/// unless it was written within `GC_GRACE`, which is never touched.
 pub fn collect_garbage(
     refs: &RefStore,
     turns: &TurnIndex,
     manifests: &ManifestStore,
     blobs: &BlobStore,
 ) -> Result<GcStats> {
+    let cutoff = SystemTime::now()
+        .checked_sub(GC_GRACE)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    // Unreadable or undatable files count as young: the sweep declines to
+    // delete anything it cannot age.
+    let settled = |path: &Path| -> bool {
+        fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|written| written <= cutoff)
+    };
     let mut live_manifests = BTreeSet::new();
     let mut live_turn_ids = BTreeSet::new();
     for log in refs.thread_logs()? {
@@ -364,7 +489,10 @@ pub fn collect_garbage(
     let mut stats = GcStats::default();
     let mut live_blobs = BTreeSet::new();
     for id in manifests.ids()? {
-        if live_manifests.contains(&id) {
+        // A manifest too young to sweep is also too young to trust as dead:
+        // its blobs stay live with it, or the next capture to reference it
+        // would find its contents gone.
+        if live_manifests.contains(&id) || !settled(&manifests.path_for(&id)) {
             stats.manifests_kept += 1;
             for entry in manifests.load(&id)?.entries.values() {
                 live_blobs.insert(entry.hash.clone());
@@ -376,7 +504,7 @@ pub fn collect_garbage(
     }
 
     for hash in blobs.hashes()? {
-        if live_blobs.contains(&hash) {
+        if live_blobs.contains(&hash) || !settled(&blobs.path_for(&hash)) {
             stats.blobs_kept += 1;
         } else {
             blobs.remove(&hash)?;
@@ -392,6 +520,18 @@ mod tests {
 
     use super::*;
     use pretty_assertions::assert_eq;
+
+    /// Backdate a file past `GC_GRACE` so a sweep will consider it.
+    ///
+    /// Tests write everything milliseconds before they assert, which is
+    /// exactly the state the grace window exists to protect. Reaching for the
+    /// clock is the only way to exercise the other side of it.
+    fn age_out(path: &Path) {
+        let when = SystemTime::now() - GC_GRACE - Duration::from_secs(60);
+        let f = fs::File::options().write(true).open(path).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
 
     #[test]
     fn append_and_load_roundtrip() {
@@ -458,6 +598,23 @@ mod tests {
         )
         .unwrap();
 
+        // Everything written a moment ago is inside the grace window, so a
+        // sweep right now must take nothing at all — the point being that a
+        // concurrent capture's not-yet-referenced manifest is indistinguishable
+        // from garbage, and guessing wrong destroys a live session's snapshot.
+        let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
+        assert_eq!(
+            (stats.manifests_removed, stats.blobs_removed),
+            (0, 0),
+            "fresh objects are never swept"
+        );
+        assert!(manifests.load(&dead_id).is_ok());
+
+        age_out(&manifests.path_for(&dead_id));
+        age_out(&manifests.path_for(&live_id));
+        age_out(&blobs.path_for(&dead_hash));
+        age_out(&blobs.path_for(&live_hash));
+
         let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
         assert_eq!(stats.manifests_kept, 1);
         assert_eq!(stats.manifests_removed, 1);
@@ -470,6 +627,8 @@ mod tests {
 
         // Dropping the thread makes everything garbage.
         refs.remove("t1").unwrap();
+        age_out(&manifests.path_for(&live_id));
+        age_out(&blobs.path_for(&live_hash));
         let stats = collect_garbage(&refs, &turns, &manifests, &blobs).unwrap();
         assert_eq!(stats.manifests_removed, 1);
         assert_eq!(stats.blobs_removed, 1);

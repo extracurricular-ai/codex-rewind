@@ -97,7 +97,6 @@ pub struct Manifest {
 }
 
 impl Manifest {
-
     /// Content-addressed id: SHA-256 of the canonical JSON serialization.
     pub fn id(&self) -> Result<String> {
         let bytes = serde_json::to_vec(self)?;
@@ -139,6 +138,11 @@ impl ManifestStore {
             }
         })?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Where `id` lives, so the sweep can ask how old it is.
+    pub(crate) fn path_for(&self, id: &str) -> PathBuf {
+        self.manifest_path(id)
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {

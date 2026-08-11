@@ -70,6 +70,7 @@ impl ThreadRequestProcessor {
                 .into_iter()
                 .map(|thread_id| thread_id.to_string()),
         );
+        codex_file_snapshots::forget_threads(self.config.codex_home.as_path(), deleted_thread_ids);
         Ok(ThreadDeleteResponse {})
     }
 

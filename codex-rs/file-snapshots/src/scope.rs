@@ -325,7 +325,8 @@ mod tests {
     fn set_mtime_ago(path: &Path, secs: u64) {
         let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
         let f = fs::File::options().write(true).open(path).unwrap();
-        f.set_times(fs::FileTimes::new().set_modified(when)).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
     }
 
     /// A throwaway repository holding `paths`, all added to the index.
@@ -336,13 +337,16 @@ mod tests {
     fn git_fixture(paths: &[&str]) -> Option<(PathBuf, tempfile::TempDir)> {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
+        // Keep the developer's own git config out of the fixture by pointing
+        // at a file that does not exist. `/dev/null` would do it on Unix and
+        // fail on Windows, and these tests are expected to run everywhere.
+        let absent_config = root.join("no-such-gitconfig");
         let git = |args: &[&str]| -> bool {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(&root)
-                // Keep the developer's own git config out of the fixture.
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_GLOBAL", &absent_config)
+                .env("GIT_CONFIG_SYSTEM", &absent_config)
                 .output()
                 .is_ok_and(|out| out.status.success())
         };
@@ -435,7 +439,12 @@ mod tests {
         .unwrap();
 
         let ignore = load_ignore(root);
-        let picked = recent_files(root, &ignore, /*include_hidden*/ false, &BTreeSet::new());
+        let picked = recent_files(
+            root,
+            &ignore,
+            /*include_hidden*/ false,
+            &BTreeSet::new(),
+        );
 
         assert_eq!(picked.len(), RECENT_LIMIT, "count is capped");
         assert!(
