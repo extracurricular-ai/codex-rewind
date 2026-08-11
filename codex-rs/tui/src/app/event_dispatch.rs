@@ -351,6 +351,10 @@ impl App {
                 }
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::ConfirmRewindToFirstPrompt => {
+                self.chat_widget.confirm_rewind_to_first_prompt();
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::RewindToNthUserMessage { nth } => {
                 self.rewind_to_nth_user_message(nth);
                 tui.frame_requester().schedule_frame();

@@ -317,6 +317,10 @@ pub(crate) enum AppEvent {
     OpenBacktrackPicker,
 
     /// Rewind to the prompt chosen from the `/rewind` picker.
+    /// Ask before rewinding to the first prompt: it restarts the conversation
+    /// rather than branching, so `/redo` has nothing to return to.
+    ConfirmRewindToFirstPrompt,
+
     RewindToNthUserMessage {
         nth: usize,
     },

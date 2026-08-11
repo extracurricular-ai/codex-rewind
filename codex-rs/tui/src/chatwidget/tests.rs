@@ -261,3 +261,27 @@ pub(crate) use helpers::make_chatwidget_manual_with_sender;
 pub(crate) use helpers::set_chatgpt_auth;
 pub(crate) use helpers::set_fast_mode_test_catalog;
 pub(super) use helpers::*;
+
+mod rewind_picker {
+    use super::unbounded_channel;
+    use crate::app_event::AppEvent;
+    use crate::app_event_sender::AppEventSender;
+    use crate::chatwidget::rewind_picker_items;
+    use assert_matches::assert_matches;
+
+    fn event_for(nth: usize) -> AppEvent {
+        let items = rewind_picker_items(vec![(nth, format!("prompt {nth}"))], /*total*/ 3);
+        let (tx, mut rx) = unbounded_channel();
+        let sender = AppEventSender::new(tx);
+        items[0].actions[0](&sender);
+        rx.try_recv().expect("selecting a prompt emits an event")
+    }
+
+    #[test]
+    fn selecting_the_first_prompt_asks_first() {
+        // It restarts the conversation rather than branching it, so `/redo`
+        // has no parent to return to. Every other prompt just rewinds.
+        assert_matches!(event_for(0), AppEvent::ConfirmRewindToFirstPrompt);
+        assert_matches!(event_for(1), AppEvent::RewindToNthUserMessage { nth: 1 });
+    }
+}

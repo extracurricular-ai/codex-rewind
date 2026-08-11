@@ -1537,22 +1537,58 @@ impl ChatWidget {
     /// Show the `/rewind` prompt list. `entries` is `(nth_user_message, label)`
     /// newest first; `total` is the number of prompts in the session.
     pub(crate) fn show_rewind_picker(&mut self, entries: Vec<(usize, String)>, total: usize) {
-        let items = entries
-            .into_iter()
-            .map(|(nth, label)| SelectionItem {
-                name: label,
-                description: Some(format!("prompt {} of {total}", nth + 1)),
-                actions: vec![Box::new(move |tx| {
-                    tx.send(AppEvent::RewindToNthUserMessage { nth });
-                })],
-                dismiss_on_select: true,
-                ..Default::default()
-            })
-            .collect();
+        let items = rewind_picker_items(entries, total);
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("Rewind to a previous prompt".to_string()),
             subtitle: Some(
                 "The conversation branches before the prompt you pick, and its text returns to the composer."
+                    .to_string(),
+            ),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
+    /// Confirm a rewind to the very first prompt.
+    ///
+    ///
+    /// Every other rewind branches the conversation, which is what lets
+    /// `/redo` walk back to it. There is nothing before the first prompt to
+    /// branch from, so the conversation restarts instead — and a fresh
+    /// conversation has no parent to return to. The files are still restored
+    /// and the old conversation is still archived, but the pairing that makes
+    /// `/redo` work is gone. The files remain recoverable — the restore is
+    /// recorded against the workspace, not the conversation — but the
+    /// conversation itself is only reachable by resuming it from the archive
+    /// by hand, so it is worth saying before rather than after.
+    pub(crate) fn confirm_rewind_to_first_prompt(&mut self) {
+        let items = vec![
+            SelectionItem {
+                name: "Rewind and start over".to_string(),
+                description: Some(
+                    "Restores the files to before the first prompt and opens a new conversation."
+                        .to_string(),
+                ),
+                actions: vec![Box::new(|tx| {
+                    tx.send(AppEvent::RewindToNthUserMessage { nth: 0 });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Keep this conversation".to_string(),
+                description: Some("Leave the files and the conversation alone.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Rewind to the very beginning?".to_string()),
+            subtitle: Some(
+                "The conversation cannot be brought back — a new one has nothing to return to. It is archived rather than deleted, and /redo still restores the files."
                     .to_string(),
             ),
             footer_hint: Some(standard_popup_hint_line()),
@@ -2106,3 +2142,25 @@ fn extract_first_bold(s: &str) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Build the `/rewind` prompt list. Split out so the routing below can be
+/// tested without a bottom pane: selecting the first prompt asks for
+/// confirmation instead of rewinding, because that one cannot be undone.
+fn rewind_picker_items(entries: Vec<(usize, String)>, total: usize) -> Vec<SelectionItem> {
+    entries
+        .into_iter()
+        .map(|(nth, label)| SelectionItem {
+            name: label,
+            description: Some(format!("prompt {} of {total}", nth + 1)),
+            actions: vec![Box::new(move |tx| {
+                if nth == 0 {
+                    tx.send(AppEvent::ConfirmRewindToFirstPrompt);
+                } else {
+                    tx.send(AppEvent::RewindToNthUserMessage { nth });
+                }
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        })
+        .collect()
+}
