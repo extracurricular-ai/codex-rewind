@@ -351,17 +351,39 @@ impl SnapshotStore {
         // undone. The checkpoint is appended to the thread doing the work;
         // where the *undo record* is filed is a separate question, answered
         // by `record_under` below.
+        //
+        // Whatever the caller scanned, the target's own paths are added to
+        // it. This makes the safety capture sufficient *by construction*
+        // rather than by argument: a plan can only write `target.entries`
+        // and only delete `target.absent`, so observing both means every
+        // path the plan could touch has been looked at.
+        //
+        // Without it the sufficiency rested on the caller passing the
+        // thread's whole history, which silently fails for an undo — the
+        // undo record is filed under the thread the rewind switched *to*,
+        // and `inherit_log` copies only up to the fork turn, so that
+        // thread's history contains neither the safety manifest nor
+        // anything the source learned afterwards. A path recorded absent by
+        // the safety capture and put back on disk by something other than
+        // the rewind (a shell command, an editor, another session) was then
+        // in `target.absent` but missing from `current.entries`, and
+        // `plan_restore` needs both to delete. It survived the undo in
+        // silence.
+        let target_manifest = self.manifests.load(&target.manifest_id)?;
+        let observed = current_files
+            .into_iter()
+            .chain(target_manifest.entries.keys().map(PathBuf::from))
+            .chain(target_manifest.absent.iter().map(PathBuf::from));
         let safety = self.checkpoint(
             thread_id,
             &format!("{SAFETY_TURN_PREFIX}{}", target.manifest_id),
-            current_files,
+            observed,
         )?;
 
         // 2. Compare the two states directly. Nothing here consults a
         // thread's history, so the outcome depends only on where the
         // workspace is and where it is going.
         let current = self.manifests.load(&safety.id)?;
-        let target_manifest = self.manifests.load(&target.manifest_id)?;
         let plan = plan_restore(&target_manifest, &current, is_protected);
         let stats = apply_plan(&self.blobs, &plan)?;
 
@@ -405,6 +427,42 @@ impl SnapshotStore {
     /// point at.
     pub fn gc(&self) -> Result<GcStats> {
         collect_garbage(&self.refs, &self.turns, &self.manifests, &self.blobs)
+    }
+
+    /// Paths this thread has observed that `target` has no opinion about and
+    /// that lie outside `roots` — so a restore to it will leave them exactly
+    /// as they are, whatever the user expected.
+    ///
+    /// Tracking is *discovered*, not retroactive. Files under a root are
+    /// enumerated at every checkpoint, so every turn knows about them and
+    /// rewinding further back restores strictly more. Files outside one
+    /// arrive only when the edit hook first touches them, which means an
+    /// earlier turn genuinely has no record of a file a later turn does —
+    /// and rewinding *further back* then restores *less*, which is the
+    /// opposite of what anyone expects.
+    ///
+    /// Leaving them alone is the right call: this turn has no content to
+    /// write, and inventing some from a later turn's pre-image would put
+    /// bytes of unknown provenance on disk. But it is invisible, so callers
+    /// use this to say so before the user commits to it.
+    pub fn unrestorable_outside(
+        &self,
+        thread_id: &str,
+        target: &RestoreTarget,
+        roots: &[PathBuf],
+    ) -> Result<Vec<String>> {
+        let manifest = self.manifests.load(&target.manifest_id)?;
+        let mut out: Vec<String> = self
+            .tracked_paths(thread_id)?
+            .into_iter()
+            .filter(|path| !manifest.entries.contains_key(path) && !manifest.absent.contains(path))
+            .filter(|path| {
+                let path = Path::new(path);
+                !roots.iter().any(|root| path.starts_with(root))
+            })
+            .collect();
+        out.sort();
+        Ok(out)
     }
 
     /// Sweep just the manifests named by threads that have been removed.

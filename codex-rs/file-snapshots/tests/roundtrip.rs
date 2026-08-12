@@ -945,3 +945,125 @@ fn forgetting_threads_is_best_effort() {
     codex_file_snapshots::forget_threads(dir.path(), &["never-tracked".to_string()]);
     codex_file_snapshots::forget_threads(dir.path(), &[]);
 }
+
+#[test]
+fn an_undo_removes_a_file_recreated_outside_the_workspace() {
+    // The gap that survived every other guard. A path enters the thread's
+    // records only *after* the turn a rewind forks at, so the fork never
+    // inherits it; something other than the rewind puts it back on disk; and
+    // it sits outside the workspace, where no scan can reach it. The undo
+    // then held a tombstone for a file it could not see, and `plan_restore`
+    // needs both to delete — so it silently survived.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let outside = dir.path().join("elsewhere");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store.checkpoint(THREAD, "fork-here", scan()).unwrap();
+
+    // A later turn deletes a file the workspace scan cannot see. The edit
+    // hook records it, so the *source* thread knows about it from now on.
+    let script = outside.join("deploy.sh");
+    fs::write(&script, "old").unwrap();
+    store.checkpoint(THREAD, "turn-2", scan()).unwrap();
+    store
+        .attach_pre_edit(THREAD, "turn-2", &script.to_string_lossy(), Some(b"old"))
+        .unwrap()
+        .expect("the pre-image of a file about to be deleted is recorded");
+    fs::remove_file(&script).unwrap();
+
+    // Rewind to the earlier turn. The fork inherits only up to that turn, so
+    // it never learns the path exists. The rewind itself scans the way the
+    // app-server does — the workspace plus everything *this* thread has
+    // observed — which is what lets the safety capture record the script as
+    // absent.
+    store.inherit_log(THREAD, BRANCH, "fork-here").unwrap();
+    let mut source_scope = scan();
+    source_scope.extend(
+        store
+            .tracked_paths(THREAD)
+            .unwrap()
+            .into_iter()
+            .map(Into::into),
+    );
+    let outcome = store
+        .restore_to(
+            THREAD,
+            Some(BRANCH),
+            &store.target_for_turn("fork-here").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            source_scope,
+            &|_| false,
+        )
+        .unwrap();
+    assert!(!script.exists(), "still deleted; the target never saw it");
+
+    // Something that leaves no trace in the fork's records puts it back.
+    fs::write(&script, "resurrected by a shell command").unwrap();
+
+    // Redo. The safety manifest recorded the path as absent, so it must go —
+    // even though the fork's own history has never heard of it.
+    store
+        .restore_to(
+            BRANCH,
+            Some(BRANCH),
+            &outcome.safety,
+            RestoreKind::Undo,
+            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            &|_| false,
+        )
+        .unwrap();
+    assert!(
+        !script.exists(),
+        "the undo must delete a path its target recorded as absent, whatever \
+         the scan happened to cover"
+    );
+}
+
+#[test]
+fn a_turn_reports_what_it_cannot_put_back() {
+    // Tracking is discovered, not retroactive: a turn from before a path was
+    // ever seen has no content to restore for it, so rewinding *further back*
+    // restores *less*. That is the right call — inventing content from a
+    // later turn's pre-image would write bytes of unknown provenance — but it
+    // is invisible, so it has to be said out loud.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let outside = dir.path().join("elsewhere");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store.checkpoint(THREAD, "early", scan()).unwrap();
+
+    let script = outside.join("deploy.sh");
+    fs::write(&script, "old").unwrap();
+    store.checkpoint(THREAD, "late", scan()).unwrap();
+    store
+        .attach_pre_edit(THREAD, "late", &script.to_string_lossy(), Some(b"old"))
+        .unwrap()
+        .unwrap();
+
+    let roots = vec![ws.clone()];
+    let early = store.target_for_turn("early").unwrap().unwrap();
+    assert_eq!(
+        store.unrestorable_outside(THREAD, &early, &roots).unwrap(),
+        vec![script.to_string_lossy().into_owned()],
+        "the early turn predates the discovery, so it cannot put this back"
+    );
+
+    let late = store.target_for_turn("late").unwrap().unwrap();
+    assert!(
+        store
+            .unrestorable_outside(THREAD, &late, &roots)
+            .unwrap()
+            .is_empty(),
+        "the later turn holds the pre-image, so it can"
+    );
+}

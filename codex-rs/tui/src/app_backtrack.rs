@@ -31,6 +31,45 @@ use crate::bottom_pane::LocalImageAttachment;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::UserMessage;
 use crate::chatwidget::mention_bindings_from_user_inputs;
+/// What a rewind to `before_turn_id` will silently decline to put back.
+///
+/// Tracking is discovered rather than retroactive. Files under the working
+/// directory are enumerated at every checkpoint, so any turn can restore
+/// them; a file *outside* it is only ever seen once the agent's own tools
+/// touch it, so a turn from before that moment has no record of it and no
+/// content to write. Leaving it alone is right — the alternative is putting
+/// bytes of unknown provenance on disk — but from the outside it looks like
+/// the rewind simply did not work, and going *further* back makes it worse,
+/// which is the opposite of what anyone expects.
+///
+/// Read from the store directly, like the other file-snapshot prompts: this
+/// is a question about what to tell the user, and the server has no opinion
+/// on that.
+pub(crate) fn unrestorable_notice(
+    config: &crate::legacy_core::config::Config,
+    thread_id: ThreadId,
+    before_turn_id: &str,
+) -> Option<(String, String)> {
+    let root = config.codex_home.as_path().join("file_snapshots");
+    let store = codex_file_snapshots::SnapshotStore::open(&root).ok()?;
+    let target = store.target_for_turn(before_turn_id).ok()??;
+    let roots = vec![config.cwd.to_path_buf()];
+    let stranded = store
+        .unrestorable_outside(&thread_id.to_string(), &target, &roots)
+        .ok()?;
+    if stranded.is_empty() {
+        return None;
+    }
+    let count = stranded.len();
+    let noun = if count == 1 { "file" } else { "files" };
+    Some((
+        format!(
+            "{count} {noun} outside the working directory were not yet tracked at this prompt, so they were left as they are."
+        ),
+        "rewind to a more recent prompt to restore them".to_string(),
+    ))
+}
+
 #[cfg(test)]
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::SessionInfoCell;

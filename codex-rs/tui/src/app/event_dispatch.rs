@@ -396,6 +396,7 @@ impl App {
                         buffered
                     }
                 };
+                let mut unrestorable: Option<(String, String)> = None;
                 let started = match turns {
                     Some(turns) => match crate::app_backtrack::backtrack_fork_before_turn_id(
                         &turns,
@@ -408,6 +409,14 @@ impl App {
                         {
                             let before_turn_id = before_turn_id
                                 .or_else(|| turns.first().map(|turn| turn.id.clone()));
+                            // Asked of the *source* thread, whose history is
+                            // what knows which paths have ever been observed;
+                            // the fork inherits only part of it.
+                            if restore_files && let Some(turn) = before_turn_id.as_deref() {
+                                unrestorable = crate::app_backtrack::unrestorable_notice(
+                                    &config, thread_id, turn,
+                                );
+                            }
                             app_server
                                 .fork_thread_at(
                                     config.clone(),
@@ -477,6 +486,9 @@ impl App {
                                 // kept intact for /redo, so retire the thread
                                 // it replaced instead of listing both.
                                 self.retire_rewound_thread(app_server, thread_id).await;
+                                if let Some((message, hint)) = unrestorable {
+                                    self.chat_widget.add_info_message(message, Some(hint));
+                                }
                             }
                             Err(err) => {
                                 self.restore_backtrack_prompt_after_branch_error(prompt, err);
