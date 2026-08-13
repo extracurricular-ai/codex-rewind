@@ -1049,3 +1049,50 @@ fn a_turn_reports_what_it_cannot_put_back() {
         "the later turn holds the pre-image, so it can"
     );
 }
+
+#[test]
+fn the_undo_warning_covers_what_it_will_delete() {
+    // The warning reads two manifests because they answer different
+    // questions. The rewind's target says where the workspace was left, so it
+    // catches edits made since. Only the safety manifest — the state the undo
+    // restores — knows that a file existing now was absent then and is about
+    // to be removed, which is the case a user would most want stopped.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+
+    fs::write(ws.join("kept.txt"), "v1").unwrap();
+    store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
+
+    // A path the agent creates and then deletes, so the safety capture
+    // records it as absent while the rewind target never mentions it.
+    let scratch = ws.join("scratch.txt");
+    store
+        .attach_pre_edit(THREAD, "turn-1", &scratch.to_string_lossy(), None)
+        .unwrap();
+    store
+        .restore_to(
+            THREAD,
+            Some(BRANCH),
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            all_files(&ws),
+            &|_| false,
+        )
+        .unwrap();
+
+    assert!(
+        store.undo_conflicts(BRANCH, &|_| false).unwrap().is_empty(),
+        "nothing has moved yet"
+    );
+
+    // The user writes it back. The undo will delete it again.
+    fs::write(&scratch, "written after the rewind").unwrap();
+    assert_eq!(
+        store.undo_conflicts(BRANCH, &|_| false).unwrap(),
+        vec![scratch.to_string_lossy().into_owned()],
+        "a file the undo is about to remove must be reported, not just the \
+         ones it will overwrite"
+    );
+}

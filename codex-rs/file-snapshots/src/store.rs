@@ -260,7 +260,24 @@ impl SnapshotStore {
                 moved.push(path.clone());
             }
         }
+
+        // And what the undo will *delete*, which the target cannot tell us.
+        // The two manifests answer different questions: the target is where
+        // the rewind left the workspace, so it catches edits made since; the
+        // safety manifest is what the undo restores, so it is the only thing
+        // that knows a file existing now was absent then and is about to be
+        // removed. Reporting only the first missed exactly the case a user
+        // would most want stopped — a file they created after the rewind,
+        // deleted without a word.
+        let restoring = self.manifests.load(&record.safety_manifest_id)?;
+        for path in &restoring.absent {
+            if !is_protected(path) && Path::new(path).exists() {
+                moved.push(path.clone());
+            }
+        }
+
         moved.sort();
+        moved.dedup();
         Ok(moved)
     }
 

@@ -1602,7 +1602,7 @@ impl ChatWidget {
             SelectionItem {
                 name: "Undo anyway".to_string(),
                 description: Some(format!(
-                    "Overwrites {total} changed file{}.",
+                    "Replaces or removes {total} file{}.",
                     if total == 1 { "" } else { "s" }
                 )),
                 actions: vec![Box::new(|tx| {
@@ -1622,7 +1622,7 @@ impl ChatWidget {
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("These files changed after the rewind".to_string()),
             subtitle: Some(format!(
-                "Undoing restores the state from before it, replacing them: {}",
+                "Undoing returns the workspace to the state before it. Anything created since is removed, and anything edited is replaced: {}",
                 listed.join(", ")
             )),
             footer_hint: Some(standard_popup_hint_line()),
