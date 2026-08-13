@@ -1096,3 +1096,56 @@ fn the_undo_warning_covers_what_it_will_delete() {
          ones it will overwrite"
     );
 }
+
+#[test]
+fn the_undo_warning_covers_files_the_rewind_never_touched() {
+    // An undo restores the whole safety manifest, which is wider than the
+    // rewind's target: it holds paths the rewind had no opinion about and
+    // therefore left alone. The target cannot say what the rewind left for
+    // those, so checking against it checks nothing — while the undo writes
+    // over them regardless. Found in real use, where a second session had
+    // created a file after the fork point.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store
+        .checkpoint(THREAD, "fork-here", all_files(&ws))
+        .unwrap();
+
+    // Appears only after the turn the rewind targets, so the target has no
+    // entry for it — but the safety capture, taken later, does.
+    let bystander = ws.join("bystander.txt");
+    fs::write(&bystander, "untouched by the rewind").unwrap();
+
+    store
+        .restore_to(
+            THREAD,
+            Some(BRANCH),
+            &store.target_for_turn("fork-here").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            all_files(&ws),
+            &|_| false,
+        )
+        .unwrap();
+    assert_eq!(
+        read(&bystander),
+        "untouched by the rewind",
+        "the rewind leaves a path its target never mentioned"
+    );
+    assert!(
+        store.undo_conflicts(BRANCH, &|_| false).unwrap().is_empty(),
+        "and while it still matches, there is nothing to warn about"
+    );
+
+    // Someone edits it. The undo will write the old bytes back over this.
+    fs::write(&bystander, "edited after the rewind").unwrap();
+    assert_eq!(
+        store.undo_conflicts(BRANCH, &|_| false).unwrap(),
+        vec![bystander.to_string_lossy().into_owned()],
+        "a path the undo will overwrite must be reported even though the \
+         rewind's target has never heard of it"
+    );
+}

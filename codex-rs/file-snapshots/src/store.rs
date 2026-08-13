@@ -261,15 +261,35 @@ impl SnapshotStore {
             }
         }
 
-        // And what the undo will *delete*, which the target cannot tell us.
-        // The two manifests answer different questions: the target is where
-        // the rewind left the workspace, so it catches edits made since; the
-        // safety manifest is what the undo restores, so it is the only thing
-        // that knows a file existing now was absent then and is about to be
-        // removed. Reporting only the first missed exactly the case a user
-        // would most want stopped — a file they created after the rewind,
-        // deleted without a word.
+        // The target only knows the paths the rewind had an opinion about.
+        // An undo restores the whole safety manifest, which is wider — it was
+        // captured from the performing thread's scope, so it holds paths the
+        // rewind left untouched. For those the target cannot say what the
+        // rewind left, and comparing against it silently checks nothing.
+        //
+        // The safety manifest can, and for exactly these paths it is the
+        // right thing to compare against: the rewind did not touch them, so
+        // what the capture found is *also* what the rewind left — and it is
+        // simultaneously what the undo is about to write over.
         let restoring = self.manifests.load(&record.safety_manifest_id)?;
+        for (path, entry) in &restoring.entries {
+            if is_protected(path)
+                || expected.entries.contains_key(path)
+                || expected.absent.contains(path)
+            {
+                continue;
+            }
+            let matches = fs::read(path)
+                .map(|bytes| BlobStore::hash_bytes(&bytes) == entry.hash)
+                .unwrap_or(false);
+            if !matches {
+                moved.push(path.clone());
+            }
+        }
+
+        // And what the undo will *delete*, which the target likewise cannot
+        // tell us: only the safety manifest knows a file existing now was
+        // absent then and is about to be removed.
         for path in &restoring.absent {
             if !is_protected(path) && Path::new(path).exists() {
                 moved.push(path.clone());
