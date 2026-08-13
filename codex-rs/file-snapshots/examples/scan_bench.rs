@@ -28,7 +28,7 @@ fn main() {
 
         println!("{root}");
         let t = std::time::Instant::now();
-        let all = codex_file_snapshots::workspace_files(p, false).unwrap_or_default();
+        let all = subtree_walk(p);
         report("subtree walk", &all, t.elapsed());
 
         let t = std::time::Instant::now();
@@ -56,4 +56,28 @@ fn main() {
             blind.len()
         );
     }
+}
+
+/// The naive walk this crate deliberately no longer performs, kept here so the
+/// comparison has something to compare against.
+fn subtree_walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
 }

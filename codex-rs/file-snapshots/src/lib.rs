@@ -46,7 +46,6 @@ pub use scope::is_ignored;
 pub use scope::load_ignore;
 pub use scope::recent_files;
 pub use scope::tracked_files;
-pub use scope::workspace_files;
 pub use store::RestoreKind;
 pub use store::RestoreOutcome;
 pub use store::RestoreTarget;

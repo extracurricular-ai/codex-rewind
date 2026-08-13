@@ -13,13 +13,46 @@ use codex_file_snapshots::SnapshotStore;
 use codex_file_snapshots::is_ignored;
 use codex_file_snapshots::load_ignore;
 use codex_file_snapshots::tracked_files;
-use codex_file_snapshots::workspace_files;
 use pretty_assertions::assert_eq;
 
 const THREAD: &str = "thread-1";
 /// The thread a rewind hands the workspace to, and therefore the one its undo
 /// record is filed under. Distinct from `THREAD`, which performs the restore.
 const BRANCH: &str = "branch-thread";
+
+/// Every regular file under `root`, skipping `.git` and dot-entries.
+///
+/// The library deliberately no longer offers a subtree walk — bounding
+/// tracking by the project rather than by the tree is the whole point of the
+/// three partitions — so a test that wants one spells it out rather than
+/// keeping a production API alive for its own convenience.
+fn all_files(root: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, ignore: &ignore::gitignore::Gitignore, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            // Ignore rules belong to enumeration, exactly as they do in
+            // production: an ignored path is never offered to a capture.
+            if is_ignored(ignore, &path) {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, ignore, out);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &load_ignore(root), &mut out);
+    out.sort();
+    out
+}
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
@@ -39,13 +72,7 @@ fn full_rewind_redo_gc_scenario() {
     fs::write(ws.join(SNAPSHOT_IGNORE_FILENAME), "*.log\n").unwrap();
 
     // Turn 1 checkpoint.
-    let cp1 = store
-        .checkpoint(
-            THREAD,
-            "turn-1",
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    let cp1 = store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
     assert_eq!(
         cp1.manifest.entries.len(),
         2,
@@ -69,13 +96,7 @@ fn full_rewind_redo_gc_scenario() {
     fs::write(ws.join("c.txt"), "charlie (agent)").unwrap();
 
     // Turn 2 checkpoint observes the agent's changes.
-    let cp2 = store
-        .checkpoint(
-            THREAD,
-            "turn-2",
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    let cp2 = store.checkpoint(THREAD, "turn-2", all_files(&ws)).unwrap();
     assert_eq!(
         cp2.manifest.entries.len(),
         2,
@@ -93,7 +114,7 @@ fn full_rewind_redo_gc_scenario() {
     // safety checkpoint could not record that it was gone, and the redo could
     // never take it away again.
     let current = || {
-        let mut files = workspace_files(&ws, /*include_hidden*/ false).unwrap();
+        let mut files = all_files(&ws);
         files.extend(
             store
                 .tracked_paths(THREAD)
@@ -195,23 +216,11 @@ fn restore_preserves_permissions() {
     fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
 
-    store
-        .checkpoint(
-            THREAD,
-            "turn-1",
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
 
     fs::write(&script, "#!/bin/sh\necho changed\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).unwrap();
-    store
-        .checkpoint(
-            THREAD,
-            "turn-2",
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    store.checkpoint(THREAD, "turn-2", all_files(&ws)).unwrap();
 
     store
         .restore_to(
@@ -219,7 +228,7 @@ fn restore_preserves_permissions() {
             Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            all_files(&ws),
             &|_| false,
         )
         .unwrap();
@@ -244,13 +253,7 @@ fn thread_marker_and_pre_edit_attach() {
 
     // Turn-start scan sees only a.txt.
     fs::write(ws.join("a.txt"), "alpha").unwrap();
-    let cp1 = store
-        .checkpoint(
-            THREAD,
-            "turn-1",
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    let cp1 = store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
 
     // Agent edits a file OUTSIDE the workspace scan: pre-image attaches
     // retroactively under the same turn.
@@ -330,10 +333,7 @@ fn thread_marker_and_pre_edit_attach() {
             Some(BRANCH),
             &store.target_for_turn("turn-1").unwrap().unwrap(),
             RestoreKind::Rewind,
-            workspace_files(&ws, /*include_hidden*/ false)
-                .unwrap()
-                .into_iter()
-                .chain([outside.clone()]),
+            all_files(&ws).into_iter().chain([outside.clone()]),
             &|_| false,
         )
         .unwrap();
@@ -348,13 +348,7 @@ fn turn_resolution_and_fork_inheritance() {
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
-    store
-        .checkpoint(
-            THREAD,
-            "turn-1",
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    store.checkpoint(THREAD, "turn-1", all_files(&ws)).unwrap();
     // Supplemental attach under the same turn: resolution must pick it.
     let outside = dir.path().join("ext.cfg");
     let supplemental = store
@@ -362,13 +356,7 @@ fn turn_resolution_and_fork_inheritance() {
         .unwrap()
         .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
-    store
-        .checkpoint(
-            THREAD,
-            "turn-2",
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    store.checkpoint(THREAD, "turn-2", all_files(&ws)).unwrap();
 
     assert_eq!(
         store
@@ -411,7 +399,7 @@ fn rewinding_twice_still_restores() {
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store.checkpoint(THREAD, "turn-1", scan()).unwrap();
@@ -481,7 +469,7 @@ fn an_undo_reports_what_moved_since_the_rewind() {
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     fs::write(ws.join("kept.txt"), "v1").unwrap();
     fs::write(ws.join("build.log"), "noise").unwrap();
@@ -533,7 +521,7 @@ fn a_restore_with_no_destination_leaves_no_undo() {
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store.checkpoint(THREAD, "turn-1", scan()).unwrap();
@@ -565,7 +553,7 @@ fn two_sessions_in_one_workspace_do_not_share_undos() {
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store.checkpoint("session-a", "a-turn-1", scan()).unwrap();
@@ -631,7 +619,7 @@ fn nested_rewinds_unwind_in_the_order_they_were_made() {
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2")] {
         fs::write(ws.join("a.txt"), contents).unwrap();
@@ -757,13 +745,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
 
     // Turn 1 starts with an empty scope: `inner/` holds nothing.
-    let cp1 = store
-        .checkpoint(
-            THREAD,
-            "turn-1",
-            workspace_files(&cwd, /*include_hidden*/ false).unwrap(),
-        )
-        .unwrap();
+    let cp1 = store.checkpoint(THREAD, "turn-1", all_files(&cwd)).unwrap();
     assert!(cp1.manifest.entries.is_empty());
 
     // The agent creates a file in the parent directory.
@@ -781,7 +763,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
 
     // Rewind to turn 1. The safety scope has to include what the thread has
     // observed, or the new file is not even a candidate.
-    let mut current: Vec<_> = workspace_files(&cwd, false).unwrap();
+    let mut current: Vec<_> = all_files(&cwd);
     current.extend(
         store
             .tracked_paths(THREAD)
@@ -817,7 +799,7 @@ fn undo_walks_back_through_successive_rewinds() {
     let ws = dir.path().join("ws");
     fs::create_dir_all(&ws).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     for (turn, contents) in [("turn-1", "v1"), ("turn-2", "v2"), ("turn-3", "v3")] {
         fs::write(ws.join("a.txt"), contents).unwrap();
@@ -887,7 +869,7 @@ fn deleting_a_conversation_takes_its_snapshots_with_it() {
     let store = SnapshotStore::open(home.join("file_snapshots")).unwrap();
 
     fs::write(ws.join("secret.txt"), "sensitive").unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
     store.checkpoint(THREAD, "turn-1", scan()).unwrap();
 
     // A rewind, so the thread also owns an undo record — a second file, under
@@ -960,7 +942,7 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     fs::create_dir_all(&ws).unwrap();
     fs::create_dir_all(&outside).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store.checkpoint(THREAD, "fork-here", scan()).unwrap();
@@ -1013,7 +995,7 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
             Some(BRANCH),
             &outcome.safety,
             RestoreKind::Undo,
-            workspace_files(&ws, /*include_hidden*/ false).unwrap(),
+            all_files(&ws),
             &|_| false,
         )
         .unwrap();
@@ -1037,7 +1019,7 @@ fn a_turn_reports_what_it_cannot_put_back() {
     fs::create_dir_all(&ws).unwrap();
     fs::create_dir_all(&outside).unwrap();
     let store = SnapshotStore::open(dir.path().join("file_snapshots")).unwrap();
-    let scan = || workspace_files(&ws, /*include_hidden*/ false).unwrap();
+    let scan = || all_files(&ws);
 
     fs::write(ws.join("a.txt"), "v1").unwrap();
     store.checkpoint(THREAD, "early", scan()).unwrap();

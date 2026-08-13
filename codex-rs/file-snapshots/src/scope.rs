@@ -35,8 +35,6 @@ use ignore::WalkBuilder;
 use ignore::gitignore::Gitignore;
 use ignore::gitignore::GitignoreBuilder;
 
-use crate::error::Result;
-
 /// Name of the dedicated snapshot ignore file (provisional; the final
 /// name is an open question in the RFC).
 pub const SNAPSHOT_IGNORE_FILENAME: &str = ".codexsnapignore";
@@ -69,41 +67,6 @@ pub fn load_ignore(root: &Path) -> Gitignore {
 /// Symmetric protection check: is `path` invisible to snapshot operations?
 pub fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
     ignore.matched_path_or_any_parents(path, false).is_ignore()
-}
-
-/// Enumerate the tracked files of a workspace: every regular file under
-/// `root`, minus `.git`, minus paths matched by the snapshot ignore file,
-/// and — unless `include_hidden` — minus dot-files and dot-directories.
-///
-/// Hidden entries are excluded by default because they are mostly tool
-/// state rather than work product: editor settings, virtualenvs, caches,
-/// credentials. Rewinding a turn should not roll those back. Anything the
-/// agent actually edits is tracked through the edit hook regardless, so an
-/// explicitly modified `.github/workflows/ci.yml` still restores.
-/// Results are sorted for deterministic manifests.
-pub fn workspace_files(root: &Path, include_hidden: bool) -> Result<Vec<PathBuf>> {
-    let ignore = load_ignore(root);
-    let walker = WalkBuilder::new(root)
-        .standard_filters(false)
-        // `.git` is excluded even when hidden entries are tracked: restoring
-        // repository internals would corrupt the user's history.
-        .hidden(!include_hidden)
-        .follow_links(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
-        .build();
-
-    let mut out = BTreeSet::new();
-    for entry in walker {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        if is_ignored(&ignore, entry.path()) {
-            continue;
-        }
-        out.insert(entry.into_path());
-    }
-    Ok(out.into_iter().collect())
 }
 
 /// Largest file the recency partition will pick up.
@@ -422,7 +385,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_files_respect_snapshot_ignore_and_skip_git() {
+    fn the_recency_walk_respects_the_ignore_file_and_skips_git() {
+        // These rules used to live on a subtree walk that production no
+        // longer performs. They still matter, because the recency partition
+        // walks the filesystem too and inherits every one of them.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         touch(&root.join("keep.txt"), "k");
@@ -434,13 +400,19 @@ mod tests {
         touch(&root.join(".git/HEAD"), "ref");
         touch(&root.join(SNAPSHOT_IGNORE_FILENAME), "*.log\n");
 
-        let files = workspace_files(root, /*include_hidden*/ false).unwrap();
-        let names: Vec<String> = files
-            .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
-            .collect();
+        let ignore = load_ignore(root);
+        let names = |include_hidden: bool| -> Vec<String> {
+            let mut out: Vec<String> =
+                recent_files(root, &ignore, include_hidden, &BTreeSet::new())
+                    .iter()
+                    .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                    .collect();
+            out.sort();
+            out
+        };
+
         assert_eq!(
-            names,
+            names(/*include_hidden*/ false),
             vec!["keep.txt".to_string(), "sub/keep2.txt".to_string()],
             "logs ignored; .git and other dot-entries skipped — including the \
              ignore file itself, which follows the same rule as any other \
@@ -448,15 +420,11 @@ mod tests {
         );
 
         // Opting in reaches hidden entries, but never `.git`.
-        let with_hidden = workspace_files(root, /*include_hidden*/ true).unwrap();
-        let names: Vec<String> = with_hidden
-            .iter()
-            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert!(names.contains(&SNAPSHOT_IGNORE_FILENAME.to_string()));
+        let with_hidden = names(/*include_hidden*/ true);
+        assert!(with_hidden.contains(&SNAPSHOT_IGNORE_FILENAME.to_string()));
         assert!(
-            names.iter().all(|name| !name.starts_with(".git/")),
-            "repository internals are never scanned: {names:?}"
+            with_hidden.iter().all(|name| !name.starts_with(".git/")),
+            "repository internals are never scanned: {with_hidden:?}"
         );
     }
 
