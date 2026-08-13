@@ -60,11 +60,25 @@ pub(crate) fn unrestorable_notice(
     if stranded.is_empty() {
         return None;
     }
+    // Name them. A count alone tells someone that something is wrong without
+    // telling them what, and these are by definition files they will not
+    // think to look for — they are outside the directory being worked in.
+    const SHOWN: usize = 3;
     let count = stranded.len();
-    let noun = if count == 1 { "file" } else { "files" };
+    let mut listed: Vec<String> = stranded
+        .iter()
+        .take(SHOWN)
+        .map(|path| crate::chatwidget::display_path(path, config.cwd.as_path()))
+        .collect();
+    if count > SHOWN {
+        listed.push(format!("and {} more", count - SHOWN));
+    }
+    let were = if count == 1 { "was" } else { "were" };
     Some((
         format!(
-            "{count} {noun} outside the working directory were not yet tracked at this prompt, so they were left as they are."
+            "{} {were} not tracked yet at this prompt, so {} left untouched.",
+            listed.join(", "),
+            if count == 1 { "it was" } else { "they were" }
         ),
         "rewind to a more recent prompt to restore them".to_string(),
     ))

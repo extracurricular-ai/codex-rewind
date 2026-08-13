@@ -262,6 +262,38 @@ pub(crate) use helpers::set_chatgpt_auth;
 pub(crate) use helpers::set_fast_mode_test_catalog;
 pub(super) use helpers::*;
 
+mod display_path {
+    use crate::chatwidget::display_path;
+    use pretty_assertions::assert_eq;
+    use std::path::Path;
+
+    #[test]
+    fn names_stay_readable_in_a_one_line_prompt() {
+        let cwd = Path::new("/repo/service/api");
+
+        assert_eq!(
+            display_path("/repo/service/api/src/main.rs", cwd),
+            "src/main.rs",
+            "inside the working directory, drop the prefix"
+        );
+        // The case the snapshot prompts actually hit: these warnings exist to
+        // name files *outside* the working directory, and an absolute path is
+        // what gets truncated away mid-name.
+        assert_eq!(
+            display_path("/repo/service/notes.md", cwd),
+            "../notes.md",
+            "one level up says both the name and that it is outside"
+        );
+        assert_eq!(display_path("/repo/build.sh", cwd), "../../build.sh");
+        // Far enough away that counting `..` stops helping.
+        assert_eq!(
+            display_path("/etc/hosts", cwd),
+            "/etc/hosts",
+            "unrelated paths stay absolute rather than growing a ladder of dots"
+        );
+    }
+}
+
 mod redo_prompt {
     use crate::chatwidget::RedoPrompt;
     use crate::chatwidget::redo_prompt;

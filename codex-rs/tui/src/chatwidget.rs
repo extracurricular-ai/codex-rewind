@@ -1586,13 +1586,7 @@ impl ChatWidget {
         let mut listed: Vec<String> = disturbed
             .iter()
             .take(SHOWN)
-            .map(|path| {
-                std::path::Path::new(path)
-                    .strip_prefix(self.config.cwd.as_path())
-                    .unwrap_or_else(|_| std::path::Path::new(path))
-                    .display()
-                    .to_string()
-            })
+            .map(|path| display_path(path, self.config.cwd.as_path()))
             .collect();
         if total > SHOWN {
             listed.push(format!("and {} more", total - SHOWN));
@@ -1619,10 +1613,14 @@ impl ChatWidget {
             },
         ];
 
+        // The list goes first and the explanation second. Which files are at
+        // stake is the part a person has to read; leading with prose pushed
+        // the names off the end of the line, and a warning naming no file is
+        // no warning at all.
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some("These files changed after the rewind".to_string()),
             subtitle: Some(format!(
-                "Undoing returns the workspace to the state before it. Anything created since is removed, and anything edited is replaced: {}",
+                "{} — undoing removes anything created since, and replaces anything edited.",
                 listed.join(", ")
             )),
             footer_hint: Some(standard_popup_hint_line()),
@@ -2225,6 +2223,51 @@ fn extract_first_bold(s: &str) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// A path a person can read in a one-line prompt.
+///
+/// Absolute paths are unusable here: the popup is a single line, and the file
+/// snapshot prompts are precisely the ones that name files *outside* the
+/// working directory, so the interesting part of the name is the part that
+/// gets truncated away. `../notes.md` is short, and it also says the one thing
+/// worth knowing — that the file is not in the directory being worked in.
+///
+/// Beyond a few levels up the relative form stops being informative, so this
+/// falls back to abbreviating the home directory instead.
+pub(crate) fn display_path(path: &str, cwd: &Path) -> String {
+    const MAX_ASCENT: usize = 3;
+
+    let path = Path::new(path);
+    if let Ok(relative) = path.strip_prefix(cwd) {
+        return relative.display().to_string();
+    }
+
+    let mut ascent = PathBuf::new();
+    let mut base = cwd;
+    for _ in 0..MAX_ASCENT {
+        let Some(parent) = base.parent() else { break };
+        // The filesystem root is an ancestor of everything, so matching there
+        // says nothing — it would render `/etc/hosts` as `../../../etc/hosts`,
+        // which is longer than the truth and implies a relationship that does
+        // not exist.
+        if parent.parent().is_none() {
+            break;
+        }
+        ascent.push("..");
+        if let Ok(relative) = path.strip_prefix(parent) {
+            return ascent.join(relative).display().to_string();
+        }
+        base = parent;
+    }
+
+    match std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+    {
+        Some(relative) => format!("~/{}", relative.display()),
+        None => path.display().to_string(),
+    }
+}
 
 /// What, if anything, `/redo` should ask before running.
 #[derive(Debug, PartialEq, Eq)]
