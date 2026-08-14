@@ -129,15 +129,37 @@ jobs:
       - name: Stage
         shell: bash
         run: |
+          set -euo pipefail
           dest="vendor/${{ matrix.triple }}/bin"
           mkdir -p "$dest"
+
           if [[ "${{ matrix.name }}" == win32-* ]]; then
+            # Windows keeps its debug info in a separate .pdb, so the .exe is
+            # already lean and there is nothing to strip.
             cp "codex-rs/target/${{ matrix.triple }}/release/codexr.exe" "$dest/"
           else
             cp "codex-rs/target/${{ matrix.triple }}/release/codexr" "$dest/"
             chmod +x "$dest/codexr"
+
+            # The workspace release profile keeps symbols on purpose —
+            # `strip = false`, with a comment saying packaging archives the
+            # sidecar symbols and strips afterwards. That packaging lived in
+            # upstream's release workflows, which this repository does not
+            # have, so the stripping has to happen here instead.
+            #
+            # It matters most on Linux, where `split-debuginfo = "off"` puts
+            # the debug info inside the ELF: unstripped Linux tarballs came out
+            # at 290 MB against 90 MB for macOS, whose symbols go to a separate
+            # .dSYM that is never copied. That difference is what an npm
+            # install would have to download.
+            before=$(stat -c%s "$dest/codexr" 2>/dev/null || stat -f%z "$dest/codexr")
+            strip "$dest/codexr"
+            after=$(stat -c%s "$dest/codexr" 2>/dev/null || stat -f%z "$dest/codexr")
+            echo "stripped: $((before / 1048576)) MB -> $((after / 1048576)) MB"
           fi
+
           tar -czf "codexr-${{ matrix.triple }}.tar.gz" -C vendor "${{ matrix.triple }}"
+          echo "tarball: $(du -h "codexr-${{ matrix.triple }}.tar.gz" | cut -f1)"
 
       - uses: actions/upload-artifact@v4
         with:
