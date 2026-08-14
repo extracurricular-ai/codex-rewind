@@ -9,6 +9,15 @@ name: build
 # minute of wall clock. Pick what you need.
 
 on:
+  # Pushing a release tag builds everything and attaches it to that tag.
+  # Tags are pushed rarely and deliberately, so this costs quota exactly when a
+  # release is wanted and never otherwise. The pattern is narrow so a stray tag
+  # cannot start a six-platform matrix by accident.
+  push:
+    tags:
+      - "v*-rewind.*"
+
+  # And a manual run for everything else, where you pick the platforms.
   workflow_dispatch:
     inputs:
       targets:
@@ -29,9 +38,18 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
     steps:
       - id: plan
         shell: python
+        env:
+          # Read through the environment rather than interpolating into the
+          # script body: a tag name is attacker-influenced text, and pasting it
+          # into source would let it end the string it lands in.
+          EVENT: ${{ github.event_name }}
+          RAW_TARGETS: ${{ inputs.targets }}
+          RAW_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           import json, os
 
@@ -44,17 +62,29 @@ jobs:
               "win32-arm64":  {"triple": "aarch64-pc-windows-msvc",    "runner": "windows-11-arm"},
           }
 
-          raw = """${{ inputs.targets }}""".strip()
-          names = list(ALL) if raw == "all" else [t.strip() for t in raw.split(",") if t.strip()]
+          on_tag = os.environ["EVENT"] == "push"
+
+          # A tag is a release: build everything, and attach to the tag itself.
+          if on_tag:
+              names = list(ALL)
+              tag = os.environ["REF_NAME"]
+          else:
+              raw = os.environ.get("RAW_TARGETS", "").strip()
+              names = list(ALL) if raw == "all" else [t.strip() for t in raw.split(",") if t.strip()]
+              tag = os.environ.get("RAW_TAG", "").strip()
 
           unknown = [n for n in names if n not in ALL]
           if unknown:
               raise SystemExit(f"unknown target(s): {', '.join(unknown)}. Known: {', '.join(ALL)}")
+          if not names:
+              raise SystemExit("no targets selected")
 
           include = [{"name": n, **ALL[n]} for n in names]
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"matrix={json.dumps({'include': include})}\n")
+              fh.write(f"release_tag={tag}\n")
           print(f"building: {', '.join(names)}")
+          print(f"release tag: {tag or '(artifacts only)'}")
 
   build:
     name: ${{ matrix.name }}
@@ -109,14 +139,17 @@ jobs:
           retention-days: 14
 
       - name: Attach to release
-        if: inputs.release_tag != ''
+        if: needs.plan.outputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.release_tag }}
+          TRIPLE: ${{ matrix.triple }}
         shell: bash
         run: |
-          tag="${{ inputs.release_tag }}"
-          # A draft keeps the tag off the repository until you publish it, so a
-          # half-finished matrix never looks like a release.
-          gh release view "$tag" >/dev/null 2>&1 || \
-            gh release create "$tag" --draft --title "$tag" --notes "Built by the build workflow."
-          gh release upload "$tag" "codexr-${{ matrix.triple }}.tar.gz" --clobber
+          # Created as a draft either way, so a matrix that fails halfway never
+          # looks like a finished release. On a manual run the draft also keeps
+          # the tag off the repository until you publish, which means a
+          # `-rewind.<n>` tag only ever names something that was really built.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --draft --title "$TAG" --notes "Built by the build workflow."
+          gh release upload "$TAG" "codexr-$TRIPLE.tar.gz" --clobber

@@ -2,13 +2,31 @@
 
 One workflow: `build.yml`. Everything else upstream ships was removed.
 
-Actions minutes are limited on this repository, so nothing runs automatically —
-no push triggers, no pull-request triggers. You start a build when you want
-binaries, and you name the platforms you want.
+Actions minutes are limited on this repository, so it never runs on a push to a
+branch and never on a pull request. It starts two ways.
 
-## Building
+## Cutting a release: push a tag
 
-*Actions → build → Run workflow*, or:
+```bash
+git tag v0.147.0-rewind.0
+git push dist v0.147.0-rewind.0
+```
+
+Any tag matching `v*-rewind.*` builds **all six platforms** and attaches them to
+a draft release for that tag. Tags are pushed rarely and deliberately, so this
+spends quota exactly when a release is wanted and never otherwise. The pattern
+is narrow on purpose: a stray tag cannot start a six-platform matrix.
+
+## Building some platforms: run it by hand
+
+**In the browser** — *Actions → build → Run workflow*, on the right. Fill in
+`targets` and leave `release_tag` blank to get plain artifacts.
+
+> The button only appears once `build.yml` is on the repository's **default
+> branch**. On any other branch the workflow exists but has nowhere to be
+> triggered from — this catches everyone once.
+
+Or from the CLI, if you have `gh`:
 
 ```bash
 gh workflow run build.yml -f targets=linux-x64,linux-arm64
@@ -47,14 +65,15 @@ python3 codex-cli/scripts/build_npm_package.py --package codex-linux-arm64 \
 
 ## Attaching them to a release
 
-Pass `release_tag`. The workflow creates that release **as a draft** if it does
-not exist and uploads each archive as it finishes, so a matrix that fails
-halfway never looks like a finished release. Review the draft and publish it
-yourself.
+Both routes attach to a release, and both create it **as a draft** — a matrix
+that fails halfway then never looks like a finished release. Review it and
+publish yourself.
 
-Note that a draft release does not create the git tag — the tag appears only
-when you publish. That is deliberate: `<upstream>-rewind.<n>` tags are supposed
-to name something that was actually built.
+On a manual run the draft has a second effect: a draft release does not create
+the git tag, so the tag appears only when you publish. That is deliberate —
+`<upstream>-rewind.<n>` should only ever name something that was really built.
+(Pushing a tag obviously creates it first; there the draft is just the review
+step.)
 
 ## Why the Linux targets are musl
 
