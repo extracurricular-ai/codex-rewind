@@ -1,5 +1,7 @@
 # codex-rewind
 
+**English** · [简体中文](./README.zh-CN.md)
+
 **An unofficial distribution of [OpenAI Codex CLI](https://github.com/openai/codex).**
 
 > For what Codex CLI is, how to sign in, and how to use it, read
