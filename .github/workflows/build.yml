@@ -99,8 +99,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # From inside `codex-rs`, so `rust-toolchain.toml` applies and the target
+      # lands on the pinned toolchain. Run at the repository root it installs
+      # against the runner's default toolchain instead, and the build then
+      # fails with "can't find crate for `core`" — which reads like a missing
+      # target rather than a target on the wrong toolchain.
       - name: Install the Rust target
-        run: rustup target add ${{ matrix.triple }}
+        working-directory: codex-rs
+        run: |
+          rustup show active-toolchain
+          rustup target add ${{ matrix.triple }}
+          rustup target list --installed
 
       # The Linux packages target musl so the binary runs on any distribution
       # without a glibc version to match.
