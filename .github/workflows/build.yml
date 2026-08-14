@@ -1,0 +1,122 @@
+name: build
+
+# The only workflow in this repository. Actions minutes are limited here, so it
+# runs when asked and not on every push, and it builds exactly the targets you
+# name rather than all six by default.
+#
+# Runner cost is not uniform: GitHub bills Linux at 1x, Windows at 2x and macOS
+# at 10x. Building all six targets therefore costs roughly 25 Linux-minutes per
+# minute of wall clock. Pick what you need.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Comma-separated: linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64, win32-arm64 — or 'all'"
+        required: true
+        default: "linux-x64,linux-arm64"
+      release_tag:
+        description: "Attach the binaries to this release tag (created as a draft if absent). Leave blank to only keep them as run artifacts."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    name: Plan targets
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        shell: python
+        run: |
+          import json, os
+
+          ALL = {
+              "linux-x64":    {"triple": "x86_64-unknown-linux-musl",  "runner": "ubuntu-24.04"},
+              "linux-arm64":  {"triple": "aarch64-unknown-linux-musl", "runner": "ubuntu-24.04-arm"},
+              "darwin-x64":   {"triple": "x86_64-apple-darwin",        "runner": "macos-15"},
+              "darwin-arm64": {"triple": "aarch64-apple-darwin",       "runner": "macos-15"},
+              "win32-x64":    {"triple": "x86_64-pc-windows-msvc",     "runner": "windows-2025"},
+              "win32-arm64":  {"triple": "aarch64-pc-windows-msvc",    "runner": "windows-11-arm"},
+          }
+
+          raw = """${{ inputs.targets }}""".strip()
+          names = list(ALL) if raw == "all" else [t.strip() for t in raw.split(",") if t.strip()]
+
+          unknown = [n for n in names if n not in ALL]
+          if unknown:
+              raise SystemExit(f"unknown target(s): {', '.join(unknown)}. Known: {', '.join(ALL)}")
+
+          include = [{"name": n, **ALL[n]} for n in names]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"matrix={json.dumps({'include': include})}\n")
+          print(f"building: {', '.join(names)}")
+
+  build:
+    name: ${{ matrix.name }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.triple }}
+
+      # The Linux packages target musl so the binary runs on any distribution
+      # without a glibc version to match.
+      - name: Install musl tooling
+        if: startsWith(matrix.name, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: ${{ matrix.triple }}
+
+      - name: Build
+        working-directory: codex-rs
+        run: cargo build --release --bin codexr --target ${{ matrix.triple }}
+
+      # Laid out as the npm packaging script expects to find it, so the tarball
+      # step can point `--vendor-src` straight at the downloaded artifacts.
+      - name: Stage
+        shell: bash
+        run: |
+          dest="vendor/${{ matrix.triple }}"
+          mkdir -p "$dest"
+          if [[ "${{ matrix.name }}" == win32-* ]]; then
+            cp "codex-rs/target/${{ matrix.triple }}/release/codexr.exe" "$dest/"
+          else
+            cp "codex-rs/target/${{ matrix.triple }}/release/codexr" "$dest/"
+            chmod +x "$dest/codexr"
+          fi
+          tar -czf "codexr-${{ matrix.triple }}.tar.gz" -C vendor "${{ matrix.triple }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codexr-${{ matrix.triple }}
+          path: codexr-${{ matrix.triple }}.tar.gz
+          retention-days: 14
+
+      - name: Attach to release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="${{ inputs.release_tag }}"
+          # A draft keeps the tag off the repository until you publish it, so a
+          # half-finished matrix never looks like a release.
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --draft --title "$tag" --notes "Built by the build workflow."
+          gh release upload "$tag" "codexr-${{ matrix.triple }}.tar.gz" --clobber
