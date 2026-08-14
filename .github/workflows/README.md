@@ -1,9 +1,35 @@
 # Workflows
 
-One workflow: `build.yml`. Everything else upstream ships was removed.
+Two things run here: verification, and building binaries.
 
-Actions minutes are limited on this repository, so it never runs on a push to a
-branch and never on a pull request. It starts two ways.
+Actions is free and unmetered for public repositories on standard runners, so
+there is no minute budget to protect — an earlier version of this file assumed
+otherwise and cut CI down to nothing, which traded away the only check on an
+upstream merge for a saving that did not exist.
+
+## Verification — `blocking-ci.yml`
+
+Runs on every pull request and on pushes to `main`, and calls `rust-ci`,
+`repo-checks`, `codespell` and `cargo-deny`. The `required` job inside it is the
+one to mark as a required status check; it is written to fail loudly rather than
+appear green when a dependency was skipped.
+
+`rust-ci-full.yml` is the heavier cross-platform suite. It is reachable three
+ways: called by `rust-ci`, run by hand, or triggered by pushing any branch whose
+name contains **`full-ci`**. That last one is the useful one after an upstream
+merge, where the dangerous failure is a merge that resolved cleanly and is
+semantically wrong — nothing but the integration tests will catch it.
+
+What stays deleted, and why: upstream's five `rust-release*` workflows need
+self-hosted runners, Apple notarisation, Azure Key Vault signing and R2
+credentials; `bazel.yml` cannot be verified from this side; the issue bots, CLA
+check, SDK, V8 and Python pipelines are upstream's own infrastructure. So is
+`dependabot.yaml` — six ecosystems on a weekly schedule is noise for a
+distribution that takes its dependency updates through the upstream sync.
+
+## Building binaries — `build.yml`
+
+Never runs on a branch push or a pull request. It starts two ways.
 
 ## Cutting a release: push a tag
 
@@ -13,9 +39,8 @@ git push dist v0.147.0-rewind.0
 ```
 
 Any tag matching `v*-rewind.*` builds **all six platforms** and attaches them to
-a draft release for that tag. Tags are pushed rarely and deliberately, so this
-spends quota exactly when a release is wanted and never otherwise. The pattern
-is narrow on purpose: a stray tag cannot start a six-platform matrix.
+a draft release for that tag. The pattern is narrow on purpose: a stray tag
+should not start a six-platform matrix and leave a half-built release behind.
 
 ## Building some platforms: run it by hand
 
@@ -36,10 +61,9 @@ gh workflow run build.yml -f targets=all -f release_tag=v0.147.0-rewind.0
 `targets` accepts any comma-separated subset of `linux-x64`, `linux-arm64`,
 `darwin-x64`, `darwin-arm64`, `win32-x64`, `win32-arm64`, or `all`.
 
-**Runner minutes are not billed equally.** GitHub charges Linux at 1x, Windows
-at 2x and macOS at **10x**, so `targets=all` costs about 25 Linux-minutes for
-every wall-clock minute. Build the platform you are actually going to run, and
-leave `all` for a release.
+Picking a subset is about wall-clock time, not money: a cold release build of
+this workspace is 1,386 crates with full optimisation, so one platform is a
+much faster way to check that a change compiles than six.
 
 ## Getting the binaries
 
