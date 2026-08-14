@@ -31,6 +31,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::BANNED_PREFIX_SUGGESTIONS;
 use crate::exec_policy::ExecPolicyManager;
 use crate::exec_policy::default_policy_path;
+use crate::image_preparation::ImageResizeNoticeMode;
 use crate::image_preparation::prepare_response_items as prepare_image_response_items;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
@@ -303,6 +304,7 @@ use crate::exec_policy::ExecPolicyUpdateError;
 use crate::guardian::GuardianReviewOptions;
 use crate::guardian::GuardianReviewSessionManager;
 use crate::mcp::McpManager;
+use crate::mcp::McpThreadIdentity;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
@@ -1432,8 +1434,9 @@ impl Session {
         // Keep the recorded rollout unchanged. Prepare its reconstructed history before
         // installing it, so legacy media is processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
-        // This meets media preparation requirements without modifying persisted rollouts.
-        prepare_image_response_items(&mut history);
+        // Never backfill resize notices during replay; only newly recorded items may
+        // emit them, so the historical model prefix remains unchanged.
+        let _ = prepare_image_response_items(&mut history, ImageResizeNoticeMode::Disabled);
         prepare_audio_response_items(&mut history);
         {
             let mut state = self.state.lock().await;
@@ -2898,13 +2901,25 @@ impl Session {
         turn_context: &TurnContext,
         items: &'a [ResponseItem],
     ) -> (Cow<'a, [ResponseItem]>, Vec<ImagePreparationMetadata>) {
-        let mut items = Cow::Borrowed(items);
-        let image_preparations = prepare_image_response_items(items.to_mut());
-        prepare_audio_response_items(items.to_mut());
+        let mut items = items.to_vec();
+        let image_preparations = prepare_image_response_items(
+            &mut items,
+            if turn_context
+                .config
+                .features
+                .enabled(Feature::ImageResizeNotice)
+            {
+                ImageResizeNoticeMode::Enabled
+            } else {
+                ImageResizeNoticeMode::Disabled
+            },
+        );
+        prepare_audio_response_items(&mut items);
         // Most response items get their passthrough turn ID at the durable history boundary.
-        for item in items.to_mut() {
+        for item in &mut items {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
+        let items = Cow::Owned(items);
         (
             Self::assign_missing_response_item_ids(items),
             image_preparations,
@@ -3534,14 +3549,16 @@ impl Session {
                 "developer" if fragment.markers().0 == MULTI_AGENT_MODE_OPEN_TAG => {
                     initial_multi_agent_mode = Some(fragment);
                 }
+                "developer"
+                    if fragment.requires_separate_message() && fragment.markers().0.is_empty() =>
+                {
+                    separate_developer_sections.push(fragment.render());
+                }
                 "developer" => developer_sections.push(fragment.render()),
                 "user" => contextual_user_sections.push(fragment.render()),
                 _ => {}
             }
         }
-
-        let multi_agent_v2_usage_hint_text =
-            multi_agents::usage_hint_text(turn_context, &session_source);
 
         let mut items = Vec::with_capacity(4);
         if let Some(developer_message) =
@@ -3555,14 +3572,6 @@ impl Session {
             {
                 items.push(developer_message);
             }
-        }
-        if let Some(usage_hint_text) = multi_agent_v2_usage_hint_text
-            && let Some(usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    usage_hint_text.to_string(),
-                ])
-        {
-            items.push(usage_hint_message);
         }
         if let Some(initial_multi_agent_mode) = initial_multi_agent_mode {
             items.push(initial_multi_agent_mode.into_boxed_response_item());

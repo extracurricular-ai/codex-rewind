@@ -6,11 +6,14 @@ use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
+use codex_core::StartThreadOptions;
 use codex_core::config::Config;
+use codex_exec_server::CreateDirectoryOptions;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_features::Feature;
+use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -31,12 +34,14 @@ use codex_skills_extension::catalog::SkillReadResult;
 use codex_skills_extension::catalog::SkillResourceId;
 use codex_skills_extension::catalog::SkillSearchResult;
 use codex_skills_extension::catalog::SkillSourceKind;
+use codex_skills_extension::install;
 use codex_skills_extension::install_with_providers;
 use codex_skills_extension::provider::SkillListQuery;
 use codex_skills_extension::provider::SkillProviderFuture;
 use codex_skills_extension::provider::SkillReadRequest;
 use codex_skills_extension::provider::SkillSearchRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use codex_utils_string::approx_token_count;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::apps_enabled_builder;
@@ -46,6 +51,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
@@ -66,7 +72,7 @@ struct StaticSkillProvider {
     main_prompt_contents: Option<String>,
 }
 
-struct ExecutorSkillProvider {
+struct CatalogSkillProvider {
     catalog: SkillCatalog,
 }
 
@@ -128,7 +134,7 @@ impl SkillProvider for StaticSkillProvider {
     }
 }
 
-impl SkillProvider for ExecutorSkillProvider {
+impl SkillProvider for CatalogSkillProvider {
     fn list(&self, _query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog> {
         Box::pin(async { Ok(self.catalog.clone()) })
     }
@@ -239,7 +245,7 @@ fn catalog_extensions(
     let mut extensions =
         ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
     let mut providers =
-        SkillProviders::new().with_executor_provider(Arc::new(ExecutorSkillProvider {
+        SkillProviders::new().with_executor_provider(Arc::new(CatalogSkillProvider {
             catalog: executor_catalog,
         }));
     if include_host_provider {
@@ -443,6 +449,204 @@ async fn rendered_catalogs_for_turns(
     }));
     let _codex_home_guard = codex_home;
     Ok((developer_texts, client_warning_messages))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "executor-backed repo skills require matching host and executor path conventions"
+    );
+    skip_if_no_network!(Ok(()));
+
+    const HOST_SKILL_BODY: &str = "Use the host skill instructions.";
+    const REPO_SKILL_BODY: &str = "Use the repository skill instructions.";
+    const PLUGIN_SKILL_BODY: &str = "Use the legacy plugin skill instructions.";
+
+    let server = responses::start_mock_server().await;
+    let apps_server = AppsTestServer::mount_with_connector_name(&server, "Google Calendar").await?;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+
+    let codex_home = Arc::new(TempDir::new()?);
+    let host_skill_dir = codex_home.path().join("skills/host-search");
+    std::fs::create_dir_all(&host_skill_dir)?;
+    let host_skill_path = host_skill_dir.join("SKILL.md");
+    std::fs::write(
+        &host_skill_path,
+        format!(
+            "---\nname: host-search\ndescription: inspect host data\n---\n\n{HOST_SKILL_BODY}\n"
+        ),
+    )?;
+    let host_skill_path = dunce::canonicalize(host_skill_path)?;
+    let plugin_root = codex_home.path().join("plugins/cache/test/sample/local");
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"sample","description":"inspect sample data"}"#,
+    )?;
+    let plugin_skill_dir = plugin_root.join("skills/sample-search");
+    std::fs::create_dir_all(&plugin_skill_dir)?;
+    let plugin_skill_path = plugin_skill_dir.join("SKILL.md");
+    std::fs::write(
+        &plugin_skill_path,
+        format!("---\ndescription: inspect sample data\n---\n\n{PLUGIN_SKILL_BODY}\n"),
+    )?;
+    let plugin_skill_path = dunce::canonicalize(plugin_skill_path)?;
+    std::fs::write(
+        plugin_root.join(".app.json"),
+        r#"{"apps":{"sample":{"id":"calendar"}}}"#,
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[features]\nplugins = true\n\n[plugins.\"sample@test\"]\nenabled = true\n",
+    )?;
+
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        include_instructions: config.include_skill_instructions,
+        bundled_skills_enabled: config.bundled_skills_enabled(),
+        orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+        shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+    });
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&codex_home))
+        .with_extensions(Arc::new(extensions.build()))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_workspace_setup(|cwd, fs| async move {
+            let skill_dir = cwd.join(".agents/skills/repo-search");
+            fs.create_directory(
+                &PathUri::from_host_native_path(&skill_dir)?,
+                CreateDirectoryOptions { recursive: true },
+                /*sandbox*/ None,
+            )
+            .await?;
+            fs.write_file(
+                &PathUri::from_host_native_path(skill_dir.join("SKILL.md"))?,
+                format!(
+                    "---\nname: repo-search\ndescription: inspect repo data\n---\n\n{REPO_SKILL_BODY}\n"
+                )
+                .into_bytes(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok(())
+        })
+        .with_config(move |config| {
+            config
+                .features
+                .enable(Feature::Apps)
+                .expect("test config should allow feature update");
+            config.chatgpt_base_url = apps_server.chatgpt_base_url;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let repo_skill_path = test
+        .fs()
+        .canonicalize(
+            &PathUri::from_abs_path(&test.config.cwd.join(".agents/skills/repo-search/SKILL.md")),
+            /*sandbox*/ None,
+        )
+        .await?
+        .to_abs_path()?
+        .to_path_buf();
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![
+                UserInput::Text {
+                    text: "use all skills".to_string(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::Skill {
+                    name: "host-search".to_string(),
+                    path: host_skill_path.clone(),
+                },
+                UserInput::Skill {
+                    name: "repo-search".to_string(),
+                    path: repo_skill_path.clone(),
+                },
+                UserInput::Skill {
+                    name: "sample:sample-search".to_string(),
+                    path: plugin_skill_path.clone(),
+                },
+            ],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    core_test_support::wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let request = response.single_request();
+    let developer_messages = request.message_input_texts("developer");
+    let developer_text = developer_messages.join("\n\n");
+    let apps_pos = developer_text
+        .find("## Apps")
+        .expect("expected apps section in developer message");
+    let skills_pos = developer_text
+        .find("## Skills")
+        .expect("expected skills section in developer message");
+    let plugins_pos = developer_text
+        .find("## Plugins")
+        .expect("expected plugins section in developer message");
+    assert!(
+        skills_pos < apps_pos && apps_pos < plugins_pos,
+        "expected Skills -> Apps -> Plugins order: {developer_messages:?}"
+    );
+    assert!(
+        !developer_text.contains("`sample`: inspect sample data"),
+        "did not expect plugin description in developer message: {developer_messages:?}"
+    );
+    assert!(
+        developer_text.contains("skill entries are prefixed with `plugin_name:`"),
+        "expected plugin skill naming guidance in developer message: {developer_messages:?}"
+    );
+    assert!(
+        developer_text.contains("sample:sample-search: inspect sample data"),
+        "expected namespaced plugin skill summary in developer message: {developer_messages:?}"
+    );
+    assert!(
+        developer_text.contains("repo-search: inspect repo data"),
+        "expected repo skill summary in developer message: {developer_messages:?}"
+    );
+    assert!(
+        developer_text.contains("host-search: inspect host data"),
+        "expected host skill summary in developer message: {developer_messages:?}"
+    );
+
+    let user_text = request.message_input_texts("user").join("\n");
+    for (name, path, body) in [
+        ("host-search", &host_skill_path, HOST_SKILL_BODY),
+        ("repo-search", &repo_skill_path, REPO_SKILL_BODY),
+        (
+            "sample:sample-search",
+            &plugin_skill_path,
+            PLUGIN_SKILL_BODY,
+        ),
+    ] {
+        assert!(
+            user_text.contains(&format!("<skill>\n<name>{name}</name>")),
+            "expected injected skill `{name}` in user input: {user_text}"
+        );
+        assert!(
+            user_text.contains(path.to_string_lossy().as_ref()),
+            "expected path for `{name}` in user input: {user_text}"
+        );
+        assert!(
+            user_text.contains(body),
+            "expected body for `{name}` in user input: {user_text}"
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1106,6 +1310,107 @@ async fn production_turn_keeps_full_executor_only_catalog_when_it_fits() -> Resu
     let executor_lines = skill_lines(catalog_text(&developer_texts, "exec"), "exec");
 
     assert_full_descriptions(&executor_lines, &EXECUTOR_CATALOG);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_turn_keeps_orchestrator_world_state_incremental_across_turns() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_sequence(
+        &server,
+        ["resp-1", "resp-2"]
+            .into_iter()
+            .map(|response_id| {
+                sse(vec![
+                    ev_response_created(response_id),
+                    ev_completed(response_id),
+                ])
+            })
+            .collect(),
+    )
+    .await;
+    let skill_name = "orchestrator-search";
+    let skill_description = "Search available company knowledge.";
+    let skill_resource = "skill://codex_apps/orchestrator-search/SKILL.md";
+    let catalog = SkillCatalog {
+        entries: vec![
+            SkillCatalogEntry::new(
+                SkillPackageId("orchestrator/orchestrator-search".to_string()),
+                SkillAuthority::new(SkillSourceKind::Orchestrator, CODEX_APPS_MCP_SERVER_NAME),
+                skill_name,
+                skill_description,
+                SkillResourceId::new(skill_resource),
+            )
+            .with_display_path(skill_resource),
+        ],
+        warnings: Vec::new(),
+    };
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    install_with_providers(
+        &mut extensions,
+        SkillProviders::new()
+            .with_orchestrator_provider(Arc::new(CatalogSkillProvider { catalog })),
+        |config: &Config| SkillsExtensionConfig {
+            include_instructions: config.include_skill_instructions,
+            bundled_skills_enabled: false,
+            orchestrator_skills_enabled: config.orchestrator_skills_enabled,
+            shadow_selection_enabled: false,
+        },
+    );
+    let mut builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| {
+            configure_catalog_test(config);
+            config.orchestrator_skills_enabled = true;
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let orchestrator_thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            environments: Some(Vec::new()),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?;
+
+    for prompt in [
+        "Inspect the available skills.",
+        "Inspect the available skills again.",
+    ] {
+        orchestrator_thread
+            .thread
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: prompt.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: Default::default(),
+            })
+            .await?;
+        core_test_support::wait_for_event(&orchestrator_thread.thread, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+    }
+
+    let requests = response.requests();
+    assert_eq!(requests.len(), 2);
+    let expected_line =
+        format!("- {skill_name}: {skill_description} (orchestrator resource: {skill_resource})");
+    for (index, request) in requests.iter().enumerate() {
+        let developer_texts = request.message_input_texts("developer");
+        let occurrences = developer_texts
+            .iter()
+            .map(|text| text.matches(&expected_line).count())
+            .sum::<usize>();
+        assert_eq!(
+            occurrences, 1,
+            "request {index} should contain the orchestrator catalog exactly once: {developer_texts:?}"
+        );
+    }
 
     Ok(())
 }
