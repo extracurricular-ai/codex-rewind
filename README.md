@@ -1,6 +1,6 @@
 # codex-rewind
 
-**English** · [简体中文](./README.zh-CN.md)
+**English** · [简体中文](https://github.com/extracurricular-ai/codex-rewind/blob/main/README.zh-CN.md)
 
 **An unofficial distribution of [OpenAI Codex CLI](https://github.com/openai/codex).**
 
@@ -9,7 +9,8 @@
 > applies here. This page only covers what this distribution adds.
 >
 > Not affiliated with, endorsed by, or supported by OpenAI. Apache-2.0, same as
-> upstream. Report problems here, not to OpenAI.
+> upstream. Report problems here, not to OpenAI — and take the version from npm, not
+> from `codexr --version`, which reports `0.0.0`. See [Reporting a bug](#reporting-a-bug).
 
 ---
 
@@ -46,9 +47,12 @@ codex           # the official one, if you have it
 ```
 
 Releases are versioned `<upstream>-rewind.<n>` — `0.147.0-rewind.1` is built from
-upstream `rust-v0.147.0`, so the baseline it carries is always visible. Being semver
-prereleases, they are also skipped by version *ranges*: a `^0.147.0` dependency will
-never resolve to one by accident.
+upstream `rust-v0.147.0`, so the baseline each release carries is visible in its
+version number. Being semver prereleases, they are also skipped by version *ranges*:
+a `^0.147.0` dependency will never resolve to one by accident.
+
+That number lives in the npm package only; the binary does not know it. See
+[Reporting a bug](#reporting-a-bug).
 
 ## Enable it
 
@@ -135,9 +139,22 @@ contents are stored once no matter how many turns or sessions share them. `/stat
 shows the size. Deleting a conversation deletes its snapshots with it, contents
 included.
 
+## Reporting a bug
+
+**`codexr --version` reports `0.0.0`, not the release you installed.** The version is
+stamped into the npm package, not into the binary — upstream stamps the binary during
+a release process this distribution does not run. Read it off npm instead:
+
+```shell
+npm ls -g codex-rewind
+```
+
+Include that in any bug report. Without it there is no way to tell which build you
+were running, because every release so far reports the same `0.0.0`.
+
 ## Contributing
 
-Sign your commits off (`git commit -s`); see [CONTRIBUTING.md](./CONTRIBUTING.md).
+Sign your commits off: `git commit -s`.
 
 > If a change here is ever proposed to openai/codex, its original author must sign
 > OpenAI's CLA personally. Maintainers cannot do it for you.

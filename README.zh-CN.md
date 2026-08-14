@@ -1,6 +1,6 @@
 # codex-rewind
 
-[English](./README.md) · **简体中文**
+[English](https://github.com/extracurricular-ai/codex-rewind/blob/main/README.md) · **简体中文**
 
 **[OpenAI Codex CLI](https://github.com/openai/codex) 的非官方发行版。**
 
@@ -9,7 +9,8 @@
 > 本页只讲这个发行版**多出来的东西**。
 >
 > 与 OpenAI 无隶属关系,未获其背书或支持。许可证与上游一致,均为 Apache-2.0。
-> 有问题请在本仓库反馈,不要提给 OpenAI。
+> 有问题请在本仓库反馈,不要提给 OpenAI —— 版本号请从 npm 取,不要用
+> `codexr --version`,它报的是 `0.0.0`。见[提交 bug 报告](#提交-bug-报告)。
 
 ---
 
@@ -43,8 +44,10 @@ codex           # 官方版(如果你装了)
 ```
 
 版本号格式是 `<上游版本>-rewind.<n>` —— `0.147.0-rewind.1` 表示它构建自上游
-`rust-v0.147.0`,基线永远看得见。它们在 semver 里属于 prerelease,所以**版本范围**会跳过
-它们:写 `^0.147.0` 的依赖永远不会误装到。
+`rust-v0.147.0`,每个版本的基线都写在版本号里。它们在 semver 里属于 prerelease,
+所以**版本范围**会跳过它们:写 `^0.147.0` 的依赖永远不会误装到。
+
+这个号码只存在于 npm 包里,二进制本身并不知道。见[提交 bug 报告](#提交-bug-报告)。
 
 ## 启用
 
@@ -119,9 +122,21 @@ CODEX_HOME=~/.codex-rewind codexr
 多少会话共享它。`/status` 会显示占用大小。**删除对话时会连同它的快照一起删除**,文件内容
 也一并清除。
 
+## 提交 bug 报告
+
+**`codexr --version` 报的是 `0.0.0`,不是你装的那个版本。** 版本号只打在 npm 包里,
+没有打进二进制 —— 上游是在它自己的发布流程里给二进制打版本号的,而这个发行版不跑那套流程。
+请改从 npm 读:
+
+```shell
+npm ls -g codex-rewind
+```
+
+提 bug 时请附上它。没有它就无从判断你跑的是哪个构建,因为目前每个版本报的都是同一个 `0.0.0`。
+
 ## 参与贡献
 
-提交请带签名(`git commit -s`),详见 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+提交请带签名:`git commit -s`。
 
 > 本仓库的改动若将来要提给 openai/codex,**原作者必须本人签署 OpenAI 的 CLA**,
 > 维护者无法代签。
