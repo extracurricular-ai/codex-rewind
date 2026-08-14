@@ -9,8 +9,8 @@
 > applies here. This page only covers what this distribution adds.
 >
 > Not affiliated with, endorsed by, or supported by OpenAI. Apache-2.0, same as
-> upstream. Report problems here, not to OpenAI — and take the version from npm, not
-> from `codexr --version`, which reports `0.0.0`. See [Reporting a bug](#reporting-a-bug).
+> upstream. Report problems here, not to OpenAI — and include the npm version, which
+> is the only one that names the release. See [Reporting a bug](#reporting-a-bug).
 
 ---
 
@@ -51,8 +51,8 @@ upstream `rust-v0.147.0`, so the baseline each release carries is visible in its
 version number. Being semver prereleases, they are also skipped by version *ranges*:
 a `^0.147.0` dependency will never resolve to one by accident.
 
-That number lives in the npm package only; the binary does not know it. See
-[Reporting a bug](#reporting-a-bug).
+The baseline half is what `codexr --version` reports. The `-rewind.<n>` half lives
+only in the npm package. See [Reporting a bug](#reporting-a-bug).
 
 ## Enable it
 
@@ -141,16 +141,19 @@ included.
 
 ## Reporting a bug
 
-**`codexr --version` reports `0.0.0`, not the release you installed.** The version is
-stamped into the npm package, not into the binary — upstream stamps the binary during
-a release process this distribution does not run. Read it off npm instead:
+**`codexr --version` reports the upstream baseline, not the release.** It says
+`0.147.0` where the release is `0.147.0-rewind.1`: the version compiled into the
+binary comes from the upstream workspace, and the `-rewind.<n>` suffix is added
+during npm packaging. Two releases on the same baseline report the same number.
+
+So take the release from npm:
 
 ```shell
 npm ls -g codex-rewind
 ```
 
-Include that in any bug report. Without it there is no way to tell which build you
-were running, because every release so far reports the same `0.0.0`.
+Include both in a bug report. The npm version identifies the release; `codexr
+--version` confirms which upstream it was built from.
 
 ## Contributing
 
