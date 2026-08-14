@@ -1,0 +1,119 @@
+name: release
+
+# Pushing a release tag builds all six platforms and publishes them to npm.
+#
+# The split from `build.yml` is the safety property, not tidiness. Verifying a
+# change by hand goes through `build.yml`, which has no path to npm at all — so
+# a build you started to answer "does this compile" can never become a release.
+# Tagging is the separate, deliberate act that says publish this.
+#
+# An npm version cannot be replaced once it exists. Push the tag when you mean
+# it, and rehearse with `dry_run` first if you are unsure.
+
+on:
+  push:
+    tags:
+      # Narrow on purpose: an unrelated tag should not start a six-platform
+      # matrix and put something on npm.
+      - "v*-rewind.*"
+
+  # Rehearsal, and the manual escape hatch if a tag build failed partway.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v0.147.0-rewind.0"
+        required: true
+      dry_run:
+        description: "Pack and validate against the registry without uploading."
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      targets: all
+      release_tag: ${{ inputs.tag || github.ref_name }}
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # A reusable workflow shares the calling run's artifact scope, so these
+      # are the tarballs the build job just uploaded.
+      - name: Collect the binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rebuild the vendor tree
+        shell: bash
+        run: |
+          mkdir -p vendor
+          find artifacts -name '*.tar.gz' -exec tar -xzf {} -C vendor \;
+          echo "vendor tree:"
+          find vendor -type f | sort
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          if [[ -z "$version" ]]; then
+            echo "::error::could not derive a version from tag '$TAG'" >&2
+            exit 1
+          fi
+
+          if [[ "$DRY_RUN" != "true" && -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "::error::NPM_TOKEN is not set. Add it under Settings → Secrets and" \
+                 "variables → Actions, or run this workflow by hand with dry_run on." >&2
+            exit 1
+          fi
+
+          publish() {  # <tarball> [dist-tag]
+            local tarball="$1" tag="${2:-}"
+            if [[ "$DRY_RUN" == "true" ]]; then
+              npm publish "$tarball" --dry-run ${tag:+--tag "$tag"}
+            else
+              npm publish "$tarball" ${tag:+--tag "$tag"}
+            fi
+          }
+
+          # All seven of these are the *same* npm package name, separated by a
+          # version suffix. The six platform builds are kept off `latest`,
+          # because `latest` is what a bare `npm install` follows — point it at
+          # one platform and every other platform installs a package with no
+          # binary it can run.
+          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
+            python3 codex-cli/scripts/build_npm_package.py \
+              --package "codex-$pkg" --version "$version" \
+              --vendor-src vendor --pack-output "/tmp/$pkg.tgz"
+            publish "/tmp/$pkg.tgz" "$pkg"
+          done
+
+          # The launcher last, and only once all six resolve: its
+          # optionalDependencies name them by exact version.
+          python3 codex-cli/scripts/build_npm_package.py \
+            --package codex --version "$version" --pack-output /tmp/launcher.tgz
+          publish /tmp/launcher.tgz
+
+          echo "published $version" >> "$GITHUB_STEP_SUMMARY"
