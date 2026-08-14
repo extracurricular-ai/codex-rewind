@@ -8,11 +8,11 @@ use codex_install_context::StandalonePlatform;
 /// Update action the CLI should perform after the TUI exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateAction {
-    /// Update via `npm install -g @openai/codex@latest`.
+    /// Update via `npm install -g codex-rewind@latest`.
     NpmGlobalLatest,
-    /// Update via `bun install -g @openai/codex@latest`.
+    /// Update via `bun install -g codex-rewind@latest`.
     BunGlobalLatest,
-    /// Update via `pnpm add -g @openai/codex@latest`.
+    /// Update via `pnpm add -g codex-rewind@latest`.
     PnpmGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
@@ -41,9 +41,13 @@ impl UpdateAction {
     /// Returns the list of command-line arguments for invoking the update.
     pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
-            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
-            UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
+            // This fork is distributed as the unscoped `codex-rewind` package, not
+            // upstream's `@openai/codex`. Leaving these pointed at upstream makes
+            // `codexr update` install a different vendor's CLI, never update this
+            // one, and still report success.
+            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "codex-rewind"]),
+            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "codex-rewind"]),
+            UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "codex-rewind"]),
             UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
             UpdateAction::StandaloneUnix => (
                 "sh",
