@@ -32,7 +32,7 @@ repositories at all.
 ## Install
 
 ```shell
-npm install -g codex-rewind@next
+npm install -g codex-rewind
 ```
 
 The command is **`codexr`**, not `codex`, so this installs alongside the official
@@ -44,9 +44,9 @@ codex           # the official one, if you have it
 ```
 
 Releases are versioned `<upstream>-rewind.<n>` — `0.147.0-rewind.1` is built from
-upstream `rust-v0.147.0`. They are semver prereleases, so a plain
-`npm install codex-rewind` will not pick one up by accident; ask for `@next` or name
-the version.
+upstream `rust-v0.147.0`, so the baseline it carries is always visible. Being semver
+prereleases, they are also skipped by version *ranges*: a `^0.147.0` dependency will
+never resolve to one by accident.
 
 ## Enable it
 
