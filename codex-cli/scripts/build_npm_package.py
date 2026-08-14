@@ -230,6 +230,14 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
     package_json: dict
     package_json_path: Path | None = None
 
+    # Apache-2.0 §4(a) requires a copy of the licence in every redistribution and
+    # §4(d) the NOTICE attributions. This applies to the platform packages as much
+    # as the launcher: they carry a binary compiled from the licensed source.
+    for legal_file in ("LICENSE", "NOTICE"):
+        legal_src = REPO_ROOT / legal_file
+        if legal_src.exists():
+            shutil.copy2(legal_src, staging_dir / legal_file)
+
     if package == "codex":
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
@@ -258,7 +266,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
             "license": codex_package_json.get("license", "Apache-2.0"),
             "os": [platform_package["os"]],
             "cpu": [platform_package["cpu"]],
-            "files": ["vendor"],
+            "files": ["vendor", "LICENSE", "NOTICE"],
             "repository": codex_package_json.get("repository"),
         }
 
@@ -292,7 +300,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         package_json["version"] = version
 
     if package == "codex":
-        package_json["files"] = ["bin/codex.js"]
+        package_json["files"] = ["bin/codex.js", "LICENSE", "NOTICE"]
         package_json["optionalDependencies"] = {
             CODEX_PLATFORM_PACKAGES[platform_package]["npm_name"]: (
                 f"npm:{CODEX_NPM_NAME}@"
@@ -344,10 +352,6 @@ def stage_codex_sdk_sources(staging_dir: Path) -> None:
     readme_src = package_root / "README.md"
     if readme_src.exists():
         shutil.copy2(readme_src, staging_dir / "README.md")
-
-    license_src = REPO_ROOT / "LICENSE"
-    if license_src.exists():
-        shutil.copy2(license_src, staging_dir / "LICENSE")
 
 
 def copy_native_binaries(
