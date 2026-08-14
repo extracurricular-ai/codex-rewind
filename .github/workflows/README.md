@@ -87,6 +87,52 @@ python3 codex-cli/scripts/build_npm_package.py --package codex-linux-arm64 \
   --version 0.147.0-rewind.0 --vendor-src vendor --pack-output out.tgz
 ```
 
+## Publishing to npm
+
+Publishing is never automatic — not even on a tag. An npm version cannot be
+replaced once it exists, so it stays a separate, deliberate run made *after*
+looking at what the tag built.
+
+*Actions → build → Run workflow*, with:
+
+    targets      = all          (required — see below)
+    release_tag  = v0.147.0-rewind.0
+    publish      = checked
+    dry_run      = checked      (leave on for the first attempt)
+
+A dry run packs all seven tarballs and validates them against the registry
+without uploading. Re-run with `dry_run` off to publish for real.
+
+`targets` must be `all`. The launcher names each platform build by exact
+version in its `optionalDependencies`, so publishing a partial set ships a
+package that cannot install anywhere it did not build — and no version can be
+replaced to fix it.
+
+### What actually gets published
+
+Seven versions of **one** package, `codex-rewind`:
+
+| version | dist-tag |
+| --- | --- |
+| `0.147.0-rewind.0-linux-x64`, and five more like it | `linux-x64`, … |
+| `0.147.0-rewind.0` — the launcher | `latest` |
+
+The platform builds are deliberately kept off `latest`. That tag is what a bare
+`npm install` follows, so pointing it at a platform build would hand every
+other platform a package with no binary it can run. The launcher is published
+last, and only once all six resolve.
+
+### Auth
+
+Set `NPM_TOKEN` under *Settings → Secrets and variables → Actions* — a granular
+access token with publish rights is enough.
+
+Once the package exists you can drop the token and switch to trusted publishing
+(OIDC) on its npm settings page, which also attaches provenance showing which
+commit and workflow produced each version. It cannot be set up beforehand: the
+package has to exist to have a settings page, which is why a first publish is
+always token-based.
+
 ## Attaching them to a release
 
 Both routes attach to a release, and both create it **as a draft** — a matrix

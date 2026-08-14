@@ -1,18 +1,18 @@
 name: build
 
-# The only workflow in this repository. Actions minutes are limited here, so it
-# runs when asked and not on every push, and it builds exactly the targets you
-# name rather than all six by default.
+# Builds the release binaries, and optionally publishes them to npm.
 #
-# Runner cost is not uniform: GitHub bills Linux at 1x, Windows at 2x and macOS
-# at 10x. Building all six targets therefore costs roughly 25 Linux-minutes per
-# minute of wall clock. Pick what you need.
+# It never runs on a branch push or a pull request — verification lives in
+# blocking-ci, and a build here is something you ask for. Selecting a subset of
+# platforms is about wall-clock time rather than cost: a cold release build of
+# this workspace is 1,386 crates with full optimisation.
 
 on:
-  # Pushing a release tag builds everything and attaches it to that tag.
-  # Tags are pushed rarely and deliberately, so this costs quota exactly when a
-  # release is wanted and never otherwise. The pattern is narrow so a stray tag
-  # cannot start a six-platform matrix by accident.
+  # A release tag builds all six platforms and attaches them to that tag's
+  # release. It does *not* publish to npm: a version cannot be republished, so
+  # that step stays an explicit, separately-triggered decision made after
+  # looking at what was built. The pattern is narrow so a stray tag cannot
+  # start a six-platform matrix by accident.
   push:
     tags:
       - "v*-rewind.*"
@@ -28,6 +28,16 @@ on:
         description: "Attach the binaries to this release tag (created as a draft if absent). Leave blank to only keep them as run artifacts."
         required: false
         default: ""
+      publish:
+        description: "Publish to npm. Requires all six platforms, so it is ignored unless targets=all."
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: "With publish: pack and validate, but do not upload to npm."
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: write
@@ -39,6 +49,9 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       release_tag: ${{ steps.plan.outputs.release_tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+      dry_run: ${{ steps.plan.outputs.dry_run }}
+      version: ${{ steps.plan.outputs.version }}
     steps:
       - id: plan
         shell: python
@@ -49,6 +62,8 @@ jobs:
           EVENT: ${{ github.event_name }}
           RAW_TARGETS: ${{ inputs.targets }}
           RAW_TAG: ${{ inputs.release_tag }}
+          RAW_PUBLISH: ${{ inputs.publish }}
+          RAW_DRY_RUN: ${{ inputs.dry_run }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           import json, os
@@ -79,12 +94,29 @@ jobs:
           if not names:
               raise SystemExit("no targets selected")
 
+          # Publishing needs all six: the launcher's optionalDependencies name
+          # every platform by exact version, so a partial set ships a package
+          # that cannot install anywhere it did not build. And npm will not let
+          # a version be replaced, so the fix would be a version bump.
+          publish = (not on_tag) and os.environ.get("RAW_PUBLISH") == "true"
+          if publish and set(names) != set(ALL):
+              raise SystemExit("publish needs targets=all — a partial set would ship a broken launcher")
+
+          version = tag[1:] if tag.startswith("v") else tag
+          if publish and not version:
+              raise SystemExit("publish needs release_tag — that is where the npm version comes from")
+
           include = [{"name": n, **ALL[n]} for n in names]
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"matrix={json.dumps({'include': include})}\n")
               fh.write(f"release_tag={tag}\n")
+              fh.write(f"publish={str(publish).lower()}\n")
+              fh.write(f"dry_run={os.environ.get('RAW_DRY_RUN', 'true')}\n")
+              fh.write(f"version={version}\n")
           print(f"building: {', '.join(names)}")
           print(f"release tag: {tag or '(artifacts only)'}")
+          if publish:
+              print(f"publishing {version}, dry_run={os.environ.get('RAW_DRY_RUN', 'true')}")
 
   build:
     name: ${{ matrix.name }}
@@ -128,10 +160,14 @@ jobs:
 
       # Laid out as the npm packaging script expects to find it, so the tarball
       # step can point `--vendor-src` straight at the downloaded artifacts.
+      # `vendor/<triple>/bin/codexr` is not an arbitrary layout: it is where
+      # `bin/codex.js` looks, and `--vendor-src` copies these directories
+      # through verbatim. Staging it flat here would produce a package that
+      # installs cleanly and then cannot find its own binary.
       - name: Stage
         shell: bash
         run: |
-          dest="vendor/${{ matrix.triple }}"
+          dest="vendor/${{ matrix.triple }}/bin"
           mkdir -p "$dest"
           if [[ "${{ matrix.name }}" == win32-* ]]; then
             cp "codex-rs/target/${{ matrix.triple }}/release/codexr.exe" "$dest/"
@@ -162,3 +198,79 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --draft --title "$TAG" --notes "Built by the build workflow."
           gh release upload "$TAG" "codexr-$TRIPLE.tar.gz" --clobber
+
+  publish:
+    name: Publish to npm
+    needs: [plan, build]
+    # `needs` already fails this job if any platform failed. The condition adds
+    # the other half: publishing a partial set would leave the launcher pointing
+    # at versions that do not exist, and npm has no clean way back.
+    if: |
+      needs.plan.outputs.publish == 'true' &&
+      !failure() && !cancelled()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Collect the binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rebuild the vendor tree
+        shell: bash
+        run: |
+          mkdir -p vendor
+          find artifacts -name '*.tar.gz' -exec tar -xzf {} -C vendor \;
+          echo "vendor tree:"
+          find vendor -type f | sort
+
+      # Every one of these publishes the *same* npm package name. The six
+      # platform builds are distinguished by a version suffix and kept off the
+      # `latest` tag, because `latest` is what a bare `npm install` follows —
+      # point it at a platform build and every other platform installs a
+      # package with no binary it can run. The launcher goes last and takes
+      # `latest`, since its optionalDependencies name the six by exact version.
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          DRY_RUN: ${{ needs.plan.outputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$DRY_RUN" != "true" && -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "::error::NPM_TOKEN is not set. Add it under Settings → Secrets → Actions," \
+                 "or run with dry_run enabled." >&2
+            exit 1
+          fi
+
+          publish() {  # <staged tarball> [dist-tag]
+            local tarball="$1" tag="${2:-}"
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "would publish: $tarball ${tag:+--tag $tag}"
+              npm publish "$tarball" --dry-run ${tag:+--tag "$tag"}
+            else
+              npm publish "$tarball" ${tag:+--tag "$tag"}
+            fi
+          }
+
+          for pkg in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
+            python3 codex-cli/scripts/build_npm_package.py \
+              --package "codex-$pkg" --version "$VERSION" \
+              --vendor-src vendor --pack-output "/tmp/$pkg.tgz"
+            publish "/tmp/$pkg.tgz" "$pkg"
+          done
+
+          # Last, and only once all six resolve.
+          python3 codex-cli/scripts/build_npm_package.py \
+            --package codex --version "$VERSION" --pack-output /tmp/launcher.tgz
+          publish /tmp/launcher.tgz
