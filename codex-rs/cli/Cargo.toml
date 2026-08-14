@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 build = "build.rs"
-default-run = "codex"
+default-run = "codexr"
 
 [[bin]]
-name = "codex"
+name = "codexr"
 path = "src/main.rs"
 
 [[bin]]

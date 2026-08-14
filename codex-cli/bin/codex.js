@@ -14,12 +14,12 @@ const require = createRequire(import.meta.url);
 const codexPackageRoot = realpathSync(path.join(__dirname, ".."));
 
 const PLATFORM_PACKAGE_BY_TARGET = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+  "x86_64-unknown-linux-musl": "codex-rewind-linux-x64",
+  "aarch64-unknown-linux-musl": "codex-rewind-linux-arm64",
+  "x86_64-apple-darwin": "codex-rewind-darwin-x64",
+  "aarch64-apple-darwin": "codex-rewind-darwin-arm64",
+  "x86_64-pc-windows-msvc": "codex-rewind-win32-x64",
+  "aarch64-pc-windows-msvc": "codex-rewind-win32-arm64",
 };
 
 const { platform, arch } = process;
@@ -98,10 +98,10 @@ function findCodexExecutable() {
   const packageManager = detectPackageManager();
   const updateCommand =
     packageManager === "bun"
-      ? "bun install -g @openai/codex@latest"
+      ? "bun install -g codex-rewind@latest"
       : packageManager === "pnpm"
-        ? "pnpm add -g @openai/codex@latest"
-        : "npm install -g @openai/codex@latest";
+        ? "pnpm add -g codex-rewind@latest"
+        : "npm install -g codex-rewind@latest";
   throw new Error(
     `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
   );

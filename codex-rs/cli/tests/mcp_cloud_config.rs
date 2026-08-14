@@ -118,7 +118,7 @@ impl CloudManagedMcpFixture {
     }
 
     fn command(&self, args: &[&str]) -> Result<Command> {
-        let mut command = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+        let mut command = Command::new(codex_utils_cargo_bin::cargo_bin("codexr")?);
         command
             .kill_on_drop(true)
             .current_dir(self.codex_home.path())

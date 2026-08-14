@@ -747,7 +747,7 @@ async fn wait_for_selected_mcp_server(
 }
 
 async fn spawn_exec_server(codex_home: &std::path::Path, url: &str) -> Result<Child> {
-    let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+    let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codexr")?)
         .args(["exec-server", "--listen", url])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

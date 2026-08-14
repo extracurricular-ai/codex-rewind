@@ -1,81 +1,146 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# codex-rewind
+
+**An unofficial distribution of [OpenAI Codex CLI](https://github.com/openai/codex).**
+
+> For what Codex CLI is, how to sign in, and how to use it, read
+> **[the official README](https://github.com/openai/codex#readme)**. Everything there
+> applies here. This page only covers what this distribution adds.
+>
+> Not affiliated with, endorsed by, or supported by OpenAI. Apache-2.0, same as
+> upstream. Report problems here, not to OpenAI.
 
 ---
 
-## Quickstart
+## What this adds: rewind
 
-### Installing and running Codex CLI
+Upstream Codex can take you back to an earlier point in a **conversation**. It cannot
+take your **files** back with it — so the model ends up reasoning from a conversation
+that predates the code sitting on disk.
 
-Run the following on Mac or Linux to install Codex CLI:
+This distribution adds the missing half. `/rewind` restores the workspace to how it
+looked at the prompt you pick, and `/redo` puts it back if you change your mind.
+
+```
+/rewind     pick a prompt; the conversation and the files both return to it
+/redo       undo that
+```
+
+No git required, and it never touches your git state — no commits, no stashes, no
+index writes, nothing inside `.git`. It works in directories that are not
+repositories at all.
+
+## Install
 
 ```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+npm install -g codex-rewind@next
 ```
 
-Run the following on Windows to install Codex CLI:
+The command is **`codexr`**, not `codex`, so this installs alongside the official
+build rather than replacing it.
 
 ```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
+codexr          # this distribution
+codex           # the official one, if you have it
 ```
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+Releases are versioned `<upstream>-rewind.<n>` — `0.147.0-rewind.1` is built from
+upstream `rust-v0.147.0`. They are semver prereleases, so a plain
+`npm install codex-rewind` will not pick one up by accident; ask for `@next` or name
+the version.
+
+## Enable it
+
+Rewind is off by default. Turn it on in `/experimental`, or:
+
+```toml
+# ~/.codex/config.toml
+[features]
+file_snapshots = true
+```
+
+It binds **per session**: enabling affects new sessions only, and disabling never
+stops a session that is already tracking. So a session either has snapshots for its
+whole life or has none — there is no half-tracked state to reason about.
+
+## ⚠️ Sharing `~/.codex` with the official build
+
+This distribution deliberately uses the **same** `~/.codex` directory as official
+Codex, so your login, config, and conversation history carry over and you do not
+have to sign in twice.
+
+The cost is worth understanding:
+
+- **Opening a rewind-tracked session with the official `codex` breaks tracking for
+  it.** The official build knows nothing about snapshots. It will happily continue
+  the conversation, and every turn it runs is a turn with no checkpoint behind it —
+  so a later `/rewind` in `codexr` can restore the workspace only as far as the last
+  turn *this* build saw. There is no error and no warning; the gap is silent.
+- Conversations started in the official build have no snapshots at all. `/rewind`
+  there falls back to conversation-only, exactly as upstream behaves.
+- The official build logs `unknown feature key in config: file_snapshots` and
+  ignores the `[file_snapshots]` section. Harmless, but you will see it.
+
+**If you use both, finish a conversation in the build you started it in.** If you
+would rather keep them fully apart, point this one somewhere else:
 
 ```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
+CODEX_HOME=~/.codex-rewind codexr
 ```
 
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
+You will sign in again in that directory, and the two builds will then share
+nothing.
 
-Codex CLI can also be installed via the following package managers:
+## What gets tracked
 
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
+Three sources, unioned, each bounded by something other than the size of your
+directory tree — so the cost does not grow with how long you have been building in
+a repository:
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+| | |
+| --- | --- |
+| **Files git tracks** | read from the index. No cap: what your project committed is your project's, however much of it there is. |
+| **Files the agent edits** | captured from the edit tool, wherever they live — including outside the working directory. No cap. |
+| **Recently modified files** | the residue, for shell-made changes to everything else. Capped at 100 files, 16 MB each, skipping `node_modules`, `target`, `Pods` and the like. |
 
-Then simply run `codex` to get started.
+Hidden files are left alone by default — `.env`, `.vscode/`, virtualenvs and caches
+are tool state, not your work, and rolling them back with a turn would be a nasty
+surprise. `.git` is never read. Files the agent explicitly edits are tracked even if
+hidden, because those *are* your work.
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+To exclude more, add a `.codexsnapignore` (gitignore syntax). It is deliberately
+separate from `.gitignore`: an ignored path is never snapshotted, never restored,
+and **never deleted** by a restore.
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+## What it will not do
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+- **Restore a file no snapshot ever saw.** Deleting needs positive evidence that the
+  file was absent — a capture that looked and did not find it. Nothing is inferred
+  from a path merely being missing, because guessing wrong destroys work that was
+  never the agent's to remove.
+- **Restore work from before it knew a file existed.** Files outside the working
+  directory enter tracking when the agent first touches them, so a prompt from before
+  that moment has no copy to give back. Rewinding there says so, and tells you to
+  pick a more recent prompt.
+- **Merge concurrent sessions.** Two sessions in one directory can overwrite each
+  other's files. `/redo` warns and names the files before it does, but it does not
+  merge. Use a worktree or a separate checkout.
+- **Work on remote environments.** Local only.
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+## Disk use
 
-</details>
+Snapshots live in `~/.codex/file_snapshots/`, content-addressed, so identical file
+contents are stored once no matter how many turns or sessions share them. `/status`
+shows the size. Deleting a conversation deletes its snapshots with it, contents
+included.
 
-### Using Codex with your ChatGPT plan
+## Contributing
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
+Sign your commits off (`git commit -s`); see [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+> If a change here is ever proposed to openai/codex, its original author must sign
+> OpenAI's CLA personally. Maintainers cannot do it for you.
 
-## Docs
+## Licence
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+Apache-2.0, inherited from upstream, with the `NOTICE` file intact and changes
+stated as §4 requires. No OpenAI trademark or endorsement is claimed.

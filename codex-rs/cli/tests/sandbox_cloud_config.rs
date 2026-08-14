@@ -98,7 +98,7 @@ async fn sandbox_fetches_and_enforces_cloud_managed_permission_profile() -> Resu
         .mount(&server)
         .await;
 
-    let codex = codex_utils_cargo_bin::cargo_bin("codex")?;
+    let codex = codex_utils_cargo_bin::cargo_bin("codexr")?;
     let chatgpt_base_url_override = format!("chatgpt_base_url=\"{chatgpt_base_url}\"");
     let output = Command::new(&codex)
         .current_dir(codex_home.path())

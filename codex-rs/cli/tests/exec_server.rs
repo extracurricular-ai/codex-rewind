@@ -47,7 +47,7 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
-    let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+    let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codexr")?);
     cmd.env("CODEX_HOME", codex_home);
     Ok(cmd)
 }
@@ -175,7 +175,7 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{collector_url}/v1/metrics", pr
 "#
         ),
     )?;
-    let mut command = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+    let mut command = tokio::process::Command::new(codex_utils_cargo_bin::cargo_bin("codexr")?);
     command
         .env("CODEX_HOME", codex_home.path())
         .env("CODEX_API_KEY", "test-api-key")
@@ -395,7 +395,7 @@ metrics_exporter = {{ otlp-http = {{ endpoint = "{base_url}/v1/metrics", protoco
     let argv = vec!["ping.exe", "-n", "61", "127.0.0.1"];
     #[cfg(not(windows))]
     let argv = vec!["/bin/sleep", "60"];
-    let codex_bin = codex_utils_cargo_bin::cargo_bin("codex")?;
+    let codex_bin = codex_utils_cargo_bin::cargo_bin("codexr")?;
     let codex_home = codex_home.path().to_path_buf();
     let subprocess = async move {
         let mut command = tokio::process::Command::new(codex_bin);
@@ -529,7 +529,7 @@ async fn send_json_line(
 #[test]
 fn local_exec_server_exits_successfully_on_sigterm() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let mut child = std::process::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+    let mut child = std::process::Command::new(codex_utils_cargo_bin::cargo_bin("codexr")?)
         .env("CODEX_HOME", codex_home.path())
         .args(["exec-server", "--listen", "ws://127.0.0.1:0"])
         .stdout(Stdio::piped())

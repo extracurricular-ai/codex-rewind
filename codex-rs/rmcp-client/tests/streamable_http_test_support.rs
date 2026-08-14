@@ -335,7 +335,7 @@ impl Drop for ExecServerProcess {
 /// Starts a local exec-server and connects an initialized `ExecServerClient`.
 pub(crate) async fn spawn_exec_server() -> anyhow::Result<ExecServerProcess> {
     let codex_home = TempDir::new()?;
-    let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
+    let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codexr")?)
         .args(["exec-server", "--listen", "ws://127.0.0.1:0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
