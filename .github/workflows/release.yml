@@ -112,8 +112,14 @@ jobs:
 
           # The launcher last, and only once all six resolve: its
           # optionalDependencies name them by exact version.
+          #
+          # `latest` is spelled out rather than left to default. Every version
+          # this workflow publishes is a semver prerelease — `-rewind.<n>` — and
+          # npm refuses to publish one without an explicit `--tag`, so omitting
+          # it fails here, at the seventh of seven publishes, with the six
+          # platform packages already public and the version already spent.
           python3 codex-cli/scripts/build_npm_package.py \
             --package codex --version "$version" --pack-output /tmp/launcher.tgz
-          publish /tmp/launcher.tgz
+          publish /tmp/launcher.tgz latest
 
           echo "published $version" >> "$GITHUB_STEP_SUMMARY"
