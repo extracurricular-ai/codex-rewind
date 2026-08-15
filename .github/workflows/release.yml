@@ -9,6 +9,11 @@ name: release
 #
 # An npm version cannot be replaced once it exists. Push the tag when you mean
 # it, and rehearse with `dry_run` first if you are unsure.
+#
+# There is no npm token here. The registry authenticates this workflow through
+# OIDC — the trusted publisher registered against the `codex-rewind` package
+# names this repository and this filename, so only this file, in this
+# repository, can publish. Renaming it revokes that.
 
 on:
   push:
@@ -43,15 +48,30 @@ jobs:
     name: Publish to npm
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      # npm trusted publishing: the registry authenticates this job by the OIDC
+      # token GitHub mints for it, so there is no npm token in this repository.
+      # The trusted publisher registered on npmjs.com names this workflow file by
+      # name — moving the publish step into another workflow breaks the claim.
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      # Deliberately no `registry-url`. It writes an .npmrc line reading
+      # `_authToken=${NODE_AUTH_TOKEN}`, and with no token set that resolves to
+      # an empty credential which npm sends and the registry rejects — instead
+      # of npm noticing the OIDC environment and using it. registry.npmjs.org is
+      # the default anyway.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+
+      # Node 22 ships npm 10.x; trusted publishing needs 11.5.1 or later.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
 
       # A reusable workflow shares the calling run's artifact scope, so these
       # are the tarballs the build job just uploaded.
@@ -70,7 +90,6 @@ jobs:
 
       - name: Publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         shell: bash
@@ -83,11 +102,7 @@ jobs:
             exit 1
           fi
 
-          if [[ "$DRY_RUN" != "true" && -z "${NODE_AUTH_TOKEN:-}" ]]; then
-            echo "::error::NPM_TOKEN is not set. Add it under Settings → Secrets and" \
-                 "variables → Actions, or run this workflow by hand with dry_run on." >&2
-            exit 1
-          fi
+          npm --version  # must be >= 11.5.1 for trusted publishing
 
           publish() {  # <tarball> [dist-tag]
             local tarball="$1" tag="${2:-}"
