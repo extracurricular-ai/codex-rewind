@@ -52,7 +52,13 @@ codex           # 官方版(如果你装了)
 
 ## 启用
 
-rewind 默认关闭。在 `/experimental` 里打开,或者:
+rewind 默认关闭。想先试一次、不改任何文件:
+
+```shell
+codexr --enable file_snapshots
+```
+
+想长期开着,在 `/experimental` 里打开,或者:
 
 ```toml
 # ~/.codex/config.toml

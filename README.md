@@ -56,7 +56,13 @@ only in the npm package. See [Reporting a bug](#reporting-a-bug).
 
 ## Enable it
 
-Rewind is off by default. Turn it on in `/experimental`, or:
+Rewind is off by default. To try it on a single run, without changing any file:
+
+```shell
+codexr --enable file_snapshots
+```
+
+To keep it on, turn it on in `/experimental`, or:
 
 ```toml
 # ~/.codex/config.toml
