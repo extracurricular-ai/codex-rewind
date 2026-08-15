@@ -70,8 +70,14 @@ jobs:
           node-version: 22
 
       # Node 22 ships npm 10.x; trusted publishing needs 11.5.1 or later.
+      #
+      # Pinned to a major rather than `@latest`, which floats: it picked up npm
+      # 12 the first time this ran, and npm 12 changed `npm pack --json` from a
+      # list to an object keyed by package name. The packaging script reads both
+      # now, but a release should not be the thing that discovers what the npm
+      # registry published this morning.
       - name: Upgrade npm
-        run: npm install -g npm@latest
+        run: npm install -g "npm@^11.5.1"
 
       # A reusable workflow shares the calling run's artifact scope, so these
       # are the tarballs the build job just uploaded.

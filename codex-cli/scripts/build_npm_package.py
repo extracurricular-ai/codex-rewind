@@ -438,7 +438,17 @@ def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
         if not pack_output:
             raise RuntimeError("npm pack did not produce an output tarball.")
 
-        tarball_name = pack_output[0].get("filename") or pack_output[0].get("name")
+        # npm 12 changed the shape of `npm pack --json`: up to npm 11 it is a
+        # list of entries, from npm 12 it is an object keyed by package name.
+        # Read both, so the packaging does not break the next time the runner's
+        # npm crosses a major version.
+        if isinstance(pack_output, dict):
+            entries = list(pack_output.values())
+        else:
+            entries = pack_output
+
+        first = entries[0]
+        tarball_name = first.get("filename") or first.get("name")
         if not tarball_name:
             raise RuntimeError("Unable to determine npm pack output filename.")
 
