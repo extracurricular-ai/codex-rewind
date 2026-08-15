@@ -87,7 +87,12 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # A cold build is 1,386 crates at full optimisation, and any change to
+    # Cargo.lock — an upstream merge, say — invalidates the dependency cache and
+    # makes the next run cold again. 90 minutes was not enough for darwin-x64
+    # after merging rust-v0.147.0, and a timed-out job never reaches the cache's
+    # save step, so a too-tight limit makes every subsequent run cold as well.
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,8 +121,17 @@ jobs:
           workspaces: codex-rs
           key: ${{ matrix.triple }}
 
+      # No debug info. The workspace release profile asks for
+      # `debug = "line-tables-only"` with `split-debuginfo = "off"`, which puts
+      # it inside the binary — and the Stage step below strips it straight back
+      # out. Generating and linking it is work whose only result is thrown away,
+      # and `split-debuginfo = "off"` makes it the linker's problem on every
+      # platform. Overridden here rather than in the profile so a local
+      # `cargo build --release` still produces something debuggable.
       - name: Build
         working-directory: codex-rs
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
         run: cargo build --release --bin codexr --target ${{ matrix.triple }}
 
       # Laid out as the npm packaging script expects to find it, so the tarball
@@ -147,11 +161,15 @@ jobs:
             # upstream's release workflows, which this repository does not
             # have, so the stripping has to happen here instead.
             #
-            # It matters most on Linux, where `split-debuginfo = "off"` puts
-            # the debug info inside the ELF: unstripped Linux tarballs came out
-            # at 290 MB against 90 MB for macOS, whose symbols go to a separate
-            # .dSYM that is never copied. That difference is what an npm
-            # install would have to download.
+            # This used to be where the debug info went: with the profile's
+            # `split-debuginfo = "off"` it lands inside the ELF, and unstripped
+            # Linux tarballs came out at 290 MB against 90 MB for macOS, whose
+            # symbols go to a separate .dSYM that is never copied. The build
+            # step above now turns debug info off outright, so most of that is
+            # never generated. What is left here is the symbol table, which
+            # `strip` still removes and which nothing needs in a published
+            # tarball — and the numbers below say how much, whatever the build
+            # settings happen to be.
             before=$(stat -c%s "$dest/codexr" 2>/dev/null || stat -f%z "$dest/codexr")
             strip "$dest/codexr"
             after=$(stat -c%s "$dest/codexr" 2>/dev/null || stat -f%z "$dest/codexr")
