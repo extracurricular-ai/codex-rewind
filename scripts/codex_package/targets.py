@@ -53,6 +53,15 @@ PACKAGE_VARIANTS: dict[str, PackageVariant] = {
         cargo_bin="codex",
         executable_stem="codex",
     ),
+    # This fork ships its entrypoint as `codexr` so it can be installed
+    # alongside upstream's `codex` (see `codex-rs/cli/Cargo.toml`). Without a
+    # variant of its own the builder would look for a `codex` bin target that
+    # no longer exists here.
+    "codexr": PackageVariant(
+        name="codexr",
+        cargo_bin="codexr",
+        executable_stem="codexr",
+    ),
     "codex-app-server": PackageVariant(
         name="codex-app-server",
         cargo_bin="codex-app-server",

@@ -92,7 +92,22 @@ jobs:
     # makes the next run cold again. 90 minutes was not enough for darwin-x64
     # after merging rust-v0.147.0, and a timed-out job never reaches the cache's
     # save step, so a too-tight limit makes every subsequent run cold as well.
-    timeout-minutes: 200
+    # Raised from 200 when packaging started building the rest of the package's
+    # binaries (`codex-code-mode-host`, and `bwrap` or the two Windows helpers).
+    timeout-minutes: 260
+    # Job-level rather than step-level because both cargo invocations below —
+    # the entrypoint build, and the one the package builder runs — must agree.
+    # `CARGO_PROFILE_*` is part of the fingerprint, so a step that sets it and a
+    # step that does not would rebuild all 1,386 crates against each other.
+    env:
+      # No debug info. The workspace release profile asks for
+      # `debug = "line-tables-only"` with `split-debuginfo = "off"`, which puts
+      # it inside the binary — and the Stage step below strips it straight back
+      # out. Generating and linking it is work whose only result is thrown away,
+      # and `split-debuginfo = "off"` makes it the linker's problem on every
+      # platform. Overridden here rather than in the profile so a local
+      # `cargo build --release` still produces something debuggable.
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,72 +127,114 @@ jobs:
 
       # The Linux packages target musl so the binary runs on any distribution
       # without a glibc version to match.
+      #
+      # `libcap-dev` is for `bwrap`, which the packaging step below builds:
+      # `codex-rs/bwrap/build.rs` probes libcap through pkg-config and panics
+      # without it. The host's headers are correct even for the musl targets —
+      # that build script passes them as `-idirafter` precisely so the target
+      # sysroot wins during a musl cross build.
       - name: Install musl tooling
         if: startsWith(matrix.name, 'linux')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools libcap-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
           key: ${{ matrix.triple }}
 
-      # No debug info. The workspace release profile asks for
-      # `debug = "line-tables-only"` with `split-debuginfo = "off"`, which puts
-      # it inside the binary — and the Stage step below strips it straight back
-      # out. Generating and linking it is work whose only result is thrown away,
-      # and `split-debuginfo = "off"` makes it the linker's problem on every
-      # platform. Overridden here rather than in the profile so a local
-      # `cargo build --release` still produces something debuggable.
+      # Only the entrypoint. The Stage step builds the rest of the package's
+      # binaries, because it is the thing that knows what a package contains.
+      # (`CARGO_PROFILE_RELEASE_DEBUG` is set on the job so both agree.)
       - name: Build
         working-directory: codex-rs
-        env:
-          CARGO_PROFILE_RELEASE_DEBUG: "false"
         run: cargo build --release --bin codexr --target ${{ matrix.triple }}
 
-      # Laid out as the npm packaging script expects to find it, so the tarball
-      # step can point `--vendor-src` straight at the downloaded artifacts.
-      # `vendor/<triple>/bin/codexr` is not an arbitrary layout: it is where
-      # `bin/codex.js` looks, and `--vendor-src` copies these directories
-      # through verbatim. Staging it flat here would produce a package that
-      # installs cleanly and then cannot find its own binary.
+      # A Codex package is more than the entrypoint. `codex-code-mode-host` sits
+      # beside it in `bin/`, and `codex-resources/` and `codex-path/` hold the
+      # bundled bwrap, the patched zsh, and ripgrep. Shipping only `bin/codexr`
+      # is what 0.147.0-rewind.1 did, and it left code mode unavailable and
+      # `codexr doctor` reporting that ripgrep could not be found.
+      #
+      # `scripts/build_codex_package.py` is upstream's own builder for that
+      # layout: it source-builds the helper binaries, fetches ripgrep and zsh
+      # through the verified DotSlash manifests in `scripts/codex_package/`,
+      # and writes the `codex-package.json` that `codex-rs/install-context`
+      # requires before it will look in `codex-resources/` or `codex-path/` at
+      # all. Copying those directories without that file would ship dead
+      # weight. Using the builder rather than hand-copying here is also what
+      # keeps this workflow correct when upstream adds a new package artifact.
+      #
+      # The package root doubles as the npm vendor layout: `vendor/<triple>/`
+      # with the entrypoint at `bin/codexr` is where `bin/codex.js` looks, and
+      # `build_npm_package.py` copies each `vendor/<triple>` tree through
+      # verbatim.
       - name: Stage
         shell: bash
         run: |
           set -euo pipefail
-          dest="vendor/${{ matrix.triple }}/bin"
-          mkdir -p "$dest"
+          triple="${{ matrix.triple }}"
+          release_dir="codex-rs/target/$triple/release"
 
+          # Staged out of the Cargo target directory before stripping, because
+          # `Swatinem/rust-cache` saves that directory: stripping in place would
+          # put a binary into the cache that Cargo still considers fresh.
+          mkdir -p staging
           if [[ "${{ matrix.name }}" == win32-* ]]; then
             # Windows keeps its debug info in a separate .pdb, so the .exe is
             # already lean and there is nothing to strip.
-            cp "codex-rs/target/${{ matrix.triple }}/release/codexr.exe" "$dest/"
+            entrypoint="staging/codexr.exe"
+            cp "$release_dir/codexr.exe" "$entrypoint"
           else
-            cp "codex-rs/target/${{ matrix.triple }}/release/codexr" "$dest/"
-            chmod +x "$dest/codexr"
+            entrypoint="staging/codexr"
+            cp "$release_dir/codexr" "$entrypoint"
+            chmod +x "$entrypoint"
 
             # The workspace release profile keeps symbols on purpose —
             # `strip = false`, with a comment saying packaging archives the
             # sidecar symbols and strips afterwards. That packaging lived in
             # upstream's release workflows, which this repository does not
             # have, so the stripping has to happen here instead.
-            #
-            # This used to be where the debug info went: with the profile's
-            # `split-debuginfo = "off"` it lands inside the ELF, and unstripped
-            # Linux tarballs came out at 290 MB against 90 MB for macOS, whose
-            # symbols go to a separate .dSYM that is never copied. The build
-            # step above now turns debug info off outright, so most of that is
-            # never generated. What is left here is the symbol table, which
-            # `strip` still removes and which nothing needs in a published
-            # tarball — and the numbers below say how much, whatever the build
-            # settings happen to be.
-            before=$(stat -c%s "$dest/codexr" 2>/dev/null || stat -f%z "$dest/codexr")
-            strip "$dest/codexr"
-            after=$(stat -c%s "$dest/codexr" 2>/dev/null || stat -f%z "$dest/codexr")
-            echo "stripped: $((before / 1048576)) MB -> $((after / 1048576)) MB"
+            before=$(stat -c%s "$entrypoint" 2>/dev/null || stat -f%z "$entrypoint")
+            strip "$entrypoint"
+            after=$(stat -c%s "$entrypoint" 2>/dev/null || stat -f%z "$entrypoint")
+            echo "stripped codexr: $((before / 1048576)) MB -> $((after / 1048576)) MB"
           fi
 
-          tar -czf "codexr-${{ matrix.triple }}.tar.gz" -C vendor "${{ matrix.triple }}"
-          echo "tarball: $(du -h "codexr-${{ matrix.triple }}.tar.gz" | cut -f1)"
+          # Same fallback `.github/scripts/build-codex-package-archive.sh`
+          # uses: the Windows runners do not always expose `python3`.
+          if command -v python3 >/dev/null 2>&1; then
+            python_bin="python3"
+          else
+            python_bin="python"
+          fi
+
+          "$python_bin" scripts/build_codex_package.py \
+            --variant codexr \
+            --target "$triple" \
+            --cargo-profile release \
+            --entrypoint-bin "$entrypoint" \
+            --package-dir "vendor/$triple" \
+            --force
+
+          # The helpers the builder just compiled carry symbols for the same
+          # reason the entrypoint did. ripgrep and zsh arrive prebuilt from
+          # their DotSlash manifests, so they are left exactly as verified.
+          if [[ "${{ matrix.name }}" != win32-* ]]; then
+            for helper in "vendor/$triple/bin/codex-code-mode-host" \
+                          "vendor/$triple/codex-resources/bwrap"; do
+              [[ -f "$helper" ]] || continue
+              before=$(stat -c%s "$helper" 2>/dev/null || stat -f%z "$helper")
+              strip "$helper"
+              after=$(stat -c%s "$helper" 2>/dev/null || stat -f%z "$helper")
+              echo "stripped $(basename "$helper"): $((before / 1048576)) MB -> $((after / 1048576)) MB"
+            done
+          fi
+
+          echo "package contents:"
+          find "vendor/$triple" -type f | sort
+
+          tar -czf "codexr-$triple.tar.gz" -C vendor "$triple"
+          echo "tarball: $(du -h "codexr-$triple.tar.gz" | cut -f1)"
 
       - uses: actions/upload-artifact@v4
         with:
