@@ -127,15 +127,79 @@ jobs:
 
       # The Linux packages target musl so the binary runs on any distribution
       # without a glibc version to match.
-      #
-      # `libcap-dev` is for `bwrap`, which the packaging step below builds:
-      # `codex-rs/bwrap/build.rs` probes libcap through pkg-config and panics
-      # without it. The host's headers are correct even for the musl targets —
-      # that build script passes them as `-idirafter` precisely so the target
-      # sysroot wins during a musl cross build.
       - name: Install musl tooling
         if: startsWith(matrix.name, 'linux')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools libcap-dev
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # `bwrap`, which the Stage step builds, compiles vendored bubblewrap and
+      # links it against libcap through pkg-config. Debian's `libcap-dev` is a
+      # glibc build, so pkg-config refuses to offer it to a musl target at all
+      # ("pkg-config has not been configured to support cross-compilation") —
+      # and forcing it would be worse, because a glibc `libcap.a` has no
+      # business inside a statically linked musl binary. So build libcap
+      # against musl and point pkg-config at that instead. `PKG_CONFIG_PATH`
+      # is searched ahead of the default directories, and no `libcap-dev` is
+      # installed, so there is nothing for this to silently fall back to.
+      #
+      # `musl-gcc` sees only musl's own headers, which do not include the
+      # kernel UAPI headers bubblewrap needs (`linux/loop.h`,
+      # `linux/capability.h`). Those are appended with `-idirafter` so musl
+      # still wins for everything it provides and only `linux/*` and `asm/*`
+      # fall through to the system copies. This is set before the entrypoint
+      # build rather than on the Stage step so both cargo invocations see the
+      # same flags and do not re-fingerprint each other's native code.
+      #
+      # Both Linux runners are the same architecture as the target they build,
+      # so this swaps libc without also crossing architectures.
+      - name: Build libcap against musl
+        if: startsWith(matrix.name, 'linux')
+        shell: bash
+        env:
+          LIBCAP_VERSION: "2.75"
+          LIBCAP_SHA256: f58898263cf4a20da5920e4340b3ff7addfa5021b48d79e7ad6b97c196557998
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/musl-libcap"
+          src="$RUNNER_TEMP/libcap-src"
+          tarball="$RUNNER_TEMP/libcap.tar.gz"
+          mkdir -p "$src"
+
+          # The kernel.org release tarball, not the cgit snapshot: it is a
+          # static file with a digest worth pinning.
+          curl -sSfL -o "$tarball" \
+            "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-$LIBCAP_VERSION.tar.gz"
+          echo "$LIBCAP_SHA256  $tarball" | sha256sum -c -
+          tar -xzf "$tarball" -C "$src" --strip-components=1
+
+          make -C "$src/libcap" install \
+            CC=musl-gcc BUILD_CC=gcc GOLANG=no PAM_CAP=no SHARED=no \
+            lib=lib prefix="$prefix"
+
+          # libcap's own generated .pc hardcodes `prefix=/usr` whatever the
+          # make variable says, which would send pkg-config straight back to
+          # the host's glibc build.
+          cat > "$prefix/lib/pkgconfig/libcap.pc" <<EOF
+          prefix=$prefix
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+
+          Name: libcap
+          Description: libcap built against musl for Codex packaging
+          Version: $LIBCAP_VERSION
+          Libs: -L\${libdir} -lcap
+          Cflags: -I\${includedir}
+          EOF
+
+          triple="${{ matrix.triple }}"
+          triple_env="${triple//-/_}"
+          {
+            echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+            echo "CFLAGS_$triple_env=-idirafter /usr/include -idirafter /usr/include/$(gcc -print-multiarch)"
+          } >> "$GITHUB_ENV"
+
+          PKG_CONFIG_PATH="$prefix/lib/pkgconfig" PKG_CONFIG_ALLOW_CROSS=1 \
+            pkg-config --cflags --libs libcap
 
       - uses: Swatinem/rust-cache@v2
         with:
