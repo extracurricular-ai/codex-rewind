@@ -206,6 +206,27 @@ jobs:
           workspaces: codex-rs
           key: ${{ matrix.triple }}
 
+      # The `v8` crate unpacks librusty_v8 into
+      # `target/<triple>/<profile>/gn_out/obj/`, which is not a directory Cargo
+      # owns, so the cache's own "Cleaning ... target" pass drops it before
+      # saving. `.fingerprint/v8-*` is Cargo's and survives — so a restored
+      # cache says the build script is up to date while the 150 MB archive it
+      # was supposed to have unpacked is gone. Cargo then replays the recorded
+      # `rustc-link-search` at an empty directory:
+      #
+      #     error: could not find native static library `rusty_v8`
+      #
+      # This is what broke macOS and Windows on the second release attempt,
+      # after the first attempt succeeded and saved a cache for them. Linux was
+      # spared only because its first attempt failed, so it had no cache to
+      # restore. Reproduced locally by deleting `gn_out` while keeping the
+      # fingerprint, and fixed by exactly this: drop the fingerprint so the
+      # build script re-runs and unpacks the archive again. It costs seconds —
+      # the archive is already downloaded and digest-checked by then.
+      - name: Drop the V8 fingerprint the cache leaves behind
+        shell: bash
+        run: rm -rf codex-rs/target/${{ matrix.triple }}/release/.fingerprint/v8-*
+
       # Only the entrypoint. The Stage step builds the rest of the package's
       # binaries, because it is the thing that knows what a package contains.
       # (`CARGO_PROFILE_RELEASE_DEBUG` is set on the job so both agree.)
