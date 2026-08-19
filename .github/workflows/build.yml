@@ -201,17 +201,64 @@ jobs:
           PKG_CONFIG_PATH="$prefix/lib/pkgconfig" PKG_CONFIG_ALLOW_CROSS=1 \
             pkg-config --cflags --libs libcap
 
+      # `codex-code-mode-host` links V8, and the workspace asks for the
+      # `v8_enable_sandbox` feature, which needs the pointer-compression +
+      # sandbox build of librusty_v8 that Codex publishes — not the default
+      # prebuilt the `v8` crate would otherwise fetch from denoland. The
+      # package builder knows how to resolve that pair, so borrow its resolver
+      # rather than restating the URLs, and export the result so every cargo
+      # invocation in this job sees it.
+      #
+      # Exported here rather than left to the builder's own internal handling
+      # because the first run that let the builder source-build the host
+      # failed on macOS and Windows with "could not find native static library
+      # `rusty_v8`" while the same builder call worked on Linux. Setting the
+      # variables for the build ourselves is the arrangement that is actually
+      # exercised, so use it everywhere instead of only where it broke.
+      - name: Resolve the Codex-built V8 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python_bin="python3"
+          else
+            python_bin="python"
+          fi
+
+          "$python_bin" - "${{ matrix.triple }}" <<'PY' >> "$GITHUB_ENV"
+          import sys
+          sys.path.insert(0, "scripts")
+          from codex_package.targets import TARGET_SPECS
+          from codex_package.v8 import resolve_codex_v8_cargo_env
+
+          for key, value in resolve_codex_v8_cargo_env(TARGET_SPECS[sys.argv[1]]).items():
+              print(f"{key}={value}")
+          PY
+
+          # Both are downloaded and digest-checked by the resolver above, so
+          # this is only here to make a truncated or missing artifact obvious
+          # in the log rather than as a link error thousands of lines later.
+          grep -E '^RUSTY_V8_' "$GITHUB_ENV" | while IFS='=' read -r _ path; do
+            ls -l "$path"
+          done
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
           key: ${{ matrix.triple }}
 
-      # Only the entrypoint. The Stage step builds the rest of the package's
-      # binaries, because it is the thing that knows what a package contains.
-      # (`CARGO_PROFILE_RELEASE_DEBUG` is set on the job so both agree.)
+      # The entrypoint and the code-mode host together, in one invocation, so
+      # they share a dependency graph and the V8 environment resolved above.
+      # The Stage step hands both to the package builder as prebuilt inputs;
+      # what it still builds for itself is bwrap on Linux and the two sandbox
+      # helpers on Windows, none of which touch V8.
+      # (`CARGO_PROFILE_RELEASE_DEBUG` is set on the job so every cargo call
+      # in this job agrees on the profile.)
       - name: Build
         working-directory: codex-rs
-        run: cargo build --release --bin codexr --target ${{ matrix.triple }}
+        run: |
+          cargo build --release --target ${{ matrix.triple }} \
+            --bin codexr --bin codex-code-mode-host
 
       # A Codex package is more than the entrypoint. `codex-code-mode-host` sits
       # beside it in `bin/`, and `codex-resources/` and `codex-path/` hold the
@@ -247,21 +294,27 @@ jobs:
             # Windows keeps its debug info in a separate .pdb, so the .exe is
             # already lean and there is nothing to strip.
             entrypoint="staging/codexr.exe"
+            code_mode_host="staging/codex-code-mode-host.exe"
             cp "$release_dir/codexr.exe" "$entrypoint"
+            cp "$release_dir/codex-code-mode-host.exe" "$code_mode_host"
           else
             entrypoint="staging/codexr"
+            code_mode_host="staging/codex-code-mode-host"
             cp "$release_dir/codexr" "$entrypoint"
-            chmod +x "$entrypoint"
+            cp "$release_dir/codex-code-mode-host" "$code_mode_host"
+            chmod +x "$entrypoint" "$code_mode_host"
 
             # The workspace release profile keeps symbols on purpose —
             # `strip = false`, with a comment saying packaging archives the
             # sidecar symbols and strips afterwards. That packaging lived in
             # upstream's release workflows, which this repository does not
             # have, so the stripping has to happen here instead.
-            before=$(stat -c%s "$entrypoint" 2>/dev/null || stat -f%z "$entrypoint")
-            strip "$entrypoint"
-            after=$(stat -c%s "$entrypoint" 2>/dev/null || stat -f%z "$entrypoint")
-            echo "stripped codexr: $((before / 1048576)) MB -> $((after / 1048576)) MB"
+            for binary in "$entrypoint" "$code_mode_host"; do
+              before=$(stat -c%s "$binary" 2>/dev/null || stat -f%z "$binary")
+              strip "$binary"
+              after=$(stat -c%s "$binary" 2>/dev/null || stat -f%z "$binary")
+              echo "stripped $(basename "$binary"): $((before / 1048576)) MB -> $((after / 1048576)) MB"
+            done
           fi
 
           # Same fallback `.github/scripts/build-codex-package-archive.sh`
