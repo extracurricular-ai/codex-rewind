@@ -2,6 +2,11 @@
 
 **English** · [简体中文](https://github.com/extracurricular-ai/codex-rewind/blob/main/README.zh-CN.md)
 
+[![npm](https://img.shields.io/npm/v/codex-rewind?label=npm&color=cb3837)](https://www.npmjs.com/package/codex-rewind)
+[![downloads](https://img.shields.io/npm/dm/codex-rewind?label=downloads&color=2f855a)](https://www.npmjs.com/package/codex-rewind)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
+[![platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-informational)](#install)
+
 **An unofficial distribution of [OpenAI Codex CLI](https://github.com/openai/codex).**
 
 > For what Codex CLI is, how to sign in, and how to use it, read
@@ -23,9 +28,16 @@ that predates the code sitting on disk.
 This distribution adds the missing half. `/rewind` restores the workspace to how it
 looked at the prompt you pick, and `/redo` puts it back if you change your mind.
 
+![The agent deletes notes.txt; /rewind picks the prompt before that; ls shows the file back.](https://raw.githubusercontent.com/extracurricular-ai/codex-rewind/main/.github/rewind.gif)
+
+▶ [Full walkthrough (22 min)](https://youtu.be/OpJI8NQ-mvY) — the demo above in full,
+then the design behind it: why git is the wrong foundation, what the three buckets are,
+and where it stops.
+
 ```
 /rewind     pick a prompt; the conversation and the files both return to it
 /redo       undo that
+/status     shows whether snapshots are on, and what they cost on disk
 ```
 
 No git required, and it never touches your git state — no commits, no stashes, no
@@ -45,6 +57,19 @@ build rather than replacing it.
 codexr          # this distribution
 codex           # the official one, if you have it
 ```
+
+Ships prebuilt binaries for macOS, Linux and Windows on both x64 and arm64, the same
+targets as upstream. Node 16 or newer.
+
+To remove it:
+
+```shell
+npm uninstall -g codex-rewind
+rm -rf ~/.codex/file_snapshots      # optional: the snapshots themselves
+```
+
+Do not delete `~/.codex` itself — the official build uses the same directory for your
+login and history.
 
 Releases are versioned `<upstream>-rewind.<n>` — `0.147.0-rewind.1` is built from
 upstream `rust-v0.147.0`, so the baseline each release carries is visible in its
@@ -102,6 +127,24 @@ CODEX_HOME=~/.codex-rewind codexr
 You will sign in again in that directory, and the two builds will then share
 nothing.
 
+## "Why not just commit before every turn?"
+
+People do, and they say it is a hassle
+([#19205](https://github.com/openai/codex/issues/19205)). Two reasons it is not a
+substitute:
+
+- **Someone has to remember, every single turn.** A person doing it calls it a hassle,
+  which is what #19205 is. A model doing it will sometimes forget. A checkpoint should
+  happen whether anybody thought of it or not.
+- **Git only sees files git already knows about.** The incidents behind
+  [#9203](https://github.com/openai/codex/issues/9203) are untracked files —
+  spreadsheets, notes, generated data. `git status` is clean and there is nothing to
+  restore from.
+
+The design reasoning, the measurements behind the three-partition bound, and the
+correctness rules are in the
+**[RFC](https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/rfc-file-snapshot-rewind.md)**.
+
 ## What gets tracked
 
 Three sources, unioned, each bounded by something other than the size of your
@@ -122,6 +165,27 @@ hidden, because those *are* your work.
 To exclude more, add a `.codexsnapignore` (gitignore syntax). It is deliberately
 separate from `.gitignore`: an ignored path is never snapshotted, never restored,
 and **never deleted** by a restore.
+
+## Coming from Claude Code
+
+Claude Code has had checkpointing for a while, and if that is your reference point,
+these are the differences that matter:
+
+| | Claude Code `file-history` | codex-rewind |
+| --- | --- | --- |
+| What is in scope | files its own edit tools touched | that, **plus** the git index, **plus** the 100 most recently changed |
+| Changes made by a shell command | not tracked | caught by the recency bucket |
+| How far back you can go | the 100 most recent checkpoints in a session | no cap — turns are not discarded to make room |
+| Storage | per-file copies | content-addressed and deduplicated |
+| Requires git | no | no |
+
+The unbounded part is the same on both sides: neither puts a limit on how many files
+the agent may edit. What differs is what *else* is in scope, and whether anything gets
+thrown away to make room.
+
+<sub>Claude Code figures quoted from its own documentation (Claude Code Docs →
+Checkpointing), current as of August 2026. Its own limitations page is where "bash
+command changes not tracked" and "external changes not tracked" come from.</sub>
 
 ## What it will not do
 

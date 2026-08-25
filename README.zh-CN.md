@@ -2,6 +2,11 @@
 
 [English](https://github.com/extracurricular-ai/codex-rewind/blob/main/README.md) · **简体中文**
 
+[![npm](https://img.shields.io/npm/v/codex-rewind?label=npm&color=cb3837)](https://www.npmjs.com/package/codex-rewind)
+[![downloads](https://img.shields.io/npm/dm/codex-rewind?label=downloads&color=2f855a)](https://www.npmjs.com/package/codex-rewind)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)
+[![platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-informational)](#安装)
+
 **[OpenAI Codex CLI](https://github.com/openai/codex) 的非官方发行版。**
 
 > Codex CLI 是什么、怎么登录、怎么使用,请看
@@ -22,9 +27,15 @@
 这个发行版补上了缺的那一半。`/rewind` 把工作区恢复成你选中那条提示词时的样子,
 `/redo` 在你反悔时把它放回去。
 
+![agent 删掉 notes.txt;/rewind 选中删除之前那一步;ls 显示文件回来了](https://raw.githubusercontent.com/extracurricular-ai/codex-rewind/main/.github/rewind.gif)
+
+▶ [完整讲解(22 分钟)](https://youtu.be/OpJI8NQ-mvY) —— 上面这段演示的完整版,
+以及它背后的设计:为什么 git 是错的地基、三个桶是什么、以及它到哪儿为止。
+
 ```
 /rewind     选一条提示词,对话和文件一起回到那时
 /redo       撤销上一次 rewind
+/status     查看快照是否开启,以及占了多少磁盘
 ```
 
 **不需要 git,也绝不碰你的 git 状态** —— 不提交、不 stash、不写 index,`.git` 里面
@@ -42,6 +53,18 @@ npm install -g codex-rewind
 codexr          # 这个发行版
 codex           # 官方版(如果你装了)
 ```
+
+提供 macOS、Linux、Windows 的预编译二进制,x64 和 arm64 都有,和上游的目标平台一致。
+需要 Node 16 或更高。
+
+卸载:
+
+```shell
+npm uninstall -g codex-rewind
+rm -rf ~/.codex/file_snapshots      # 可选:连快照一起删掉
+```
+
+**不要删 `~/.codex` 本身** —— 官方版用的是同一个目录,你的登录和历史都在里面。
 
 版本号格式是 `<上游版本>-rewind.<n>` —— `0.147.0-rewind.1` 表示它构建自上游
 `rust-v0.147.0`,每个版本的基线都写在版本号里。它们在 semver 里属于 prerelease,
@@ -93,6 +116,20 @@ CODEX_HOME=~/.codex-rewind codexr
 
 在那个目录里你需要重新登录一次,之后两个版本就什么都不共享了。
 
+## 「为什么不每轮 commit 一次?」
+
+有人这么做,并且说很折磨([#19205](https://github.com/openai/codex/issues/19205))。
+两个理由说明它不是替代品:
+
+- **每一轮都得有人记得这件事。** 人来做,那就是 #19205 里说的「折磨」;
+  模型来做,它总会有忘掉的时候。检查点应该自己发生,不管有没有人想起来。
+- **git 只看得见它已经知道的文件。** [#9203](https://github.com/openai/codex/issues/9203)
+  背后的事故都是未跟踪文件 —— 表格、笔记、生成的数据。
+  `git status` 显示一切正常,而你没有任何东西可以恢复。
+
+设计推理、三分区边界背后的实测数据,以及正确性规则都在
+**[RFC](https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/rfc-file-snapshot-rewind.md)** 里。
+
 ## 追踪哪些文件
 
 三个来源取并集,而且**每一个的上界都不是目录树的大小**——所以成本不会随着"这个仓库被
@@ -110,6 +147,25 @@ CODEX_HOME=~/.codex-rewind codexr
 
 想排除更多,加一个 `.codexsnapignore`(gitignore 语法)。它**刻意**和 `.gitignore` 分开:
 被它忽略的路径不会被快照、不会被恢复,**也不会被恢复操作删除**。
+
+## 从 Claude Code 过来的话
+
+Claude Code 有检查点功能已经有一段时间了。如果那是你的参照系,差别在这几处:
+
+| | Claude Code `file-history` | codex-rewind |
+| --- | --- | --- |
+| 追踪范围 | 它自己的编辑工具碰过的文件 | 同样这些,**外加** git 索引,**外加**最近改动的 100 个 |
+| shell 命令做的改动 | 不追踪 | 由「最近改动」这个桶兜住 |
+| 能回溯多远 | 一个会话里最近的 100 个检查点 | 没有上限 —— 不会为了腾地方丢弃轮次 |
+| 存储形式 | 逐文件副本 | 内容寻址、去重 |
+| 是否需要 git | 否 | 否 |
+
+**无界的那部分两边是一样的**:谁都没有限制 agent 能编辑多少文件。
+差别在于**还有什么在范围内**,以及**会不会为了腾地方丢东西**。
+
+<sub>Claude Code 的数字引自其官方文档(Claude Code Docs → Checkpointing),
+数据截至 2026 年 8 月。「bash 命令的改动不被追踪」「外部改动不被追踪」
+出自同一页的 Limitations 小节。</sub>
 
 ## 它不做什么
 
