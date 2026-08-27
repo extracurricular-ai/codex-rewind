@@ -209,6 +209,22 @@ contents are stored once no matter how many turns or sessions share them. `/stat
 shows the size. Deleting a conversation deletes its snapshots with it, contents
 included.
 
+## Spin-offs
+
+Two projects that grew out of this one, for when a Codex distribution is not the
+shape you need:
+
+- **[filesnap](https://github.com/extracurricular-ai/filesnap)** — the snapshot engine on
+  its own, with no agent wrapped around it. A Rust crate and CLI
+  (`cargo install filesnap-cli`): content-addressed store, `capture` and `restore` keyed
+  by session and turn, JSON Lines output for scripting, `.filesnapignore`, and the same
+  rule that a file no snapshot ever saw is never deleted. Reach for it to put rewind into
+  something of your own.
+- **[dsh-filesnap](https://github.com/extracurricular-ai/dsh-filesnap)** — the same
+  `/rewind` and `/redo`, as a plugin for DeepSeek Harness:
+  `dsh plugin --profile web add dsh-filesnap`. Per-turn workspace snapshots, rewind
+  controls in the browser UI, and git left alone here too.
+
 ## Reporting a bug
 
 **`codexr --version` reports the upstream baseline, not the release.** It says

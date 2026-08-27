@@ -185,6 +185,20 @@ Claude Code 有检查点功能已经有一段时间了。如果那是你的参�
 多少会话共享它。`/status` 会显示占用大小。**删除对话时会连同它的快照一起删除**,文件内容
 也一并清除。
 
+## 衍生项目
+
+从这个仓库衍生出去的两个项目,如果你要的不是「装在一个 Codex 发行版里的那一份」:
+
+- **[filesnap](https://github.com/extracurricular-ai/filesnap)** —— 快照引擎本身,外面
+  不套任何 agent。一个 Rust crate + CLI(`cargo install filesnap-cli`):内容寻址的存储、
+  按 session 和 turn 做 `capture` / `restore`、方便脚本处理的 JSON Lines 输出、
+  `.filesnapignore`,以及同一条规则——没有任何快照见过的文件,绝不删。想把 rewind 做进
+  自己的东西里,用它。
+- **[dsh-filesnap](https://github.com/extracurricular-ai/dsh-filesnap)** —— 同样的
+  `/rewind` 和 `/redo`,做成 DeepSeek Harness 的插件:
+  `dsh plugin --profile web add dsh-filesnap`。每轮工作区快照、浏览器 UI 里的 rewind
+  入口,同样不碰 git。
+
 ## 提交 bug 报告
 
 **`codexr --version` 报的是上游基线,不是发行版号。** 发行版是 `0.147.0-rewind.1`
