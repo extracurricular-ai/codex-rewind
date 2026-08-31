@@ -64,7 +64,7 @@ targets as upstream. Node 16 or newer.
 Removing it again is two commands, and leaves your conversations untouched — see
 [Clean uninstall](#clean-uninstall).
 
-Releases are versioned `<upstream>-rewind.<n>` — `0.151.0-rewind.1` is built from
+Releases are versioned `<upstream>-rewind.<n>` — `0.151.0-rewind.0` is built from
 upstream `rust-v0.151.0`, so the baseline each release carries is visible in its
 version number. Being semver prereleases, they are also skipped by version *ranges*:
 a `^0.151.0` dependency will never resolve to one by accident.
@@ -325,7 +325,7 @@ shape you need:
 ## Reporting a bug
 
 **`codexr --version` reports the upstream baseline, not the release.** It says
-`0.151.0` where the release is `0.151.0-rewind.1`: the version compiled into the
+`0.151.0` where the release is `0.151.0-rewind.0`: the version compiled into the
 binary comes from the upstream workspace, and the `-rewind.<n>` suffix is added
 during npm packaging. Two releases on the same baseline report the same number.
 
