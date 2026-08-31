@@ -329,6 +329,66 @@
     - **只在某一个平台上有意义的断言,不能因为看着冗余就删。** `git_tracked_files` 那条字符串断言在 Unix 上是恒真式;2026-08-31 用一个只含测试、不含修复的临时分支实测,Windows 那条腿**变红**,ubuntu 和 macOS **绿**——对照组证明了测试没写错,红的是真 bug。构造性论证之外,这是唯一的实证途径。
     - **`cargo test` 发现不了 CI 会红的东西。** 这一轮 clippy 在测试全绿的情况下抓出 9 处:删函数后遗留的 import、6 处 redundant clone、被吃掉的 `#[test]` 属性、以及本 crate 禁用的 `expect`。改完必须跑 `cargo clippy --all-targets -- -D warnings`,不能只跑测试。
 
+### 上游同步 rust-v0.147.0 → rust-v0.151.0(2026-08-31)
+
+59. **冲突不是同步的成本,无冲突才是。** 23 个冲突里 15 个机械(8 个 `.github/` 删除 + 7 个生成物)、4 个是相邻插入、只有 1 个真语义冲突。而**另有 11 处破坏完全没有冲突标记**,git 认为合得干干净净,要到编译期才炸。
+    - 三类,共同根因是**这个 fork 扩展了上游的公共 API,而上游在持续增加新的调用点**:
+      - **二进制改名**:fork 把 cli 的 `[[bin]] name` 改成 `codexr`;上游新增的两个测试文件(`cli/tests/queue.rs`、`cli/tests/doctor_enterprise_network.rs`)用 `cargo_bin("codex")`。7 处。
+      - **函数签名扩展**:fork 给 `fork_thread_at` 加了 `restore_files` 参数;上游在 `tui/src/app/working_directory.rs` 新增了一处调用(`/cd` 的 fork)。传 `false` —— `/cd` 不是 rewind。
+      - **结构体字段扩展**:fork 给 `AppEvent::ForkSessionForPromptEdit` 加了 `restore_files` 字段;上游的测试构造和模式匹配缺字段。3 处。
+    - **这个根因不会消失**,所以每次同步都会遇到。
+
+60. **同步的验收清单(不要靠"读一遍热点文件"的记性)。**
+    1. 解决所有冲突标记
+    2. `cargo check --tests` 覆盖 `codex-tui` / `codex-app-server` / `codex-core` —— 抓决策 59 那三类 API 破坏
+    3. **`cargo test` 跑本 fork 关心的那批测试**(rewind / redo / prompt-edit / file_snapshots),`check` 抓不住行为回归(决策 66)。**不要跑整个 tui 套件** —— 基线本身就是红的(决策 67)
+    4. `grep -rn 'cargo_bin("codex")' --include=*.rs codex-rs/`
+    5. 跑 `tests.yml`
+    - **第 2 条要特别强调**:`cargo test -p codex-file-snapshots` 和 schema 测试**全绿说明不了任何问题**,因为它们根本不编译 app-server 和 tui。这次就是最后那道检查才发现 11 处破坏的。
+
+61. **冲突要看边界切在哪里,不只是看两边内容。** 对 `thread_processor.rs` 用脚本统一"两边都保留",然后没有回读结果。第一处(import 撞 import)确实是相邻插入;**第二处不是** —— 上游的 `thread_revert` 和 fork 的 `thread_undo_file_restore` 跨在同一个函数体中间,机械拼接把 fork handler 的尾部(`.await; Ok(None) }`)吃掉了,报 `unclosed delimiter`。
+    - 相邻插入和跨函数体的冲突**在 diff 里长得一模一样**。凡是脚本化处理的冲突,解决后必须回读合并结果,或至少 `cargo check` 该包。
+
+62. **不要改造上游的测试来覆盖 fork 的场景。** fork 曾把上游的 `prompt_edit_forks_before_selected_prompt_and_preserves_source` 改造成"内存视图为空"的场景。上游这次把同一个测试演进成了覆盖 replay buffer 的场景并引入 `selected_turn`,取 fork 版直接编译失败,只能取上游版 —— fork 那个场景的覆盖就丢了。
+    - 已补:新写独立测试 `a_rewind_works_when_the_in_memory_view_holds_no_turns_of_its_own`,照搬上游的搭建,只改"内存视图为空"这一个变量。
+    - **不要改回**:改造上游测试等于给自己保证每次同步都冲突,而且冲突时只能二选一。要覆盖 fork 的场景就新写一个。
+
+63. **那个唯一的真语义冲突,结果是两个修复可以叠加。** `tui/src/app/event_dispatch.rs`:上游和 fork **各自独立修了同一个 bug**(rewind 把每个 prompt 都报成 missing,因为内存 turn 视图从不增长)。上游把 replay buffer 并进那个视图;fork 改成向服务端要权威列表。
+    - 两者**互补**:fork 的 `buffered` 正是服务端读取失败时的兜底,而上游的改进让这个兜底更准。取上游逻辑、绑到 fork 的变量名,两个修复都留下。
+    - 值得记住的形态:上游修同一个 bug **不代表**要放弃 fork 的修法,先看两者是不是处在不同的层。
+
+64. **`just write-app-server-schema` 是坏的,而且是上游坏的 —— 不要顺手修。** 它指向 `--bin write_schema_fixtures`,而上游已经把入口改成 `#[ignore]` 测试 + 环境变量驱动,没同步改 justfile。核对过 `rust-v0.151.0` 的 justfile,上游自己也是坏的。改它就是又造一处每次同步都冲突的地方。正确调用:
+
+    ```
+    cd codex-rs
+    for exp in 0 1; do
+      CODEX_APP_SERVER_SCHEMA_ROOT="$PWD/app-server-protocol/schema" \
+      CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL=$exp \
+      cargo test -p codex-app-server-protocol --lib \
+        write_schema_fixtures_from_env -- --ignored --exact \
+        schema_fixtures_tests::write_schema_fixtures_from_env
+    done
+    ```
+    - 生成物一律**先 `--theirs` 打底再重新生成**,不要手工合(两个 `.zst` 是二进制,git 直接放弃)。`Cargo.lock` 例外地会被 git 自动并好,fork 的条目还在。
+
+65. **快照引擎跨 4 个上游版本零冲突、零改动、零回归。** 49 单元 + 19 集成 + core 的 3 个端到端全绿。把它做成不依赖其他 codex crate 的独立 crate,这次第一次经受跨版本同步的检验并通过了 —— 这条记下来是因为它**证明了那个设计决定的价值**,下次有人想图方便让它依赖 `codex-core` 时,应该看到这个结果。
+
+66. **`cargo check --tests` 抓不住行为回归 —— 决策 60 的清单第 2 条不够。**
+    - 合并后跑完整测试才发现:上游的 `prompt_edit_forks_before_selected_prompt_and_preserves_source` **本身是红的**。原因是我取上游版时**只看到 fork 对它做的一处修改,实际有两处**:
+      - ① `started.turns` → `Vec::new()`(覆盖"内存视图为空",这处是"改造上游测试",按决策 62 应独立成测试)
+      - ② 把上游的「源文件原地不变」断言**替换**成「源被归档、不在 `/resume` 列表」—— **这处是必须的**,因为 fork 的 `retire_rewound_thread`(`event_dispatch.rs:677`)在 rewind 时归档源线程,rollout 会移出 `sessions/`,上游那句 `read_to_string(&source_path)` 在这个构建下必然 ENOENT。
+    - **教训一**:决定"取上游版"之前,要先数清 **fork 对这个测试改了几处、每处是"改造"还是"适配"**。改造可以丢(另写独立测试),适配丢了就是回归。
+    - **教训二**:清单第 2 条要升级成 **`cargo test`,不是 `cargo check`**。`check` 只编译,而这处回归编译完全正常。`check` 能抓 API 破坏(决策 59 那三类),抓不住行为回归。
+    - 修复时又撞到决策 59 的同一类:上游给 `ThreadListParams` 加了 `project_id`,而我从合并前的 fork 版复制断言,带的是旧字段集。**只要 fork 和上游都在动同一批类型,这类问题就会一直出现。**
+
+67. **`codex-tui` 的测试基线本来就是红的 —— 不要把整个套件加进验收。** 2026-08-31 实测:
+    - 合并**前**(`ba2d5de63`):3369 passed / **33 failed**
+    - 合并**后**:3947 passed / **28–30 failed**(同一份代码两次运行数字不同,**其中有 flaky**)
+    - 失败全是上游的 UI 快照、终端渲染、输入时序类(`*_update_available_history_cell_snapshot`、`status_snapshot_*`、`startup_draft_*` 等),**与 file_snapshots 无关**。那几个 `update_available` 很可能只是版本号从 0.147 变成 0.151 导致快照不匹配。
+    - 根因:这批测试**从来不在本 fork 的验收范围内**(`tests.yml` 只覆盖 file-snapshots、core 的三个端到端、编译检查),所以一直红着,没人看过。
+    - **不要"顺手修绿"**:那是上游的 UI 快照,修了就是给每次同步多造一批冲突,而且它们在上游自己的 CI 矩阵里是绿的(环境差异)。
+    - **落地**:决策 66 说的"要真跑测试"仍然成立,但**范围是 fork 关心的那批**,不是整个套件。这次真正的回归(`preserves_source`)就在这批里,窄范围一样抓得到。加整个套件进 CI 只会造出又一个永远红的必需检查 —— 正是 `.github/workflows/README.md` 里批评过的东西。
+
 ## 四、已知但暂不处理
 
 41. **resume 之后,会话 UI 不显示 apply_patch 的 diff**(你报的,2026-08-13)。
