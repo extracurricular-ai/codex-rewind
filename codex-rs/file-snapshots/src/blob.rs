@@ -6,14 +6,19 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use sha2::Digest;
 use sha2::Sha256;
 
 use crate::error::Result;
 use crate::error::SnapshotError;
+
+/// Distinguishes concurrent writers *within* one process; the pid covers
+/// the cross-process half.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct BlobStore {
     root: PathBuf,
@@ -34,6 +39,14 @@ impl BlobStore {
 
     /// Store `content`, returning its hash. Writing is atomic (tmp file +
     /// rename) and idempotent: existing blobs are never rewritten.
+    ///
+    /// Concurrent writers are not coordinated, and do not need to be. Content
+    /// addressing means two writers racing for one hash are writing the same
+    /// bytes, so there is nothing to arbitrate — only a temp file to avoid
+    /// sharing. A lock would buy the same guarantee at the cost of a
+    /// cross-platform dependency, stale-lock handling after a crash, and a
+    /// queue in front of the tens-to-hundreds of blobs a single capture
+    /// writes. This is what git does for the same reason.
     pub fn store_bytes(&self, content: &[u8]) -> Result<String> {
         let hash = Self::hash_bytes(content);
         let path = self.blob_path(&hash);
@@ -41,24 +54,27 @@ impl BlobStore {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| SnapshotError::io(parent, e))?;
             }
-            let tmp = path.with_extension("tmp");
+            // Unique per writer. Deriving the temp name from the hash alone
+            // let two processes sharing a CODEX_HOME truncate each other's
+            // in-flight file. The `.tmp` suffix stays last so `hashes()` keeps
+            // recognising it — a name ending in anything else would be read
+            // back as a blob hash.
+            let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp = path.with_extension(format!("{}.{counter}.tmp", std::process::id()));
             fs::write(&tmp, content).map_err(|e| SnapshotError::io(&tmp, e))?;
-            fs::rename(&tmp, &path).map_err(|e| SnapshotError::io(&path, e))?;
+            if let Err(err) = fs::rename(&tmp, &path) {
+                // Losing the race is success: whatever is at `path` has this
+                // hash, so it is this content. Windows reaches here whenever a
+                // reader holds the destination open, where Unix would have
+                // replaced it silently.
+                if !path.exists() {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(SnapshotError::io(&path, err));
+                }
+                let _ = fs::remove_file(&tmp);
+            }
         }
         Ok(hash)
-    }
-
-    /// Read and store the file at `path`, returning `(hash, size)`.
-    ///
-    /// The file is read exactly once so the stored blob and the returned
-    /// hash are always consistent even if the file changes concurrently.
-    // TODO(reflink): for large files, stream-hash then clone via
-    // copy_file_range/FICLONE instead of buffering the whole content.
-    pub fn store_file(&self, path: &Path) -> Result<(String, u64)> {
-        let content = fs::read(path).map_err(|e| SnapshotError::io(path, e))?;
-        let size = content.len() as u64;
-        let hash = self.store_bytes(&content)?;
-        Ok((hash, size))
     }
 
     pub fn contains(&self, hash: &str) -> bool {
@@ -104,7 +120,12 @@ impl BlobStore {
             for entry in entries {
                 let entry = entry.map_err(|e| SnapshotError::io(dir.path(), e))?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".tmp") {
+                // A blob's name is the rest of its hex hash and nothing else.
+                // Reconstructing a hash from whatever is present would have
+                // the sweep delete files it never wrote, on the strength of a
+                // name it invented — `.DS_Store` is enough to trigger it, and
+                // so is any in-flight `.tmp`.
+                if !name.chars().all(|c| c.is_ascii_hexdigit()) {
                     continue;
                 }
                 out.insert(format!("{prefix}{name}"));
@@ -143,19 +164,6 @@ mod tests {
     }
 
     #[test]
-    fn store_file_matches_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = BlobStore::open(dir.path().join("blobs")).unwrap();
-        let file = dir.path().join("f.txt");
-        fs::write(&file, b"content").unwrap();
-
-        let (hash, size) = store.store_file(&file).unwrap();
-        assert_eq!(size, 7);
-        assert_eq!(hash, BlobStore::hash_bytes(b"content"));
-        assert_eq!(store.load(&hash).unwrap(), b"content");
-    }
-
-    #[test]
     fn missing_blob_is_typed_error() {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::open(dir.path().join("blobs")).unwrap();
@@ -163,6 +171,64 @@ mod tests {
             store.load("deadbeef"),
             Err(crate::error::SnapshotError::MissingBlob(_))
         ));
+    }
+
+    /// `hashes()` reads directory names back as blob hashes, so anything the
+    /// sweep is shown that is not a published blob becomes a fabricated hash —
+    /// which GC would then happily delete. Two things reach it: this store's
+    /// own in-flight temp files, and whatever else lands in the tree
+    /// (`.DS_Store` is the everyday one on macOS).
+    ///
+    /// The temp path is built here the way `store_bytes` builds it, so a
+    /// change to that naming rule that silently breaks the `.tmp` filter shows
+    /// up as a failure rather than as a corrupted sweep.
+    #[test]
+    fn an_in_flight_write_is_invisible_to_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path().join("blobs")).unwrap();
+        let hash = store.store_bytes(b"published").unwrap();
+
+        let published = store.path_for(&hash);
+        let blob_dir = published.parent().unwrap();
+
+        // Another writer, mid-write, using the same shape store_bytes does.
+        let in_flight = published.with_extension(format!("{}.7.tmp", std::process::id()));
+        fs::write(&in_flight, b"half").unwrap();
+        // And a stray nobody put there on purpose.
+        let stray = blob_dir.join(".DS_Store");
+        fs::write(&stray, b"finder").unwrap();
+
+        let seen = store.hashes().unwrap();
+        assert_eq!(
+            seen,
+            BTreeSet::from([hash]),
+            "only published blobs are hashes; an in-flight temp and a stray \
+             file are neither"
+        );
+        assert!(
+            in_flight.exists(),
+            "the sweep must not touch another writer"
+        );
+    }
+
+    /// Losing the rename race is success, not an error: whatever sits at the
+    /// destination has this hash, so it is this content. Windows takes this
+    /// path whenever a reader holds the destination open.
+    #[test]
+    fn a_blob_already_published_by_someone_else_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path().join("blobs")).unwrap();
+
+        let first = store.store_bytes(b"same bytes").unwrap();
+        let again = store.store_bytes(b"same bytes").unwrap();
+
+        assert_eq!(first, again);
+        assert_eq!(store.load(&first).unwrap(), b"same bytes");
+        assert_eq!(
+            store.hashes().unwrap().len(),
+            1,
+            "no temp file survives a completed write"
+        );
     }
 
     #[test]
