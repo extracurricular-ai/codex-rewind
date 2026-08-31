@@ -129,8 +129,35 @@ npm uninstall -g codex-rewind     # the program
 rm -rf ~/.codex/file_snapshots    # the snapshots
 ```
 
-`~/.codex/file_snapshots/` is the **only** directory this distribution creates.
-`/status` shows its size first, if you want to see what you are deleting.
+### Everything it puts on your disk
+
+The complete list of what exists because of this build and not the official one, so
+you can check rather than take the two commands on faith:
+
+| Path | What it is | Removed by |
+| --- | --- | --- |
+| `~/.codex/file_snapshots/` | the whole snapshot store: `blobs/`, `manifests/`, `refs/`, `turns/`, `restores/` | `rm -rf` above |
+| `<npm prefix>/lib/node_modules/codex-rewind/` | the `codexr` launcher | `npm uninstall` above |
+| `<npm prefix>/lib/node_modules/codex-rewind-<platform>/` | the native binary and its helpers, pulled in as an optional dependency | `npm uninstall` above |
+| `<npm prefix>/bin/codexr` | the symlink that puts `codexr` on your PATH | `npm uninstall` above |
+| `[features] file_snapshots` in `config.toml` | the on switch | by hand, below |
+| `[file_snapshots]` in `config.toml` | tuning, only if you set any | by hand, below |
+
+`/status` shows the store's size, if you want to see what you are deleting first.
+
+Two more live in your **project**, not in `~/.codex`, and neither is created without
+you:
+
+- `.codexsnapignore` — only if you wrote one. It is yours; delete it like any other
+  file in your repository.
+- `<file>.<pid>.<n>.codex-restore-tmp` — a restore's temp file, removed whether the
+  restore succeeds or fails. One can only survive a crash mid-restore, and it is
+  safe to delete.
+
+Nothing else. No shell rc line, no PATH edit beyond npm's own, no cache, no state
+directory of its own, and nothing written next to the binary. `~/.codex/sessions/`,
+`~/.codex/archived_sessions/`, `~/.codex/log/` and the rest of `~/.codex` are
+upstream's and are shared with the official build — leave them alone.
 
 npm is the only route this ships through. The standalone installer scripts in this
 repository are upstream's — they install the official `codex` binary from
