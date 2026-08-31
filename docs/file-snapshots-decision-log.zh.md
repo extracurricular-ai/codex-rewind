@@ -389,6 +389,15 @@
     - **不要"顺手修绿"**:那是上游的 UI 快照,修了就是给每次同步多造一批冲突,而且它们在上游自己的 CI 矩阵里是绿的(环境差异)。
     - **落地**:决策 66 说的"要真跑测试"仍然成立,但**范围是 fork 关心的那批**,不是整个套件。这次真正的回归(`preserves_source`)就在这批里,窄范围一样抓得到。加整个套件进 CI 只会造出又一个永远红的必需检查 —— 正是 `.github/workflows/README.md` 里批评过的东西。
 
+68. **上游同步必须用 merge commit,不能 rebase —— 理由是 merge-base,不是历史风格。** 普通 PR 用 rebase 保持线性是对的;**上游同步是唯一的例外**,而且光看 `main` 上有 merge 提交推不出为什么,所以记在这里。
+    - rebase 会把上游的**内容**搬进 `main`,但**不会让上游的提交成为祖先**。于是下次 `git merge-base main rust-v0.152.x` 仍然算到旧的基点,已经解决过的冲突会**全部重放一遍**。
+    - 2026-08-31 实测(v0.147.0 → v0.151.0):
+      - merge 之后 `git merge-base --is-ancestor rust-v0.151.0 HEAD` 为真 ⇒ 下次同步只处理增量
+      - 若 rebase,merge-base 退回 `92b83e226` ⇒ 下次要连同**991 个上游提交**一起重来
+    - **在 fork 里,merge commit 是记录"上游到 X 已并入"这个事实的唯一机制。**
+    - 常见的反对意见是"那几个修冲突的 commit 会不会被埋" —— 不会。用 GitHub 的 "Create a merge commit" 之后,PR 里的每个 commit **都作为祖先落在 `main` 上**,`git log`/`git blame`/`cherry-pick` 一样够得着。
+    - 补充:分支里含 merge commit 时,GitHub 的 "Rebase and merge" 通常直接不可用 —— 它没法把一个 merge 重放成线性提交。所以这多半不是二选一。
+
 ## 四、已知但暂不处理
 
 41. **resume 之后,会话 UI 不显示 apply_patch 的 diff**(你报的,2026-08-13)。
