@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::Path;
 
+use codex_file_snapshots::DEFAULT_MODE;
 use codex_file_snapshots::RestoreKind;
 use codex_file_snapshots::SNAPSHOT_IGNORE_FILENAME;
 use codex_file_snapshots::SnapshotStore;
@@ -90,6 +91,7 @@ fn full_rewind_redo_gc_scenario() {
             "turn-1",
             &ws.join("c.txt").to_string_lossy(),
             /*pre_content*/ None,
+            DEFAULT_MODE,
         )
         .unwrap()
         .expect("creating a file records that it did not exist");
@@ -264,6 +266,7 @@ fn thread_marker_and_pre_edit_attach() {
             "turn-1",
             &outside.to_string_lossy(),
             Some(b"pre-edit state"),
+            DEFAULT_MODE,
         )
         .unwrap()
         .expect("new path should attach");
@@ -276,7 +279,8 @@ fn thread_marker_and_pre_edit_attach() {
                 THREAD,
                 "turn-1",
                 &ws.join("a.txt").to_string_lossy(),
-                Some(b"x")
+                Some(b"x"),
+                DEFAULT_MODE,
             )
             .unwrap()
             .is_none()
@@ -286,7 +290,7 @@ fn thread_marker_and_pre_edit_attach() {
     // order to remove the file, and outside a complete scan nothing else
     // supplies it.
     let tombstoned = store
-        .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None)
+        .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None, DEFAULT_MODE)
         .unwrap()
         .expect("a created path is recorded as absent");
     assert!(
@@ -299,7 +303,7 @@ fn thread_marker_and_pre_edit_attach() {
     // Recording it twice adds nothing.
     assert!(
         store
-            .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None)
+            .attach_pre_edit(THREAD, "turn-1", "/brand/new.txt", None, DEFAULT_MODE)
             .unwrap()
             .is_none()
     );
@@ -352,7 +356,13 @@ fn turn_resolution_and_fork_inheritance() {
     // Supplemental attach under the same turn: resolution must pick it.
     let outside = dir.path().join("ext.cfg");
     let supplemental = store
-        .attach_pre_edit(THREAD, "turn-1", &outside.to_string_lossy(), Some(b"pre"))
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &outside.to_string_lossy(),
+            Some(b"pre"),
+            DEFAULT_MODE,
+        )
         .unwrap()
         .unwrap();
     fs::write(ws.join("a.txt"), "v2").unwrap();
@@ -704,7 +714,13 @@ fn a_capture_covers_every_configured_root() {
     fs::write(b.join("main.rs"), "fn b() { changed }").unwrap();
     let born = b.join("extra.rs");
     store
-        .attach_pre_edit(THREAD, "turn-1", &born.to_string_lossy(), None)
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &born.to_string_lossy(),
+            None,
+            DEFAULT_MODE,
+        )
         .unwrap()
         .expect("creating a file records that it did not exist");
     fs::write(&born, "born").unwrap();
@@ -756,6 +772,7 @@ fn a_file_created_outside_the_scanned_scope_is_removed_by_a_rewind() {
             "turn-1",
             &created.to_string_lossy(),
             /*pre_content*/ None,
+            DEFAULT_MODE,
         )
         .unwrap()
         .expect("creating a file records that it did not exist");
@@ -856,6 +873,82 @@ fn undo_walks_back_through_successive_rewinds() {
     );
 }
 
+/// Deleting the conversation that *performed* a rewind must leave the branch
+/// it handed the workspace to still able to undo.
+///
+/// The asymmetry that makes this bite: the safety checkpoint is appended to
+/// the log of the thread doing the work, while the undo record is filed under
+/// the thread the rewind switched *to*, and `inherit_log` copies only up to
+/// the fork turn. So deleting only the performer puts the safety manifest into
+/// the doomed set while the surviving branch still needs it — and
+/// `collect_garbage_for` has no grace window to soften a wrong answer. The
+/// restore log is the sole root keeping it alive.
+#[test]
+fn deleting_the_conversation_that_rewound_leaves_the_branch_its_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let ws = home.join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    let store = SnapshotStore::open(home.join("file_snapshots")).unwrap();
+    let scan = || all_files(&ws);
+
+    fs::write(ws.join("a.txt"), "v1").unwrap();
+    store.checkpoint(THREAD, "turn-1", scan()).unwrap();
+    fs::write(ws.join("a.txt"), "v2").unwrap();
+    store.checkpoint(THREAD, "turn-2", scan()).unwrap();
+
+    // The branch forks at turn-1, so it inherits that turn and not turn-2.
+    store.inherit_log(THREAD, BRANCH, "turn-1").unwrap();
+
+    let outcome = store
+        .restore_to(
+            THREAD,
+            Some(BRANCH),
+            &store.target_for_turn("turn-1").unwrap().unwrap(),
+            RestoreKind::Rewind,
+            scan(),
+            &|_| false,
+        )
+        .unwrap();
+    assert_eq!(read(&ws.join("a.txt")), "v1");
+    let safety = outcome.safety.manifest_id().to_string();
+
+    // The performer is deleted; the branch is not.
+    codex_file_snapshots::forget_threads(home, &[THREAD.to_string()]);
+
+    // Ordered so a failure names its own cause.
+    let undo = store
+        .last_restore_target(BRANCH)
+        .unwrap()
+        .expect("the branch still has a restore to undo");
+    assert_eq!(undo.manifest_id(), safety);
+    assert!(
+        store.manifest(undo.manifest_id()).is_ok(),
+        "the safety manifest survived, though only the deleted thread's log \
+         ever named it"
+    );
+    assert!(
+        store.undo_conflicts(BRANCH, &|_| false).is_ok(),
+        "and so did the target manifest, which is a separate root"
+    );
+    assert!(store.target_for_turn("turn-1").unwrap().is_some());
+    assert!(
+        store.target_for_turn("turn-2").unwrap().is_none(),
+        "the turn only the deleted thread held is gone — retain_turns is \
+         doing its half too"
+    );
+
+    // The assertion that proves the point: the undo actually works.
+    store
+        .restore_to(BRANCH, None, &undo, RestoreKind::Undo, scan(), &|_| false)
+        .unwrap();
+    assert_eq!(
+        read(&ws.join("a.txt")),
+        "v2",
+        "undoing the rewind returns the workspace to where it was"
+    );
+}
+
 #[test]
 fn deleting_a_conversation_takes_its_snapshots_with_it() {
     // The whole of "snapshot lifetime = session lifetime". Until this ran,
@@ -953,7 +1046,13 @@ fn an_undo_removes_a_file_recreated_outside_the_workspace() {
     fs::write(&script, "old").unwrap();
     store.checkpoint(THREAD, "turn-2", scan()).unwrap();
     store
-        .attach_pre_edit(THREAD, "turn-2", &script.to_string_lossy(), Some(b"old"))
+        .attach_pre_edit(
+            THREAD,
+            "turn-2",
+            &script.to_string_lossy(),
+            Some(b"old"),
+            DEFAULT_MODE,
+        )
         .unwrap()
         .expect("the pre-image of a file about to be deleted is recorded");
     fs::remove_file(&script).unwrap();
@@ -1028,7 +1127,13 @@ fn a_turn_reports_what_it_cannot_put_back() {
     fs::write(&script, "old").unwrap();
     store.checkpoint(THREAD, "late", scan()).unwrap();
     store
-        .attach_pre_edit(THREAD, "late", &script.to_string_lossy(), Some(b"old"))
+        .attach_pre_edit(
+            THREAD,
+            "late",
+            &script.to_string_lossy(),
+            Some(b"old"),
+            DEFAULT_MODE,
+        )
         .unwrap()
         .unwrap();
 
@@ -1069,7 +1174,13 @@ fn the_undo_warning_covers_what_it_will_delete() {
     // records it as absent while the rewind target never mentions it.
     let scratch = ws.join("scratch.txt");
     store
-        .attach_pre_edit(THREAD, "turn-1", &scratch.to_string_lossy(), None)
+        .attach_pre_edit(
+            THREAD,
+            "turn-1",
+            &scratch.to_string_lossy(),
+            None,
+            DEFAULT_MODE,
+        )
         .unwrap();
     store
         .restore_to(

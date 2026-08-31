@@ -59,7 +59,12 @@ pub fn mtime_parts(meta: &fs::Metadata) -> (i64, u32) {
         .map_or((0, 0), |d| (d.as_secs() as i64, d.subsec_nanos()))
 }
 
-/// Permission bits to record for a file (`mode & 0o7777`; `0o644` off-unix).
+/// Recorded when a file's real permissions cannot be read, and on every
+/// platform without them.
+pub const DEFAULT_MODE: u32 = 0o644;
+
+/// Permission bits to record for a file (`mode & 0o7777`; `DEFAULT_MODE`
+/// off-unix).
 pub fn mode_of(meta: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
@@ -69,7 +74,7 @@ pub fn mode_of(meta: &fs::Metadata) -> u32 {
     #[cfg(not(unix))]
     {
         let _ = meta;
-        0o644
+        DEFAULT_MODE
     }
 }
 
