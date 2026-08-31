@@ -9,9 +9,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthEnvTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
@@ -194,7 +199,7 @@ impl CodexFeedback {
         }
     }
 
-    /// Returns a [`tracing_subscriber`] layer that captures full-fidelity logs into this feedback
+    /// Returns a [`tracing_subscriber`] layer that captures diagnostic logs into this feedback
     /// ring buffer.
     ///
     /// This is intended for initialization code so call sites don't have to duplicate the exact
@@ -208,11 +213,17 @@ impl CodexFeedback {
             .with_timer(tracing_subscriber::fmt::time::SystemTime)
             .with_ansi(false)
             .with_target(false)
-            // Capture everything, regardless of the caller's `RUST_LOG`, so feedback includes the
-            // full trace when the user uploads a report.
+            // Capture diagnostics independently of `RUST_LOG` without filling the feedback ring
+            // with high-volume request and response payloads.
             .with_filter(
                 Targets::new()
                     .with_default(Level::TRACE)
+                    .with_target("codex_http_client::transport", LevelFilter::DEBUG)
+                    .with_target("codex_api::sse", LevelFilter::DEBUG)
+                    // `tracing-log` checks legacy log records against their original
+                    // target before re-emitting them as `log`; tungstenite TRACE
+                    // includes full websocket frames and authenticated handshakes.
+                    .with_target("tungstenite", LevelFilter::DEBUG)
                     .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
                     .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF),
             )
@@ -414,25 +425,35 @@ impl FeedbackSnapshot {
     }
 
     /// Upload feedback to Sentry with optional attachments.
-    pub fn upload_feedback(&self, options: FeedbackUploadOptions<'_>) -> Result<()> {
-        use std::str::FromStr;
-        use std::sync::Arc;
+    pub async fn upload_feedback(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        http_client_factory: &HttpClientFactory,
+    ) -> Result<()> {
+        self.upload_feedback_with_dsn(options, http_client_factory, SENTRY_DSN)
+            .await
+    }
 
-        use sentry::Client;
+    async fn upload_feedback_with_dsn(
+        &self,
+        options: FeedbackUploadOptions<'_>,
+        http_client_factory: &HttpClientFactory,
+        dsn: &str,
+    ) -> Result<()> {
+        use std::str::FromStr;
+
         use sentry::ClientOptions;
         use sentry::protocol::Envelope;
         use sentry::protocol::EnvelopeItem;
         use sentry::protocol::Event;
         use sentry::protocol::Level;
-        use sentry::transports::DefaultTransportFactory;
         use sentry::types::Dsn;
 
-        // Build Sentry client
-        let client = Client::from_config(ClientOptions {
-            dsn: Some(Dsn::from_str(SENTRY_DSN).map_err(|e| anyhow!("invalid DSN: {e}"))?),
-            transport: Some(Arc::new(DefaultTransportFactory {})),
-            ..Default::default()
-        });
+        let started_at = Instant::now();
+        let dsn = Dsn::from_str(dsn).map_err(|error| anyhow!("invalid DSN: {error}"))?;
+        let upload_url = dsn.envelope_api_url();
+        let sentry_options = ClientOptions::default();
+        let sentry_auth = dsn.to_auth(Some(sentry_options.user_agent.as_ref()));
 
         let tags = self.upload_tags(
             options.classification,
@@ -471,18 +492,80 @@ impl FeedbackSnapshot {
         }
         envelope.add_item(EnvelopeItem::Event(event));
 
-        for attachment in self.feedback_attachments(
+        let attachments = self.feedback_attachments(
             options.include_logs,
             options.extra_attachments,
             options.extra_attachment_paths,
             options.logs_override,
-        ) {
+        );
+        let attachment_count = attachments.len();
+        for attachment in attachments {
             envelope.add_item(EnvelopeItem::Attachment(attachment));
         }
 
-        client.send_envelope(envelope);
-        client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS)));
-        Ok(())
+        let mut body = Vec::new();
+        envelope
+            .to_writer(&mut body)
+            .context("failed to serialize feedback upload")?;
+
+        tracing::info!(
+            thread_id = %self.thread_id,
+            classification = options.classification,
+            include_logs = options.include_logs,
+            attachment_count,
+            payload_bytes = body.len(),
+            "uploading feedback to Sentry"
+        );
+
+        let mut status = None;
+        let result: Result<()> = async {
+            let client_pool = RouteAwareClientPool::new_without_redirects(
+                http_client_factory.clone(),
+                ClientRouteClass::Other,
+            );
+            let response = client_pool
+                .post(upload_url.as_str())
+                .header("X-Sentry-Auth", sentry_auth.to_string())
+                .body(body)
+                .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS))
+                .send()
+                .await
+                .context("failed to upload feedback to Sentry")?;
+            let response_status = response.status();
+            status = Some(response_status.as_u16());
+            response
+                .error_for_status()
+                .context("failed to upload feedback to Sentry")?;
+            anyhow::ensure!(
+                response_status.is_success(),
+                "Sentry rejected feedback upload with HTTP status {response_status}"
+            );
+            Ok(())
+        }
+        .await;
+
+        match &result {
+            Ok(()) => tracing::info!(
+                thread_id = %self.thread_id,
+                classification = options.classification,
+                include_logs = options.include_logs,
+                status,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "feedback uploaded to Sentry"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    thread_id = %self.thread_id,
+                    classification = options.classification,
+                    include_logs = options.include_logs,
+                    status,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %format!("{error:#}"),
+                    "feedback upload failed"
+                )
+            }
+        }
+        result
     }
 
     fn upload_tags(
@@ -703,9 +786,16 @@ mod tests {
 
     use super::*;
     use crate::FeedbackDiagnostic;
+    use codex_http_client::OutboundProxyPolicy;
     use pretty_assertions::assert_eq;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header_exists;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     #[test]
     fn ring_buffer_drops_front_when_full() {
@@ -721,18 +811,50 @@ mod tests {
     }
 
     #[test]
-    fn logger_layer_excludes_responses_websocket_timing_payloads() {
+    fn logger_layer_filters_noisy_trace_payloads() {
         let fb = CodexFeedback::new();
         let _guard = tracing_subscriber::registry()
+            // Keep another TRACE subscriber interested so bridged records are
+            // emitted; feedback must still reject them with its own filter.
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
             .with(fb.logger_layer())
             .set_default();
 
         tracing::trace!(target: "codex_api::responses_websocket_timing", payload = "secret");
-        tracing::trace!(target: "codex_feedback_test", "retained");
+        tracing::trace!(target: "codex_http_client::transport", "transport-trace");
+        tracing::trace!(target: "codex_api::sse", "sse-trace");
+        tracing::trace!(target: "codex_api::sse::responses", "nested-sse-trace");
+        tracing::debug!(target: "codex_http_client::transport", "transport-debug");
+        tracing::debug!(target: "codex_api::sse::responses", "sse-debug");
+        tracing::trace!(target: "codex_feedback_test", "unrelated-trace");
+        log::trace!(target: "codex_feedback_test", "unrelated-log-trace");
+        log::trace!(
+            target: "tungstenite::handshake::client",
+            "websocket-handshake-payload"
+        );
+        log::trace!(target: "tungstenite::protocol", "websocket-frame-payload");
+        log::debug!(target: "tungstenite::protocol", "websocket-debug");
 
         let logs = String::from_utf8(fb.snapshot(/*session_id*/ None).bytes).unwrap();
-        assert!(!logs.contains("secret"));
-        assert!(logs.contains("retained"));
+        for excluded in [
+            "secret",
+            "transport-trace",
+            "sse-trace",
+            "nested-sse-trace",
+            "websocket-handshake-payload",
+            "websocket-frame-payload",
+        ] {
+            assert!(!logs.contains(excluded));
+        }
+        for retained in [
+            "transport-debug",
+            "sse-debug",
+            "unrelated-trace",
+            "unrelated-log-trace",
+            "websocket-debug",
+        ] {
+            assert!(logs.contains(retained));
+        }
     }
 
     #[test]
@@ -747,6 +869,114 @@ mod tests {
         let snap = fb.snapshot(/*session_id*/ None);
         pretty_assertions::assert_eq!(snap.tags.get("model").map(String::as_str), Some("gpt-5"));
         pretty_assertions::assert_eq!(snap.tags.get("cached").map(String::as_str), Some("true"));
+    }
+
+    async fn upload_test_feedback(feedback: &CodexFeedback, dsn: &str) -> Result<()> {
+        feedback
+            .snapshot(/*session_id*/ None)
+            .upload_feedback_with_dsn(
+                FeedbackUploadOptions {
+                    classification: "bug",
+                    reason: Some("private feedback"),
+                    tags: None,
+                    include_logs: true,
+                    extra_attachments: &[],
+                    extra_attachment_paths: &[],
+                    session_source: Some(SessionSource::Cli),
+                    logs_override: Some(b"private log contents".to_vec()),
+                },
+                &HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                dsn,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_waits_for_successful_sentry_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .and(header_exists("X-Sentry-Auth"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dsn = format!("http://public@{}/42", server.address());
+        upload_test_feedback(&CodexFeedback::new(), &dsn)
+            .await
+            .expect("successful Sentry response should complete feedback upload");
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_reports_rejected_sentry_response_without_exposing_feedback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let feedback = CodexFeedback::new();
+        let dsn = format!("http://public@{}/42", server.address());
+
+        let error = upload_test_feedback(&feedback, &dsn)
+            .await
+            .expect_err("rejected Sentry responses must fail feedback uploads");
+
+        let error = format!("{error:#}");
+        assert!(error.contains("503"));
+        assert!(!error.contains("private feedback"));
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_does_not_forward_private_data_to_redirect_target() {
+        let sentry_server = MockServer::start().await;
+        let redirect_target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/42/envelope/"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/capture", redirect_target.uri())),
+            )
+            .expect(1)
+            .mount(&sentry_server)
+            .await;
+        let dsn = format!("http://public@{}/42", sentry_server.address());
+        let error = upload_test_feedback(&CodexFeedback::new(), &dsn)
+            .await
+            .expect_err("redirected feedback uploads must be rejected");
+
+        assert!(error.to_string().contains("307"));
+        assert!(
+            redirect_target
+                .received_requests()
+                .await
+                .expect("redirect target should record requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_upload_reports_transport_failures() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("unused local address should be available");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        drop(listener);
+
+        let dsn = format!("http://public@{address}/42");
+        let error = upload_test_feedback(&CodexFeedback::new(), &dsn)
+            .await
+            .expect_err("transport failures must fail feedback uploads");
+
+        assert!(
+            error
+                .downcast_ref::<codex_http_client::RouteAwareRequestError>()
+                .is_some_and(codex_http_client::RouteAwareRequestError::is_connect)
+        );
     }
 
     #[test]

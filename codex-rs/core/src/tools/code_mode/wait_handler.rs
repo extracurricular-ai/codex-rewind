@@ -54,7 +54,10 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
         create_wait_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -77,6 +80,7 @@ impl CodeModeWaitHandler {
             session.services.analytics_events_client.clone(),
             session.thread_id.to_string(),
             turn.sub_id.clone(),
+            turn.turn_metadata_state.clone(),
             call_id.clone(),
             WAIT_TOOL_NAME,
         );

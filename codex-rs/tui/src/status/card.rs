@@ -48,6 +48,7 @@ use super::rate_limits::compose_rate_limit_data_many;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
 use super::remote_connection::RemoteConnectionStatus;
+use super::thread_usage::StatusThreadUsage;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_lines;
 use crate::wrapping::word_wrap_lines;
@@ -80,9 +81,14 @@ struct StatusRateLimitState {
 #[derive(Debug, Clone)]
 pub(crate) struct StatusHistoryHandle {
     rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
+    thread_usage: StatusThreadUsage,
 }
 
 impl StatusHistoryHandle {
+    pub(crate) fn reserve_thread_usage_label_width(&self) {
+        self.thread_usage.reserve_label_width();
+    }
+
     pub(crate) fn finish_rate_limit_refresh(
         &self,
         rate_limits: &[RateLimitSnapshotDisplay],
@@ -100,6 +106,13 @@ impl StatusHistoryHandle {
             .expect("status history rate-limit state poisoned");
         state.rate_limits = rate_limits;
         state.refreshing_rate_limits = false;
+    }
+
+    pub(crate) fn set_thread_usage(
+        &self,
+        estimate: Option<codex_app_server_protocol::ThreadUsage>,
+    ) {
+        self.thread_usage.set_estimate(estimate);
     }
 }
 
@@ -122,6 +135,7 @@ struct StatusHistoryCell {
     file_snapshots: Option<String>,
     token_usage: StatusTokenUsageData,
     rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
+    thread_usage: StatusThreadUsage,
 }
 
 #[cfg(test)]
@@ -381,6 +395,7 @@ impl StatusHistoryCell {
             refreshing_rate_limits,
         }));
         let agents_summary = Arc::new(RwLock::new(agents_summary));
+        let thread_usage = StatusThreadUsage::default();
 
         (
             Self {
@@ -400,8 +415,12 @@ impl StatusHistoryCell {
                 token_usage,
                 agents_summary,
                 rate_limit_state: rate_limit_state.clone(),
+                thread_usage: thread_usage.clone(),
             },
-            StatusHistoryHandle { rate_limit_state },
+            StatusHistoryHandle {
+                rate_limit_state,
+                thread_usage,
+            },
         )
     }
 
@@ -805,8 +824,8 @@ impl HistoryCell for StatusHistoryCell {
         if self.token_usage.context_window.is_some() {
             push_label(&mut labels, &mut seen, "Context window");
         }
-
         self.collect_rate_limit_labels(&rate_limit_state, &mut seen, &mut labels);
+        self.thread_usage.push_labels(&mut labels, &mut seen);
 
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
         let value_width = formatter.value_width(available_inner_width);
@@ -898,6 +917,11 @@ impl HistoryCell for StatusHistoryCell {
         }
 
         lines.extend(self.rate_limit_lines(&rate_limit_state, available_inner_width, &formatter));
+        let thread_usage_lines = self.thread_usage.lines(&formatter, value_width);
+        if !thread_usage_lines.is_empty() {
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+            lines.extend(thread_usage_lines);
+        }
 
         let content_width = lines.iter().map(line_width).max().unwrap_or(0);
         let inner_width = content_width.min(available_inner_width);

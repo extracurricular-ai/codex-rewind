@@ -56,6 +56,8 @@ pub struct HookEventsToml {
     pub subagent_stop: Vec<MatcherGroup>,
     #[serde(rename = "Stop", default)]
     pub stop: Vec<MatcherGroup>,
+    #[serde(rename = "Interrupt", default)]
+    pub interrupt: Vec<MatcherGroup>,
 }
 
 impl HookEventsToml {
@@ -72,6 +74,7 @@ impl HookEventsToml {
             subagent_start,
             subagent_stop,
             stop,
+            interrupt,
         } = self;
         pre_tool_use.is_empty()
             && permission_request.is_empty()
@@ -84,6 +87,7 @@ impl HookEventsToml {
             && subagent_start.is_empty()
             && subagent_stop.is_empty()
             && stop.is_empty()
+            && interrupt.is_empty()
     }
 
     pub fn handler_count(&self) -> usize {
@@ -99,6 +103,7 @@ impl HookEventsToml {
             subagent_start,
             subagent_stop,
             stop,
+            interrupt,
         } = self;
         [
             pre_tool_use,
@@ -112,6 +117,7 @@ impl HookEventsToml {
             subagent_start,
             subagent_stop,
             stop,
+            interrupt,
         ]
         .into_iter()
         .flatten()
@@ -119,7 +125,7 @@ impl HookEventsToml {
         .sum()
     }
 
-    pub fn into_matcher_groups(self) -> [(HookEventName, Vec<MatcherGroup>); 11] {
+    pub fn into_matcher_groups(self) -> [(HookEventName, Vec<MatcherGroup>); 12] {
         [
             (HookEventName::PreToolUse, self.pre_tool_use),
             (HookEventName::PermissionRequest, self.permission_request),
@@ -132,6 +138,7 @@ impl HookEventsToml {
             (HookEventName::SubagentStart, self.subagent_start),
             (HookEventName::SubagentStop, self.subagent_stop),
             (HookEventName::Stop, self.stop),
+            (HookEventName::Interrupt, self.interrupt),
         ]
     }
 }
@@ -169,10 +176,37 @@ pub enum HookHandlerConfig {
         )]
         additional_context_limit: Option<usize>,
     },
+    #[serde(rename = "mcp_tool")]
+    McpTool {
+        server: String,
+        tool: String,
+        #[serde(default, deserialize_with = "deserialize_mcp_tool_input")]
+        input: serde_json::Map<String, serde_json::Value>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+    },
     #[serde(rename = "prompt")]
     Prompt {},
     #[serde(rename = "agent")]
     Agent {},
+}
+
+// Reject values such as null that cannot be represented in TOML for trust hashing.
+fn deserialize_mcp_tool_input<'de, D>(
+    deserializer: D,
+) -> Result<serde_json::Map<String, serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let input = serde_json::Map::deserialize(deserializer)?;
+    toml::Value::try_from(&input).map_err(|error| {
+        serde::de::Error::custom(format!(
+            "MCP hook input must be representable as TOML: {error}"
+        ))
+    })?;
+    Ok(input)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]

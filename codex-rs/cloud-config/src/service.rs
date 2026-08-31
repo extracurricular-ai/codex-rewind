@@ -1,8 +1,7 @@
 //! Cloud config bundle lifecycle orchestration.
 //!
-//! Startup loads a single shared bundle from cache or backend, and a background
-//! refresher keeps the cache warm for future app starts without changing the
-//! already-snapshotted runtime config.
+//! Startup loads a shared bundle from cache or backend, and background refresh
+//! updates both the on-disk cache and the bundle observed by future config loads.
 
 use crate::backend::BundleClient;
 use crate::backend::BundleRequestError;
@@ -27,12 +26,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::Mutex;
+use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use tokio::time::timeout;
 
 pub(crate) const CLOUD_CONFIG_BUNDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS: usize = 5;
 const CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CLOUD_CONFIG_BUNDLE_LOAD_FAILED_MESSAGE: &str =
     "Failed to load cloud config bundle (workspace-managed policies).";
 const CLOUD_CONFIG_BUNDLE_AUTH_RECOVERY_FAILED_MESSAGE: &str = concat!(
@@ -50,7 +52,8 @@ fn cloud_config_eligible_auth(auth: &CodexAuth) -> bool {
     };
     auth.uses_codex_backend()
         && (plan_type.is_business_like()
-            || matches!(plan_type, PlanType::Enterprise | PlanType::Edu))
+            || plan_type.is_education_like()
+            || plan_type == PlanType::Enterprise)
 }
 
 fn optional_bundle(bundle: CloudConfigBundle) -> Option<CloudConfigBundle> {
@@ -77,18 +80,7 @@ pub(crate) struct CloudConfigBundleService<C> {
     cache: CloudConfigBundleCache,
     codex_home: AbsolutePathBuf,
     timeout: Duration,
-}
-
-impl<C> Clone for CloudConfigBundleService<C> {
-    fn clone(&self) -> Self {
-        Self {
-            auth_manager: Arc::clone(&self.auth_manager),
-            client: Arc::clone(&self.client),
-            cache: self.cache.clone(),
-            codex_home: self.codex_home.clone(),
-            timeout: self.timeout,
-        }
-    }
+    latest_bundle: OnceCell<Mutex<Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>,
 }
 
 impl<C> CloudConfigBundleService<C>
@@ -108,7 +100,19 @@ where
             cache: CloudConfigBundleCache::new(codex_home.clone()),
             codex_home,
             timeout,
+            latest_bundle: OnceCell::new(),
         }
+    }
+
+    pub(crate) async fn get_latest(
+        &self,
+    ) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
+        self.latest_bundle
+            .get_or_init(|| async { Mutex::new(self.load_startup_bundle_with_timeout().await) })
+            .await
+            .lock()
+            .await
+            .clone()
     }
 
     pub(crate) async fn load_startup_bundle_with_timeout(
@@ -456,7 +460,18 @@ where
 
     pub(crate) async fn refresh_cache_in_background(&self) {
         loop {
-            sleep(CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL).await;
+            let mut refresh_interval = CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL;
+            if let Some(latest_bundle) = self.latest_bundle.get()
+                && matches!(
+                    &*latest_bundle.lock().await,
+                    Err(error) if error.code() == CloudConfigBundleLoadErrorCode::Timeout
+                )
+            {
+                // Recover startup timeouts through this worker without making
+                // readers fetch concurrently or extending the startup deadline.
+                refresh_interval = CLOUD_CONFIG_BUNDLE_TIMEOUT_RETRY_INTERVAL;
+            }
+            sleep(refresh_interval).await;
             match timeout(self.timeout, self.refresh_cache_once()).await {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -482,7 +497,12 @@ where
             .fetch_remote_bundle_and_update_cache_with_retries(auth, "refresh")
             .await
         {
-            Ok(bundle) => emit_load_metric("refresh", "success", bundle.as_ref()),
+            Ok(bundle) => {
+                emit_load_metric("refresh", "success", bundle.as_ref());
+                if let Some(latest_bundle) = self.latest_bundle.get() {
+                    *latest_bundle.lock().await = Ok(bundle);
+                }
+            }
             Err(err) => {
                 tracing::error!(
                     path = %self.cache.path().display(),
@@ -490,6 +510,12 @@ where
                     "Failed to refresh cloud config bundle cache from remote"
                 );
                 emit_load_metric("refresh", "error", /*bundle*/ None);
+                if let Some(latest_bundle) = self.latest_bundle.get() {
+                    let mut latest_bundle = latest_bundle.lock().await;
+                    if latest_bundle.is_err() {
+                        *latest_bundle = Err(err);
+                    }
+                }
             }
         }
         true

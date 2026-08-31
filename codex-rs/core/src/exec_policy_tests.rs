@@ -687,7 +687,6 @@ fn commands_for_exec_policy_falls_back_for_empty_shell_script() {
         commands_for_exec_policy(&command),
         ExecPolicyCommands {
             commands: vec![command],
-            used_complex_parsing: false,
             command_origin: ExecPolicyCommandOrigin::Generic,
         }
     );
@@ -705,7 +704,6 @@ fn commands_for_exec_policy_falls_back_for_whitespace_shell_script() {
         commands_for_exec_policy(&command),
         ExecPolicyCommands {
             commands: vec![command],
-            used_complex_parsing: false,
             command_origin: ExecPolicyCommandOrigin::Generic,
         }
     );
@@ -751,7 +749,7 @@ async fn ignore_user_config_keeps_user_policy_files() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn evaluates_heredoc_script_against_prefix_rules() {
+async fn heredoc_script_stays_in_sandbox_despite_inner_allow_rule() {
     let command = vec![
         "bash".to_string(),
         "-lc".to_string(),
@@ -768,15 +766,19 @@ async fn evaluates_heredoc_script_against_prefix_rules() {
             prefix_rule: None,
         },
         ExecApprovalRequirement::Skip {
-            bypass_sandbox: true,
-            proposed_execpolicy_amendment: None,
+            bypass_sandbox: false,
+            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "python3 <<'PY'\nprint('hello')\nPY".to_string(),
+            ])),
         },
     )
     .await;
 }
 
 #[tokio::test]
-async fn omits_auto_amendment_for_heredoc_fallback_prompts() {
+async fn proposes_full_command_amendment_for_heredoc_prompts() {
     assert_exec_approval_requirement_for_command(
         ExecApprovalRequirementScenario {
             policy_src: None,
@@ -792,14 +794,18 @@ async fn omits_auto_amendment_for_heredoc_fallback_prompts() {
         },
         ExecApprovalRequirement::NeedsApproval {
             reason: None,
-            proposed_execpolicy_amendment: None,
+            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "python3 <<'PY'\nprint('hello')\nPY".to_string(),
+            ])),
         },
     )
     .await;
 }
 
 #[tokio::test]
-async fn drops_requested_amendment_for_heredoc_fallback_prompts_when_it_wont_match() {
+async fn heredoc_prompt_replaces_unrelated_requested_prefix_with_full_command() {
     assert_exec_approval_requirement_for_command(
         ExecApprovalRequirementScenario {
             policy_src: None,
@@ -819,14 +825,18 @@ async fn drops_requested_amendment_for_heredoc_fallback_prompts_when_it_wont_mat
         },
         ExecApprovalRequirement::NeedsApproval {
             reason: None,
-            proposed_execpolicy_amendment: None,
+            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "python3 <<'PY'\nprint('hello')\nPY".to_string(),
+            ])),
         },
     )
     .await;
 }
 
 #[tokio::test]
-async fn drops_requested_amendment_for_heredoc_fallback_prompts_when_it_matches() {
+async fn heredoc_prompt_replaces_inner_requested_prefix_with_full_command() {
     assert_exec_approval_requirement_for_command(
         ExecApprovalRequirementScenario {
             policy_src: None,
@@ -842,7 +852,11 @@ async fn drops_requested_amendment_for_heredoc_fallback_prompts_when_it_matches(
         },
         ExecApprovalRequirement::NeedsApproval {
             reason: None,
-            proposed_execpolicy_amendment: None,
+            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "python3 <<'PY'\nprint('hello')\nPY".to_string(),
+            ])),
         },
     )
     .await;
@@ -993,6 +1007,52 @@ async fn exec_approval_requirement_prefers_execpolicy_match() {
 }
 
 #[tokio::test]
+async fn git_status_obeys_approval_policy_and_explicit_rules() {
+    let command = vec_str(&["git", "status"]);
+    let amendment = Some(ExecPolicyAmendment::new(command.clone()));
+
+    for (approval_policy, policy_src, expected_requirement) in [
+        (
+            AskForApproval::UnlessTrusted,
+            None,
+            ExecApprovalRequirement::NeedsApproval {
+                reason: None,
+                proposed_execpolicy_amendment: amendment.clone(),
+            },
+        ),
+        (
+            AskForApproval::OnRequest,
+            None,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: amendment,
+            },
+        ),
+        (
+            AskForApproval::UnlessTrusted,
+            Some(r#"prefix_rule(pattern=["git", "status"], decision="allow")"#.to_string()),
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: true,
+                proposed_execpolicy_amendment: None,
+            },
+        ),
+    ] {
+        assert_exec_approval_requirement_for_command(
+            ExecApprovalRequirementScenario {
+                policy_src,
+                command: command.clone(),
+                approval_policy,
+                permission_profile: PermissionProfile::workspace_write(),
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                prefix_rule: None,
+            },
+            expected_requirement,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn absolute_path_exec_approval_requirement_matches_host_executable_rules() {
     let git_path = host_program_path("git");
     let git_path_literal = starlark_string(&git_path);
@@ -1044,8 +1104,8 @@ prefix_rule(pattern=["git"], decision="prompt")
             sandbox_permissions: SandboxPermissions::UseDefault,
             prefix_rule: None,
         },
-        ExecApprovalRequirement::Skip {
-            bypass_sandbox: false,
+        ExecApprovalRequirement::NeedsApproval {
+            reason: None,
             proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
                 disallowed_git_path,
                 "status".to_string(),
@@ -1118,7 +1178,6 @@ fn unmatched_granular_policy_still_prompts_for_restricted_sandbox_escalation() {
                 permission_profile: &PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 sandbox_permissions: SandboxPermissions::RequireEscalated,
-                used_complex_parsing: false,
                 command_origin: ExecPolicyCommandOrigin::Generic,
             },
         )
@@ -1138,7 +1197,6 @@ fn unmatched_on_request_uses_permission_profile_file_system_policy_for_escalatio
                 permission_profile: &PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 sandbox_permissions: SandboxPermissions::RequireEscalated,
-                used_complex_parsing: false,
                 command_origin: ExecPolicyCommandOrigin::Generic,
             },
         )
@@ -1158,7 +1216,6 @@ fn known_safe_on_request_still_prompts_for_restricted_sandbox_escalation() {
                 permission_profile: &PermissionProfile::workspace_write(),
                 windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
                 sandbox_permissions: SandboxPermissions::RequireEscalated,
-                used_complex_parsing: false,
                 command_origin: ExecPolicyCommandOrigin::Generic,
             },
         )
@@ -1389,9 +1446,11 @@ async fn mixed_rule_and_sandbox_prompt_prioritizes_rule_for_rejection_decision()
                 mcp_elicitations: true,
             }),
             permission_profile: PermissionProfile::read_only(),
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             sandbox_permissions: SandboxPermissions::RequireEscalated,
             prefix_rule: None,
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await;
 
@@ -1426,9 +1485,11 @@ async fn forced_rm_preserves_rule_rejection_when_granular_rules_are_disabled() {
                 mcp_elicitations: true,
             }),
             permission_profile: PermissionProfile::read_only(),
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             sandbox_permissions: SandboxPermissions::RequireEscalated,
             prefix_rule: None,
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await;
 
@@ -1450,9 +1511,11 @@ async fn exec_approval_requirement_falls_back_to_heuristics() {
             command: &command,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             sandbox_permissions: SandboxPermissions::UseDefault,
             prefix_rule: None,
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await;
 
@@ -1475,9 +1538,11 @@ async fn empty_bash_lc_script_falls_back_to_original_command() {
             command: &command,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             sandbox_permissions: SandboxPermissions::UseDefault,
             prefix_rule: None,
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await;
 
@@ -1504,9 +1569,11 @@ async fn whitespace_bash_lc_script_falls_back_to_original_command() {
             command: &command,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             sandbox_permissions: SandboxPermissions::UseDefault,
             prefix_rule: None,
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await;
 
@@ -1533,9 +1600,11 @@ async fn request_rule_uses_prefix_rule() {
             command: &command,
             approval_policy: AskForApproval::OnRequest,
             permission_profile: PermissionProfile::read_only(),
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             sandbox_permissions: SandboxPermissions::RequireEscalated,
             prefix_rule: Some(vec!["cargo".to_string(), "install".to_string()]),
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await;
 
@@ -1565,9 +1634,11 @@ async fn request_rule_falls_back_when_prefix_rule_does_not_approve_all_commands(
             command: &command,
             approval_policy: AskForApproval::OnRequest,
             permission_profile: PermissionProfile::Disabled,
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
             sandbox_permissions: SandboxPermissions::RequireEscalated,
             prefix_rule: Some(vec!["cargo".to_string(), "install".to_string()]),
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await;
 
@@ -1604,9 +1675,11 @@ async fn heuristics_apply_when_other_commands_match_policy() {
                 command: &command,
                 approval_policy: AskForApproval::UnlessTrusted,
                 permission_profile: PermissionProfile::Disabled,
+                environment_policy: None,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 prefix_rule: None,
+                allow_prefix_rules: AllowPrefixRules::Honor,
             })
             .await,
         ExecApprovalRequirement::NeedsApproval {
@@ -2082,9 +2155,11 @@ async fn forced_rm_requires_approval_or_specific_rejection_on_all_platforms() {
                 command: &dangerous_command,
                 approval_policy: AskForApproval::OnRequest,
                 permission_profile: PermissionProfile::read_only(),
+                environment_policy: None,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 sandbox_permissions: permissions,
                 prefix_rule: None,
+                allow_prefix_rules: AllowPrefixRules::Honor,
             })
             .await,
         r#"On all platforms, a forbidden command should require approval
@@ -2103,9 +2178,11 @@ async fn forced_rm_requires_approval_or_specific_rejection_on_all_platforms() {
                 command: &dangerous_command,
                 approval_policy: AskForApproval::Never,
                 permission_profile: PermissionProfile::read_only(),
+                environment_policy: None,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 sandbox_permissions: permissions,
                 prefix_rule: None,
+                allow_prefix_rules: AllowPrefixRules::Honor,
             })
             .await,
         r#"On all platforms, a forbidden command should require approval
@@ -2161,9 +2238,11 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
                 command: &sneaky_command,
                 approval_policy: AskForApproval::OnRequest,
                 permission_profile: PermissionProfile::read_only(),
+                environment_policy: None,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 sandbox_permissions: permissions,
                 prefix_rule: None,
+                allow_prefix_rules: AllowPrefixRules::Honor,
             })
             .await,
         "{pwsh_approval_reason}"
@@ -2253,9 +2332,11 @@ async fn exec_approval_requirement_for_command(
             command: &command,
             approval_policy,
             permission_profile,
+            environment_policy: None,
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
             sandbox_permissions,
             prefix_rule,
+            allow_prefix_rules: AllowPrefixRules::Honor,
         })
         .await
 }

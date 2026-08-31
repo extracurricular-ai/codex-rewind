@@ -8,6 +8,7 @@ use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -21,7 +22,7 @@ pub struct Prompt {
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
-    pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) tools: Arc<[ToolSpec]>,
 
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
@@ -33,17 +34,20 @@ pub struct Prompt {
 
     /// Whether the Responses API should strictly validate `output_schema`.
     pub output_schema_strict: bool,
+
+    pub(crate) cyber_access_program: Option<codex_protocol::turn_input::CyberAccessProgram>,
 }
 
 impl Default for Prompt {
     fn default() -> Self {
         Self {
             input: Vec::new(),
-            tools: Vec::new(),
+            tools: Arc::default(),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),
             output_schema: None,
             output_schema_strict: true,
+            cyber_access_program: None,
         }
     }
 }

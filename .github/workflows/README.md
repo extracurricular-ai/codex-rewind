@@ -145,14 +145,58 @@ Seven versions of **one** package, `codex-rewind`:
 
 | version | dist-tag |
 | --- | --- |
-| `0.147.0-rewind.0-linux-x64`, and five more like it | `linux-x64`, … |
-| `0.147.0-rewind.0` — the launcher | `latest` |
+| `0.151.0-rewind.0-linux-x64`, and five more like it | `linux-x64`, … |
+| `0.151.0-rewind.0` — the launcher | `next` |
 
 The platform builds are deliberately kept off `latest`. That tag is what a bare
 `npm install` follows, so pointing it at a platform build would hand every
 other platform a package with no binary it can run. The launcher is published
 last, and only once all six resolve — its `optionalDependencies` name them by
 exact version.
+
+### Publishing is not the same act as becoming the default
+
+**A finished release does not change what `npm install -g codex-rewind` gets.**
+The launcher goes to `next`. Expect that, or the first tag push after this will
+look like it failed.
+
+The release is on the registry and fully installable the moment the workflow
+ends. Ask for it by name:
+
+```shell
+npm install -g codex-rewind@next
+```
+
+It behaves exactly like the eventual `latest` would: the launcher pins the six
+platform packages by exact version, so a `next` launcher resolves the same
+binaries a promoted one will.
+
+Promote it once you are satisfied:
+
+```shell
+npm login                                              # once
+npm dist-tag add codex-rewind@0.151.0-rewind.0 latest
+npm dist-tag ls codex-rewind                           # confirm
+```
+
+That is a pointer move against a version already published — no rebuild, no new
+version number, and reversible by pointing `latest` back, where a *version* can
+never be replaced once it exists.
+
+It has to be local. npm's OIDC trusted publishing
+[covers `npm publish` and `npm stage publish` only](https://docs.npmjs.com/trusted-publishers/);
+`npm dist-tag` needs a token, and having none is the property that lets this
+repository publish without a secret at all. [npm/cli#8547](https://github.com/npm/cli/issues/8547)
+asks for the gap to be closed and is still open.
+
+Keeping the last step manual is not a workaround, though. Deciding that a build
+becomes what every user installs is the step most worth a human, and this is the
+same split that keeps `build.yml` unable to publish: an action taken to answer
+one question can never quietly answer a larger one.
+
+The `npm_tag` input overrides the tag on a manual run — pass `latest` to go
+straight there, which is worth doing only when the exact artifact has already
+been tested some other way.
 
 ### Auth
 

@@ -9,9 +9,12 @@ use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
+use crate::status::format_credit_micros;
+use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::ConfigLayerSource;
+use codex_config::os_host_name;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::PermissionProfile;
@@ -70,6 +73,20 @@ impl StatusSurfaceSelections {
     fn uses_workspace_headline(&self) -> bool {
         self.status_line_items
             .contains(&StatusLineItem::WorkspaceHeadline)
+    }
+
+    fn uses_thread_usage(&self) -> bool {
+        self.status_line_items.iter().any(|item| {
+            matches!(
+                item,
+                StatusLineItem::ThreadCredits | StatusLineItem::EstimatedThreadCost
+            )
+        }) || self.terminal_title_items.iter().any(|item| {
+            matches!(
+                item,
+                TerminalTitleItem::ThreadCredits | TerminalTitleItem::EstimatedThreadCost
+            )
+        })
     }
 }
 
@@ -172,6 +189,12 @@ impl ChatWidget {
         } else {
             self.request_status_line_workspace_headline_if_due(Instant::now());
         }
+
+        if selections.uses_thread_usage() {
+            self.ensure_thread_usage_requested();
+        } else {
+            self.cancel_thread_usage_polling();
+        }
     }
 
     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
@@ -221,11 +244,15 @@ impl ChatWidget {
     /// Empty selections clear the managed title. Non-empty selections render the
     /// current values in configured order, skip unavailable segments, and cache
     /// the last successfully written title so redundant OSC writes are avoided.
-    /// When the `activity` item is present in an animated running state, this also
-    /// schedules the next frame so the title animation keeps advancing.
+    /// Animated titles record their next refresh for the foreground loop, independently
+    /// of full TUI redraws.
     fn refresh_terminal_title_from_selections(&mut self, selections: &StatusSurfaceSelections) {
         self.last_terminal_title_requires_action =
             self.terminal_title_shows_action_required_with_selections(selections);
+        let now = Instant::now();
+        self.terminal_title_next_refresh = self
+            .terminal_title_animation_interval_with_selections(selections)
+            .map(|interval| now + interval);
         if selections.terminal_title_items.is_empty() {
             if let Err(err) = self.clear_managed_terminal_title() {
                 tracing::debug!(error = %err, "failed to clear terminal title");
@@ -233,13 +260,8 @@ impl ChatWidget {
             return;
         }
 
-        let now = Instant::now();
         let title = self.terminal_title_text_for_selections(selections, now);
-        let animation_interval = self.terminal_title_animation_interval_with_selections(selections);
         if self.last_terminal_title == title {
-            if let Some(interval) = animation_interval {
-                self.frame_requester.schedule_frame_in(interval);
-            }
             return;
         }
         match title {
@@ -261,10 +283,6 @@ impl ChatWidget {
                     tracing::debug!(error = %err, "failed to clear terminal title");
                 }
             }
-        }
-
-        if let Some(interval) = animation_interval {
-            self.frame_requester.schedule_frame_in(interval);
         }
     }
 
@@ -660,6 +678,7 @@ impl ChatWidget {
                 ))
             }
             StatusLineItem::ProjectRoot => self.status_line_project_root_name(),
+            StatusLineItem::Hostname => os_host_name(),
             StatusLineItem::GitBranch => self.status_line_branch.clone(),
             StatusLineItem::PullRequestNumber => self
                 .status_line_git_summary
@@ -727,14 +746,32 @@ impl ChatWidget {
                     format_tokens_compact(self.status_line_total_usage().output_tokens)
                 )
             }),
+            StatusLineItem::ThreadCredits => self
+                .estimated_thread_usage()
+                .map(|usage| usage.estimated_usage_credits_micros)
+                .map(|credits| format!("{} credits", format_credit_micros(credits))),
+            StatusLineItem::EstimatedThreadCost => self
+                .estimated_thread_usage()
+                .and_then(|usage| usage.estimated_usage_usd_micros)
+                .and_then(format_estimated_usd_micros),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
-            StatusLineItem::FastMode => Some(
-                if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
-                    "Fast on".to_string()
-                } else {
-                    "Fast off".to_string()
-                },
-            ),
+            StatusLineItem::FastMode => self
+                .model_catalog
+                .try_list_models()
+                .ok()
+                .and_then(|models| {
+                    models
+                        .into_iter()
+                        .find(|preset| preset.model == self.current_model())
+                })
+                .is_none_or(|preset| preset.supports_fast_mode())
+                .then(|| {
+                    if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
+                        "Fast on".to_string()
+                    } else {
+                        "Fast off".to_string()
+                    }
+                }),
             StatusLineItem::RawOutput => self.raw_output_mode().then(|| "raw output".to_string()),
             StatusLineItem::ThreadTitle => self.thread_name.as_ref().map_or_else(
                 || self.thread_id.map(|id| id.to_string()),
@@ -770,6 +807,7 @@ impl ChatWidget {
             StatusSurfacePreviewItem::Status => return Some(self.run_state_status_text()),
             StatusSurfacePreviewItem::TaskProgress => return self.terminal_title_task_progress(),
             StatusSurfacePreviewItem::CurrentDir => StatusLineItem::CurrentDir,
+            StatusSurfacePreviewItem::Hostname => StatusLineItem::Hostname,
             StatusSurfacePreviewItem::ThreadTitle => StatusLineItem::ThreadTitle,
             StatusSurfacePreviewItem::GitBranch => StatusLineItem::GitBranch,
             StatusSurfacePreviewItem::PullRequestNumber => StatusLineItem::PullRequestNumber,
@@ -785,6 +823,8 @@ impl ChatWidget {
             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
             StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
+            StatusSurfacePreviewItem::ThreadCredits => StatusLineItem::ThreadCredits,
+            StatusSurfacePreviewItem::EstimatedThreadCost => StatusLineItem::EstimatedThreadCost,
             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
@@ -842,6 +882,12 @@ impl ChatWidget {
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::TotalOutputTokens => self
                 .status_line_value_for_item(StatusLineItem::TotalOutputTokens)
+                .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
+            TerminalTitleItem::ThreadCredits => self
+                .status_line_value_for_item(StatusLineItem::ThreadCredits)
+                .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
+            TerminalTitleItem::EstimatedThreadCost => self
+                .status_line_value_for_item(StatusLineItem::EstimatedThreadCost)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::SessionId => self
                 .status_line_value_for_item(StatusLineItem::SessionId)

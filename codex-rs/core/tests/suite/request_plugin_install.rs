@@ -1,4 +1,3 @@
-#![cfg(not(target_os = "windows"))]
 #![allow(clippy::unwrap_used)]
 
 use anyhow::Context;
@@ -6,7 +5,9 @@ use anyhow::Result;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverable;
 use codex_config::types::ToolSuggestDiscoverableType;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core_plugins::startup_sync::curated_plugins_repo_path;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
@@ -46,6 +47,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use tempfile::TempDir;
+use test_case::test_case;
 use wiremock::Mock;
 use wiremock::MockGuard;
 use wiremock::MockServer;
@@ -116,7 +119,7 @@ fn configure_apps_without_search_tool(config: &mut Config, apps_base_url: &str) 
 
 async fn mount_recommendations(server: &wiremock::MockServer, response: ResponseTemplate) {
     Mock::given(method("GET"))
-        .and(path("/ps/plugins/suggested"))
+        .and(path("/ps/plugins/suggested/codex"))
         .and(query_param("scope", "GLOBAL"))
         .respond_with(response)
         .mount(server)
@@ -156,7 +159,7 @@ async fn build_test(
                 configure_apps_without_search_tool(config, apps_base_url.as_str());
             }
         });
-    builder.build(server).await
+    builder.build_with_auto_env(server).await
 }
 
 async fn build_gated_step_preparation_test(
@@ -206,26 +209,23 @@ async fn start_gated_step_preparation(test: &TestCodex, server: &MockServer) -> 
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|request| request.url.path() == "/ps/plugins/suggested")
+        .filter(|request| request.url.path() == "/ps/plugins/suggested/codex")
         .count();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "prepare MCP and plugin recommendations".to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let fs = test.fs();
@@ -233,7 +233,7 @@ async fn start_gated_step_preparation(test: &TestCodex, server: &MockServer) -> 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let mcp_started = fs
-                .read_file_text(&pid_file, /*sandbox*/ None)
+                .read_file_text(&pid_file, Default::default(), /*sandbox*/ None)
                 .await
                 .is_ok_and(|pid| !pid.trim().is_empty());
             let recommendation_count = server
@@ -241,7 +241,7 @@ async fn start_gated_step_preparation(test: &TestCodex, server: &MockServer) -> 
                 .await
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|request| request.url.path() == "/ps/plugins/suggested")
+                .filter(|request| request.url.path() == "/ps/plugins/suggested/codex")
                 .count();
             if mcp_started && recommendation_count > prior_recommendation_count {
                 break;
@@ -260,15 +260,12 @@ async fn start_install_turn(test: &TestCodex, prompt: &str) -> Result<Elicitatio
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -281,8 +278,8 @@ async fn start_install_turn(test: &TestCodex, prompt: &str) -> Result<Elicitatio
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     Ok(wait_for_event_match(&test.codex, |event| match event {
@@ -315,20 +312,34 @@ async fn resolve_install_elicitation(
 
 async fn mount_remote_calendar_recommendation(server: &wiremock::MockServer) {
     Mock::given(method("GET"))
-        .and(path("/ps/plugins/suggested"))
+        .and(path("/ps/plugins/suggested/codex"))
         .and(query_param("scope", "GLOBAL"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "enabled": true,
             "plugins": [{
                 "id": REMOTE_CALENDAR_PLUGIN_ID,
                 "name": "calendar",
-                "status": "ENABLED",
-                "installation_policy": "AVAILABLE",
-                "release": {
-                    "display_name": "Calendar",
-                    "app_ids": [CALENDAR_CONNECTOR_ID]
-                }
+                "display_name": "Calendar"
             }]
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/ps/plugins/{REMOTE_CALENDAR_PLUGIN_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": REMOTE_CALENDAR_PLUGIN_ID,
+            "name": "calendar",
+            "scope": "GLOBAL",
+            "status": "ENABLED",
+            "installation_policy": "AVAILABLE",
+            "authentication_policy": "ON_USE",
+            "release": {
+                "display_name": "Calendar",
+                "description": "Manage calendar events.",
+                "app_ids": [CALENDAR_CONNECTOR_ID],
+                "interface": {}
+            }
         })))
         .expect(1)
         .mount(server)
@@ -355,7 +366,6 @@ async fn mount_empty_remote_installed_plugins(server: &wiremock::MockServer) -> 
 async fn mount_remote_calendar_installed_plugins(server: &wiremock::MockServer) {
     Mock::given(method("GET"))
         .and(path("/ps/plugins/installed"))
-        .and(query_param("scope", "GLOBAL"))
         .respond_with(remote_installed_plugins_response(vec![json!({
             "id": REMOTE_CALENDAR_PLUGIN_ID,
             "name": "calendar",
@@ -373,15 +383,6 @@ async fn mount_remote_calendar_installed_plugins(server: &wiremock::MockServer) 
         .with_priority(1)
         .mount(server)
         .await;
-    for scope in ["WORKSPACE", "USER"] {
-        Mock::given(method("GET"))
-            .and(path("/ps/plugins/installed"))
-            .and(query_param("scope", scope))
-            .respond_with(remote_installed_plugins_response(Vec::new()))
-            .with_priority(1)
-            .mount(server)
-            .await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -401,9 +402,7 @@ async fn mcp_discovery_overlaps_endpoint_plugin_recommendations() -> Result<()> 
             "plugins": [{
                 "id": "plugin_github",
                 "name": "github",
-                "status": "ENABLED",
-                "installation_policy": "AVAILABLE",
-                "release": {"display_name": "GitHub"}
+                "display_name": "GitHub"
             }]
         })),
     )
@@ -425,7 +424,12 @@ async fn mcp_discovery_overlaps_endpoint_plugin_recommendations() -> Result<()> 
         "sampling should wait for the complete MCP catalog"
     );
     test.fs()
-        .write_file(&barrier, b"ready".to_vec(), /*sandbox*/ None)
+        .write_file(
+            &barrier,
+            b"ready".to_vec(),
+            Default::default(),
+            /*sandbox*/ None,
+        )
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -490,7 +494,12 @@ async fn interrupting_concurrent_step_preparation_prevents_sampling() -> Result<
     );
 
     test.fs()
-        .write_file(&barrier, b"ready".to_vec(), /*sandbox*/ None)
+        .write_file(
+            &barrier,
+            b"ready".to_vec(),
+            Default::default(),
+            /*sandbox*/ None,
+        )
         .await?;
     test.codex.shutdown_and_wait().await?;
     assert!(
@@ -558,6 +567,118 @@ async fn explicit_false_preserves_legacy_workflow() -> Result<()> {
     Ok(())
 }
 
+#[test_case(true; "enabled plugin skill")]
+#[test_case(false; "disabled plugin skill")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_plugin_skill_availability_reaches_tool_suggestion_candidates(
+    skill_enabled: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    let codex_home = Arc::new(TempDir::new()?);
+    let curated_root = curated_plugins_repo_path(codex_home.path());
+    let plugin_root = curated_root.join("plugins/sample");
+    std::fs::create_dir_all(curated_root.join(".agents/plugins"))?;
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    std::fs::create_dir_all(plugin_root.join("skills/search"))?;
+    std::fs::write(
+        curated_root.join(".agents/plugins/marketplace.json"),
+        r#"{
+  "name": "openai-curated",
+  "plugins": [{
+    "name": "sample",
+    "source": {"source": "local", "path": "./plugins/sample"}
+  }]
+}"#,
+    )?;
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"sample","description":"Search sample data"}"#,
+    )?;
+    std::fs::write(
+        plugin_root.join("skills/search/SKILL.md"),
+        "---\nname: search\ndescription: Search sample data\n---\n",
+    )?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "[features]\nplugins = true\n\n[[skills.config]]\nname = \"sample:search\"\nenabled = {skill_enabled}\n"
+        ),
+    )?;
+
+    let call_id = "list-skill-backed-plugin-candidates";
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(call_id, LIST_AVAILABLE_PLUGINS_TO_INSTALL_TOOL_NAME, "{}"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config({
+            let apps_base_url = apps_server.chatgpt_base_url.clone();
+            move |config| {
+                config
+                    .permissions
+                    .set_permission_profile(PermissionProfile::Disabled)
+                    .expect("test config should allow disabled permissions");
+                configure_apps_without_search_tool(config, apps_base_url.as_str());
+                config
+                    .features
+                    .disable(Feature::RemotePlugin)
+                    .expect("test config should allow local plugin suggestions");
+                config.tool_suggest.discoverables = vec![ToolSuggestDiscoverable {
+                    kind: ToolSuggestDiscoverableType::Plugin,
+                    id: "sample@openai-curated".to_string(),
+                }];
+            }
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    test.submit_turn_with_approval_and_permission_profile(
+        "list available plugins",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_legacy_tools(&requests[0].body_json());
+    let output: Value = serde_json::from_str(
+        &requests[1]
+            .function_call_output_text(call_id)
+            .expect("list tool output"),
+    )?;
+    assert_eq!(
+        output,
+        json!({
+            "tools": [{
+                "id": "sample@openai-curated",
+                "name": "sample",
+                "description": "Search sample data",
+                "tool_type": "plugin",
+                "has_skills": skill_enabled,
+                "mcp_server_names": [],
+                "app_connector_ids": []
+            }]
+        })
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn endpoint_mode_injects_candidates_hides_list_and_rejects_invented_ids() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -572,16 +693,12 @@ async fn endpoint_mode_injects_candidates_hides_list_and_rejects_invented_ids() 
                 {
                     "id": "plugin_google_calendar",
                     "name": "google-calendar",
-                    "status": "ENABLED",
-                    "installation_policy": "AVAILABLE",
-                    "release": {"display_name": "Google Calendar"}
+                    "display_name": "Google Calendar"
                 },
                 {
                     "id": "plugin_github",
                     "name": "github",
-                    "status": "ENABLED",
-                    "installation_policy": "AVAILABLE",
-                    "release": {"display_name": "GitHub"}
+                    "display_name": "GitHub"
                 }
             ]
         })),
@@ -641,8 +758,7 @@ async fn endpoint_mode_injects_candidates_hides_list_and_rejects_invented_ids() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn endpoint_recommendation_adds_install_identity_only_to_elicitation_metadata() -> Result<()>
-{
+async fn endpoint_recommendation_hydrates_install_identity_after_selection() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     run_remote_plugin_install_metadata_case().await
@@ -661,16 +777,30 @@ async fn run_remote_plugin_install_metadata_case() -> Result<()> {
             "plugins": [{
                 "id": REMOTE_PLUGIN_ID,
                 "name": "github",
-                "status": "ENABLED",
-                "installation_policy": "AVAILABLE",
-                "release": {
-                    "display_name": "GitHub",
-                    "app_ids": [APP_CONNECTOR_ID]
-                }
+                "display_name": "GitHub"
             }]
         })),
     )
     .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/ps/plugins/{REMOTE_PLUGIN_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": REMOTE_PLUGIN_ID,
+            "name": "github",
+            "scope": "GLOBAL",
+            "status": "ENABLED",
+            "installation_policy": "AVAILABLE",
+            "authentication_policy": "ON_USE",
+            "release": {
+                "display_name": "GitHub",
+                "description": "Work with GitHub repositories.",
+                "app_ids": [APP_CONNECTOR_ID],
+                "interface": {}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     let call_id = "install-github";
     let mock = mount_sse_sequence(
         &server,
@@ -729,6 +859,10 @@ async fn run_remote_plugin_install_metadata_case() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    assert_eq!(
+        meta["suggestion_id"],
+        analytics_event["event_params"]["suggestion_id"]
+    );
     let thread_id = analytics_event["event_params"]["thread_id"].clone();
     let turn_id = analytics_event["event_params"]["turn_id"].clone();
     assert_eq!(
@@ -761,6 +895,82 @@ async fn run_remote_plugin_install_metadata_case() -> Result<()> {
         assert!(!body.contains(REMOTE_PLUGIN_ID));
         assert!(!body.contains(APP_CONNECTOR_ID));
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_recommendation_skips_unavailable_plugin_elicitation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const REMOTE_PLUGIN_ID: &str = "plugin_connector_github";
+
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    mount_recommendations(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "enabled": true,
+            "plugins": [{
+                "id": REMOTE_PLUGIN_ID,
+                "name": "github",
+                "display_name": "GitHub"
+            }]
+        })),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/ps/plugins/{REMOTE_PLUGIN_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": REMOTE_PLUGIN_ID,
+            "name": "github",
+            "scope": "GLOBAL",
+            "status": "DISABLED_BY_ADMIN",
+            "installation_policy": "AVAILABLE",
+            "authentication_policy": "ON_USE",
+            "release": {
+                "display_name": "GitHub",
+                "description": "Work with GitHub repositories.",
+                "app_ids": ["connector_github"],
+                "interface": {}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let call_id = "install-unavailable-github";
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    call_id,
+                    REQUEST_PLUGIN_INSTALL_TOOL_NAME,
+                    &serde_json::to_string(&json!({
+                        "plugin_id": "github@openai-curated-remote",
+                        "suggest_reason": "Use GitHub for this request"
+                    }))?,
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+    let test = build_test(&server, &apps_server).await?;
+
+    test.submit_turn("use GitHub").await?;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].function_call_output_text(call_id).as_deref(),
+        Some("The recommended plugins for this turn are no longer available.")
+    );
     Ok(())
 }
 
@@ -899,7 +1109,7 @@ async fn endpoint_mode_with_no_eligible_candidates_exposes_no_suggestion_tools()
             "plugins": [{
                 "id": "plugin_google_calendar",
                 "name": "google-calendar",
-                "release": {"display_name": "Google Calendar"}
+                "display_name": "Google Calendar"
             }]
         })),
     )
@@ -924,7 +1134,7 @@ async fn endpoint_mode_with_no_eligible_candidates_exposes_no_suggestion_tools()
                 )];
             }
         });
-    let test = builder.build(&server).await?;
+    let test = builder.build_with_auto_env(&server).await?;
 
     test.submit_turn("list tools").await?;
 

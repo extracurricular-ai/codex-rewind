@@ -137,14 +137,15 @@ pub(crate) fn migration_copy_for_models(
 pub(crate) async fn run_model_migration_prompt(
     tui: &mut Tui,
     copy: ModelMigrationCopy,
-) -> ModelMigrationOutcome {
+) -> std::io::Result<ModelMigrationOutcome> {
     let alt = AltScreenGuard::enter(tui);
     let mut screen = ModelMigrationScreen::new(alt.tui.frame_requester(), copy);
 
-    let _ = alt.tui.draw(u16::MAX, |frame| {
+    alt.tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
-    });
+    })?;
 
+    alt.tui.discard_pending_input_before_interactive_screen()?;
     let events = alt.tui.event_stream();
     tokio::pin!(events);
 
@@ -153,8 +154,8 @@ pub(crate) async fn run_model_migration_prompt(
             let _ = alt.tui.screen_size_for_event(&event);
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
-                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+                TuiEvent::Paste(_) | TuiEvent::FocusLost => {}
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     let _ = alt.tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     });
@@ -166,7 +167,7 @@ pub(crate) async fn run_model_migration_prompt(
         }
     }
 
-    screen.outcome()
+    Ok(screen.outcome())
 }
 
 struct ModelMigrationScreen {

@@ -33,6 +33,10 @@ on:
         type: boolean
         required: false
         default: true
+      npm_tag:
+        description: "dist-tag for the launcher. `next` publishes without changing what a bare `npm install` gets; pass `latest` only to go straight there."
+        required: false
+        default: "next"
 
 permissions:
   contents: write
@@ -111,6 +115,9 @@ jobs:
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          # `inputs` is empty on a tag push, so this is also the default for the
+          # path that actually releases.
+          NPM_TAG: ${{ inputs.npm_tag || 'next' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -147,13 +154,39 @@ jobs:
           # The launcher last, and only once all six resolve: its
           # optionalDependencies name them by exact version.
           #
-          # `latest` is spelled out rather than left to default. Every version
+          # The tag is spelled out rather than left to default. Every version
           # this workflow publishes is a semver prerelease — `-rewind.<n>` — and
           # npm refuses to publish one without an explicit `--tag`, so omitting
           # it fails here, at the seventh of seven publishes, with the six
           # platform packages already public and the version already spent.
+          #
+          # It defaults to `next`, not `latest`. Publishing and becoming what
+          # everyone installs are two decisions, and this workflow makes only
+          # the first — the same split that keeps build.yml unable to publish
+          # at all. The release is fully installable the moment this finishes;
+          # a bare `npm install` simply keeps resolving to whatever `latest`
+          # pointed at before it.
+          #
+          # Promoting is deliberately *not* automated here, and cannot be:
+          # npm's OIDC trusted publishing covers `npm publish` only, so
+          # `npm dist-tag` needs a token this repository does not have and does
+          # not want. It is one local command against a version already on the
+          # registry — no rebuild, no new version, and reversible, since a
+          # dist-tag is a pointer where a version is permanent.
           python3 codex-cli/scripts/build_npm_package.py \
             --package codex --version "$version" --pack-output /tmp/launcher.tgz
-          publish /tmp/launcher.tgz latest
+          publish /tmp/launcher.tgz "$NPM_TAG"
 
-          echo "published $version" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "published \`$version\` under dist-tag \`$NPM_TAG\`"
+            if [[ "$NPM_TAG" != "latest" ]]; then
+              echo
+              echo "A bare \`npm install\` is unaffected. Test this build with:"
+              echo
+              echo "    npm install -g codex-rewind@$NPM_TAG"
+              echo
+              echo "Then promote it locally (\`npm login\` first; OIDC cannot do this):"
+              echo
+              echo "    npm dist-tag add codex-rewind@$version latest"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -4,9 +4,9 @@ use anyhow::Result;
 use core_test_support::responses::WebSocketConnectionConfig;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_exec_command_call;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
@@ -30,7 +30,7 @@ async fn responses_turn_state_persists_within_turn_and_resets_after() -> Result<
     let first_response = sse(vec![
         ev_response_created("resp-1"),
         ev_reasoning_item("rsn-1", &["thinking"], &[]),
-        ev_shell_command_call(call_id, "echo turn-state"),
+        ev_exec_command_call(call_id, "echo turn-state"),
         ev_completed("resp-1"),
     ]);
     let second_response = sse(vec![
@@ -94,6 +94,7 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
 
     let server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
         requests: vec![
+            vec![ev_response_created("warm-1"), ev_completed("warm-1")],
             vec![
                 json!({
                     "type": "response.metadata",
@@ -101,7 +102,7 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
                 }),
                 ev_response_created("resp-1"),
                 ev_reasoning_item("rsn-1", &["thinking"], &[]),
-                ev_shell_command_call("ws-shell-turn-state", "echo websocket"),
+                ev_exec_command_call("ws-shell-turn-state", "echo websocket"),
                 ev_completed("resp-1"),
             ],
             vec![
@@ -110,9 +111,9 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
                 ev_completed("resp-2"),
             ],
             vec![
-                ev_response_created("resp-3"),
+                ev_response_created("resp-4"),
                 ev_assistant_message("msg-2", "done"),
-                ev_completed("resp-3"),
+                ev_completed("resp-4"),
             ],
         ],
         response_headers: Vec::new(),
@@ -123,22 +124,74 @@ async fn websocket_turn_state_persists_within_turn_and_resets_after() -> Result<
 
     let mut builder = test_codex();
     let test = builder.build_with_websocket_server(&server).await?;
-    // Phase 1: the first response mints state for its same-turn tool follow-up.
+    // Phase 1: startup prewarm uses the connection without generating a response.
+    // Phase 2: the first turn mints state for its same-turn tool follow-up.
     test.submit_turn("run the echo command").await?;
-    // Phase 2: the follow-up replays that state on the same physical connection.
-    // Phase 3: the next logical turn reuses the connection but starts with empty state.
+    // Phase 3: the follow-up replays that state on the same physical connection.
+    // Phase 4: the next logical turn reuses the connection but starts with empty state.
     test.submit_turn("start another turn").await?;
 
     assert_eq!(server.handshakes().len(), 1);
     let requests = server.single_connection();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
+    let bodies = requests
+        .iter()
+        .map(core_test_support::responses::WebSocketRequest::body_json)
+        .collect::<Vec<_>>();
     assert_eq!(
-        requests
+        bodies
             .iter()
-            .map(|request| request.body_json()["client_metadata"][TURN_STATE_HEADER].clone())
+            .map(|body| body["client_metadata"][TURN_STATE_HEADER].clone())
             .collect::<Vec<_>>(),
-        vec![json!(null), json!("ts-1"), json!(null)]
+        vec![json!(null), json!(null), json!("ts-1"), json!(null)]
     );
+    let turn_metadata = bodies
+        .iter()
+        .map(|body| {
+            serde_json::from_str::<Value>(
+                body["client_metadata"]["x-codex-turn-metadata"]
+                    .as_str()
+                    .expect("websocket request should include turn metadata"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        turn_metadata
+            .iter()
+            .map(|metadata| metadata["request_kind"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("prewarm"),
+            json!("turn"),
+            json!("turn"),
+            json!("turn"),
+        ]
+    );
+    assert_eq!(bodies[0]["generate"], json!(false));
+    assert!(bodies[1..].iter().all(|body| body["generate"].is_null()));
+    assert_eq!(
+        turn_metadata
+            .iter()
+            .map(|metadata| metadata["sandbox_mode"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!("read-only"),
+            json!("danger-full-access"),
+            json!("danger-full-access"),
+            json!("danger-full-access"),
+        ]
+    );
+    let first_turn_id = turn_metadata[1]["turn_id"]
+        .as_str()
+        .expect("first turn should include turn_id");
+    let follow_up_turn_id = turn_metadata[2]["turn_id"]
+        .as_str()
+        .expect("same-turn follow-up should include turn_id");
+    let next_turn_id = turn_metadata[3]["turn_id"]
+        .as_str()
+        .expect("next turn should include turn_id");
+    assert_eq!(first_turn_id, follow_up_turn_id);
+    assert_ne!(follow_up_turn_id, next_turn_id);
 
     server.shutdown().await;
     Ok(())
@@ -156,7 +209,7 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
                     "headers": {(TURN_STATE_HEADER): "ts-1"},
                 }),
                 ev_response_created("resp-1"),
-                ev_shell_command_call("ws-shell-1", "echo one"),
+                ev_exec_command_call("ws-shell-1", "echo one"),
                 ev_completed("resp-1"),
             ],
             vec![
@@ -165,7 +218,7 @@ async fn websocket_turn_state_is_stable_within_turn() -> Result<()> {
                     "headers": {(TURN_STATE_HEADER): "ts-2"},
                 }),
                 ev_response_created("resp-2"),
-                ev_shell_command_call("ws-shell-2", "echo two"),
+                ev_exec_command_call("ws-shell-2", "echo two"),
                 ev_completed("resp-2"),
             ],
             vec![

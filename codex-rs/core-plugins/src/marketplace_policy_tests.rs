@@ -7,10 +7,25 @@ use codex_config::RequirementsLayerEntry;
 use codex_config::compose_requirements;
 use pretty_assertions::assert_eq;
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 fn config_layer_stack(requirements_toml: &str) -> ConfigLayerStack {
     config_layer_stack_with_user_config(requirements_toml, /*user_config*/ None)
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn primary_runtime_cache_uses_user_profile_on_windows() {
+    assert_eq!(
+        primary_runtime_cache_dir_from_user_profile(Some(PathBuf::from(r"C:\Users\user"))),
+        Some(PathBuf::from(r"C:\Users\user\.cache"))
+    );
+    assert!(is_expected_managed_path(
+        Path::new(r"\\?\c:\users\USER\.cache"),
+        Path::new(r"C:\Users/user\.cache"),
+    ));
 }
 
 fn config_layer_stack_with_user_config(
@@ -205,7 +220,7 @@ restrict_to_allowed_sources = {restricted}
 }
 
 #[test]
-fn strict_install_validates_configured_name_source_and_root() {
+fn system_marketplace_discovery_and_install_validate_source_and_root() {
     let codex_home = TempDir::new().expect("create Codex home");
     let configured_root = TempDir::new().expect("create configured marketplace");
     let other_root = TempDir::new().expect("create other marketplace");
@@ -241,6 +256,18 @@ source = {configured_root:?}
             config_file,
         )),
     );
+    let layer = stack.layers_low_to_high().next().expect("configured layer");
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::System {
+                file: AbsolutePathBuf::try_from(codex_home.path().join("system.toml")).unwrap(),
+            },
+            layer.config.clone(),
+        )],
+        stack.requirements().clone(),
+        stack.requirements_toml().clone(),
+    )
+    .expect("system config stack");
     let policy = MarketplacePolicy::from_requirements(stack.requirements());
     let configured_path =
         AbsolutePathBuf::try_from(configured_root.join(".agents/plugins/marketplace.json"))
@@ -248,6 +275,15 @@ source = {configured_root:?}
     let other_path = AbsolutePathBuf::try_from(other_root.join(".agents/plugins/marketplace.json"))
         .expect("other marketplace path");
 
+    fs::create_dir_all(configured_path.as_path().parent().unwrap()).unwrap();
+    fs::write(&configured_path, r#"{"name":"company","plugins":[]}"#).unwrap();
+    assert_eq!(
+        crate::installed_marketplaces::installed_marketplace_roots_from_layer_stack(
+            &stack,
+            codex_home.path()
+        ),
+        vec![AbsolutePathBuf::try_from(configured_root).unwrap()],
+    );
     assert_eq!(
         policy.validate_install(&stack, codex_home.path(), &configured_path, "company"),
         Ok(())
@@ -352,6 +388,81 @@ restrict_to_allowed_sources = true
             )
             .is_err()
     );
+
+    let repository_manifest = AbsolutePathBuf::try_from(
+        codex_home
+            .path()
+            .join("repository/.agents/plugins/marketplace.json"),
+    )
+    .expect("absolute repository manifest");
+    let unrestricted = ConfigLayerStack::default();
+    for config in [&stack, &unrestricted] {
+        for marketplace in [
+            OPENAI_CURATED_MARKETPLACE_NAME,
+            OPENAI_API_CURATED_MARKETPLACE_NAME,
+            OPENAI_BUNDLED_MARKETPLACE_NAME,
+            OPENAI_BUNDLED_ALPHA_MARKETPLACE_NAME,
+            OPENAI_PRIMARY_RUNTIME_MARKETPLACE_NAME,
+            crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME,
+            crate::remote::REMOTE_CREATED_BY_ME_MARKETPLACE_NAME,
+            crate::remote::REMOTE_WORKSPACE_MARKETPLACE_NAME,
+            crate::remote::REMOTE_WORKSPACE_SHARED_WITH_ME_MARKETPLACE_NAME,
+            crate::remote::REMOTE_WORKSPACE_SHARED_WITH_ME_PRIVATE_MARKETPLACE_NAME,
+            crate::remote::REMOTE_WORKSPACE_SHARED_WITH_ME_UNLISTED_MARKETPLACE_NAME,
+        ] {
+            assert!(
+                MarketplacePolicy::from_requirements(config.requirements())
+                    .validate_install(config, codex_home.path(), &repository_manifest, marketplace)
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_marketplaces_cannot_borrow_managed_provenance() {
+    let codex_home = TempDir::new().expect("create Codex home");
+    let official_root = curated_plugins_repo_path(codex_home.path());
+    let manifest = official_root.join(".agents/plugins/marketplace.json");
+    fs::create_dir_all(manifest.parent().expect("manifest directory"))
+        .expect("create manifest directory");
+    fs::write(&manifest, "{}").expect("write official manifest");
+
+    let root_alias = codex_home.path().join("repository");
+    std::os::unix::fs::symlink(&official_root, &root_alias).expect("symlink official root");
+    let parent_alias = codex_home.path().join("parent-alias");
+    std::os::unix::fs::symlink(
+        official_root.parent().expect("official root parent"),
+        &parent_alias,
+    )
+    .expect("symlink official root parent");
+    let manifest_alias = codex_home
+        .path()
+        .join("manifest-alias/.agents/plugins/api_marketplace.json");
+    fs::create_dir_all(manifest_alias.parent().expect("manifest alias parent"))
+        .expect("create manifest alias directory");
+    std::os::unix::fs::symlink(&manifest, &manifest_alias).expect("symlink official manifest");
+    let stack = ConfigLayerStack::default();
+
+    for (path, marketplace) in [
+        (
+            root_alias.join(".agents/plugins/marketplace.json"),
+            OPENAI_CURATED_MARKETPLACE_NAME,
+        ),
+        (
+            parent_alias.join("plugins/.agents/plugins/marketplace.json"),
+            OPENAI_CURATED_MARKETPLACE_NAME,
+        ),
+        (manifest_alias, OPENAI_API_CURATED_MARKETPLACE_NAME),
+    ] {
+        let manifest = AbsolutePathBuf::try_from(path).expect("absolute repository manifest");
+        assert!(
+            MarketplacePolicy::from_requirements(stack.requirements())
+                .validate_install(&stack, codex_home.path(), &manifest, marketplace)
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -418,7 +529,7 @@ enabled = true
     );
 
     let projected =
-        project_effective_user_config(&stack, codex_home.path()).expect("project user config");
+        policy_filtered_plugin_config(&stack, codex_home.path()).expect("project plugin config");
     assert_eq!(
         projected["marketplaces"]
             .as_table()
@@ -484,7 +595,7 @@ enabled = true
     );
 
     let projected =
-        project_effective_user_config(&stack, codex_home.path()).expect("project user config");
+        policy_filtered_plugin_config(&stack, codex_home.path()).expect("project plugin config");
 
     assert_eq!(
         projected["marketplaces"]
@@ -507,7 +618,7 @@ enabled = true
 }
 
 #[test]
-fn allowlisted_config_names_are_not_globally_reserved() {
+fn allowlisted_sources_cannot_claim_reserved_marketplace_names() {
     let codex_home = TempDir::new().expect("create Codex home");
     let source_root = TempDir::new().expect("create marketplace root");
     let source_root = source_root
@@ -550,7 +661,7 @@ enabled = true
     );
 
     let projected =
-        project_effective_user_config(&stack, codex_home.path()).expect("project user config");
+        policy_filtered_plugin_config(&stack, codex_home.path()).expect("project plugin config");
     assert_eq!(
         projected["marketplaces"]
             .as_table()
@@ -558,7 +669,7 @@ enabled = true
             .keys()
             .cloned()
             .collect::<Vec<_>>(),
-        vec!["openai-bundled".to_string(), "openai-curated".to_string()]
+        Vec::<String>::new()
     );
     assert_eq!(
         projected["plugins"]
@@ -567,15 +678,12 @@ enabled = true
             .keys()
             .cloned()
             .collect::<Vec<_>>(),
-        vec![
-            "sample@openai-bundled".to_string(),
-            "sample@openai-curated".to_string()
-        ]
+        Vec::<String>::new()
     );
 }
 
 #[test]
-fn blocked_upgrade_is_rejected_before_marketplace_installation() {
+fn blocked_or_reserved_upgrade_is_rejected_before_marketplace_installation() {
     let codex_home = TempDir::new().expect("create Codex home");
     let config_file = AbsolutePathBuf::try_from(codex_home.path().join("config.toml"))
         .expect("absolute config path");
@@ -590,7 +698,7 @@ restrict_to_allowed_sources = true
 source_type = "git"
 source = "https://github.com/example/blocked.git"
 "#,
-            config_file,
+            config_file.clone(),
         )),
     );
 
@@ -604,6 +712,21 @@ source = "https://github.com/example/blocked.git"
             .message
             .contains("is not allowed by requirements")
     );
+    assert!(!marketplace_install_root(codex_home.path()).exists());
+
+    let stack = config_layer_stack_with_user_config(
+        "[marketplaces]\nrestrict_to_allowed_sources = false\n",
+        Some((
+            "[marketplaces.openai-bundled]\nsource_type = \"git\"\nsource = \"https://github.com/example/blocked.git\"\n",
+            config_file,
+        )),
+    );
+    let outcome = upgrade_configured_git_marketplaces(
+        codex_home.path(),
+        &stack,
+        Some(crate::OPENAI_BUNDLED_MARKETPLACE_NAME),
+    );
+    assert!(outcome.errors[0].message.contains("is reserved"));
     assert!(!marketplace_install_root(codex_home.path()).exists());
 }
 

@@ -11,6 +11,9 @@ use pretty_assertions::assert_eq;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[path = "code_fence_render_tests.rs"]
+mod code_fence_tests;
+
 fn test_cwd() -> PathBuf {
     std::env::temp_dir()
 }
@@ -248,6 +251,20 @@ fn inline_visualizations_without_context_use_canonical_full_render() {
         "inline_visualizations_without_context_use_canonical_full_render",
         render.lines
     );
+}
+
+#[test]
+fn inline_visualization_content_references_use_canonical_full_render() {
+    let (_, render) = assert_rich_stream_matches_full_render(
+        &[
+            "Before.\n\n",
+            "\u{e200}visualize\u{e202}{\"path\":\"/tmp/missing.html\"}\u{e201}\n",
+        ],
+        Some(80),
+    );
+
+    assert_eq!(render.stable_source_len, 0);
+    assert!(render.has_inline_visualization_directive);
 }
 
 #[test]

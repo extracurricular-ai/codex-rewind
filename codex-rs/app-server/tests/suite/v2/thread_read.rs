@@ -11,6 +11,7 @@ use codex_app_server::in_process;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::DeprecationNoticeNotification;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
@@ -63,7 +64,6 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource as ProtocolSessionSource;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -71,11 +71,13 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
+use codex_rollout::RolloutItem;
 use codex_thread_store::AppendThreadItemsParams;
 use codex_thread_store::CreateThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
+use codex_thread_store::PersistContext;
 use codex_thread_store::ThreadMetadataPatch;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
@@ -208,6 +210,10 @@ async fn thread_read_can_include_turns() -> Result<()> {
         other => panic!("expected user message item, got {other:?}"),
     }
     assert_eq!(thread.status, ThreadStatus::NotLoaded);
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
 
     Ok(())
 }
@@ -243,6 +249,31 @@ async fn paginated_stored_thread_routes_projected_turns() -> Result<()> {
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
     assert_eq!(thread.history_mode, ThreadHistoryMode::Paginated);
     assert!(thread.turns.is_empty());
+    assert!(
+        !mcp.pending_notification_methods()
+            .contains(&"deprecationNotice".to_string())
+    );
+
+    let full_read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: conversation_id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let notice: DeprecationNoticeNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("deprecationNotice"),
+    )
+    .await??;
+    assert_eq!(
+        notice,
+        DeprecationNoticeNotification {
+            summary: "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`.".to_string(),
+            details: None,
+        }
+    );
+    let _: ThreadReadResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(full_read_id)).await??;
 
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
@@ -254,6 +285,7 @@ async fn paginated_stored_thread_routes_projected_turns() -> Result<()> {
             source_kinds: None,
             archived: None,
             section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
@@ -487,7 +519,9 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
             },
         })
         .await?;
-    store.persist_thread(thread_id).await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
@@ -533,6 +567,7 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
                         }],
                         phase: Some(MessagePhase::Commentary),
                         memory_citation: None,
+                        delivery: None,
                     }),
                 ),
                 paginated_completed_item(
@@ -545,6 +580,7 @@ async fn thread_search_occurrences_reads_paginated_projection() -> Result<()> {
                         }],
                         phase: Some(MessagePhase::FinalAnswer),
                         memory_citation: None,
+                        delivery: None,
                     }),
                 ),
                 paginated_turn_completed("turn-1"),
@@ -938,6 +974,7 @@ async fn thread_list_includes_store_thread_without_rollout_path() -> Result<()> 
                 source_kinds: None,
                 archived: None,
                 section_id: None,
+                project_id: None,
                 cwd: None,
                 use_state_db_only: false,
                 search_term: None,
@@ -1317,6 +1354,7 @@ async fn paginated_thread_name_set_is_reflected_in_read_list_and_metadata_resume
             source_kinds: None,
             archived: None,
             section_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: true,
             search_term: None,
@@ -1406,6 +1444,7 @@ async fn thread_read_include_turns_rejects_unmaterialized_loaded_thread() -> Res
     let start_id = mcp
         .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
             ..Default::default()
         })
         .await?;
@@ -1535,7 +1574,9 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
             },
         })
         .await?;
-    store.persist_thread(thread_id).await?;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await?;
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
@@ -1569,6 +1610,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
                         }],
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
                     }),
                 ),
                 paginated_completed_item(
@@ -1620,6 +1662,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
                 text: "first".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
         ],
         items_view: TurnItemsView::Full,
@@ -1805,6 +1848,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
                     text: "first".to_string(),
                     phase: None,
                     memory_citation: None,
+                    delivery: None,
                 },
             ],
             items_view: TurnItemsView::Summary,
@@ -2050,6 +2094,7 @@ fn append_agent_message(path: &Path, timestamp: &str, text: &str) -> anyhow::Res
                 message: text.to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             }))?,
         })
     )?;

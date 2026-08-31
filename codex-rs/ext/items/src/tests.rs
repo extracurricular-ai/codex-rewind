@@ -15,7 +15,9 @@ fn completed_image_generation_item() -> ExtensionItem {
         revised_prompt: Some("A blue square".to_string()),
         result: "cG5n".to_string(),
         transparent_background: None,
+        failure: None,
         saved_path: None,
+        imagegen_request_id: None,
     })
 }
 
@@ -33,6 +35,7 @@ fn image_generation_item_preserves_stable_wire_shape() {
             "revisedPrompt": "A blue square",
             "result": "cG5n",
             "transparentBackground": null,
+            "failure": null,
         })
     );
     assert_eq!(
@@ -70,6 +73,7 @@ fn image_generation_item_preserves_authoritative_transparency() {
             "revisedPrompt": "A blue square",
             "result": "cG5n",
             "transparentBackground": true,
+            "failure": null,
         })
     );
     assert_eq!(
@@ -84,6 +88,25 @@ fn image_generation_transparency_is_optional_in_typescript() {
         ImageGenerationItem::inline().contains("transparentBackground?: boolean"),
         "image-generation transparency must remain optional for existing TypeScript clients"
     );
+}
+
+#[test]
+fn image_generation_request_id_stays_internal() {
+    let ExtensionItem::ImageGeneration(mut image) = completed_image_generation_item() else {
+        panic!("expected image-generation item");
+    };
+    image.imagegen_request_id = Some("req-imagegen-123".to_string());
+    let item = ExtensionItem::ImageGeneration(image);
+    let value = serde_json::to_value(&item).expect("serialize extension item");
+
+    assert!(value.get("imagegenRequestId").is_none());
+    let ExtensionItem::ImageGeneration(round_tripped) =
+        serde_json::from_value::<ExtensionItem>(value).expect("deserialize extension item")
+    else {
+        panic!("expected image-generation item");
+    };
+    assert_eq!(round_tripped.imagegen_request_id, None);
+    assert!(!ImageGenerationItem::inline().contains("imagegenRequestId"));
 }
 
 #[test]

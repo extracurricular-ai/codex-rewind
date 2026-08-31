@@ -43,6 +43,7 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_core::config::Config;
 use codex_core_plugins::PluginsManager;
 use codex_core_plugins::marketplace::MarketplacePluginInstallPolicy;
+use codex_login::AuthManager;
 use codex_protocol::protocol::Product;
 use codex_rollout::StateDbHandle;
 use serde_json::Value as JsonValue;
@@ -53,6 +54,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use toml::Value as TomlValue;
 
 #[cfg(test)]
@@ -68,6 +70,7 @@ pub struct ExternalAgentConfigService {
     pub(super) connector_metadata_roots: Vec<PathBuf>,
     pub(crate) external_agent_home: PathBuf,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
+    pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) source: ExternalAgentSource,
     pub(crate) session_import_limits: ExternalAgentSessionImportLimits,
     state_db: Option<StateDbHandle>,
@@ -76,6 +79,7 @@ pub struct ExternalAgentConfigService {
 impl ExternalAgentConfigService {
     pub fn new(
         codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
         analytics_events_client: AnalyticsEventsClient,
         state_db: Option<StateDbHandle>,
     ) -> Self {
@@ -87,6 +91,7 @@ impl ExternalAgentConfigService {
             connector_metadata_roots,
             external_agent_home,
             analytics_events_client: Some(analytics_events_client),
+            auth_manager,
             source,
             session_import_limits: ExternalAgentSessionImportLimits::default(),
             state_db,
@@ -102,6 +107,7 @@ impl ExternalAgentConfigService {
             connector_metadata_roots,
             external_agent_home,
             analytics_events_client: self.analytics_events_client.clone(),
+            auth_manager: Arc::clone(&self.auth_manager),
             source,
             session_import_limits: self.session_import_limits,
             state_db: self.state_db.clone(),
@@ -157,6 +163,9 @@ impl ExternalAgentConfigService {
             connector_metadata_roots,
             external_agent_home,
             analytics_events_client: None,
+            auth_manager: codex_login::test_support::auth_manager_from_optional_auth(
+                /*auth*/ None,
+            ),
             source,
             session_import_limits: ExternalAgentSessionImportLimits::default(),
             state_db: None,
@@ -476,8 +485,7 @@ impl ExternalAgentConfigService {
         scope: &MigrationScope,
     ) -> io::Result<Option<JsonValue>> {
         let source_settings = self.source_settings(scope);
-        self.source
-            .effective_settings(self.source_config_dir(scope).as_path(), &source_settings)
+        self.source.effective_settings(&source_settings)
     }
 
     pub(crate) fn build_mcp_config(

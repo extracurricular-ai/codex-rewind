@@ -2,12 +2,16 @@
 #![cfg(unix)]
 
 use anyhow::Result;
+use codex_core::TurnInputRequest;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::GranularApprovalConfig;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::mount_function_call_agent_response;
 use core_test_support::responses::start_mock_server;
@@ -31,10 +35,10 @@ fn write_skill_metadata(home: &Path, name: &str, contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn shell_command_arguments(command: &str) -> Result<String> {
+fn exec_command_arguments(command: &str) -> Result<String> {
     Ok(serde_json::to_string(&serde_json::json!({
-        "command": command,
-        "timeout_ms": 500,
+        "cmd": command,
+        "yield_time_ms": 500,
     }))?)
 }
 
@@ -47,30 +51,27 @@ async fn submit_turn_with_policies(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(permission_profile, test.cwd_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: prompt.to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(approval_policy),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     Ok(())
 }
@@ -191,9 +192,9 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
 
     let command = skill_script_command(&test, "sandboxed.sh")?;
     let call_id = "zsh-fork-skill-script-ignores-permissions";
-    let arguments = shell_command_arguments(&command)?;
+    let arguments = exec_command_arguments(&command)?;
     let mocks =
-        mount_function_call_agent_response(&server, call_id, &arguments, "shell_command").await;
+        mount_function_call_agent_response(&server, call_id, &arguments, "exec_command").await;
 
     submit_turn_with_policies(
         &test,
@@ -258,10 +259,9 @@ async fn shell_zsh_fork_still_enforces_workspace_write_sandbox() -> Result<()> {
     .await?;
 
     let command = format!("touch {outside_path}");
-    let arguments = shell_command_arguments(&command)?;
+    let arguments = exec_command_arguments(&command)?;
     let mocks =
-        mount_function_call_agent_response(&server, tool_call_id, &arguments, "shell_command")
-            .await;
+        mount_function_call_agent_response(&server, tool_call_id, &arguments, "exec_command").await;
 
     submit_turn_with_policies(
         &test,

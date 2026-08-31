@@ -12,6 +12,30 @@ pub fn shlex_join(tokens: &[String]) -> String {
         .unwrap_or_else(|_| "<command included NUL byte>".to_string())
 }
 
+/// Tokenizes a PowerShell command while preserving Windows paths and reader aliases.
+pub fn tokenize_powershell_command(command: &str) -> Vec<String> {
+    let normalized = command.replace('\\', "/");
+    let mut tokens = shlex_split(&normalized)
+        .unwrap_or_else(|| normalized.split_whitespace().map(str::to_string).collect());
+    if let Some(executable) = tokens.first_mut()
+        && matches!(
+            executable.to_ascii_lowercase().as_str(),
+            "get-content" | "gc" | "type"
+        )
+    {
+        *executable = "Get-Content".to_owned();
+        // POSIX shlex must not silently rewrite a PowerShell file path.
+        if tokens
+            .iter()
+            .skip(1)
+            .any(|argument| !normalized.contains(argument))
+        {
+            return Vec::new();
+        }
+    }
+    tokens
+}
+
 /// Extracts the shell and script from a command, regardless of platform
 pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
     extract_bash_command(command).or_else(|| extract_powershell_command(command))
@@ -833,6 +857,34 @@ mod tests {
     }
 
     #[test]
+    fn keeps_mutating_sed_in_compound_command() {
+        for sed_command in [
+            "sed -n -i.bak 1p secret.txt",
+            "sed -ni.bak 1p secret.txt",
+            "sed -Eni.bak 1p secret.txt",
+        ] {
+            let inner = format!("cat README.md && {sed_command}");
+            assert_parsed(
+                &vec_str(&["bash", "-lc", &inner]),
+                vec![ParsedCommand::Unknown { cmd: inner }],
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_sed_operands_after_double_dash_when_checking_mutation() {
+        let inner = "cat README.md && sed 's/a/x/' -- -input.txt";
+        assert_parsed(
+            &vec_str(&["bash", "-lc", inner]),
+            vec![ParsedCommand::Read {
+                cmd: "cat README.md".to_string(),
+                name: "README.md".to_string(),
+                path: PathBuf::from("README.md"),
+            }],
+        );
+    }
+
+    #[test]
     fn empty_tokens_is_not_small() {
         let empty: Vec<String> = Vec::new();
         assert!(!is_small_formatting_command(&empty));
@@ -1246,6 +1298,102 @@ mod tests {
     }
 
     #[test]
+    fn powershell_file_reads_are_classified() {
+        for (shell, script, path) in [
+            (
+                "powershell",
+                r"Get-Content C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r#"get-content -Raw "C:\skills and plugins\SKILL.md""#,
+                "C:/skills and plugins/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content 'C:\skills and plugins\SKILL.md'",
+                "C:/skills and plugins/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content -Path C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content -LiteralPath C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content C:\skills\demo\SKILL.md -Raw",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content -Raw -LiteralPath C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content C:\workspace\README.md",
+                "C:/workspace/README.md",
+            ),
+            (
+                "powershell",
+                "gc C:/skills/demo/SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                "type C:/skills/demo/SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "Get-Content C:/skills/demo/SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+        ] {
+            assert_parsed(
+                &vec_str(&[shell, "-NoProfile", "-Command", script]),
+                vec![ParsedCommand::Read {
+                    cmd: script.to_string(),
+                    name: PathBuf::from(path)
+                        .file_name()
+                        .expect("file path")
+                        .to_string_lossy()
+                        .into_owned(),
+                    path: PathBuf::from(path),
+                }],
+            );
+        }
+    }
+
+    #[test]
+    fn complex_powershell_file_reads_are_intentionally_not_classified() {
+        for script in [
+            r"Get-Content 'C:\Users\O''Brien\skill\SKILL.md'",
+            r#"Get-Content "$(Remove-Item C:/important)/skills/demo/SKILL.md""#,
+            "Get-Content -ReadCount:([IO.File]::Delete('C:/important')) C:/skills/demo/SKILL.md",
+            "Get-Content C:/Users/Alice/.ssh/id_rsa,C:/skills/demo/SKILL.md",
+            "Get-Content C:/skills/demo/SKILL.md -Raw; Remove-Item C:/important",
+            "Get-Content C:/skills/demo/SKILL.md C:/important",
+            "Get-Content C:/skills/*/SKILL.md",
+            "Get-Content -Encoding UTF8 C:/skills/demo/SKILL.md",
+            "Get-Content -Raw",
+        ] {
+            assert_parsed(
+                &vec_str(&["powershell", "-Command", script]),
+                vec![ParsedCommand::Unknown {
+                    cmd: script.to_string(),
+                }],
+            );
+        }
+    }
+
+    #[test]
     fn pwsh_with_noprofile_and_c_alias_is_stripped() {
         assert_parsed(
             &vec_str(&["pwsh", "-NoProfile", "-c", "Write-Host hi"]),
@@ -1277,7 +1425,29 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
         return commands;
     }
 
-    if let Some((_, script)) = extract_powershell_command(command) {
+    let powershell_command = command
+        .first()
+        .filter(|shell| shell.contains('\\'))
+        .map(|shell| {
+            let mut normalized = command.to_vec();
+            normalized[0] = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_owned();
+            normalized
+        });
+    if let Some((_, script)) =
+        extract_powershell_command(powershell_command.as_deref().unwrap_or(command))
+    {
+        let tokens = tokenize_powershell_command(script);
+        if tokens
+            .first()
+            .is_some_and(|executable| executable == "Get-Content")
+            && let [ParsedCommand::Read { name, path, .. }] = parse_command_impl(&tokens).as_slice()
+        {
+            return vec![ParsedCommand::Read {
+                cmd: script.to_string(),
+                name: name.clone(),
+                path: path.clone(),
+            }];
+        }
         return vec![ParsedCommand::Unknown {
             cmd: script.to_string(),
         }];
@@ -1418,7 +1588,8 @@ fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
 
 fn sed_read_path(args: &[String]) -> Option<String> {
     let args_no_connector = trim_at_connector(args);
-    if !args_no_connector.iter().any(|arg| arg == "-n") {
+    if sed_has_in_place_flag(&args_no_connector) || !args_no_connector.iter().any(|arg| arg == "-n")
+    {
         return None;
     }
     let mut has_range_script = false;
@@ -2016,8 +2187,10 @@ fn is_small_formatting_command(tokens: &[String]) -> bool {
         }
         "sed" => {
             // Keep `sed -n <range> file` (treated as a file read elsewhere);
-            // otherwise consider it a formatting helper in a pipeline.
-            sed_read_path(&tokens[1..]).is_none()
+            // keep in-place mutations as unknown actions; otherwise consider it
+            // a formatting helper in a pipeline.
+            let args = &tokens[1..];
+            !sed_has_in_place_flag(args) && sed_read_path(args).is_none()
         }
         _ => false,
     }
@@ -2058,17 +2231,55 @@ fn xargs_is_mutating_subcommand(tokens: &[String]) -> bool {
         return false;
     };
     match head.as_str() {
-        "perl" | "ruby" => xargs_has_in_place_flag(tail),
-        "sed" => xargs_has_in_place_flag(tail) || tail.iter().any(|token| token == "--in-place"),
+        "perl" | "ruby" => has_in_place_flag(tail),
+        "sed" => sed_has_in_place_flag(tail),
         "rg" => tail.iter().any(|token| token == "--replace"),
         _ => false,
     }
 }
 
-fn xargs_has_in_place_flag(tokens: &[String]) -> bool {
+fn has_in_place_flag(tokens: &[String]) -> bool {
     tokens.iter().any(|token| {
-        token == "-i" || token.starts_with("-i") || token == "-pi" || token.starts_with("-pi")
+        token == "-i"
+            || token.starts_with("-i")
+            || token == "-pi"
+            || token.starts_with("-pi")
+            || token == "--in-place"
+            || token.starts_with("--in-place=")
     })
+}
+
+fn sed_has_in_place_flag(tokens: &[String]) -> bool {
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            "--" => break,
+            "-e" | "-f" | "--expression" | "--file" => {
+                let _ = tokens.next();
+            }
+            "--in-place" => return true,
+            token if token.starts_with("--in-place=") => return true,
+            token if token.starts_with("--") => {}
+            token => {
+                let Some(short_options) = token.strip_prefix('-') else {
+                    continue;
+                };
+                for (index, option) in short_options.char_indices() {
+                    match option {
+                        'i' => return true,
+                        'e' | 'f' => {
+                            if index + option.len_utf8() == short_options.len() {
+                                let _ = tokens.next();
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn drop_small_formatting_commands(mut commands: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -2253,8 +2464,32 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 path,
             }
         }
-        Some((head, tail)) if head == "cat" => {
-            if let Some(path) = single_non_flag_operand(tail, &[]) {
+        Some((head, tail)) if head == "cat" || head.eq_ignore_ascii_case("Get-Content") => {
+            let path = if head == "cat" {
+                single_non_flag_operand(tail, &[])
+            } else {
+                // Intentionally miss complex reads: conservative presentation should not
+                // require implementing PowerShell's full expression and argument grammar.
+                if tail.iter().all(|argument| {
+                    !argument.starts_with('-')
+                        || ["-Raw", "-Path", "-LiteralPath"]
+                            .iter()
+                            .any(|flag| argument.eq_ignore_ascii_case(flag))
+                }) {
+                    single_non_flag_operand(tail, &[])
+                } else {
+                    None
+                }
+                .filter(|path| {
+                    !path.is_empty()
+                        && !path.starts_with('-')
+                        && path.chars().all(|character| {
+                            character.is_alphanumeric()
+                                || matches!(character, ' ' | '/' | '\\' | '.' | '-' | '_' | ':')
+                        })
+                })
+            };
+            if let Some(path) = path {
                 let name = short_display_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),

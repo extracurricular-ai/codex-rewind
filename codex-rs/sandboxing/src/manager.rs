@@ -11,6 +11,8 @@ use crate::policy_transforms::should_require_platform_sandbox;
 use crate::resolve_windows_elevated_filesystem_overrides;
 #[cfg(target_os = "windows")]
 use crate::resolve_windows_restricted_token_filesystem_overrides;
+#[cfg(target_os = "macos")]
+use crate::seatbelt::MacosSeatbeltProfile;
 #[cfg(target_os = "windows")]
 use crate::windows_sandbox_uses_elevated_backend;
 use codex_network_proxy::ManagedNetworkSandboxContext;
@@ -117,6 +119,8 @@ pub struct SandboxExecRequest {
     pub network: Option<NetworkProxy>,
     pub network_environment_id: Option<String>,
     pub sandbox: SandboxType,
+    // TODO(anp): Reconcile these backend copies with the supplied sandbox context
+    // (TurnEnvironment::sandbox_context for turns), preserving this launch snapshot.
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub permission_profile: PermissionProfile,
@@ -137,6 +141,8 @@ pub struct SandboxTransformRequest<'a> {
     pub network: Option<&'a NetworkProxy>,
     pub sandbox_policy_cwd: &'a PathUri,
     pub codex_linux_sandbox_exe: Option<&'a Path>,
+    // TODO(anp): Reconcile these backend inputs with the supplied sandbox context
+    // (TurnEnvironment::sandbox_context for turns) so selection shares its authority.
     pub use_legacy_landlock: bool,
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
@@ -205,6 +211,8 @@ pub enum SandboxTransformError {
     },
     MissingLinuxSandboxExecutable,
     EnvironmentNetworkProxy(String),
+    #[cfg(target_os = "macos")]
+    SeatbeltPreparation(String),
     #[cfg(target_os = "linux")]
     Wsl1UnsupportedForBubblewrap,
     #[cfg(not(target_os = "macos"))]
@@ -232,6 +240,10 @@ impl std::fmt::Display for SandboxTransformError {
             Self::EnvironmentNetworkProxy(err) => {
                 write!(f, "failed to prepare environment network proxy: {err}")
             }
+            #[cfg(target_os = "macos")]
+            Self::SeatbeltPreparation(err) => {
+                write!(f, "failed to prepare Seatbelt sandbox: {err}")
+            }
             #[cfg(target_os = "linux")]
             Self::Wsl1UnsupportedForBubblewrap => write!(f, "{WSL1_BWRAP_WARNING}"),
             #[cfg(not(target_os = "macos"))]
@@ -251,6 +263,8 @@ impl std::error::Error for SandboxTransformError {
             | Self::InvalidSandboxPolicyCwd { source, .. } => Some(source),
             Self::MissingLinuxSandboxExecutable => None,
             Self::EnvironmentNetworkProxy(_) => None,
+            #[cfg(target_os = "macos")]
+            Self::SeatbeltPreparation(_) => None,
             #[cfg(target_os = "linux")]
             Self::Wsl1UnsupportedForBubblewrap => None,
             #[cfg(not(target_os = "macos"))]
@@ -262,11 +276,22 @@ impl std::error::Error for SandboxTransformError {
 }
 
 #[derive(Default)]
-pub struct SandboxManager;
+pub struct SandboxManager {
+    #[cfg(target_os = "macos")]
+    seatbelt_profile: MacosSeatbeltProfile,
+}
 
 impl SandboxManager {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Creates a manager that applies the narrower runtime profile required by filesystem helpers.
+    pub fn for_file_system_helpers() -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            seatbelt_profile: MacosSeatbeltProfile::FileSystemHelper,
+        }
     }
 
     pub fn select_initial(
@@ -347,24 +372,35 @@ impl SandboxManager {
             SandboxType::MacosSeatbelt => {
                 use crate::seatbelt::CreateSeatbeltCommandArgsParams;
                 use crate::seatbelt::MACOS_PATH_TO_SEATBELT_EXECUTABLE;
-                use crate::seatbelt::create_seatbelt_command_args;
+                use crate::seatbelt::SeatbeltPreparationError;
+                use crate::seatbelt::create_seatbelt_command_args_with_profile;
 
                 let pending = pending_sandboxed_request?;
                 let (file_system_sandbox_policy, network_sandbox_policy) = pending
                     .effective_permission_profile
                     .to_runtime_permissions();
-                let mut args = create_seatbelt_command_args(CreateSeatbeltCommandArgsParams {
-                    command: os_argv_to_strings(argv),
-                    file_system_sandbox_policy: &file_system_sandbox_policy,
-                    network_sandbox_policy,
-                    sandbox_policy_cwd: pending.native_sandbox_policy_cwd.as_path(),
-                    enforce_managed_network,
-                    managed_network,
-                    environment_id,
-                    network,
-                    extra_allow_unix_sockets: &[],
-                })
-                .map_err(SandboxTransformError::EnvironmentNetworkProxy)?;
+                let mut args = create_seatbelt_command_args_with_profile(
+                    CreateSeatbeltCommandArgsParams {
+                        command: os_argv_to_strings(argv),
+                        file_system_sandbox_policy: &file_system_sandbox_policy,
+                        network_sandbox_policy,
+                        sandbox_policy_cwd: pending.native_sandbox_policy_cwd.as_path(),
+                        enforce_managed_network,
+                        managed_network,
+                        environment_id,
+                        network,
+                        extra_allow_unix_sockets: &[],
+                    },
+                    self.seatbelt_profile,
+                )
+                .map_err(|err| match err {
+                    SeatbeltPreparationError::FileSystem(message) => {
+                        SandboxTransformError::SeatbeltPreparation(message)
+                    }
+                    SeatbeltPreparationError::EnvironmentNetworkProxy(message) => {
+                        SandboxTransformError::EnvironmentNetworkProxy(message)
+                    }
+                })?;
                 let mut full_command = Vec::with_capacity(1 + args.len());
                 full_command.push(MACOS_PATH_TO_SEATBELT_EXECUTABLE.to_string());
                 full_command.append(&mut args);
@@ -404,11 +440,20 @@ impl SandboxManager {
                 )
             }
             #[cfg(target_os = "windows")]
-            SandboxType::WindowsRestrictedToken => (
-                os_argv_to_strings(argv),
-                None,
-                Some(pending_sandboxed_request?),
-            ),
+            SandboxType::WindowsRestrictedToken => {
+                if enforce_managed_network && windows_sandbox_level != WindowsSandboxLevel::Elevated
+                {
+                    return Err(SandboxTransformError::WindowsSandboxPreparation(
+                        "managed networking requires the elevated Windows sandbox backend"
+                            .to_string(),
+                    ));
+                }
+                (
+                    os_argv_to_strings(argv),
+                    None,
+                    Some(pending_sandboxed_request?),
+                )
+            }
             #[cfg(not(target_os = "windows"))]
             SandboxType::WindowsRestrictedToken => (
                 os_argv_to_strings(argv),
@@ -524,8 +569,7 @@ fn wrap_windows_sandbox_exec_request_for_direct_spawn(
                 })
         })
         .transpose()?;
-    let use_elevated =
-        windows_sandbox_uses_elevated_backend(request.windows_sandbox_level, proxy_enforced);
+    let use_elevated = windows_sandbox_uses_elevated_backend(request.windows_sandbox_level);
     let overrides = if use_elevated {
         resolve_windows_elevated_filesystem_overrides(
             request.sandbox,

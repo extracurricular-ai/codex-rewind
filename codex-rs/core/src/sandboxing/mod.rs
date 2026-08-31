@@ -19,14 +19,19 @@ use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::error::CodexErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::PermissionProfile;
 pub use codex_protocol::models::SandboxPermissions;
 use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::WindowsSandboxFilesystemOverrides;
+use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
+use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
+use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use codex_utils_string::truncate_middle_with_token_budget;
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -47,6 +52,7 @@ pub struct ExecRequest {
     pub cwd: PathUri,
     pub env: HashMap<String, String>,
     pub(crate) exec_server_env_config: Option<ExecServerEnvConfig>,
+    pub(crate) exec_server_shell_snapshot: Option<codex_exec_server::ShellSnapshotRequest>,
     pub network: Option<NetworkProxy>,
     pub network_environment_id: Option<String>,
     pub expiration: ExecExpiration,
@@ -54,6 +60,8 @@ pub struct ExecRequest {
     pub sandbox: SandboxType,
     pub windows_sandbox_policy_cwd: PathUri,
     pub windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
+    // TODO(anp): Reconcile these backend copies with TurnEnvironment::sandbox_context
+    // and exec_server_sandbox so local and remote launches use the same settings.
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub permission_profile: PermissionProfile,
@@ -89,6 +97,7 @@ impl ExecRequest {
             cwd,
             env,
             exec_server_env_config: None,
+            exec_server_shell_snapshot: None,
             network,
             network_environment_id,
             expiration,
@@ -112,7 +121,7 @@ impl ExecRequest {
         request: SandboxExecRequest,
         options: ExecOptions,
         windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
-    ) -> Self {
+    ) -> Result<Self, CodexErr> {
         let SandboxExecRequest {
             command,
             cwd,
@@ -131,6 +140,36 @@ impl ExecRequest {
             expiration,
             capture_policy,
         } = options;
+        let windows_sandbox_filesystem_overrides = if sandbox == SandboxType::WindowsRestrictedToken
+        {
+            let sandbox_policy_cwd = windows_sandbox_policy_cwd
+                .to_abs_path()
+                .map_err(|err| CodexErr::InvalidRequest(format!("invalid sandbox cwd: {err}")))?;
+            let use_windows_elevated_backend =
+                windows_sandbox_uses_elevated_backend(windows_sandbox_level);
+            if use_windows_elevated_backend {
+                resolve_windows_elevated_filesystem_overrides(
+                    sandbox,
+                    &permission_profile,
+                    &sandbox_policy_cwd,
+                    use_windows_elevated_backend,
+                )
+            } else {
+                resolve_windows_restricted_token_filesystem_overrides(
+                    sandbox,
+                    &permission_profile,
+                    &sandbox_policy_cwd,
+                    windows_sandbox_level,
+                )
+            }
+            .map_err(|error| {
+                CodexErr::UnsupportedOperation(
+                    truncate_middle_with_token_budget(&error, /*max_tokens*/ 900).0,
+                )
+            })?
+        } else {
+            None
+        };
         let network_sandbox_policy = permission_profile.network_sandbox_policy();
         if !network_sandbox_policy.is_enabled() {
             env.insert(
@@ -142,11 +181,12 @@ impl ExecRequest {
         if sandbox == SandboxType::MacosSeatbelt {
             env.insert(CODEX_SANDBOX_ENV_VAR.to_string(), "seatbelt".to_string());
         }
-        Self {
+        Ok(Self {
             command,
             cwd,
             env,
             exec_server_env_config: None,
+            exec_server_shell_snapshot: None,
             network,
             network_environment_id,
             expiration,
@@ -157,13 +197,13 @@ impl ExecRequest {
             windows_sandbox_level,
             windows_sandbox_private_desktop,
             permission_profile,
-            windows_sandbox_filesystem_overrides: None,
+            windows_sandbox_filesystem_overrides,
             arg0,
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,
             exec_server_managed_network: None,
             exec_server_network_proxy: None,
-        }
+        })
     }
 }
 

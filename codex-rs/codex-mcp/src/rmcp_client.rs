@@ -6,6 +6,9 @@
 //! Higher-level aggregation and resource/tool APIs live in
 //! [`crate::connection_manager`].
 
+#[path = "rmcp_client/status.rs"]
+mod status;
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -23,6 +26,7 @@ use crate::codex_apps::normalize_codex_apps_callable_namespace;
 use crate::codex_apps::normalize_codex_apps_tool_title;
 use crate::codex_apps::prepare_openai_file_params_for_model;
 use crate::elicitation::ElicitationRequestManager;
+use crate::executor_environment_http_client::ExecutorEnvironmentHttpClient;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::openai_docs_source_attribution::maybe_with_openai_docs_source_attribution;
@@ -59,6 +63,7 @@ use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::McpProtocolMode;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StdioServerLauncher;
+use codex_rmcp_client::StreamableHttpBearerToken;
 use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::ToolWithConnectorId;
 use codex_rmcp_client::is_authentication_required_error;
@@ -70,6 +75,7 @@ use rmcp::model::ElicitationCapability;
 use rmcp::model::Implementation;
 use rmcp::model::InitializeRequestParams;
 use rmcp::model::ProtocolVersion;
+use rmcp::model::ServerPeerInfo;
 use rmcp::model::Tool as RmcpTool;
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
@@ -147,6 +153,7 @@ pub(crate) type ManagedClientFuture =
 #[derive(Default)]
 struct CodexAppsStartupReconnectState {
     current_client: Option<ManagedClient>,
+    last_error: Option<StartupOutcomeError>,
     reconnect_in_flight: bool,
     consecutive_failures: u32,
     retry_not_before: Option<TokioInstant>,
@@ -227,11 +234,13 @@ impl CodexAppsStartupReconnect {
                 match result {
                     Ok(client) => {
                         state.current_client = Some(client);
+                        state.last_error = None;
                         state.consecutive_failures = 0;
                         state.retry_not_before = None;
                         true
                     }
                     Err(error) => {
+                        state.last_error = Some(error.clone());
                         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                         let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
                         state.retry_not_before = Some(TokioInstant::now() + retry_after);
@@ -316,10 +325,10 @@ impl ManagedClientStartup {
             .startup_timeout_sec
             .unwrap_or(DEFAULT_STARTUP_TIMEOUT);
         let cancel_token_for_fut = cancel_token;
-        let tool_catalog_fetch_ticket = tool_catalog_cache_context
-            .as_ref()
-            .map(McpToolCatalogCacheContext::begin_fetch);
         async move {
+            let tool_catalog_fetch_ticket = tool_catalog_cache_context
+                .as_ref()
+                .map(McpToolCatalogCacheContext::begin_fetch);
             let refresh_start = is_codex_apps_mcp_server.then(Instant::now);
             let outcome = match async {
                 if let Err(error) = validate_mcp_server_name(&server_name) {
@@ -492,22 +501,22 @@ impl AsyncManagedClient {
         self.client.clone().await
     }
 
+    /// Returns the current ready client, including its tool catalog and metadata,
+    /// without waiting for startup or initiating a reconnection.
+    pub(crate) fn ready_client(&self) -> Option<ManagedClient> {
+        self.startup_reconnect
+            .as_ref()
+            .and_then(|reconnect| reconnect.current_client())
+            .or_else(|| {
+                self.client
+                    .peek()
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned()
+            })
+    }
+
     pub(crate) fn ready_transport(&self) -> Option<Arc<RmcpClient>> {
-        let recovered = self.startup_reconnect.as_ref().and_then(|reconnect| {
-            reconnect
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .current_client
-                .as_ref()
-                .map(|client| Arc::clone(&client.client))
-        });
-        recovered.or_else(|| {
-            self.client
-                .peek()
-                .and_then(|result| result.as_ref().ok())
-                .map(|client| Arc::clone(&client.client))
-        })
+        self.ready_client().map(|client| client.client)
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
@@ -588,9 +597,9 @@ impl StartupOutcomeError {
         match self {
             Self::Cancelled => false,
             Self::Failed {
+                error,
                 is_authentication_required,
-                ..
-            } => *is_authentication_required,
+            } => *is_authentication_required || error.contains("Auth required"),
         }
     }
 }
@@ -879,10 +888,17 @@ async fn start_server_task(
         mcp_initialize_request_params(client_elicitation_capability, client_mcp_extensions);
     let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
 
+    let started_at = Instant::now();
     let initialize_result = client
         .initialize(params, startup_timeout, send_elicitation)
-        .await
-        .map_err(StartupOutcomeError::from)?;
+        .await;
+    record_protocol_discovery_metrics(
+        client.protocol_mode(),
+        is_codex_apps_mcp_server,
+        started_at,
+        &initialize_result,
+    );
+    let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
 
     let server_disables_tool_catalog_cache = initialize_result
         .capabilities
@@ -954,6 +970,37 @@ async fn start_server_task(
     };
 
     Ok(managed)
+}
+
+fn record_protocol_discovery_metrics(
+    mode: McpProtocolMode,
+    is_codex_apps_mcp_server: bool,
+    started_at: Instant,
+    result: &Result<ServerPeerInfo>,
+) {
+    let Some(metrics) = codex_otel::global() else {
+        return;
+    };
+
+    let mode = match mode {
+        McpProtocolMode::Legacy => "legacy",
+        McpProtocolMode::V20260728 => "auto",
+    };
+    let outcome = match result {
+        Ok(result) if result.protocol_version == ProtocolVersion::V_2026_07_28 => "modern",
+        Ok(_) => "legacy",
+        Err(_) => "failure",
+    };
+    let mut tags = vec![("mode", mode), ("outcome", outcome)];
+    if is_codex_apps_mcp_server {
+        tags.push(("server_kind", "openai_codex_apps"));
+    }
+    let _ = metrics.counter("codex.mcp.protocol_discovery", /*inc*/ 1, &tags);
+    let _ = metrics.record_duration(
+        "codex.mcp.protocol_discovery.duration_ms",
+        started_at.elapsed(),
+        &tags,
+    );
 }
 
 fn mcp_initialize_request_params(
@@ -1061,7 +1108,7 @@ async fn make_rmcp_client(
                 // `ExecutorStdioServerLauncher` once the executor-backed path
                 // preserves `LocalStdioServerLauncher` semantics.
                 Arc::new(LocalStdioServerLauncher::new(
-                    runtime_context.local_stdio_fallback_cwd(),
+                    runtime_context.local_process_cwd(),
                 )) as Arc<dyn StdioServerLauncher>
             } else {
                 let Some(environment) = resolved_environment.as_ref() else {
@@ -1092,17 +1139,45 @@ async fn make_rmcp_client(
             http_headers,
             env_http_headers,
             bearer_token_env_var,
+            http_headers_helper: _,
         } => {
-            let http_client = resolved_environment.as_ref().map_or_else(
-                || runtime_context.local_http_client(),
-                |environment| environment.get_http_client(),
-            );
+            let http_client = runtime_context
+                .http_client_for_server(server.config(), resolved_environment.as_ref())
+                .map_err(|error| StartupOutcomeError::from(anyhow!(error)))?;
             let http_client = maybe_with_openai_docs_source_attribution(&url, http_client);
-            let resolved_bearer_token =
-                match resolve_bearer_token(server_name, bearer_token_env_var.as_deref()) {
-                    Ok(token) => token,
-                    Err(error) => return Err(error.into()),
+            let executor_resolves_bearer_token = if !is_local_environment
+                && bearer_token_env_var.is_some()
+            {
+                let Some(environment) = resolved_environment.as_ref() else {
+                    return Err(StartupOutcomeError::from(anyhow!(
+                        "non-local HTTP MCP server `{server_name}` did not resolve an execution environment"
+                    )));
                 };
+                environment
+                    .info()
+                    .await
+                    .map_err(|error| StartupOutcomeError::from(anyhow!(error)))?
+                    .capabilities
+                    .http_header_env_vars
+            } else {
+                false
+            };
+            let (http_client, resolved_bearer_token) = if executor_resolves_bearer_token
+                && let Some(env_var) = bearer_token_env_var.as_ref()
+            {
+                (
+                    Arc::new(ExecutorEnvironmentHttpClient {
+                        bearer_token_env_var: env_var.clone(),
+                        http_client,
+                    }) as Arc<dyn codex_exec_server::HttpClient>,
+                    Some(StreamableHttpBearerToken::ProvidedByHttpClient),
+                )
+            } else {
+                let token = resolve_bearer_token(server_name, bearer_token_env_var.as_deref())
+                    .map_err(StartupOutcomeError::from)?
+                    .map(StreamableHttpBearerToken::Resolved);
+                (http_client, token)
+            };
             let redirect_mode = if server.is_agent_plugin() {
                 StreamableHttpRedirectMode::AgentPluginV1
             } else {

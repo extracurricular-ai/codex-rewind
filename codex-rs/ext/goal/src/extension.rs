@@ -48,12 +48,7 @@ use crate::tool::GoalToolExecutor;
 #[derive(Clone, Debug)]
 pub struct GoalExtensionConfig {
     pub enabled: bool,
-}
-
-impl GoalExtensionConfig {
-    fn from_enabled(enabled: bool) -> Self {
-        Self { enabled }
-    }
+    pub max_goal_token_budget: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -64,7 +59,7 @@ pub struct GoalExtension<C> {
     metrics: GoalMetrics,
     thread_manager: Weak<ThreadManager>,
     goal_service: Arc<GoalService>,
-    goals_enabled: Arc<dyn Fn(&C) -> bool + Send + Sync>,
+    goal_config: Arc<dyn Fn(&C) -> GoalExtensionConfig + Send + Sync>,
 }
 
 impl<C> std::fmt::Debug for GoalExtension<C> {
@@ -81,7 +76,7 @@ impl<C> GoalExtension<C> {
         metrics_client: Option<MetricsClient>,
         thread_manager: Weak<ThreadManager>,
         goal_service: Arc<GoalService>,
-        goals_enabled: impl Fn(&C) -> bool + Send + Sync + 'static,
+        goal_config: impl Fn(&C) -> GoalExtensionConfig + Send + Sync + 'static,
     ) -> Self {
         Self {
             state_dbs,
@@ -90,7 +85,7 @@ impl<C> GoalExtension<C> {
             metrics: GoalMetrics::new(metrics_client),
             thread_manager,
             goal_service,
-            goals_enabled: Arc::new(goals_enabled),
+            goal_config: Arc::new(goal_config),
         }
     }
 }
@@ -101,21 +96,44 @@ where
 {
     fn on_thread_start<'a>(&'a self, input: ThreadStartInput<'a, C>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
-            let enabled = (self.goals_enabled)(input.config);
+            let config = (self.goal_config)(input.config);
+            let enabled = config.enabled;
             let tools_available_for_thread = input.persistent_thread_state_available
                 && !matches!(
                     input.session_source,
                     SessionSource::SubAgent(SubAgentSource::Review)
                 );
-            input
-                .thread_store
-                .insert(GoalExtensionConfig::from_enabled(enabled));
+            input.thread_store.insert(config);
             let accounting_state = input
                 .thread_store
                 .get_or_init::<GoalAccountingState>(GoalAccountingState::default);
             let Ok(thread_id) = ThreadId::from_string(input.thread_store.level_id()) else {
                 return;
             };
+            let root_accounting_state = input
+                .session_source
+                .parent_thread_id()
+                .or_else(|| {
+                    ThreadId::from_string(input.session_store.level_id())
+                        .ok()
+                        .filter(|_| input.session_source.is_non_root_agent())
+                })
+                .and_then(|parent_thread_id| {
+                    self.goal_service
+                        .runtime_for_thread(parent_thread_id)
+                        .or_else(|| {
+                            ThreadId::from_string(input.session_store.level_id())
+                                .ok()
+                                .and_then(|root_thread_id| {
+                                    self.goal_service.runtime_for_thread(root_thread_id)
+                                })
+                        })
+                })
+                .map(|parent| {
+                    parent
+                        .root_accounting_state()
+                        .unwrap_or_else(|| parent.accounting_state())
+                });
             let runtime = input.thread_store.get_or_init::<GoalRuntimeHandle>(|| {
                 GoalRuntimeHandle::new(
                     thread_id,
@@ -128,6 +146,7 @@ where
                         analytics: self.analytics.clone(),
                         enabled,
                         tools_available_for_thread,
+                        root_accounting_state,
                     },
                 )
             });
@@ -186,8 +205,9 @@ where
         _previous_config: &C,
         new_config: &C,
     ) {
-        let enabled = (self.goals_enabled)(new_config);
-        thread_store.insert(GoalExtensionConfig::from_enabled(enabled));
+        let config = (self.goal_config)(new_config);
+        let enabled = config.enabled;
+        thread_store.insert(config);
         if let Some(runtime) = goal_runtime_handle(thread_store) {
             runtime.set_enabled(enabled);
         }
@@ -351,12 +371,12 @@ where
                 return;
             }
 
-            let Some(_recorded) = runtime
+            if let Some(root_accounting_state) = runtime.root_accounting_state() {
+                root_accounting_state.record_descendant_token_usage(&token_usage.last_token_usage);
+            }
+            let _ = runtime
                 .accounting_state()
-                .record_token_usage(turn_store.level_id(), &token_usage.total_token_usage)
-            else {
-                return;
-            };
+                .record_token_usage(turn_store.level_id(), &token_usage.total_token_usage);
         })
     }
 }
@@ -420,13 +440,18 @@ where
         &self,
         _session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>> {
+    ) -> Vec<
+        Arc<dyn for<'call> codex_extension_api::ToolExecutor<codex_extension_api::ToolCall<'call>>>,
+    > {
         let Some(runtime) = goal_runtime_handle(thread_store) else {
             return Vec::new();
         };
         if !runtime.tools_visible() {
             return Vec::new();
         }
+        let max_goal_token_budget = thread_store
+            .get::<GoalExtensionConfig>()
+            .and_then(|config| config.max_goal_token_budget);
 
         vec![
             Arc::new(GoalToolExecutor::get(
@@ -444,6 +469,7 @@ where
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),
+                max_goal_token_budget,
             )),
             Arc::new(GoalToolExecutor::update(
                 runtime.thread_id(),
@@ -464,7 +490,7 @@ pub fn install_with_backend<C>(
     metrics_client: Option<MetricsClient>,
     thread_manager: Weak<ThreadManager>,
     goal_service: Arc<GoalService>,
-    goals_enabled: impl Fn(&C) -> bool + Send + Sync + 'static,
+    goal_config: impl Fn(&C) -> GoalExtensionConfig + Send + Sync + 'static,
 ) where
     C: Send + Sync + 'static,
 {
@@ -475,7 +501,7 @@ pub fn install_with_backend<C>(
         metrics_client,
         thread_manager,
         Arc::clone(&goal_service),
-        goals_enabled,
+        goal_config,
     ));
     registry.thread_lifecycle_contributor(extension.clone());
     registry.config_contributor(extension.clone());

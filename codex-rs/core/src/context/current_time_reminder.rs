@@ -2,6 +2,7 @@ use chrono::DateTime;
 use chrono::Utc;
 
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItemKind;
 
 pub(crate) struct CurrentTimeReminder {
     current_time: DateTime<Utc>,
@@ -20,6 +21,10 @@ impl CurrentTimeReminder {
 }
 
 impl ContextualUserFragment for CurrentTimeReminder {
+    fn content_kind(&self) -> ContentItemKind {
+        ContentItemKind("current_time.reminder".to_string())
+    }
+
     fn role(&self) -> &'static str {
         "developer"
     }
@@ -29,7 +34,7 @@ impl ContextualUserFragment for CurrentTimeReminder {
     }
 
     fn type_markers() -> (&'static str, &'static str) {
-        ("", "")
+        ("<current_time_reminder>", "</current_time_reminder>")
     }
 
     fn body(&self) -> String {

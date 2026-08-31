@@ -8,8 +8,8 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::WebSearchToolType;
+use codex_protocol::protocol::MultiAgentVersion;
 
 const GPT_5_BEDROCK_CONTEXT_WINDOW: i64 = 272_000;
 const GPT_5_6_SOL_OPENAI_MODEL_ID: &str = "gpt-5.6-sol";
@@ -63,6 +63,8 @@ pub(crate) fn normalize_bedrock_catalog(mut catalog: ModelsResponse) -> ModelsRe
         model.default_service_tier = None;
         // Bedrock rejects the `search_content_types` field used by multimodal search.
         model.web_search_tool_type = WebSearchToolType::Text;
+        // Bedrock does not support the response items used by multi-agent V2.
+        model.multi_agent_version = Some(MultiAgentVersion::V1);
     }
     catalog
 }
@@ -91,22 +93,18 @@ fn gpt_5_6_bedrock_model(
     display_name: &str,
     priority: i32,
 ) -> ModelInfo {
-    let openai_model = bundled_openai_model(openai_slug);
-    let mut model = gpt_5_bedrock_model(
-        GPT_5_5_OPENAI_MODEL_ID,
-        bedrock_slug,
-        display_name,
-        priority,
-    );
-    model.description = openai_model.description;
-    model.default_reasoning_level = openai_model.default_reasoning_level;
-    model.multi_agent_version = openai_model.multi_agent_version;
+    let mut model = bundled_openai_model(openai_slug);
+    model.slug = bedrock_slug.to_string();
+    model.display_name = display_name.to_string();
+    model.priority = priority;
+    model.visibility = ModelVisibility::List;
+    model.availability_nux = None;
+    model.upgrade = None;
+    model.use_responses_lite = false;
+    model.tool_mode = None;
     model
         .supported_reasoning_levels
-        .push(ReasoningEffortPreset {
-            effort: ReasoningEffort::Max,
-            description: "Maximum reasoning depth for the hardest problems".to_string(),
-        });
+        .retain(|level| level.effort != ReasoningEffort::Ultra);
     model
 }
 
@@ -150,20 +148,50 @@ mod tests {
     fn gpt_5_bedrock_models_use_bedrock_context_window() {
         let catalog = static_model_catalog();
 
-        for model in catalog.models {
-            assert_eq!(
-                (
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|model| (
+                    model.slug.as_str(),
                     model.context_window,
                     model.max_context_window,
                     model.web_search_tool_type,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID,
+                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                    Some(872_000),
+                    WebSearchToolType::Text,
                 ),
                 (
+                    AMAZON_BEDROCK_GPT_5_6_TERRA_MODEL_ID,
+                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                    Some(872_000),
+                    WebSearchToolType::Text,
+                ),
+                (
+                    AMAZON_BEDROCK_GPT_5_6_LUNA_MODEL_ID,
+                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                    Some(872_000),
+                    WebSearchToolType::Text,
+                ),
+                (
+                    AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
                     Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
                     Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
                     WebSearchToolType::Text,
-                )
-            );
-        }
+                ),
+                (
+                    AMAZON_BEDROCK_GPT_5_4_MODEL_ID,
+                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                    Some(GPT_5_BEDROCK_CONTEXT_WINDOW),
+                    WebSearchToolType::Text,
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -174,6 +202,7 @@ mod tests {
         expected.service_tiers.clear();
         expected.default_service_tier = None;
         expected.web_search_tool_type = WebSearchToolType::Text;
+        expected.multi_agent_version = Some(MultiAgentVersion::V1);
 
         assert_eq!(
             normalize_bedrock_catalog(ModelsResponse {
@@ -204,13 +233,8 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_6_bedrock_models_use_variant_metadata_and_max_reasoning_effort() {
+    fn gpt_5_6_bedrock_models_use_bundled_metadata_with_bedrock_overrides() {
         let catalog = static_model_catalog();
-        let gpt_5_5 = catalog
-            .models
-            .iter()
-            .find(|model| model.slug == AMAZON_BEDROCK_GPT_5_5_MODEL_ID)
-            .expect("Bedrock catalog should include GPT-5.5");
 
         for (openai_slug, slug, display_name, priority) in [
             (
@@ -232,20 +256,23 @@ mod tests {
                 2,
             ),
         ] {
-            let openai_model = bundled_openai_model(openai_slug);
-            let mut expected = gpt_5_5.clone();
+            let mut expected = bundled_openai_model(openai_slug);
             expected.slug = slug.to_string();
             expected.display_name = display_name.to_string();
-            expected.description = openai_model.description;
-            expected.default_reasoning_level = openai_model.default_reasoning_level;
-            expected.multi_agent_version = openai_model.multi_agent_version;
             expected.priority = priority;
+            expected.visibility = ModelVisibility::List;
+            expected.availability_nux = None;
+            expected.upgrade = None;
+            expected.use_responses_lite = false;
+            expected.tool_mode = None;
             expected
                 .supported_reasoning_levels
-                .push(ReasoningEffortPreset {
-                    effort: ReasoningEffort::Max,
-                    description: "Maximum reasoning depth for the hardest problems".to_string(),
-                });
+                .retain(|level| level.effort != ReasoningEffort::Ultra);
+            expected.additional_speed_tiers.clear();
+            expected.service_tiers.clear();
+            expected.default_service_tier = None;
+            expected.web_search_tool_type = WebSearchToolType::Text;
+            expected.multi_agent_version = Some(MultiAgentVersion::V1);
 
             assert_eq!(
                 catalog.models.iter().find(|model| model.slug == slug),

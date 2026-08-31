@@ -185,7 +185,9 @@ fn activity_marker(start_time: Option<Instant>, animations_enabled: bool) -> Spa
 
 impl HistoryCell for ExecCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if self.is_exploring_cell() {
+        if self.calls.len() > 1 && (!self.is_exploring_cell() || !self.is_active()) {
+            self.compact_group_display_lines(width)
+        } else if self.is_exploring_cell() {
             self.exploring_display_lines(width)
         } else {
             self.command_display_lines(width)
@@ -244,6 +246,42 @@ impl HistoryCell for ExecCell {
 }
 
 impl ExecCell {
+    fn compact_group_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let completed_commands = self
+            .calls
+            .iter()
+            .take_while(|call| {
+                matches!(
+                    call.source,
+                    ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup
+                ) && call.duration.is_some()
+                    && call
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.exit_code == 0)
+            })
+            .count();
+        let mut lines = Vec::new();
+        if completed_commands > 0 {
+            let noun = if completed_commands == 1 {
+                "command"
+            } else {
+                "commands"
+            };
+            lines.push(Line::from(vec![
+                "•".green().bold(),
+                " ".into(),
+                format!("Ran {completed_commands} {noun}").bold(),
+                " · ".dim(),
+                TRANSCRIPT_HINT.dim(),
+            ]));
+        }
+        for call in &self.calls[completed_commands..] {
+            lines.extend(self.command_call_display_lines(width, call));
+        }
+        lines
+    }
+
     fn output_ellipsis_text(omitted: usize) -> String {
         format!("… +{omitted} lines ({TRANSCRIPT_HINT})")
     }
@@ -353,6 +391,10 @@ impl ExecCell {
         let [call] = &self.calls.as_slice() else {
             panic!("Expected exactly one call in a command display cell");
         };
+        self.command_call_display_lines(width, call)
+    }
+
+    fn command_call_display_lines(&self, width: u16, call: &ExecCall) -> Vec<Line<'static>> {
         let layout = EXEC_DISPLAY_LAYOUT;
         let success = call
             .duration
@@ -365,7 +407,7 @@ impl ExecCell {
         let is_interaction = call.is_unified_exec_interaction();
         let title = if is_interaction {
             ""
-        } else if self.is_active() {
+        } else if call.duration.is_none() {
             "Running"
         } else if call.is_user_shell_command() {
             "You ran"
@@ -962,6 +1004,34 @@ mod tests {
             "truncated_live_output_preview_and_transcript",
             (preview, transcript)
         );
+    }
+
+    #[test]
+    fn powershell_skill_read_snapshot() {
+        let command = vec![
+            "powershell.exe".to_string(),
+            "-Command".to_string(),
+            r"Get-Content C:\skills\demo\SKILL.md".to_string(),
+        ];
+        let parsed = codex_shell_command::parse_command::parse_command(&command);
+        let cell = new_active_exec_command(
+            "call-id".to_string(),
+            command,
+            parsed,
+            ExecCommandSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        let rendered = cell
+            .display_lines(/*width*/ 80)
+            .iter()
+            .map(render_line_text)
+            .join("\n");
+
+        insta::assert_snapshot!(rendered, @r"
+        • Exploring
+          └ Read SKILL.md
+        ");
     }
 
     #[test]

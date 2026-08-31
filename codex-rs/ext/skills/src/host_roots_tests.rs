@@ -7,9 +7,6 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirementsToml;
-use codex_core_skills::SkillMetadata;
-use codex_core_skills::loader::MAX_CONCURRENT_ROOT_SCANS;
-use codex_core_skills::loader::load_skills_from_roots;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
@@ -17,12 +14,16 @@ use codex_exec_server::ExecutorFileSystemFuture;
 use codex_exec_server::FileMetadata;
 use codex_exec_server::FileSystemReadStream;
 use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::LOCAL_FS;
 use codex_exec_server::ReadDirectoryEntry;
+use codex_exec_server::ReadFileOptions;
 use codex_exec_server::RemoveOptions;
 use codex_exec_server::WalkOptions;
 use codex_exec_server::WalkOutcome;
+use codex_exec_server::WriteFileOptions;
 use codex_protocol::protocol::SkillScope;
+use codex_skills::SkillMetadata;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_plugins::PluginIdentity;
@@ -36,6 +37,8 @@ use tokio::sync::Semaphore;
 use super::repo_agents_skill_roots;
 use super::resolve_skill_roots_with_home_dir;
 use super::roots_from_layer_stack;
+use crate::loader::MAX_CONCURRENT_ROOT_SCANS;
+use crate::loader::load_and_merge_host_skill_roots;
 
 struct BlockingMetadataFileSystem {
     inner: Arc<dyn ExecutorFileSystem>,
@@ -70,9 +73,10 @@ impl ExecutorFileSystem for BlockingMetadataFileSystem {
     fn read_file<'a>(
         &'a self,
         path: &'a PathUri,
+        options: ReadFileOptions,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>> {
-        self.inner.read_file(path, sandbox)
+        self.inner.read_file(path, options, sandbox)
     }
 
     fn read_file_stream<'a>(
@@ -87,9 +91,10 @@ impl ExecutorFileSystem for BlockingMetadataFileSystem {
         &'a self,
         path: &'a PathUri,
         contents: Vec<u8>,
+        options: WriteFileOptions,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ()> {
-        self.inner.write_file(path, contents, sandbox)
+        self.inner.write_file(path, contents, options, sandbox)
     }
 
     fn create_directory<'a>(
@@ -104,14 +109,15 @@ impl ExecutorFileSystem for BlockingMetadataFileSystem {
     fn get_metadata<'a>(
         &'a self,
         path: &'a PathUri,
+        options: GetMetadataOptions,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
         let Ok(path_abs) = path.to_abs_path() else {
-            return self.inner.get_metadata(path, sandbox);
+            return self.inner.get_metadata(path, options, sandbox);
         };
         let repo_skill_root_suffix = Path::new(".agents").join("skills");
         if !path_abs.ends_with(repo_skill_root_suffix) {
-            return self.inner.get_metadata(path, sandbox);
+            return self.inner.get_metadata(path, options, sandbox);
         }
 
         self.calls
@@ -127,7 +133,7 @@ impl ExecutorFileSystem for BlockingMetadataFileSystem {
                 .await
                 .expect("metadata release semaphore")
                 .forget();
-            self.inner.get_metadata(path, sandbox).await
+            self.inner.get_metadata(path, options, sandbox).await
         })
     }
 
@@ -317,10 +323,10 @@ async fn plugin_roots_preserve_plugin_resolution_metadata() {
         (
             root.path.clone(),
             root.scope,
-            root.plugin_identity.clone(),
-            root.plugin_namespace.clone(),
-            root.plugin_root.clone(),
-            root.discovery_mode,
+            root.plugin_identity().cloned(),
+            root.plugin_namespace().map(str::to_string),
+            root.plugin_root().cloned(),
+            root.discovery_mode(),
         ),
         (
             skills_root,
@@ -357,10 +363,10 @@ async fn unique_extra_root_loads_as_recursive_user_root() {
         (
             root.path.clone(),
             root.scope,
-            root.plugin_identity.clone(),
-            root.plugin_namespace.clone(),
-            root.plugin_root.clone(),
-            root.discovery_mode,
+            root.plugin_identity().cloned(),
+            root.plugin_namespace().map(str::to_string),
+            root.plugin_root().cloned(),
+            root.discovery_mode(),
         ),
         (
             extra_root,
@@ -373,10 +379,11 @@ async fn unique_extra_root_loads_as_recursive_user_root() {
     );
     assert!(Arc::ptr_eq(&root.file_system, &LOCAL_FS));
 
-    let outcome = load_skills_from_roots(
+    let outcome = load_and_merge_host_skill_roots(
         roots,
+        &Semaphore::new(MAX_CONCURRENT_ROOT_SCANS),
+        /*restriction_product*/ None,
         /*plugin_skill_snapshots*/ None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
     )
     .await;
 
@@ -455,10 +462,11 @@ async fn resolved_project_layer_loads_skill_without_git_marker() {
         Vec::new(),
     )
     .await;
-    let outcome = load_skills_from_roots(
+    let outcome = load_and_merge_host_skill_roots(
         roots,
+        &Semaphore::new(MAX_CONCURRENT_ROOT_SCANS),
+        /*restriction_product*/ None,
         /*plugin_skill_snapshots*/ None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
     )
     .await;
 
@@ -491,10 +499,11 @@ async fn resolved_project_layer_loads_skill_when_cwd_is_file() {
         Vec::new(),
     )
     .await;
-    let outcome = load_skills_from_roots(
+    let outcome = load_and_merge_host_skill_roots(
         roots,
+        &Semaphore::new(MAX_CONCURRENT_ROOT_SCANS),
+        /*restriction_product*/ None,
         /*plugin_skill_snapshots*/ None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
     )
     .await;
 
@@ -645,10 +654,11 @@ async fn resolved_config_and_repo_roots_preserve_order_and_dedupe_paths_not_name
     )
     .await;
     assert_eq!(roots.len(), 8);
-    let outcome = load_skills_from_roots(
+    let outcome = load_and_merge_host_skill_roots(
         roots,
+        &Semaphore::new(MAX_CONCURRENT_ROOT_SCANS),
+        /*restriction_product*/ None,
         /*plugin_skill_snapshots*/ None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
     )
     .await;
     assert!(outcome.errors.is_empty());

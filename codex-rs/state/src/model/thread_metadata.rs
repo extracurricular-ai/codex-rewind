@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -53,13 +54,37 @@ pub struct Anchor {
     pub id: Option<ThreadId>,
 }
 
-/// An independently persisted thread section and its user-facing name.
+/// Visual presentation metadata owned by a thread section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSectionAppearance {
+    pub icon: Option<String>,
+    pub color: Option<String>,
+}
+
+/// An independently persisted thread section and its user-facing presentation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadSection {
     /// Opaque UUIDv7 identifying the section independently of its name.
     pub id: String,
     /// User-facing section name.
     pub name: String,
+    #[serde(default)]
+    pub appearance: Option<ThreadSectionAppearance>,
+}
+
+impl ThreadSection {
+    pub(crate) fn from_row(
+        (id, name, appearance): (String, String, Option<String>),
+    ) -> Result<Self> {
+        Ok(Self {
+            id,
+            name,
+            appearance: appearance
+                .map(|appearance| serde_json::from_str(&appearance))
+                .transpose()?,
+        })
+    }
 }
 
 /// A cursor-paginated page of independently persisted thread sections.
@@ -152,12 +177,14 @@ pub struct ThreadMetadata {
     pub section_position: Option<i64>,
     /// The time when the thread most recently entered its current section.
     pub section_entered_at: Option<DateTime<Utc>>,
+    /// Canonical project assignment owned by app-server, if any.
+    pub project_id: Option<String>,
     /// The git commit SHA, if known.
     pub git_sha: Option<String>,
     /// The git branch name, if known.
     pub git_branch: Option<String>,
     /// The git origin URL, if known.
-    pub git_origin_url: Option<String>,
+    pub git_origin_url: Option<SanitizedGitUrl>,
 }
 
 /// Builder data required to construct [`ThreadMetadata`] without parsing filenames.
@@ -202,7 +229,7 @@ pub struct ThreadMetadataBuilder {
     /// The git branch name, if known.
     pub git_branch: Option<String>,
     /// The git origin URL, if known.
-    pub git_origin_url: Option<String>,
+    pub git_origin_url: Option<SanitizedGitUrl>,
 }
 
 impl ThreadMetadataBuilder {
@@ -285,6 +312,7 @@ impl ThreadMetadataBuilder {
             section: None,
             section_position: None,
             section_entered_at: None,
+            project_id: None,
             git_sha: self.git_sha.clone(),
             git_branch: self.git_branch.clone(),
             git_origin_url: self.git_origin_url.clone(),
@@ -408,6 +436,9 @@ impl ThreadMetadata {
         if self.section_entered_at != other.section_entered_at {
             diffs.push("section_entered_at");
         }
+        if self.project_id != other.project_id {
+            diffs.push("project_id");
+        }
         if self.git_sha != other.git_sha {
             diffs.push("git_sha");
         }
@@ -453,8 +484,10 @@ pub(crate) struct ThreadRow {
     archived_at: Option<i64>,
     section: Option<String>,
     section_name: Option<String>,
+    section_appearance: Option<String>,
     section_position: Option<i64>,
     section_entered_at_ms: Option<i64>,
+    project_id: Option<String>,
     git_sha: Option<String>,
     git_branch: Option<String>,
     git_origin_url: Option<String>,
@@ -489,8 +522,10 @@ impl ThreadRow {
             archived_at: row.try_get("archived_at")?,
             section: row.try_get("section")?,
             section_name: row.try_get("section_name")?,
+            section_appearance: row.try_get("section_appearance")?,
             section_position: row.try_get("section_position")?,
             section_entered_at_ms: row.try_get("section_entered_at_ms")?,
+            project_id: row.try_get("project_id")?,
             git_sha: row.try_get("git_sha")?,
             git_branch: row.try_get("git_branch")?,
             git_origin_url: row.try_get("git_origin_url")?,
@@ -529,8 +564,10 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             archived_at,
             section,
             section_name,
+            section_appearance,
             section_position,
             section_entered_at_ms,
+            project_id,
             git_sha,
             git_branch,
             git_origin_url,
@@ -541,7 +578,9 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             .map_err(anyhow::Error::msg)?;
         let history_mode = history_mode.parse().map_err(anyhow::Error::msg)?;
         let section = match (section, section_name) {
-            (Some(id), Some(name)) => Some(ThreadSection { id, name }),
+            (Some(id), Some(name)) => {
+                Some(ThreadSection::from_row((id, name, section_appearance))?)
+            }
             (None, None) => None,
             (Some(id), None) => {
                 return Err(anyhow::anyhow!(
@@ -585,9 +624,11 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
             section_entered_at: section_entered_at_ms
                 .map(epoch_millis_to_datetime)
                 .transpose()?,
+            project_id,
             git_sha,
             git_branch,
-            git_origin_url,
+            git_origin_url: git_origin_url
+                .and_then(|origin_url| SanitizedGitUrl::try_from(origin_url).ok()),
         })
     }
 }
@@ -654,6 +695,7 @@ mod tests {
     use super::ThreadRow;
     use chrono::DateTime;
     use chrono::Utc;
+    use codex_protocol::SanitizedGitUrl;
     use codex_protocol::ThreadId;
     use codex_protocol::openai_models::ReasoningEffort;
     use codex_protocol::protocol::ThreadHistoryMode;
@@ -688,8 +730,10 @@ mod tests {
             archived_at: None,
             section: None,
             section_name: None,
+            section_appearance: None,
             section_position: None,
             section_entered_at_ms: None,
+            project_id: None,
             git_sha: None,
             git_branch: None,
             git_origin_url: None,
@@ -726,6 +770,7 @@ mod tests {
             section: None,
             section_position: None,
             section_entered_at: None,
+            project_id: None,
             git_sha: None,
             git_branch: None,
             git_origin_url: None,
@@ -768,7 +813,10 @@ mod tests {
         reconciled.history_mode = ThreadHistoryMode::Paginated;
         reconciled.git_sha = Some("rollout-sha".to_string());
         reconciled.git_branch = Some("rollout-branch".to_string());
-        reconciled.git_origin_url = Some("rollout-origin".to_string());
+        reconciled.git_origin_url = Some(
+            SanitizedGitUrl::try_from("https://example.com/rollout-origin")
+                .expect("valid git remote URL"),
+        );
         let existing = expected_thread_metadata(/*reasoning_effort*/ None);
         let expected = reconciled.clone();
 

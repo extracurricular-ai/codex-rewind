@@ -73,6 +73,9 @@ use codex_app_server_protocol::PluginSkillReadParams;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::ProcessKillParams;
 use codex_app_server_protocol::ProcessSpawnParams;
+use codex_app_server_protocol::ProjectImportParams;
+use codex_app_server_protocol::ProjectListParams;
+use codex_app_server_protocol::ProjectReadParams;
 use codex_app_server_protocol::RemoteControlClientsListParams;
 use codex_app_server_protocol::RemoteControlClientsRevokeParams;
 use codex_app_server_protocol::RemoteControlPairingStartParams;
@@ -110,6 +113,7 @@ use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadShellCommandParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::ThreadTimelineListParams;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -257,10 +261,20 @@ impl TestAppServer {
             }
         }
 
-        let mut process = cmd
-            .kill_on_drop(true)
-            .spawn()
-            .context("codex-mcp-server proc should start")?;
+        cmd.kill_on_drop(true);
+        let mut retries = 0;
+        let mut process = loop {
+            let process = cmd.spawn();
+            if !process
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::ExecutableFileBusy)
+                || retries == 2
+            {
+                break process.context("codex-mcp-server proc should start")?;
+            }
+            retries += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         let stdin = process
             .stdin
             .take()
@@ -461,6 +475,33 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/start", params).await
+    }
+
+    /// Send a `project/import` JSON-RPC request.
+    pub async fn send_project_import_request(
+        &mut self,
+        params: ProjectImportParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/import", params).await
+    }
+
+    /// Send a `project/list` JSON-RPC request.
+    pub async fn send_project_list_request(
+        &mut self,
+        params: ProjectListParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/list", params).await
+    }
+
+    /// Send a project/read JSON-RPC request.
+    pub async fn send_project_read_request(
+        &mut self,
+        params: ProjectReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("project/read", params).await
     }
 
     /// Sends a `thread/start` request selecting the builder's automatic
@@ -1151,6 +1192,14 @@ impl TestAppServer {
         self.send_request("thread/realtime/stop", params).await
     }
 
+    pub async fn send_thread_timeline_list_request(
+        &mut self,
+        params: ThreadTimelineListParams,
+    ) -> anyhow::Result<i64> {
+        self.send_request("thread/timeline/list", Some(serde_json::to_value(params)?))
+            .await
+    }
+
     pub async fn send_thread_realtime_list_voices_request(
         &mut self,
         params: ThreadRealtimeListVoicesParams,
@@ -1509,7 +1558,7 @@ impl TestAppServer {
         tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, self.read_response(request_id)).await?
     }
 
-    async fn send_request(
+    pub async fn send_request(
         &mut self,
         method: &str,
         params: Option<serde_json::Value>,
@@ -2022,7 +2071,12 @@ impl TestAppServerBuilder {
         {
             // Bazel keeps binary targets in separate package directories.
             // Recreate the installed sibling layout without a path override.
-            let install_dir = TempDir::new()?;
+            // Prefer Bazel's TEST_TMPDIR so staging can share a filesystem with
+            // the binaries and avoid expensive cross-filesystem copies.
+            let install_dir = match std::env::var_os("TEST_TMPDIR") {
+                Some(test_tmpdir) => TempDir::new_in(test_tmpdir)?,
+                None => TempDir::new()?,
+            };
             let staged_program = install_dir.path().join(
                 program
                     .file_name()

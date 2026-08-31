@@ -3,8 +3,10 @@ use codex_core::ModelClient;
 use codex_core::NewThread;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
+use codex_core::StartIfIdleSubmission;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::content_items_to_text;
 use codex_core::detached_memory_responses_metadata;
@@ -26,7 +28,6 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::InternalSessionSource;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
@@ -256,6 +257,7 @@ impl MemoryStartupContext {
             session_source.clone(),
             config_snapshot.originator,
             config.model_verbosity,
+            config.features.enabled(Feature::ContentItemKinds),
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             /*beta_features_header*/ None,
@@ -273,6 +275,7 @@ impl MemoryStartupContext {
             window_id,
             &session_source,
             &config.cwd,
+            &config_snapshot.permission_profile,
             /*sandbox*/ None,
         )
         .await;
@@ -334,23 +337,24 @@ impl MemoryStartupContext {
             .await?;
 
         let agent = SpawnedConsolidationAgent { thread_id, thread };
-        if let Err(err) = agent
+        let submit_result = match agent
             .thread
-            .submit(Op::UserInput {
-                items: prompt,
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_turn_if_idle(TurnInputRequest::user_input(prompt))
             .await
         {
+            Ok(StartIfIdleSubmission::Started { .. }) => Ok(()),
+            Ok(submission) => Err(anyhow::anyhow!(
+                "memory consolidation input was not started: {submission:?}"
+            )),
+            Err(err) => Err(err.into()),
+        };
+        if let Err(err) = submit_result {
             if let Err(shutdown_err) = self.shutdown_consolidation_agent(agent).await {
                 tracing::warn!(
                     "failed to shut down consolidation agent after submit error: {shutdown_err}"
                 );
             }
-            return Err(err.into());
+            return Err(err);
         }
 
         Ok(agent)

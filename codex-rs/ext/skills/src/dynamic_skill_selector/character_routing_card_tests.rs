@@ -1,4 +1,4 @@
-use codex_core_skills::SkillLoadOutcome;
+use crate::SkillLoadOutcome;
 use codex_protocol::protocol::SkillScope;
 use codex_skills::SkillDependencies;
 use codex_skills::SkillInterface;
@@ -76,6 +76,7 @@ fn connector_dependencies_make_generic_skills_discoverable() {
             transport: None,
             command: None,
             url: None,
+            oauth_callback_port: None,
         }],
     };
     let documents = [

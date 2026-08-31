@@ -25,8 +25,8 @@ const TOOL_NAME: &str = "curr_time";
 struct CurrentTimeOutput(CurrentTimeReminder);
 
 impl ToolOutput for CurrentTimeOutput {
-    fn log_preview(&self) -> String {
-        self.0.render()
+    fn log_output(&self) -> String {
+        self.0.body()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -34,8 +34,7 @@ impl ToolOutput for CurrentTimeOutput {
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        FunctionToolOutput::from_text(self.0.render(), Some(true))
-            .to_response_item(call_id, payload)
+        FunctionToolOutput::from_text(self.0.body(), Some(true)).to_response_item(call_id, payload)
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
@@ -81,7 +80,10 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(format!(

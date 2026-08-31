@@ -1,12 +1,21 @@
 use codex_core::CodexThread;
 use codex_core::REVIEW_PROMPT;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::find_thread_path_by_id_str;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
+use codex_login::CodexAuth;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
@@ -26,8 +35,6 @@ use codex_protocol::protocol::ReviewLineRange;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::review_format::render_review_output_text;
@@ -226,7 +233,10 @@ async fn review_op_emits_lifecycle_and_review_output() {
         turn_metadata["parent_thread_id"].as_str(),
         Some(parent_thread_id.as_str())
     );
-    responses::assert_parent_turn(&request.body_json(), Some(review_turn_id.as_str()))
+    let request_body = request.body_json();
+    responses::assert_root_turn(&request_body, Some(review_turn_id.as_str()))
+        .expect("review request root turn metadata");
+    responses::assert_parent_turn(&request_body, Some(review_turn_id.as_str()))
         .expect("review request parent turn metadata");
 
     // Also verify that a user message with the header and a formatted finding
@@ -242,7 +252,9 @@ async fn review_op_emits_lifecycle_and_review_output() {
         }
         let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
         let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rl.item {
+        if let RolloutItem::ResponseItem(envelope) = rl.item
+            && let ResponseItem::Message { role, content, .. } = envelope.item
+        {
             if role == "user" {
                 for c in content {
                     if let ContentItem::InputText { text } = c {
@@ -619,8 +631,11 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
         .with_config(|config| {
             config.review_model = Some("gpt-5.4".to_string());
             config.model_context_window = Some(128_000);
-            config.config_lock_export_dir = Some(config.codex_home.join("review-config-locks"));
             config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
+            config
+                .features
+                .enable(Feature::FastMode)
+                .expect("enable FastMode");
             config
                 .features
                 .enable(Feature::TokenBudget)
@@ -646,7 +661,10 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
     test.fs()
         .create_directory(
             &selection.cwd,
-            CreateDirectoryOptions { recursive: true },
+            CreateDirectoryOptions {
+                recursive: true,
+                follow_symlinks: true,
+            },
             /*sandbox*/ None,
         )
         .await
@@ -662,13 +680,22 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
             approval_policy: Some(AskForApproval::Never),
             approvals_reviewer: Some(ApprovalsReviewer::User),
             permission_profile: Some(PermissionProfile::Disabled),
-            effort: Some(Some(ReasoningEffort::XHigh)),
+            personality: Some(Personality::Friendly),
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Plan,
+                settings: Settings {
+                    model: "gpt-5.2".to_string(),
+                    reasoning_effort: Some(ReasoningEffort::XHigh),
+                    developer_instructions: Some("Parent planning instructions".to_string()),
+                },
+            }),
             ..Default::default()
         },
     )
     .await
     .expect("updated thread permissions should be accepted");
 
+    let stored_settings = codex.thread_settings_snapshot().await;
     codex
         .submit(Op::Review {
             review_request: ReviewRequest {
@@ -682,6 +709,7 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
         .expect("review should start");
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
+    assert_eq!(codex.thread_settings_snapshot().await, stored_settings);
     let request = request_log.single_request();
     assert_eq!(request.body_json()["reasoning"]["effort"], "medium");
     assert_eq!(
@@ -742,21 +770,164 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
         })
         .expect("review rollout should contain session metadata");
     assert_eq!(review_session_cwd, updated_cwd.as_path());
-    let review_approvals_reviewer = review_rollout
+    let review_context = review_rollout
         .lines()
         .filter_map(|line| {
             let rollout_line: RolloutLine =
                 serde_json::from_str(line).expect("review rollout line should be valid");
             match rollout_line.item {
-                RolloutItem::TurnContext(turn_context) => turn_context.approvals_reviewer,
+                RolloutItem::TurnContext(turn_context) => Some(turn_context),
                 _ => None,
             }
         })
-        .next_back();
-    assert_eq!(review_approvals_reviewer, Some(ApprovalsReviewer::User));
+        .next_back()
+        .expect("review rollout should contain turn context");
+    assert_eq!(
+        review_context.approvals_reviewer,
+        Some(ApprovalsReviewer::User)
+    );
+    assert_eq!(review_context.personality, Some(Personality::Friendly));
+    // The review delegate still starts in its own default mode, not the parent's Plan mode.
+    assert_eq!(
+        review_context.collaboration_mode,
+        Some(CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                developer_instructions: None,
+            },
+        })
+    );
 
     let _codex_home_guard = codex_home;
     server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_omits_retained_tier_when_fast_mode_disabled() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (server, request_log) =
+        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.service_tiers = vec![ModelServiceTier {
+                id: ServiceTier::Flex.request_value().to_string(),
+                name: "Flex".to_string(),
+                description: "Flexible processing".to_string(),
+            }];
+        })
+        .with_config(|config| {
+            config
+                .features
+                .disable(Feature::FastMode)
+                .expect("disable FastMode");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            service_tier: Some(Some(ServiceTier::Flex.request_value().to_string())),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "review the changes".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(
+        test.codex
+            .thread_settings_snapshot()
+            .await
+            .service_tier
+            .as_deref(),
+        Some("flex")
+    );
+    assert_eq!(
+        request_log.single_request().body_json().get("service_tier"),
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_resolves_inherited_summary_preferences() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let (server, request_log) =
+        start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 2).await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.2", |model| {
+            model.default_reasoning_summary = ReasoningSummary::Auto;
+        })
+        .with_model_info_override("gpt-5.4", |model| {
+            model.default_reasoning_summary = ReasoningSummary::Detailed;
+        })
+        .with_model("gpt-5.2")
+        .with_config(|config| {
+            config.review_model = Some("gpt-5.4".to_string());
+            config.model_reasoning_summary = None;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    // First follow the review model's default, then use a preference updated on the thread.
+    for summary in [None, Some(ReasoningSummary::Concise)] {
+        if let Some(summary) = summary {
+            core_test_support::submit_thread_settings(
+                &test.codex,
+                ThreadSettingsOverrides {
+                    summary: Some(summary),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        let stored_settings = test.codex.thread_settings_snapshot().await;
+        test.codex
+            .submit(Op::Review {
+                review_request: ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "review the changes".to_string(),
+                    },
+                    user_facing_hint: None,
+                },
+            })
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(test.codex.thread_settings_snapshot().await, stored_settings);
+    }
+    let actual = request_log
+        .requests()
+        .iter()
+        .map(|request| {
+            let body = request.body_json();
+            serde_json::json!([body["model"], body["reasoning"]["summary"]])
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            serde_json::json!(["gpt-5.4", "detailed"]),
+            serde_json::json!(["gpt-5.4", "concise"]),
+        ]
+    );
+    Ok(())
 }
 
 /// Ensure that when a custom `review_model` is set in the config, the review
@@ -770,6 +941,7 @@ async fn review_uses_custom_review_model_from_config() {
     let codex_home = Arc::new(TempDir::new().unwrap());
     let test = test_codex()
         .with_home(Arc::clone(&codex_home))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.model = Some("gpt-4.1".to_string());
             config.review_model = Some("custom-review-model".to_string());
@@ -779,6 +951,19 @@ async fn review_uses_custom_review_model_from_config() {
         .await
         .expect("custom review conversation should be created");
     let codex = Arc::clone(&test.codex);
+    std::fs::remove_file(codex_home.path().join("models_cache.json"))
+        .expect("initial empty model catalog should be cached");
+    let mut models = codex_models_manager::bundled_models_response()
+        .expect("bundled model catalog should parse");
+    let model = models
+        .models
+        .iter_mut()
+        .find(|model| model.slug == "gpt-5.6-sol")
+        .expect("bundled model should exist");
+    model.slug = "custom-review-model".to_string();
+    model.node_repl_auto_review_required = true;
+    model.node_repl_disabled = true;
+    let models_mock = responses::mount_models_once(&server, models).await;
 
     codex
         .submit(Op::Review {
@@ -812,13 +997,22 @@ async fn review_uses_custom_review_model_from_config() {
     let body = request.body_json();
     assert_eq!(body["model"].as_str().unwrap(), "custom-review-model");
     assert_eq!(body["reasoning"]["effort"].as_str(), Some("max"));
+    let turn_metadata: serde_json::Value = serde_json::from_str(
+        &request
+            .header("x-codex-turn-metadata")
+            .expect("review request turn metadata"),
+    )
+    .expect("review request turn metadata json");
+    assert_eq!(turn_metadata["node_repl_auto_review_required"], true);
+    assert_eq!(turn_metadata["node_repl_disabled"], true);
+    assert_eq!(models_mock.requests().len(), 1);
 
     let _codex_home_guard = codex_home;
     server.verify().await;
 }
 
 /// Ensure that when `review_model` is not set in the config, the review request
-/// uses the session model.
+/// uses the session model without exposing disabled clock tools or reminders.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn review_uses_session_model_when_review_model_unset() {
     skip_if_no_network!();
@@ -831,7 +1025,7 @@ async fn review_uses_session_model_when_review_model_unset() {
         .with_config(|config| {
             config.model = Some("gpt-5.4".to_string());
             config.review_model = None;
-            config.model_reasoning_effort = Some(ReasoningEffort::Max);
+            config.model_reasoning_effort = Some(ReasoningEffort::Persistent);
         })
         .build_with_auto_env(&server)
         .await
@@ -867,7 +1061,12 @@ async fn review_uses_session_model_when_review_model_unset() {
     assert_eq!(request.path(), "/v1/responses");
     let body = request.body_json();
     assert_eq!(body["model"].as_str().unwrap(), "gpt-5.4");
-    assert_eq!(body["reasoning"]["effort"].as_str(), Some("max"));
+    assert_eq!(body["reasoning"]["effort"].as_str(), Some("disabled"));
+    assert_eq!(
+        ["curr_time", "sleep"].map(|name| request.tool_by_name("clock", name).is_some()),
+        [false, false]
+    );
+    assert!(!request.has_content_kinds(&["current_time.reminder"]));
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -1029,7 +1228,8 @@ async fn review_input_isolated_from_parent_history() {
         }
         let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
         let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rl.item
+        if let RolloutItem::ResponseItem(envelope) = rl.item
+            && let ResponseItem::Message { role, content, .. } = envelope.item
             && role == "user"
         {
             for c in content {
@@ -1096,16 +1296,10 @@ async fn review_history_surfaces_in_parent_session() {
     // 2) Continue in the parent session; request input must not include any review items.
     let followup = "back to parent".to_string();
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: followup.clone(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: followup.clone(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -1211,7 +1405,7 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
 
     core_test_support::submit_thread_settings(
         &codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             environments: Some(local_selections(repo_path.to_path_buf().abs())),
             ..Default::default()
         },

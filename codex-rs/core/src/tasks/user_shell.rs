@@ -14,6 +14,8 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
 use crate::exec_env::create_env;
+use crate::exec_env::inject_apply_patch_env;
+use crate::exec_env::inject_session_id_env;
 use crate::sandboxing::ExecRequest;
 use crate::session::TurnInput;
 use crate::session::turn_context::TurnContext;
@@ -37,6 +39,7 @@ use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
+use codex_thread_store::PersistContext;
 
 use super::SessionTask;
 use super::SessionTaskResult;
@@ -119,7 +122,7 @@ pub(crate) async fn execute_user_shell_command(
             trace_id: turn_context.trace_id.clone(),
             started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
             model_context_window: turn_context.model_context_window(),
-            collaboration_mode_kind: turn_context.mode,
+            collaboration_mode_kind: turn_context.mode(),
         });
         session.send_event(turn_context.as_ref(), event).await;
     }
@@ -155,10 +158,10 @@ pub(crate) async fn execute_user_shell_command(
         return;
     };
     let shell_snapshot_location = turn_environment.shell_snapshot(&cwd);
-    let mut exec_env_map = create_env(
-        &turn_context.config.permissions.shell_environment_policy,
-        Some(session.thread_id),
-    );
+    let shell_environment_policy = turn_environment.shell_environment_policy();
+    let mut exec_env_map = create_env(shell_environment_policy, Some(session.thread_id));
+    inject_session_id_env(&mut exec_env_map, session.session_id());
+    inject_apply_patch_env(&mut exec_env_map, &turn_context.config.features);
     if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
         strip_managed_proxy_env(&mut exec_env_map);
     }
@@ -166,11 +169,7 @@ pub(crate) async fn execute_user_shell_command(
         &display_command,
         environment_shell,
         shell_snapshot_location.as_ref(),
-        &turn_context
-            .config
-            .permissions
-            .shell_environment_policy
-            .r#set,
+        &shell_environment_policy.r#set,
         &mut exec_env_map,
     );
 
@@ -208,6 +207,7 @@ pub(crate) async fn execute_user_shell_command(
         cwd: cwd.clone().into(),
         env: exec_env_map,
         exec_server_env_config: None,
+        exec_server_shell_snapshot: None,
         // `/shell` is the explicit full-access escape hatch, so it must not
         // inherit a managed proxy from the surrounding session or turn.
         network: None,
@@ -218,7 +218,7 @@ pub(crate) async fn execute_user_shell_command(
         capture_policy: ExecCapturePolicy::ShellTool,
         sandbox: SandboxType::None,
         windows_sandbox_policy_cwd: cwd.clone().into(),
-        windows_sandbox_workspace_roots: turn_context.config.effective_workspace_roots(),
+        windows_sandbox_workspace_roots: turn_context.effective_workspace_roots(),
         windows_sandbox_level: turn_context.windows_sandbox_level,
         windows_sandbox_private_desktop: turn_context
             .config
@@ -312,7 +312,7 @@ pub(crate) async fn execute_user_shell_command(
                         duration: Some(output.duration),
                         formatted_output: Some(format_exec_output_str(
                             &output,
-                            turn_context.model_info.truncation_policy.into(),
+                            turn_context.model_info().truncation_policy.into(),
                         )),
                     }),
                 )
@@ -353,7 +353,7 @@ pub(crate) async fn execute_user_shell_command(
                         duration: Some(exec_output.duration),
                         formatted_output: Some(format_exec_output_str(
                             &exec_output,
-                            turn_context.model_info.truncation_policy.into(),
+                            turn_context.model_info().truncation_policy.into(),
                         )),
                     }),
                 )
@@ -375,6 +375,7 @@ async fn send_user_shell_error(session: &Session, turn_context: &TurnContext, me
         .send_event(
             turn_context,
             EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: message.to_string(),
                 codex_error_info: None,
             }),
@@ -459,7 +460,9 @@ async fn persist_user_shell_output(
             .await;
         // Standalone shell turns can run before any regular user turn, so
         // explicitly materialize rollout persistence after recording output.
-        session.ensure_rollout_materialized().await;
+        session
+            .ensure_rollout_materialized(PersistContext::Standard)
+            .await;
         return;
     }
 

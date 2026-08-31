@@ -1,5 +1,9 @@
 use anyhow::Context;
+use codex_core::TurnInputRequest;
 use codex_features::Feature;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
@@ -8,6 +12,7 @@ use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_protocol::protocol::ExecOutputStream;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
@@ -107,7 +112,7 @@ async fn user_shell_command_without_local_environment_emits_error() -> anyhow::R
     let test = builder.build(&server).await?;
     submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             environments: Some(codex_protocol::protocol::TurnEnvironmentSelections::new(
                 test.config.cwd.clone(),
                 vec![],
@@ -184,18 +189,18 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
     let call_id = "active-turn-shell-call";
     let args = if cfg!(windows) {
         serde_json::json!({
-            "command": "Start-Sleep -Seconds 2; Write-Output model-shell",
-            "timeout_ms": 10_000,
+            "cmd": "Start-Sleep -Seconds 2; Write-Output model-shell",
+            "yield_time_ms": 10_000,
         })
     } else {
         serde_json::json!({
-            "command": "sleep 2; echo model-shell",
-            "timeout_ms": 10_000,
+            "cmd": "sleep 2; echo model-shell",
+            "yield_time_ms": 10_000,
         })
     };
     let first = sse(vec![
         ev_response_created("resp-1"),
-        ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+        ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
         ev_completed("resp-1"),
     ]);
     let second = sse(vec![
@@ -210,34 +215,33 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
 
     fixture
         .codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run model shell command".to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(cwd)),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: fixture.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let _ = wait_for_event_match(&fixture.codex, |ev| match ev {
-        EventMsg::ExecCommandBegin(event) if event.source == ExecCommandSource::Agent => {
+        EventMsg::ExecCommandBegin(event)
+            if event.source == ExecCommandSource::UnifiedExecStartup =>
+        {
             Some(event.clone())
         }
         _ => None,
@@ -503,13 +507,13 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
     let call_id = "user-shell-double-truncation";
     let args = if cfg!(windows) {
         serde_json::json!({
-            "command": "for ($i=1; $i -le 2000; $i++) { Write-Output $i }",
-            "timeout_ms": 5_000,
+            "cmd": "for ($i=1; $i -le 2000; $i++) { Write-Output $i }",
+            "yield_time_ms": 5_000,
         })
     } else {
         serde_json::json!({
-            "command": "seq 1 2000",
-            "timeout_ms": 5_000,
+            "cmd": "seq 1 2000",
+            "yield_time_ms": 5_000,
         })
     };
 
@@ -517,7 +521,7 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
             ev_completed("resp-1"),
         ]),
     )
@@ -533,7 +537,7 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
 
     fixture
         .submit_turn_with_permission_profile(
-            "trigger big shell_command output",
+            "trigger big exec_command output",
             PermissionProfile::Disabled,
         )
         .await?;
@@ -541,13 +545,13 @@ async fn user_shell_command_is_truncated_only_once() -> anyhow::Result<()> {
     let output = mock2
         .single_request()
         .function_call_output_text(call_id)
-        .context("function_call_output present for shell_command call")?;
+        .context("function_call_output present for exec_command call")?;
 
     let truncation_headers = output.matches("Total output lines:").count();
 
     assert_eq!(
         truncation_headers, 1,
-        "shell_command output should carry only one truncation header: {output}"
+        "exec_command output should carry only one truncation header: {output}"
     );
 
     Ok(())

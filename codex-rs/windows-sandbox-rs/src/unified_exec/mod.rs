@@ -23,6 +23,8 @@ use std::path::PathBuf;
 ///
 /// Callers should parse their own input shape first, then use this request to
 /// share the elevated-vs-legacy backend selection and session launch path.
+// TODO(anp): Reconcile Windows backend and desktop copies with the supplied sandbox
+// context (TurnEnvironment::sandbox_context for turns), preserving this launch snapshot.
 pub struct WindowsSandboxSessionRequest<'a> {
     pub permission_profile: &'a PermissionProfile,
     pub workspace_roots: &'a [AbsolutePathBuf],
@@ -48,9 +50,7 @@ pub struct WindowsSandboxSessionRequest<'a> {
 pub async fn spawn_windows_sandbox_session_for_level(
     request: WindowsSandboxSessionRequest<'_>,
 ) -> Result<SpawnedProcess> {
-    if request.proxy_enforced
-        || matches!(request.windows_sandbox_level, WindowsSandboxLevel::Elevated)
-    {
+    if matches!(request.windows_sandbox_level, WindowsSandboxLevel::Elevated) {
         backends::elevated::spawn_windows_sandbox_session_elevated_for_permission_profile(
             request.permission_profile,
             request.workspace_roots,
@@ -73,6 +73,9 @@ pub async fn spawn_windows_sandbox_session_for_level(
         )
         .await
     } else {
+        if request.proxy_enforced {
+            bail!("managed networking requires the elevated Windows sandbox backend");
+        }
         if request.network_proxy_restricting_sid.is_some() {
             bail!("network proxy restricting SID requires the elevated Windows sandbox backend");
         }

@@ -3,25 +3,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use codex_config::McpServerConfig;
+use codex_config::McpServerOAuthConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::load_global_mcp_servers;
 use codex_login::default_client::is_first_party_originator;
 use codex_login::default_client::originator;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_rmcp_client::McpOAuthClientRegistration;
 use codex_rmcp_client::OAuthDiscoveryTimeout;
 use codex_rmcp_client::StreamableHttpRedirectMode;
 use codex_rmcp_client::perform_oauth_login;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::SkillMetadata;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::skills::model::SkillToolDependency;
 use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpPermissionPromptAutoApproveContext;
@@ -29,6 +30,8 @@ use codex_mcp::mcp_permission_prompt_is_auto_approved;
 use codex_mcp::oauth_login_support;
 use codex_mcp::resolve_oauth_scopes;
 use codex_mcp::should_retry_without_scopes;
+use codex_skills::SkillMetadata;
+use codex_skills::SkillToolDependency;
 
 const SKILL_MCP_DEPENDENCY_PROMPT_ID: &str = "skill_mcp_dependency_install";
 const MCP_DEPENDENCY_OPTION_INSTALL: &str = "Install";
@@ -63,6 +66,9 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     }
 
     let unprompted_missing = filter_prompted_mcp_dependencies(sess, &missing).await;
+    // Do not prompt for servers that managed or attachment policy would reject.
+    let unprompted_missing =
+        admit_mcp_dependencies(sess, config.as_ref(), unprompted_missing).await;
     if unprompted_missing.is_empty() {
         return;
     }
@@ -70,39 +76,54 @@ pub(crate) async fn maybe_prompt_and_install_mcp_dependencies(
     if should_install_mcp_dependencies(sess, turn_context, &unprompted_missing, cancellation_token)
         .await
     {
-        maybe_install_mcp_dependencies(
-            sess,
-            turn_context,
-            config.as_ref(),
-            mentioned_skills,
-            elicitation_reviewer,
-        )
-        .await;
+        // Policy may have changed while waiting for the installation prompt.
+        let missing = admit_mcp_dependencies(sess, config.as_ref(), unprompted_missing).await;
+        maybe_install_mcp_dependencies(sess, turn_context, missing, elicitation_reviewer).await;
     }
 }
 
-pub(crate) async fn maybe_install_mcp_dependencies(
+// Resolve proposed servers through the existing policy-aware catalog before installing them.
+async fn admit_mcp_dependencies(
     sess: &Session,
-    turn_context: &TurnContext,
     config: &crate::config::Config,
-    mentioned_skills: &[SkillMetadata],
-    elicitation_reviewer: Option<ElicitationReviewerHandle>,
-) {
-    if mentioned_skills.is_empty()
-        || !config
-            .features
-            .enabled(codex_features::Feature::SkillMcpDependencyInstall)
-    {
-        return;
+    mut candidates: HashMap<String, McpServerConfig>,
+) -> HashMap<String, McpServerConfig> {
+    if candidates.is_empty() {
+        return candidates;
     }
 
-    let codex_home = config.codex_home.clone();
-    let installed = sess.runtime_mcp_servers(config).await;
-    let missing = collect_missing_mcp_dependencies(mentioned_skills, &installed);
+    // Stage candidates in memory so global requirements apply before catalog resolution.
+    let mut candidate_config = config.clone();
+    let mut servers = config.mcp_servers.get().clone();
+    servers.extend(candidates.clone());
+    if let Err(err) = candidate_config.mcp_servers.set(servers) {
+        warn!("failed to validate MCP dependencies for mentioned skills: {err}");
+        return HashMap::new();
+    }
+
+    // Keep only the same candidate when attachment policy leaves it enabled.
+    let catalog = sess.runtime_mcp_config(&candidate_config).await;
+    candidates.retain(|name, config| {
+        catalog
+            .mcp_server_catalog
+            .server(name)
+            .is_some_and(|server| server.config().enabled && server.config() == config)
+    });
+    candidates
+}
+
+async fn maybe_install_mcp_dependencies(
+    sess: &Session,
+    turn_context: &TurnContext,
+    missing: HashMap<String, McpServerConfig>,
+    elicitation_reviewer: Option<ElicitationReviewerHandle>,
+) {
     if missing.is_empty() {
         return;
     }
 
+    let config = turn_context.config.as_ref();
+    let codex_home = config.codex_home.clone();
     let mut servers = match load_global_mcp_servers(&codex_home).await {
         Ok(servers) => servers,
         Err(err) => {
@@ -111,7 +132,6 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         }
     };
 
-    let mut updated = false;
     let mut added = Vec::new();
     for (name, config) in missing {
         if servers.contains_key(&name) {
@@ -119,10 +139,9 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         }
         servers.insert(name.clone(), config.clone());
         added.push((name, config));
-        updated = true;
     }
 
-    if !updated {
+    if added.is_empty() {
         return;
     }
 
@@ -172,6 +191,7 @@ pub(crate) async fn maybe_install_mcp_dependencies(
         );
         let oauth_client_id = server_config.oauth_client_id();
         let oauth_credential_name = server_config.oauth_credential_name(&name);
+        let callback_port = server_config.oauth_callback_port(config.mcp_oauth_callback_port);
         let first_attempt = perform_oauth_login(
             oauth_credential_name.as_ref(),
             &oauth_config.url,
@@ -181,8 +201,10 @@ pub(crate) async fn maybe_install_mcp_dependencies(
             oauth_config.env_http_headers.clone(),
             &resolved_scopes.scopes,
             oauth_client_id,
+            McpOAuthClientRegistration::Auto,
             server_config.oauth_resource.as_deref(),
-            config.mcp_oauth_callback_port,
+            callback_port,
+            config.mcp_oauth_callback_url.as_deref(),
             config.mcp_oauth_callback_url.as_deref(),
             Arc::clone(&http_client),
         )
@@ -199,8 +221,10 @@ pub(crate) async fn maybe_install_mcp_dependencies(
                     oauth_config.env_http_headers,
                     &[],
                     oauth_client_id,
+                    McpOAuthClientRegistration::Auto,
                     server_config.oauth_resource.as_deref(),
-                    config.mcp_oauth_callback_port,
+                    callback_port,
+                    config.mcp_oauth_callback_url.as_deref(),
                     config.mcp_oauth_callback_url.as_deref(),
                     Arc::clone(&http_client),
                 )
@@ -241,6 +265,10 @@ async fn should_install_mcp_dependencies(
         McpPermissionPromptAutoApproveContext::default(),
     ) {
         return true;
+    }
+
+    if turn_context.approval_policy() == AskForApproval::Never {
+        return false;
     }
 
     let server_list = format_missing_mcp_dependencies(missing);
@@ -383,6 +411,7 @@ fn mcp_dependency_to_server_config(
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -396,7 +425,13 @@ fn mcp_dependency_to_server_config(
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
-            oauth: None,
+            oauth: dependency
+                .oauth_callback_port
+                .map(|callback_port| McpServerOAuthConfig {
+                    client_id: None,
+                    callback_url: None,
+                    callback_port: Some(callback_port),
+                }),
             oauth_resource: None,
             tools: HashMap::new(),
         });

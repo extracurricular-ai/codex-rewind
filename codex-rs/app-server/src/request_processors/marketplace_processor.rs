@@ -51,8 +51,10 @@ impl MarketplaceRequestProcessor {
         &self,
         params: MarketplaceRemoveParams,
     ) -> Result<MarketplaceRemoveResponse, JSONRPCErrorError> {
+        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
         remove_marketplace(
-            self.config.codex_home.to_path_buf(),
+            config.codex_home.to_path_buf(),
+            config.config_layer_stack,
             CoreMarketplaceRemoveRequest {
                 marketplace_name: params.marketplace_name,
             },
@@ -86,6 +88,13 @@ impl MarketplaceRequestProcessor {
         .await
         .map_err(|err| internal_error(format!("failed to upgrade marketplaces: {err}")))?
         .map_err(invalid_request)?;
+
+        if !outcome.upgraded_roots.is_empty() {
+            self.thread_manager.plugins_manager().clear_cache();
+            self.thread_manager.skills_service().clear_cache();
+            self.thread_manager.invalidate_mcp_runtimes().await;
+            self.thread_manager.refresh_hook_runtimes().await;
+        }
 
         Ok(MarketplaceUpgradeResponse {
             selected_marketplaces: outcome.selected_marketplaces,

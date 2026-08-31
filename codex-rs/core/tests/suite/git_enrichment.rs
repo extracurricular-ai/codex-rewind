@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 #[cfg(not(target_os = "windows"))]
 use codex_core::config::Constrained;
 #[cfg(not(target_os = "windows"))]
@@ -11,10 +12,10 @@ use codex_protocol::config_types::ApprovalsReviewer;
 #[cfg(not(target_os = "windows"))]
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
+use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -30,6 +31,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
+use test_case::test_case;
 
 const ORIGIN_URL: &str = "https://example.invalid/cxa5426/repo.git";
 
@@ -146,6 +148,66 @@ async fn startup_prewarm_skips_git_enrichment_and_user_turn_observes_fresh_state
     Ok(())
 }
 
+/// Repository credentials must never cross the outbound model-request boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_git_enrichment_redacts_remote_credentials() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (repo, head) = create_git_repo()?;
+    run_git(
+        repo.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://git-user:git-secret-token@example.invalid/cxa5426/repo.git",
+        ],
+    )?;
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![
+            ev_response_created("resp-1"),
+            ev_function_call(
+                "wait-for-git",
+                "test_sync_tool",
+                r#"{"wait_for_git_enrichment":true}"#,
+            ),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ],
+    ]])
+    .await;
+    let cwd = repo.path().to_path_buf();
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            config.cwd = cwd.abs();
+        });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    test.submit_turn("inspect the workspace").await?;
+    let turn = server
+        .single_connection()
+        .get(2)
+        .context("turn follow-up request")?
+        .body_json();
+    let serialized_turn = serde_json::to_string(&turn)?;
+    assert!(!serialized_turn.contains("git-user"));
+    assert!(!serialized_turn.contains("git-secret-token"));
+    assert_eq!(
+        turn_metadata(&turn)?["workspaces"],
+        expected_workspace(repo.path(), &head, /*has_changes*/ false)
+    );
+
+    test.codex.shutdown_and_wait().await?;
+    server.shutdown().await;
+    Ok(())
+}
+
 #[cfg(not(target_os = "windows"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_prewarm_and_review_skip_redundant_git_enrichment() -> Result<()> {
@@ -162,6 +224,15 @@ async fn guardian_prewarm_and_review_skip_redundant_git_enrichment() -> Result<(
         vec![vec![ev_response_created("warm-1"), ev_completed("warm-1")]],
         vec![vec![ev_response_created("warm-2"), ev_completed("warm-2")]],
         vec![vec![
+            ev_response_created("wait-for-parent-git"),
+            ev_function_call(
+                "wait-for-parent-git",
+                "test_sync_tool",
+                r#"{"wait_for_git_enrichment":true}"#,
+            ),
+            ev_completed("wait-for-parent-git"),
+        ]],
+        vec![vec![
             ev_response_created("approval-request"),
             ev_function_call("approval-call", "exec_command", &tool_args),
             ev_completed("approval-request"),
@@ -173,11 +244,13 @@ async fn guardian_prewarm_and_review_skip_redundant_git_enrichment() -> Result<(
     ])
     .await;
     let cwd = repo.path().to_path_buf();
-    let mut builder = test_codex().with_config(move |config| {
-        config.cwd = cwd.abs();
-        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
-        config.approvals_reviewer = ApprovalsReviewer::AutoReview;
-    });
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            config.cwd = cwd.abs();
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        });
     let test = builder.build_with_websocket_server(&server).await?;
 
     let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
@@ -194,23 +267,34 @@ async fn guardian_prewarm_and_review_skip_redundant_git_enrichment() -> Result<(
 
     std::fs::write(repo.path().join("untracked.txt"), "dirty\n")?;
     test.codex
-        .submit(
-            vec![UserInput::Text {
-                text: "run a command that requires Guardian review".into(),
-                text_elements: Vec::new(),
-            }]
-            .into(),
-        )
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "run a command that requires Guardian review".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
-    let (user_turn, guardian_turn) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(
-            server.wait_for_request(/*connection_index*/ 2, /*request_index*/ 0),
-            server.wait_for_request(/*connection_index*/ 3, /*request_index*/ 0)
-        )
-    })
-    .await?;
+    let (initial_user_turn, user_turn, guardian_turn) =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(
+                server.wait_for_request(/*connection_index*/ 2, /*request_index*/ 0),
+                server.wait_for_request(/*connection_index*/ 3, /*request_index*/ 0),
+                server.wait_for_request(/*connection_index*/ 4, /*request_index*/ 0)
+            )
+        })
+        .await?;
+    let initial_user_turn = initial_user_turn.body_json();
     let user_turn = user_turn.body_json();
     let guardian_turn = guardian_turn.body_json();
+    let initial_user_turn_metadata = turn_metadata(&initial_user_turn)?;
+    assert_eq!(
+        turn_metadata(&user_turn)?["auto_review_enabled"].as_bool(),
+        Some(true)
+    );
+    if let Some(workspaces) = initial_user_turn_metadata.get("workspaces") {
+        assert_eq!(
+            workspaces,
+            &expected_workspace(repo.path(), &head, /*has_changes*/ true)
+        );
+    }
     assert_eq!(
         turn_metadata(&user_turn)?["workspaces"],
         expected_workspace(repo.path(), &head, /*has_changes*/ true)
@@ -226,8 +310,12 @@ async fn guardian_prewarm_and_review_skip_redundant_git_enrichment() -> Result<(
     Ok(())
 }
 
+#[test_case("system"; "system background thread")]
+#[test_case("ambient_background"; "ambient background thread")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ephemeral_system_thread_prewarm_skips_and_turn_observes_fresh_state() -> Result<()> {
+async fn ephemeral_system_thread_prewarm_skips_and_turn_observes_fresh_state(
+    thread_source: &str,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let (repo, head) = create_git_repo()?;
@@ -270,7 +358,7 @@ async fn ephemeral_system_thread_prewarm_skips_and_turn_observes_fresh_state() -
     let system_thread = test
         .thread_manager
         .start_thread(StartThreadOptions {
-            thread_source: Some(ThreadSource::Feature("system".to_string())),
+            thread_source: Some(ThreadSource::Feature(thread_source.to_string())),
             ..StartThreadOptions::new(config)
         })
         .await?;
@@ -285,16 +373,10 @@ async fn ephemeral_system_thread_prewarm_skips_and_turn_observes_fresh_state() -
     std::fs::write(repo.path().join("untracked.txt"), "dirty\n")?;
     system_thread
         .thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "generate a thread title".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "generate a thread title".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(system_thread.thread.as_ref(), |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -306,6 +388,7 @@ async fn ephemeral_system_thread_prewarm_skips_and_turn_observes_fresh_state() -
         .and_then(|connection| connection.get(2))
         .context("system turn follow-up request")?
         .body_json();
+    assert_root_turn(&turn, /*expected*/ None)?;
     assert_eq!(
         turn_metadata(&turn)?["workspaces"],
         expected_workspace(repo.path(), &head, /*has_changes*/ true)
@@ -353,32 +436,43 @@ async fn concurrent_turns_keep_distinct_worktree_and_repository_metadata() -> Re
     let worktree_head = run_git(&worktree, &["rev-parse", "HEAD"])?;
     let (other_repo, other_head) = create_git_repo()?;
 
+    let initial_turn = |name: &str| {
+        vec![vec![
+            ev_response_created(&format!("turn-{name}")),
+            ev_function_call(
+                &format!("wait-for-git-{name}"),
+                "test_sync_tool",
+                r#"{"barrier":{"id":"concurrent-git-enrichment","participants":3,"timeout_ms":10000},"wait_for_git_enrichment":true}"#,
+            ),
+            ev_completed(&format!("turn-{name}")),
+        ]]
+    };
+    let follow_up_turn = |name: &str| {
+        vec![vec![
+            ev_response_created(&format!("follow-up-{name}")),
+            ev_assistant_message(&format!("msg-{name}"), "done"),
+            ev_completed(&format!("follow-up-{name}")),
+        ]]
+    };
     let server = start_websocket_server(vec![
         vec![vec![ev_response_created("warm-1"), ev_completed("warm-1")]],
         vec![vec![ev_response_created("warm-2"), ev_completed("warm-2")]],
         vec![vec![ev_response_created("warm-3"), ev_completed("warm-3")]],
-        vec![vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-1"),
-        ]],
-        vec![vec![
-            ev_response_created("resp-2"),
-            ev_assistant_message("msg-2", "done"),
-            ev_completed("resp-2"),
-        ]],
-        vec![vec![
-            ev_response_created("resp-3"),
-            ev_assistant_message("msg-3", "done"),
-            ev_completed("resp-3"),
-        ]],
+        initial_turn("repo"),
+        initial_turn("worktree"),
+        initial_turn("other-repo"),
+        follow_up_turn("repo"),
+        follow_up_turn("worktree"),
+        follow_up_turn("other-repo"),
     ])
     .await;
 
     let repo_cwd = repo.path().to_path_buf();
-    let mut builder = test_codex().with_config(move |config| {
-        config.cwd = repo_cwd.abs();
-    });
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_config(move |config| {
+            config.cwd = repo_cwd.abs();
+        });
     let test = builder.build_with_websocket_server(&server).await?;
 
     let mut worktree_config = test.config.clone();
@@ -412,24 +506,21 @@ async fn concurrent_turns_keep_distinct_worktree_and_repository_metadata() -> Re
 
     std::fs::write(repo.path().join("untracked.txt"), "dirty\n")?;
     std::fs::write(other_repo.path().join("untracked.txt"), "dirty\n")?;
-    let user_turn = |prompt: &str| Op::UserInput {
-        items: vec![UserInput::Text {
+    let user_turn = |prompt: &str| {
+        TurnInputRequest::user_input(vec![UserInput::Text {
             text: prompt.to_string(),
             text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: Default::default(),
+        }])
     };
     tokio::try_join!(
-        test.codex.submit(user_turn("inspect the main worktree")),
+        test.codex
+            .start_or_steer_turn(user_turn("inspect the main worktree")),
         worktree_thread
             .thread
-            .submit(user_turn("inspect the linked worktree")),
+            .start_or_steer_turn(user_turn("inspect the linked worktree")),
         other_thread
             .thread
-            .submit(user_turn("inspect the other repository"))
+            .start_or_steer_turn(user_turn("inspect the other repository"))
     )?;
     tokio::join!(
         wait_for_event(test.codex.as_ref(), |event| matches!(
@@ -449,19 +540,35 @@ async fn concurrent_turns_keep_distinct_worktree_and_repository_metadata() -> Re
     let mut actual_workspaces = server
         .connections()
         .into_iter()
-        .skip(3)
+        .skip(6)
         .map(|connection| {
-            let request = connection.first().context("turn request")?.body_json();
-            Ok(turn_metadata(&request)?["workspaces"].clone())
+            let request = connection
+                .first()
+                .context("synchronized turn follow-up request")?
+                .body_json();
+            let thread_id = request["client_metadata"]["thread_id"]
+                .as_str()
+                .context("follow-up thread id")?
+                .to_string();
+            Ok((thread_id, turn_metadata(&request)?["workspaces"].clone()))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut expected_workspaces = vec![
-        expected_workspace(repo.path(), &repo_head, /*has_changes*/ true),
-        expected_workspace(&worktree, &worktree_head, /*has_changes*/ false),
-        expected_workspace(other_repo.path(), &other_head, /*has_changes*/ true),
+        (
+            test.session_configured.thread_id.to_string(),
+            expected_workspace(repo.path(), &repo_head, /*has_changes*/ true),
+        ),
+        (
+            worktree_thread.thread_id.to_string(),
+            expected_workspace(&worktree, &worktree_head, /*has_changes*/ false),
+        ),
+        (
+            other_thread.thread_id.to_string(),
+            expected_workspace(other_repo.path(), &other_head, /*has_changes*/ true),
+        ),
     ];
-    actual_workspaces.sort_by_key(Value::to_string);
-    expected_workspaces.sort_by_key(Value::to_string);
+    actual_workspaces.sort_by(|(left, _), (right, _)| left.cmp(right));
+    expected_workspaces.sort_by(|(left, _), (right, _)| left.cmp(right));
     assert_eq!(actual_workspaces, expected_workspaces);
 
     worktree_thread.thread.shutdown_and_wait().await?;

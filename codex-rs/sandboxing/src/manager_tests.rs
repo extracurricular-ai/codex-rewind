@@ -122,6 +122,62 @@ fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_poli
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn symlinked_workspace_reports_seatbelt_preparation_error() {
+    use std::os::unix::fs::symlink;
+
+    let manager = SandboxManager::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let target = temp_dir.path().join("target");
+    let workspace = temp_dir.path().join("workspace");
+    std::fs::create_dir(&target).expect("create target");
+    symlink(&target, &workspace).expect("create symlinked workspace");
+    let workspace = AbsolutePathBuf::from_absolute_path(workspace).expect("absolute workspace");
+    let workspace_uri = PathUri::from_abs_path(&workspace);
+    let permissions = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::workspace_write(
+            &[],
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        ),
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    let error = manager
+        .transform(SandboxTransformRequest {
+            command: SandboxCommand {
+                program: "true".into(),
+                args: Vec::new(),
+                cwd: workspace_uri.clone(),
+                env: HashMap::new(),
+                managed_network: None,
+                additional_permissions: None,
+            },
+            permissions: &permissions,
+            sandbox: SandboxType::MacosSeatbelt,
+            enforce_managed_network: false,
+            environment_id: None,
+            network: None,
+            sandbox_policy_cwd: &workspace_uri,
+            codex_linux_sandbox_exe: None,
+            use_legacy_landlock: false,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            windows_sandbox_private_desktop: false,
+        })
+        .expect_err("symlinked workspace should be rejected");
+
+    assert!(matches!(
+        &error,
+        super::SandboxTransformError::SeatbeltPreparation(message)
+            if message.contains("symlinked writable roots are not supported")
+    ));
+    assert!(
+        !error.to_string().contains("network proxy"),
+        "filesystem error should not be attributed to network proxy: {error}"
+    );
+}
+
 #[test]
 fn transform_additional_permissions_enable_network_for_external_sandbox() {
     let manager = SandboxManager::new();
@@ -199,9 +255,7 @@ fn transform_additional_permissions_preserves_denied_entries() {
             missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
-            path: FileSystemPath::Path {
-                path: denied_path.clone(),
-            },
+            path: denied_path.clone().into(),
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
         },
@@ -250,12 +304,12 @@ fn transform_additional_permissions_preserves_denied_entries() {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: denied_path },
+                path: denied_path.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: allowed_path },
+                path: allowed_path.into(),
                 access: FileSystemAccessMode::Write,
                 missing_path_behavior: None,
             },
@@ -279,7 +333,7 @@ fn managed_mitm_ca_bundle_becomes_readable_for_restricted_sandbox() {
             .expect("absolute managed bundle path");
     let permission_profile = PermissionProfile::from_runtime_permissions(
         &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path: cwd.clone() },
+            path: cwd.clone().into(),
             access: FileSystemAccessMode::Read,
             missing_path_behavior: None,
         }]),
@@ -297,14 +351,12 @@ fn managed_mitm_ca_bundle_becomes_readable_for_restricted_sandbox() {
         file_system_sandbox_policy,
         FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: cwd },
+                path: cwd.into(),
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: managed_bundle_path,
-                },
+                path: managed_bundle_path.into(),
                 access: FileSystemAccessMode::Read,
                 missing_path_behavior: None,
             },
@@ -498,7 +550,7 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
                 missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: blocked },
+                path: blocked.into(),
                 access: FileSystemAccessMode::Deny,
                 missing_path_behavior: None,
             },

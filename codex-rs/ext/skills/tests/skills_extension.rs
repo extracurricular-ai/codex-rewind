@@ -4,11 +4,13 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use codex_core_skills::SkillLoadOutcome;
-use codex_core_skills::injection::InjectedHostSkillPrompts;
-use codex_core_skills::loader::MAX_CONCURRENT_ROOT_SCANS;
-use codex_core_skills::loader::SkillRoot;
-use codex_core_skills::loader::load_skills_from_roots;
+use assert_matches::assert_matches;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigRequirementsToml;
+use codex_exec_server::CapabilityRootDiscovery;
+use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_exec_server::LOCAL_FS;
 use codex_extension_api::ConversationHistory;
 use codex_extension_api::ExtensionData;
@@ -16,11 +18,15 @@ use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
+use codex_extension_api::FunctionCallError;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
+use codex_extension_api::SkillInvocationInput;
+use codex_extension_api::SkillInvocationKind;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ToolCall;
+use codex_extension_api::ToolCallSource;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::WorldStateContributionInput;
@@ -34,6 +40,7 @@ use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
 use codex_otel::THREAD_SKILLS_TRUNCATED_METRIC;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
@@ -44,7 +51,11 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 use codex_skills::SkillMetadata;
 use codex_skills_extension::HostSkillProvider;
+use codex_skills_extension::HostSkillsLoadInput;
+use codex_skills_extension::HostSkillsService;
 use codex_skills_extension::HostSkillsSnapshot;
+use codex_skills_extension::InjectedHostSkillPrompts;
+use codex_skills_extension::SkillLoadOutcome;
 use codex_skills_extension::SkillProviders;
 use codex_skills_extension::SkillsExtensionConfig;
 use codex_skills_extension::catalog::SkillAuthority;
@@ -70,12 +81,14 @@ use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 use opentelemetry_sdk::metrics::data::AggregatedMetrics;
 use opentelemetry_sdk::metrics::data::MetricData;
 use pretty_assertions::assert_eq;
-use tokio::sync::Semaphore;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[path = "skills_extension/shadow_task_context_tests.rs"]
+mod shadow_task_context_tests;
+
 static NEXT_CODEX_HOME_ID: AtomicUsize = AtomicUsize::new(0);
-const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `environment resource` locators are owned by an execution environment, `orchestrator resource` locators are opaque non-filesystem resources, and `custom resource` locators use their provider's access mechanism.";
+const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used. Each entry includes a name, description, and source locator. `file` locators are on the host filesystem, `executor package` locators are owned by their execution environment, `orchestrator package` locators are opaque package identifiers, and `custom resource` locators use their provider's access mechanism.";
 const DEMO_SKILL_CONTENTS: &str =
     "---\nname: demo\ndescription: Demo skill.\n---\n# Demo\n\nUse the demo skill.\n";
 
@@ -545,11 +558,11 @@ async fn executor_orchestrator_and_host_share_catalog_world_state_flow() -> Test
     for (section_id, expected_line) in [
         (
             "skills",
-            "- executor-skill: Fix lint errors. (environment resource: skill://executor/executor-skill/SKILL.md)",
+            "- executor-skill: Fix lint errors. (executor package: executor/executor-skill)",
         ),
         (
             "orchestrator_skills",
-            "- orchestrator-skill: Fix lint errors. (orchestrator resource: skill://orchestrator/orchestrator-skill/SKILL.md)",
+            "- orchestrator-skill: Fix lint errors. (orchestrator package: orchestrator/orchestrator-skill)",
         ),
         (
             "host_skills",
@@ -841,6 +854,146 @@ async fn shadow_selection_uses_host_catalog_when_instructions_are_disabled() -> 
 }
 
 #[tokio::test]
+async fn shadow_lru_selector_recovers_a_skill_invoked_on_an_earlier_turn() -> TestResult {
+    let provider = Arc::new(StaticSkillProvider {
+        catalog: SkillCatalog {
+            entries: vec![test_entry(
+                SkillSourceKind::Host,
+                "host",
+                "host/lint-fix",
+                "lint-fix/SKILL.md",
+            )],
+            warnings: Vec::new(),
+        },
+        read_requests: Arc::new(Mutex::new(Vec::new())),
+        list_calls: None,
+        fail_first_list: false,
+    });
+    let metrics = MetricsClient::new(
+        MetricsConfig::in_memory(
+            "test",
+            "codex-skills-extension",
+            env!("CARGO_PKG_VERSION"),
+            InMemoryMetricExporter::default(),
+        )
+        .with_runtime_reader(),
+    )?;
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers_and_metrics(
+        &mut builder,
+        SkillProviders::new().with_host_provider(provider),
+        Some(metrics.clone()),
+        skills_extension_config,
+    );
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let mut config = default_config();
+    config.include_instructions = false;
+    config.shadow_selection_enabled = true;
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            mcp_resource_client: None,
+            extension_metrics: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    for (turn_id, text) in [("turn-1", "Fix lint errors."), ("turn-2", "continue")] {
+        let turn_store = ExtensionData::new(turn_id);
+        let fragments = registry.turn_input_contributors()[0]
+            .contribute(
+                TurnInputContext {
+                    turn_id: turn_id.to_string(),
+                    user_input: vec![UserInput::Text {
+                        text: text.to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    environments: Vec::new(),
+                },
+                /*extension_metrics*/ None,
+                &session_store,
+                &thread_store,
+                &turn_store,
+            )
+            .await;
+        assert!(fragments.is_empty());
+        registry.skill_invocation_contributors()[0]
+            .on_skill_invocation(SkillInvocationInput {
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &turn_store,
+                turn_id,
+                skill_resource: "lint-fix/SKILL.md",
+                kind: SkillInvocationKind::Implicit,
+            })
+            .await;
+    }
+
+    let snapshot = metrics.snapshot()?;
+    let metric = snapshot
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .find(|metric| metric.name() == "codex.skills.shadow_selection.invocation")
+        .ok_or("shadow invocation metric should be recorded")?;
+    let mut selector_hits = match metric.data() {
+        AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+            .data_points()
+            .filter_map(|point| {
+                let method = point
+                    .attributes()
+                    .find(|attribute| attribute.key.as_str() == "method")?
+                    .value
+                    .as_str();
+                if !matches!(
+                    method.as_ref(),
+                    "lru_v1"
+                        | "lru_plus_lexical_v1"
+                        | "lru_plus_character_routing_v1"
+                        | "lru_plus_lexical_character_routing_v1"
+                ) {
+                    return None;
+                }
+                let hit = point
+                    .attributes()
+                    .find(|attribute| attribute.key.as_str() == "hit")?
+                    .value
+                    .as_str()
+                    .to_string();
+                Some((method.to_string(), hit, point.value()))
+            })
+            .collect::<Vec<_>>(),
+        data => panic!("unexpected shadow invocation metric data: {data:?}"),
+    };
+    selector_hits.sort();
+
+    assert_eq!(
+        vec![
+            (
+                "lru_plus_character_routing_v1".to_string(),
+                "true".to_string(),
+                2,
+            ),
+            (
+                "lru_plus_lexical_character_routing_v1".to_string(),
+                "true".to_string(),
+                2,
+            ),
+            ("lru_plus_lexical_v1".to_string(), "true".to_string(), 2),
+            ("lru_v1".to_string(), "false".to_string(), 1),
+            ("lru_v1".to_string(), "true".to_string(), 1),
+        ],
+        selector_hits
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cache() -> TestResult {
     let read_requests = Arc::new(Mutex::new(Vec::new()));
     let list_calls = Arc::new(AtomicUsize::new(0));
@@ -897,6 +1050,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         environment_id: "turn-env".to_string(),
         cwd: PathUri::parse("file:///workspace").expect("cwd URI"),
         workspace_roots: Vec::new(),
+        config: EnvironmentConfigState::FromThread,
     };
     let available_sections = registry.context_contributors()[0]
         .contribute_world_state(WorldStateContributionInput {
@@ -920,7 +1074,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
     assert!(
         available_fragment
             .body()
-            .contains("(environment resource: skill://executor/lint-fix/SKILL.md)")
+            .contains("(executor package: executor/lint-fix)")
     );
 
     let fragments = registry.turn_input_contributors()[0]
@@ -996,6 +1150,45 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         .ok_or("restored skills should render")?;
     assert!(restored_fragment.body().contains("lint-fix"));
     assert_eq!(1, list_calls.load(Ordering::Relaxed));
+
+    let failed_discovery = ExecutorCapabilityDiscoverySnapshot::new(
+        &selected_roots,
+        vec![Err("exec-server transport disconnected".to_string())],
+        Default::default(),
+    );
+    let recovered_discovery = ExecutorCapabilityDiscoverySnapshot::new(
+        &selected_roots,
+        vec![Ok(Arc::new(CapabilityRootDiscovery {
+            id: "lint-fix".to_string(),
+            path: PathUri::parse("file:///skills/lint-fix")?,
+            plugin: None,
+            skills: Vec::new(),
+            namespace_manifests: Vec::new(),
+            warnings: Vec::new(),
+            error: None,
+        }))],
+        Default::default(),
+    );
+    for (turn_id, discovery, expected_list_calls) in [
+        ("failed-discovery", &failed_discovery, 2),
+        ("recovered-discovery", &recovered_discovery, 3),
+        ("cached-discovery", &recovered_discovery, 3),
+    ] {
+        registry.context_contributors()[0]
+            .contribute_world_state(WorldStateContributionInput {
+                thread_id: codex_protocol::ThreadId::new(),
+                turn_id,
+                environments: &[],
+                ready_selected_capability_roots: &selected_roots,
+                executor_capability_discovery: Some(discovery),
+                extension_metrics: None,
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &ExtensionData::new(turn_id),
+            })
+            .await;
+        assert_eq!(expected_list_calls, list_calls.load(Ordering::Relaxed));
+    }
 
     let mut listing_disabled_config = config.clone();
     listing_disabled_config.include_instructions = false;
@@ -1186,18 +1379,20 @@ async fn moderate_budget_pressure_keeps_every_catalog_entry() -> TestResult {
     let (executor, orchestrator) =
         skill_world_state_fragments(&registry, &session_store, &thread_store, "turn-1").await?;
     let description_lengths = [
-        ("executor", "environment", executor.body()),
-        ("orchestrator", "orchestrator", orchestrator.body()),
+        ("executor", executor.body()),
+        ("orchestrator", orchestrator.body()),
     ]
     .into_iter()
-    .flat_map(|(source, resource_kind, rendered)| {
-        (0..5).map(move |index| (source, resource_kind, rendered, index))
-    })
-    .map(|(source, resource_kind, rendered, index)| {
+    .flat_map(|(source, rendered)| (0..5).map(move |index| (source, rendered, index)))
+    .map(|(source, rendered, index)| {
         let name = format!("{source}-skill-{index:02}");
         let package_id = format!("{source}/{name}");
         let line_prefix = format!("- {name}: ");
-        let line_suffix = format!(" ({resource_kind} resource: skill://{package_id}/SKILL.md)");
+        let line_suffix = if source == "executor" {
+            format!(" (executor package: {package_id})")
+        } else {
+            format!(" (orchestrator package: {package_id})")
+        };
         rendered
             .lines()
             .find_map(|line| {
@@ -1315,12 +1510,12 @@ async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() 
     assert!(
         executor
             .body()
-            .contains("- executor-skill-039: (environment resource:")
+            .contains("- executor-skill-039: (executor package:")
     );
     assert!(
         orchestrator
             .body()
-            .contains("- orchestrator-skill-000: (orchestrator resource:")
+            .contains("- orchestrator-skill-000: (orchestrator package:")
     );
     assert!(!orchestrator.body().contains("- orchestrator-skill-159:"));
     for rendered in [executor.body(), orchestrator.body()] {
@@ -1348,7 +1543,10 @@ async fn extreme_budget_pressure_removes_descriptions_before_omitting_entries() 
 
 #[tokio::test]
 async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult {
-    let description = "x".repeat(1_025);
+    const OVERSIZED_WARNING: &str = "Some skills were omitted because their metadata is too large.";
+    const PROVIDER_WARNING: &str = "Some orchestrator skills could not be discovered because the provider disconnected before returning the complete catalog.";
+
+    let supplementary_warning = "w".repeat(256);
     let opaque_suffix = "\\".repeat(1_500);
     let mut entry = test_entry(
         SkillSourceKind::Orchestrator,
@@ -1356,12 +1554,25 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
         &format!("orchestrator/{opaque_suffix}"),
         &format!("skill://orchestrator/{opaque_suffix}/SKILL.md"),
     );
-    entry.description = description.clone();
+    entry.description = "x".repeat(1_025);
+    let [first_entry, mut middle_entry, mut final_entry] = ["p0", "p1", "p2"].map(|name| {
+        test_entry(
+            SkillSourceKind::Orchestrator,
+            "codex_apps",
+            name,
+            &format!("skill://{name}/SKILL.md"),
+        )
+    });
+    middle_entry.description = "d".repeat(110);
+    final_entry.description = "d".repeat(50);
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
             catalog: SkillCatalog {
                 entries: vec![
                     entry,
+                    first_entry,
+                    middle_entry,
+                    final_entry,
                     test_entry(
                         SkillSourceKind::Orchestrator,
                         "codex_apps",
@@ -1370,7 +1581,12 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
                     )
                     .hidden_from_prompt(),
                 ],
-                warnings: vec!["w".repeat(256); 4],
+                warnings: vec![
+                    PROVIDER_WARNING.to_string(),
+                    supplementary_warning.clone(),
+                    supplementary_warning.clone(),
+                    supplementary_warning.clone(),
+                ],
             },
             read_requests: Arc::new(Mutex::new(Vec::new())),
             list_calls: None,
@@ -1404,38 +1620,196 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({"authority": {"kind": "orchestrator"}}).to_string(),
     };
-    let output = list_tool
+    let call = ToolCall {
+        turn_id: "turn-1".to_string(),
+        call_id: "call-1".to_string(),
+        tool_name: list_tool.tool_name(),
+        model: "gpt-test".to_string(),
+        codex_turn_metadata: None,
+        truncation_policy: TruncationPolicy::Bytes(10_000),
+        source: ToolCallSource::Direct,
+        conversation_history: ConversationHistory::default(),
+        turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        environments: Vec::new(),
+        payload: payload.clone(),
+    };
+    let output = list_tool.handle(call.clone()).await?;
+    let complete_response = output
+        .post_tool_use_response("call-1", &payload)
+        .ok_or("skills.list should expose structured output")?;
+    let complete_skills = complete_response["skills"]
+        .as_array()
+        .ok_or("skills.list should return skills")?;
+    assert_eq!(complete_skills.len(), 4);
+    assert_eq!(complete_skills[0]["description"], "x".repeat(1_021) + "...");
+    assert_eq!(
+        complete_response["warnings"].as_array().map(Vec::len),
+        Some(4)
+    );
+    assert_eq!(complete_response["next_cursor"], serde_json::Value::Null);
+
+    let mut cursor = None;
+    for (
+        index,
+        (truncation_limit, byte_budget, expected_indices, expected_warnings, cursor_offset),
+    ) in [
+        // The escaped entry fits alone, but not alongside even one provider warning.
+        (6_458, 7_750, vec![], vec![PROVIDER_WARNING], Some("0")),
+        (6_458, 7_750, vec![0], vec![], Some("1")),
+        (266, 320, vec![1], vec![], Some("2")),
+        // A smaller budget omits the middle entry and must report the new omission.
+        (183, 220, vec![], vec![OVERSIZED_WARNING], Some("2")),
+        (183, 220, vec![3], vec![], None),
+        // Neither report may hide the other when they need separate pages.
+        (183, 220, vec![], vec![PROVIDER_WARNING], Some("0")),
+        (183, 220, vec![], vec![OVERSIZED_WARNING], Some("0")),
+        // The last retained entry fits without a cursor, despite an oversized suffix.
+        (151, 182, vec![], vec![OVERSIZED_WARNING], Some("0")),
+        (151, 182, vec![1], vec![], None),
+        // An omission notice must not displace an affordable provider warning.
+        (
+            2_000,
+            2_400,
+            vec![1, 2, 3],
+            vec![
+                PROVIDER_WARNING,
+                &supplementary_warning,
+                &supplementary_warning,
+                &supplementary_warning,
+                OVERSIZED_WARNING,
+            ],
+            None,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "authority": {"kind": "orchestrator"},
+                "cursor": cursor,
+            })
+            .to_string(),
+        };
+        let call_id = format!("bounded-page-{index}");
+        let output = list_tool
+            .handle(ToolCall {
+                call_id: call_id.clone(),
+                truncation_policy: TruncationPolicy::Bytes(truncation_limit),
+                payload: payload.clone(),
+                ..call.clone()
+            })
+            .await?;
+        assert!(output.contains_external_context());
+        let response = output
+            .post_tool_use_response(&call_id, &payload)
+            .ok_or("skills.list should expose structured output")?;
+        assert!(serde_json::to_vec(&response)?.len() <= byte_budget);
+        let next_cursor = response["next_cursor"].as_str().map(str::to_owned);
+        assert_eq!(
+            next_cursor
+                .as_deref()
+                .and_then(|value| value.split(':').nth(1)),
+            cursor_offset
+        );
+        let expected_skills = expected_indices
+            .into_iter()
+            .map(|index| &complete_skills[index])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "skills": expected_skills,
+                "warnings": expected_warnings,
+                "next_cursor": next_cursor,
+            })
+        );
+        if index == 2 {
+            let (legacy_cursor, _) = next_cursor
+                .as_deref()
+                .and_then(|cursor| cursor.rsplit_once(':'))
+                .ok_or("cursor should include its budget")?;
+            let legacy_payload = ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "authority": {"kind": "orchestrator"},
+                    "cursor": legacy_cursor,
+                })
+                .to_string(),
+            };
+            let output = list_tool
+                .handle(ToolCall {
+                    payload: legacy_payload.clone(),
+                    ..call.clone()
+                })
+                .await?;
+            assert_eq!(
+                output.post_tool_use_response(&call.call_id, &legacy_payload),
+                Some(serde_json::json!({
+                    "skills": &complete_skills[2..],
+                    "warnings": [],
+                    "next_cursor": null,
+                }))
+            );
+        }
+        cursor = next_cursor;
+    }
+
+    assert_eq!(
+        list_tool
+            .handle(ToolCall {
+                call_id: "omitted-call".to_string(),
+                truncation_policy: TruncationPolicy::Bytes(64),
+                ..call
+            })
+            .await
+            .err(),
+        Some(FunctionCallError::RespondToModel(
+            "skills.list response budget leaves no room for discovery warnings".to_string()
+        ))
+    );
+
+    let read_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "read")
+        .ok_or("skills.read tool should be registered")?;
+    // The resource fits the 2400-byte budget before escaping, but not after.
+    let insufficient_budget_payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "package": format!("orchestrator/{opaque_suffix}"),
+        })
+        .to_string(),
+    };
+    let error = read_tool
         .handle(ToolCall {
             turn_id: "turn-1".to_string(),
-            call_id: "call-1".to_string(),
-            tool_name: list_tool.tool_name(),
+            call_id: "insufficient-read-budget".to_string(),
+            tool_name: read_tool.tool_name(),
             model: "gpt-test".to_string(),
             codex_turn_metadata: None,
-            truncation_policy: TruncationPolicy::Bytes(1_024),
+            truncation_policy: TruncationPolicy::Bytes(2_000),
+            source: ToolCallSource::Direct,
             conversation_history: ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
-            payload: payload.clone(),
+            payload: insufficient_budget_payload,
         })
-        .await?;
-    let response = output
-        .post_tool_use_response("call-1", &payload)
-        .ok_or("skills.list should expose structured output")?;
-    let rendered_description = response["skills"][0]["description"]
-        .as_str()
-        .ok_or("skills.list response should include a description")?;
-
-    assert_eq!(response["skills"].as_array().map(Vec::len), Some(1));
-    assert_eq!(response["warnings"].as_array().map(Vec::len), Some(4));
-    assert_eq!(response["next_cursor"], serde_json::Value::Null);
-    assert_eq!(rendered_description, "x".repeat(1_021) + "...");
-    assert_ne!(rendered_description, description);
+        .await
+        .err()
+        .expect("skills.read should reject a response that cannot fit any contents");
+    let error = assert_matches!(error, FunctionCallError::RespondToModel(error) => error);
+    assert_eq!(
+        error,
+        "skills.read response budget leaves no room for contents"
+    );
 
     Ok(())
 }
 
 #[tokio::test]
 async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
+    const PROVIDER_WARNING: &str =
+        "orchestrator skills unavailable: temporary orchestrator failure";
+
     let list_calls = Arc::new(AtomicUsize::new(0));
     let providers =
         SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
@@ -1501,11 +1875,38 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
         let warning = event_rx.try_recv()?.into_warning();
         assert_eq!(warning.thread_id, thread_store.level_id());
         assert_eq!(warning.turn_id.as_deref(), Some(turn_id));
-        assert_eq!(
-            warning.message,
-            "orchestrator skills unavailable: temporary orchestrator failure"
-        );
+        assert_eq!(warning.message, PROVIDER_WARNING);
     }
+
+    let tools = registry.tool_contributors()[0].tools(&session_store, &thread_store);
+    let list_tool = tools
+        .iter()
+        .find(|tool| tool.tool_name().name == "list")
+        .ok_or("skills.list tool should be registered")?;
+    assert_eq!(
+        list_tool
+            .handle(ToolCall {
+                turn_id: "turn-1".to_string(),
+                call_id: "unavailable-skills".to_string(),
+                tool_name: list_tool.tool_name(),
+                model: "gpt-test".to_string(),
+                codex_turn_metadata: None,
+                truncation_policy: TruncationPolicy::Bytes(64),
+                source: ToolCallSource::Direct,
+                conversation_history: ConversationHistory::default(),
+                turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+                environments: Vec::new(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({"authority": {"kind": "orchestrator"}})
+                        .to_string(),
+                },
+            })
+            .await
+            .err(),
+        Some(FunctionCallError::RespondToModel(
+            "skills.list response budget leaves no room for discovery warnings".to_string()
+        ))
+    );
     assert_eq!(1, list_calls.load(Ordering::Relaxed));
 
     Ok(())
@@ -1577,6 +1978,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
                 environment_id: "env-1".to_string(),
                 cwd: PathUri::parse("file:///workspace").expect("cwd URI"),
                 workspace_roots: Vec::new(),
+                config: EnvironmentConfigState::FromThread,
             }],
             ready_selected_capability_roots: &selected_roots,
             executor_capability_discovery: None,
@@ -1876,22 +2278,32 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
     }
     let root = AbsolutePathBuf::try_from(std::fs::canonicalize(root)?)?;
     let rendered_root = root.to_string_lossy().replace('\\', "/");
-    let outcome = load_skills_from_roots(
-        [SkillRoot {
-            path: root,
-            scope: SkillScope::User,
-            file_system: Arc::clone(&LOCAL_FS),
-            plugin_identity: None,
-            plugin_namespace: None,
-            plugin_root: None,
-            discovery_mode: Default::default(),
-        }],
-        /*plugin_skill_snapshots*/ None,
-        Arc::new(Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
-    )
-    .await;
-    assert_eq!(outcome.errors, Vec::new());
-    assert_eq!(outcome.skills.len(), 12 + usize::from(cfg!(unix)));
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::SessionFlags,
+            toml::from_str("[skills.bundled]\nenabled = false\n")?,
+        )],
+        Default::default(),
+        ConfigRequirementsToml::default(),
+    )?;
+    let codex_home = AbsolutePathBuf::try_from(test_root.clone())?;
+    let service = HostSkillsService::new_with_restriction_product(
+        codex_home.clone(),
+        /*bundled_skills_enabled*/ false,
+        /*restriction_product*/ None,
+    );
+    service.set_extra_roots(vec![root]);
+    let snapshot = service
+        .snapshot_for_config(
+            &HostSkillsLoadInput::new(codex_home, Vec::new(), config_layer_stack),
+            Some(Arc::clone(&LOCAL_FS)),
+        )
+        .await;
+    assert_eq!(snapshot.outcome().errors, Vec::new());
+    assert_eq!(
+        snapshot.outcome().skills.len(),
+        12 + usize::from(cfg!(unix))
+    );
 
     let mut builder = ExtensionRegistryBuilder::new();
     install(&mut builder, skills_extension_config);
@@ -1916,7 +2328,7 @@ async fn host_catalog_compacts_shared_paths_under_budget_pressure() -> TestResul
     model_info.context_window = Some(10_000);
     thread_store.insert(model_info);
     let turn_store = ExtensionData::new("turn-1");
-    turn_store.insert(HostSkillsSnapshot::new(Arc::new(outcome)));
+    turn_store.insert(snapshot);
 
     let fragments = registry.turn_input_contributors()[0]
         .contribute(
@@ -2037,7 +2449,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
 #[derive(Clone)]
 struct StaticSkillProvider {
     catalog: SkillCatalog,
-    read_requests: Arc<Mutex<Vec<SkillReadRequest>>>,
+    read_requests: Arc<Mutex<Vec<(SkillAuthority, SkillPackageId, SkillResourceId)>>>,
     list_calls: Option<Arc<AtomicUsize>>,
     fail_first_list: bool,
 }
@@ -2091,6 +2503,10 @@ impl RecordingMetrics {
 }
 
 impl ExtensionMetrics for RecordingMetrics {
+    fn counter(&self, name: &str, _inc: i64, _tags: &[(&str, &str)]) {
+        panic!("unexpected counter: {name}");
+    }
+
     fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) {
         self.samples
             .lock()
@@ -2149,13 +2565,20 @@ impl SkillProvider for StaticSkillProvider {
         })
     }
 
-    fn read(&self, request: SkillReadRequest) -> SkillProviderFuture<'_, SkillReadResult> {
+    fn read<'a>(
+        &'a self,
+        request: SkillReadRequest<'a>,
+    ) -> SkillProviderFuture<'a, SkillReadResult> {
         let read_requests = Arc::clone(&self.read_requests);
         Box::pin(async move {
             read_requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(request.clone());
+                .push((
+                    request.authority.clone(),
+                    request.package.clone(),
+                    request.resource.clone(),
+                ));
             Ok(SkillReadResult {
                 resource: request.resource,
                 contents: "# Lint Fix\n\nRun the formatter.".to_string(),
@@ -2205,6 +2628,7 @@ fn default_config() -> TestConfig {
 fn skills_extension_config(config: &TestConfig) -> SkillsExtensionConfig {
     SkillsExtensionConfig {
         include_instructions: config.include_instructions,
+        max_context_tokens: None,
         bundled_skills_enabled: config.bundled_skills_enabled,
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.shadow_selection_enabled,
@@ -2220,18 +2644,10 @@ fn test_codex_home() -> PathBuf {
 }
 
 fn read_request_keys(
-    requests: &Arc<Mutex<Vec<SkillReadRequest>>>,
+    requests: &Mutex<Vec<(SkillAuthority, SkillPackageId, SkillResourceId)>>,
 ) -> Vec<(SkillAuthority, SkillPackageId, SkillResourceId)> {
     requests
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .map(|request| {
-            (
-                request.authority.clone(),
-                request.package.clone(),
-                request.resource.clone(),
-            )
-        })
-        .collect()
+        .clone()
 }

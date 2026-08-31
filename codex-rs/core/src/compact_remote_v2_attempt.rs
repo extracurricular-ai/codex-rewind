@@ -10,6 +10,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use codex_history::CodexHarnessMetadata;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -21,6 +22,7 @@ use tracing::info;
 pub(super) struct RemoteCompactV2Attempt {
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
     pub(super) prompt_input: Vec<ResponseItem>,
+    pub(super) prompt_input_metadata: Vec<Option<CodexHarnessMetadata>>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
@@ -65,27 +67,32 @@ pub(super) async fn run_remote_compact_v2_attempt(
 
     let trace_input_history = compaction_trace
         .is_enabled()
-        .then(|| history.raw_items().to_vec());
-    let mut input = history.for_prompt(&turn_context.model_info.input_modalities);
+        .then(|| history.raw_items().cloned().collect());
+    let (mut input, prompt_input_metadata): (Vec<_>, Vec<_>) = history
+        .for_prompt_annotated(&turn_context.model_info().input_modalities)
+        .into_iter()
+        .map(|envelope| (envelope.item, envelope.metadata))
+        .unzip();
     let tool_router = &step_context.tool_router;
     input.push(ResponseItem::CompactionTrigger {});
     let prompt = Prompt {
         input,
         tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        parallel_tool_calls: true,
         base_instructions,
         output_schema: None,
         output_schema_strict: true,
+        cyber_access_program: turn_context.cyber_access_program,
     };
 
-    let window_id = sess.current_window_id().await;
-    let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
-        sess.installation_id.clone(),
-        window_id,
-        CodexResponsesRequestKind::Compaction(compaction_metadata),
-    );
+    let responses_metadata = sess
+        .responses_metadata(
+            turn_context.as_ref(),
+            CodexResponsesRequestKind::Compaction(compaction_metadata),
+        )
+        .await;
     let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
-        "model": turn_context.model_info.slug.as_str(),
+        "model": turn_context.model_info().slug.as_str(),
         "instructions": prompt.base_instructions.text.as_str(),
         "input": &prompt.input,
         "parallel_tool_calls": prompt.parallel_tool_calls,
@@ -112,6 +119,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         compaction_output,
         response_id,
         token_usage,
+        usage_metadata,
     } = compaction_output_result?;
     // TODO: Emit this before compaction output validation so malformed completed
     // responses still surface their raw upstream usage.
@@ -120,6 +128,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
         EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
             response_id,
             token_usage: token_usage.clone(),
+            usage_metadata,
         }),
     )
     .await;
@@ -128,6 +137,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     Ok(RemoteCompactV2Attempt {
         trace_input_history,
         prompt_input,
+        prompt_input_metadata,
         compaction_output,
         token_usage,
         owned_client_session,

@@ -8,12 +8,12 @@ use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::McpRuntime;
 use codex_mcp::McpRuntimeInput;
+use codex_mcp::McpStartupPolicy;
 use codex_mcp::ToolInfo;
 use codex_mcp::effective_mcp_servers;
 use codex_mcp::host_owned_codex_apps_enabled;
 use codex_mcp::tool_is_model_visible;
 use codex_protocol::mcp::ClientMcpExtensions;
-use codex_protocol::models::PermissionProfile;
 
 #[cfg(test)]
 #[path = "installed_tests.rs"]
@@ -48,26 +48,18 @@ impl AppsRequestProcessor {
         let mut snapshot_tool_count = 0;
         let result = async {
             let config = self
-                .load_apps_installed_config(params.thread_id.as_deref())
+                .load_apps_config(params.thread_id.as_deref())
                 .await?;
             let auth = self.auth_manager.auth().await;
-            let apps_enabled = config
+            let runtime_enabled = config
                 .features
                 .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend));
 
-            let workspace_enabled = apps_enabled
-                && self
-                    .workspace_codex_plugins_enabled(&config, auth.as_ref())
-                    .await;
-            let runtime_enabled = apps_enabled && workspace_enabled;
-
             let mcp_manager = self.thread_manager.mcp_manager();
-            let mut mcp_config = mcp_manager.runtime_config(&config).await;
-            // Installed-app discovery has no active turn or reviewer.
-            mcp_config.permission_profile = PermissionProfile::default();
-            let mcp_config = Arc::new(mcp_config);
+            let mcp_config = mcp_manager.runtime_config(&config).await;
             let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
             mcp_servers.retain(|name, _| name == CODEX_APPS_MCP_SERVER_NAME);
+            let mcp_config = Arc::new(mcp_config.for_threadless_operations(&mcp_servers));
             let cache_key = connector_runtime_context_key(auth.as_ref());
             let previous_snapshot = mcp_manager
                 .codex_apps_tools_cache()
@@ -91,6 +83,7 @@ impl AppsRequestProcessor {
                         host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
                             .then(|| Arc::clone(&self.auth_manager));
                     let runtime = McpRuntime::new(McpRuntimeInput {
+                        startup_policy: McpStartupPolicy::Eager,
                         config: Arc::clone(&mcp_config),
                         plugins_available: false,
                         ready_selected_capability_roots: Vec::new(),
@@ -104,7 +97,7 @@ impl AppsRequestProcessor {
                         codex_apps_tools_cache_key: cache_key.clone(),
                         client_mcp_extensions: ClientMcpExtensions::default(),
                         auth: auth.clone(),
-                        codex_apps_auth_manager,
+                        auth_manager: codex_apps_auth_manager,
                         elicitation_reviewer: None,
                         elicitation_lifecycle: None,
                     })
@@ -151,11 +144,7 @@ impl AppsRequestProcessor {
                 }
             } else {
                 if force_refresh {
-                    refresh_disposition = if !apps_enabled {
-                        "skipped_apps_disabled"
-                    } else {
-                        "skipped_workspace_disabled"
-                    };
+                    refresh_disposition = "skipped_apps_disabled";
                     retained_previous_snapshot = previous_snapshot.is_some();
                 }
                 previous_snapshot
@@ -197,21 +186,6 @@ impl AppsRequestProcessor {
             );
         }
         result
-    }
-
-    async fn load_apps_installed_config(
-        &self,
-        thread_id: Option<&str>,
-    ) -> Result<Config, JSONRPCErrorError> {
-        let Some(thread_id) = thread_id else {
-            return self.load_latest_config(/*fallback_cwd*/ None).await;
-        };
-        let (_, thread) = self.load_thread(thread_id).await?;
-        let thread_config = thread.config().await;
-        self.config_manager
-            .load_latest_config_for_thread(thread_config.as_ref())
-            .await
-            .map_err(|err| internal_error(format!("failed to reload config: {err}")))
     }
 }
 

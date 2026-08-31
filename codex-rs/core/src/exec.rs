@@ -45,10 +45,13 @@ pub(crate) use codex_sandboxing::is_likely_sandbox_denied;
 #[cfg(test)]
 use codex_sandboxing::permission_profile_supports_windows_restricted_token_sandbox;
 use codex_sandboxing::record_filesystem_sandbox_violation;
+#[cfg(test)]
 use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
+#[cfg(test)]
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
 #[cfg(test)]
 use codex_sandboxing::unsupported_windows_restricted_token_sandbox_reason;
+#[cfg(any(test, target_os = "windows"))]
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -98,6 +101,8 @@ pub struct ExecParams {
     pub network: Option<NetworkProxy>,
     pub network_environment_id: Option<String>,
     pub sandbox_permissions: SandboxPermissions,
+    // TODO(anp): Reconcile these launch settings with TurnEnvironment::sandbox_context
+    // so turn-scoped execution uses the selected environment's backend.
     pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub justification: Option<String>,
@@ -158,14 +163,6 @@ pub enum ExecExpirationOutcome {
     Cancelled,
 }
 
-impl From<Option<u64>> for ExecExpiration {
-    fn from(timeout_ms: Option<u64>) -> Self {
-        timeout_ms.map_or(ExecExpiration::DefaultTimeout, |timeout_ms| {
-            ExecExpiration::Timeout(Duration::from_millis(timeout_ms))
-        })
-    }
-}
-
 impl From<u64> for ExecExpiration {
     fn from(timeout_ms: u64) -> Self {
         ExecExpiration::Timeout(Duration::from_millis(timeout_ms))
@@ -202,6 +199,7 @@ impl ExecExpiration {
     }
 
     /// If ExecExpiration is a timeout, returns the timeout in milliseconds.
+    #[cfg(target_os = "windows")]
     pub(crate) fn timeout_ms(&self) -> Option<u64> {
         match self {
             ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
@@ -379,7 +377,7 @@ pub fn build_exec_request(
         expiration,
         capture_policy,
     };
-    let mut exec_req = manager
+    let request = manager
         .transform(SandboxTransformRequest {
             command,
             permissions: permission_profile,
@@ -393,40 +391,13 @@ pub fn build_exec_request(
             windows_sandbox_level,
             windows_sandbox_private_desktop,
         })
-        .map(|request| {
-            let windows_sandbox_workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
-                vec![sandbox_cwd.clone()]
-            } else {
-                windows_sandbox_workspace_roots.to_vec()
-            };
-            ExecRequest::from_sandbox_exec_request(
-                request,
-                options,
-                windows_sandbox_workspace_roots,
-            )
-        })
         .map_err(CodexErr::from)?;
-    let use_windows_elevated_backend = windows_sandbox_uses_elevated_backend(
-        exec_req.windows_sandbox_level,
-        exec_req.network.is_some(),
-    );
-    exec_req.windows_sandbox_filesystem_overrides = if use_windows_elevated_backend {
-        resolve_windows_elevated_filesystem_overrides(
-            exec_req.sandbox,
-            &exec_req.permission_profile,
-            sandbox_cwd,
-            use_windows_elevated_backend,
-        )
+    let windows_sandbox_workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
+        vec![sandbox_cwd.clone()]
     } else {
-        resolve_windows_restricted_token_filesystem_overrides(
-            exec_req.sandbox,
-            &exec_req.permission_profile,
-            sandbox_cwd,
-            exec_req.windows_sandbox_level,
-        )
-    }
-    .map_err(CodexErr::UnsupportedOperation)?;
-    Ok(exec_req)
+        windows_sandbox_workspace_roots.to_vec()
+    };
+    ExecRequest::from_sandbox_exec_request(request, options, windows_sandbox_workspace_roots)
 }
 
 pub(crate) async fn execute_exec_request(
@@ -439,6 +410,7 @@ pub(crate) async fn execute_exec_request(
         cwd,
         env,
         exec_server_env_config: _,
+        exec_server_shell_snapshot: _,
         network,
         expiration,
         capture_policy,
@@ -665,7 +637,7 @@ async fn exec_windows_sandbox(
     let command_path = command.first().cloned();
     let sandbox_level = windows_sandbox_level;
     let proxy_enforced = network.is_some();
-    let use_elevated = windows_sandbox_uses_elevated_backend(sandbox_level, proxy_enforced);
+    let use_elevated = windows_sandbox_uses_elevated_backend(sandbox_level);
     let additional_deny_write_paths = windows_sandbox_filesystem_overrides
         .map(|overrides| overrides.additional_deny_write_paths.clone())
         .unwrap_or_default();

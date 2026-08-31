@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 use tracing::warn;
 
 use super::McpConnectionSet;
+use super::McpServerConnection;
 use crate::pagination::collect_paginated;
 use crate::rmcp_client::ManagedClient;
 
@@ -156,16 +157,24 @@ impl McpConnectionSet {
             .with_context(|| format!("resources/read failed for `{server}` ({uri})"))
     }
 
-    async fn client_by_name(&self, name: &str) -> Result<(ManagedClient, Option<Duration>)> {
+    pub(crate) async fn client_by_name(
+        &self,
+        name: &str,
+    ) -> Result<(ManagedClient, Option<Duration>)> {
+        let (client, timeout, _connection) = self.client_with_connection_by_name(name).await?;
+        Ok((client, timeout))
+    }
+
+    pub(crate) async fn client_with_connection_by_name(
+        &self,
+        name: &str,
+    ) -> Result<(ManagedClient, Option<Duration>, Arc<McpServerConnection>)> {
         let view = self
             .servers
             .get(name)
             .ok_or_else(|| anyhow!("unknown MCP server '{name}'"))?;
-        let client = view
-            .connection
-            .client()
-            .await
-            .context("failed to get client")?;
-        Ok((client, view.tool_timeout))
+        let connection = Arc::clone(&view.connection);
+        let client = connection.client().await.context("failed to get client")?;
+        Ok((client, view.tool_timeout, connection))
     }
 }
