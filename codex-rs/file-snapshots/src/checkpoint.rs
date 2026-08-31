@@ -19,6 +19,7 @@ use crate::manifest::Manifest;
 use crate::manifest::ManifestStore;
 use crate::manifest::mode_of;
 use crate::manifest::mtime_parts;
+use tracing::warn;
 
 /// How close to the moment of capture a file's mtime may be before its
 /// `(size, mtime)` fingerprint stops being proof that it is unchanged.
@@ -102,6 +103,18 @@ fn capture_at(
     let mut stats = CheckpointStats::default();
 
     for path in files {
+        // A manifest key is a `String`, so a name that is not valid UTF-8 gets
+        // a lossy one — and a restore would then create a U+FFFD-named sibling
+        // and never touch the real file. Refusing to snapshot it is the honest
+        // outcome: not restoring is recoverable, restoring to the wrong path
+        // is not. Storing raw bytes instead would mean changing the persisted
+        // manifest format for a case that is rare outside deliberately hostile
+        // filenames.
+        if path.to_str().is_none() {
+            warn!("file_snapshots: skipping a path whose name is not valid UTF-8: {path:?}");
+            stats.skipped += 1;
+            continue;
+        }
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -366,6 +379,67 @@ mod tests {
                 .absent
                 .contains(&ghost.to_string_lossy().into_owned())
         );
+    }
+
+    /// Nothing but a confirmed NotFound may produce a tombstone, because a
+    /// tombstone is a licence to delete. The tempting refactor —
+    /// `Err(_) => { manifest.absent.insert(..); continue; }` — reads as a
+    /// simplification, compiles, and silently arms a rewind to delete files
+    /// the capture never actually looked at.
+    ///
+    /// Unix-only for the symlinks, which are the sharp cases. Tracked
+    /// symlinks are not hypothetical: `git_tracked_files` filters submodules
+    /// and nothing else, so any symlink the project commits reaches `capture`
+    /// on every turn.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_path_confirmed_missing_is_recorded_as_absent() {
+        use std::os::unix::fs::symlink;
+
+        let f = fixture();
+        let real = f.ws.join("real.txt");
+        fs::write(&real, b"content").unwrap();
+
+        // A symlink to a file that exists. Skipped, not entered: were the
+        // `is_file` guard relaxed, `fs::read` would follow it and record the
+        // *target's* bytes under the *link's* path, so a restore would replace
+        // the user's symlink with a regular file.
+        let live_link = f.ws.join("live-link");
+        symlink(&real, &live_link).unwrap();
+
+        // A dangling symlink. `symlink_metadata` succeeds — the link itself is
+        // there — so this must be skipped rather than tombstoned. It is the
+        // assertion that fails if `symlink_metadata` is ever "simplified" to
+        // `metadata`, which would tombstone a symlink the user still has.
+        let dangling = f.ws.join("dangling");
+        symlink(f.ws.join("no-such-target"), &dangling).unwrap();
+
+        // A directory, and a path *under* a regular file — the latter gives
+        // ENOTDIR rather than NotFound, which is the "could not look" arm.
+        let dir = f.ws.join("subdir");
+        fs::create_dir_all(&dir).unwrap();
+        let under_a_file = real.join("child.txt");
+
+        let cp = capture(
+            &f.blobs,
+            &f.manifests,
+            vec![real.clone(), live_link, dangling, dir, under_a_file],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cp.manifest.entries.keys().collect::<Vec<_>>(),
+            vec![&real.to_string_lossy().into_owned()],
+            "only the regular file is captured"
+        );
+        assert!(
+            cp.manifest.absent.is_empty(),
+            "none of these was confirmed missing, so none may license a \
+             deletion: {:?}",
+            cp.manifest.absent
+        );
+        assert_eq!(cp.stats.skipped, 4);
     }
 
     #[cfg(unix)]
