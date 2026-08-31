@@ -61,15 +61,8 @@ codex           # the official one, if you have it
 Ships prebuilt binaries for macOS, Linux and Windows on both x64 and arm64, the same
 targets as upstream. Node 16 or newer.
 
-To remove it:
-
-```shell
-npm uninstall -g codex-rewind
-rm -rf ~/.codex/file_snapshots      # optional: the snapshots themselves
-```
-
-Do not delete `~/.codex` itself — the official build uses the same directory for your
-login and history.
+Removing it again is two commands, and leaves your conversations untouched — see
+[Clean uninstall](#clean-uninstall).
 
 Releases are versioned `<upstream>-rewind.<n>` — `0.147.0-rewind.1` is built from
 upstream `rust-v0.147.0`, so the baseline each release carries is visible in its
@@ -126,6 +119,55 @@ CODEX_HOME=~/.codex-rewind codexr
 
 You will sign in again in that directory, and the two builds will then share
 nothing.
+
+## Clean uninstall
+
+Two commands remove the program and every byte of data it created:
+
+```shell
+npm uninstall -g codex-rewind     # the program
+rm -rf ~/.codex/file_snapshots    # the snapshots
+```
+
+`~/.codex/file_snapshots/` is the **only** directory this distribution creates.
+`/status` shows its size first, if you want to see what you are deleting.
+
+npm is the only route this ships through. The standalone installer scripts in this
+repository are upstream's — they install the official `codex` binary from
+releases.openai.com and have nothing to do with this build.
+
+Optionally, remove two entries from `~/.codex/config.toml`:
+
+```toml
+[features]
+file_snapshots = true    # this line
+
+[file_snapshots]         # and this section, if you set anything in it
+track_hidden_files = true
+```
+
+Leaving them costs one log line: the official build warns `unknown feature key in
+config: file_snapshots` and ignores the rest.
+
+**Do not delete `~/.codex` itself.** The official build uses the same directory —
+your login, your config and every conversation you have ever had live there.
+
+### Your conversations are not part of this
+
+History is written in upstream's own format, and this distribution **adds nothing to
+it**: no extra event type, no extra field, no schema change. Snapshots live entirely
+under `file_snapshots/`, keyed by session and turn id — they point *at* your history
+rather than being part of it.
+
+So a conversation you ran here, rewound and all, opens in the official `codex`
+exactly like any other, before or after you uninstall. Deleting `file_snapshots/`
+takes away the ability to rewind those turns, and nothing else.
+
+One thing worth knowing because it is visible: `/rewind` **archives** the
+conversation it supersedes rather than deleting it, into
+`~/.codex/archived_sessions/`. That directory and the archiving are upstream's own
+rather than something added here, so the official build understands them — but an
+archived conversation is archived, not in the active list.
 
 ## "Why not just commit before every turn?"
 
