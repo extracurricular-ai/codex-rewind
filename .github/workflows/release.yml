@@ -38,6 +38,17 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing reaches npm that these have not passed — the snapshot tests on all
+  # three platforms, the launcher on all three, and the packaging script that
+  # builds what this workflow is about to upload.
+  #
+  # They run alongside the build rather than in front of it. `build.yml` has no
+  # path to npm, so the only step worth gating is the one that does, and
+  # serialising them would add the test time to every release for nothing.
+  tests:
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+
   build:
     uses: ./.github/workflows/build.yml
     with:
@@ -46,7 +57,9 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: build
+    # A `uses:` job succeeds only if every job inside the called workflow did,
+    # so this is the whole matrix, not a summary of it.
+    needs: [build, tests]
     runs-on: ubuntu-24.04
     permissions:
       # npm trusted publishing: the registry authenticates this job by the OIDC

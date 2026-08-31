@@ -372,7 +372,15 @@ mod tests {
             let mut out: Vec<String> =
                 recent_files(root, &ignore, include_hidden, &BTreeSet::new())
                     .iter()
-                    .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                    // Compared against `/`-separated literals below, and
+                    // Windows hands back `sub\keep2.txt`. The separator is not
+                    // what this test is about.
+                    .map(|p| {
+                        p.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
                     .collect();
             out.sort();
             out
