@@ -1,0 +1,357 @@
+name: tests
+
+# The verification this distribution owns and can actually run.
+#
+# Upstream's `rust-ci-full.yml` does have a five-target test matrix, but every
+# job in it asks for a self-hosted runner group named after the repository
+# (`codex-rewind-runners`, which exists only upstream) or for the billable
+# `macos-15-xlarge`. It is also reachable only by pushing a branch named
+# `*full-ci*`. The practical consequence is that no `cargo test` runs anywhere
+# in this repository's CI. That is the gap this file closes.
+#
+# It is a new file rather than an edit to `rust-ci.yml` on purpose: `.github/`
+# is the hottest conflict path in every upstream sync, so the checks this fork
+# depends on live somewhere upstream will never touch. It is deliberately kept
+# out of `blocking-ci.yml` too — that workflow's `required` gate is permanently
+# red here, because the argument-comment lint inside it asks for runners this
+# account does not have, and a signal muxed into a check that is always red is
+# not a signal. `tests / all` below is the status worth requiring.
+#
+# Scope is the crate this distribution adds (`codex-file-snapshots`), the
+# wiring that makes it do anything (`codex-core`), and the launcher and package
+# it actually ships. Not the whole workspace: upstream's 1,386 crates are
+# upstream's to verify.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+  # Called by release.yml, so a tag cannot publish something these checks have
+  # not passed.
+  workflow_call:
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# No `paths:` filter. A required check that is skipped never reports, and a PR
+# waiting on a status that will never arrive cannot be merged at all — the
+# failure mode is worse than the wasted minutes, which on a public repository's
+# standard runners are free and unmetered anyway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # `codex-core`'s tests abort with "thread 'tokio-rt-worker' has overflowed its
+  # stack" on the 2 MiB a Tokio worker gets by default. 8 MiB is what upstream's
+  # own test steps use, and what `.cargo/config.toml` already links Windows
+  # binaries with. Reproduced locally without it: SIGABRT before the first test
+  # reports.
+  RUST_MIN_STACK: "8388608"
+  # Debug info is the bulk of a test build's disk and link time, and nothing
+  # here reads a backtrace's line numbers. Set at workflow level rather than
+  # per-step because `CARGO_PROFILE_*` is part of Cargo's fingerprint: a step
+  # that sets it and a step that does not would rebuild everything against
+  # each other.
+  CARGO_PROFILE_TEST_DEBUG: "false"
+  CARGO_PROFILE_DEV_DEBUG: "false"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # --- The crate this distribution adds --------------------------------------
+  snapshots:
+    name: Snapshots — ${{ matrix.os }}
+    # Three platforms because the store writes real files: path separators,
+    # the executable bit, case-insensitive filesystems and Windows' habit of
+    # holding a handle open past the last close are all things only the target
+    # OS can tell us about. `fail-fast: false` so one platform's failure does
+    # not hide the other two.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          # `.cargo/config.toml` puts `-C target-feature=+crt-static` on
+          # `cfg(all(windows, target_env = "msvc"))`. Cargo applies a
+          # target-scoped rustflag to host artifacts too — build scripts and
+          # proc-macro crates, which are dylibs — unless `--target` is passed,
+          # and a proc macro cannot be built with a static CRT. Every other
+          # workflow in this repository passes `--target` and so never meets
+          # this; this one has to say so out loud. Left empty elsewhere so the
+          # runner's own architecture stays the thing being tested, rather than
+          # a triple guessed here.
+          - os: windows-latest
+            target_flag: --target x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        # So `rust-toolchain.toml` applies and the pinned toolchain is the one
+        # that builds. At the repository root cargo picks the runner's default
+        # toolchain instead.
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # `rustup toolchain install` with no argument installs whatever
+      # `rust-toolchain.toml` pins. Spelled out because rustup 1.28 stopped
+      # auto-installing behind `rustup show`, and a job that depends on that
+      # implicit behaviour fails at its third step with nothing built.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: snapshots-${{ matrix.os }}
+          # The Actions cache is 10 GB per repository and `build.yml` already
+          # stores six release-build entries in it. Saving from every pull
+          # request would evict those and each other; restoring from main is
+          # most of the benefit at none of the cost.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `--all-targets` picks up `examples/scan_bench.rs`, which nothing else
+      # compiles — `just bench` is `cargo bench --bench '*'` and never looks at
+      # examples. `--locked` because a job that silently re-resolves is testing
+      # a dependency set nobody committed.
+      - name: Unit and integration tests
+        run: cargo test -p codex-file-snapshots --all-targets --no-fail-fast --locked ${{ matrix.target_flag }}
+
+  # --- Lint, scoped to the same crate ----------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Workspace-wide `cargo fmt` is `rust-ci.yml`'s job and it does run on a
+      # standard runner, so this is scoped to the crate to keep the two from
+      # being the same check twice. The unusual `imports_granularity` flag is
+      # not optional: it is what the rest of the repository is formatted with.
+      - name: cargo fmt
+        run: cargo fmt -p codex-file-snapshots -- --config imports_granularity=Item --check
+
+      # Clippy currently runs nowhere reachable in this repository — upstream
+      # puts it in the self-hosted matrix — so this is the only place a lint
+      # regression in the snapshot code gets caught. `-D warnings` is not made
+      # redundant by `[workspace.lints]`: that table names 34 lints, and this
+      # promotes everything else warn-by-default as well.
+      - name: cargo clippy
+        run: cargo clippy -p codex-file-snapshots --all-targets --locked -- -D warnings
+
+  # --- The wiring that makes the crate do anything ---------------------------
+  wiring:
+    name: Wiring
+    # Linux only, and by far the longest job here: `codex-core`'s tests are one
+    # aggregate binary, so there is no way to build the three file-snapshot
+    # tests without building all of them. Worth it anyway — this is the layer
+    # that catches an upstream merge which resolved cleanly and left the
+    # capture hook wired to nothing.
+    #
+    # Linux only is a real choice, not an oversight: these three tests drive a
+    # loopback mock server and a tempdir, with approvals off, so there is no
+    # OS-specific code under them. Repeating a 1,000-crate build on macOS and
+    # Windows would buy nothing the `snapshots` matrix does not already cover.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # No apt step. Upstream's nextest workflow installs `libcap-dev` and
+      # `bubblewrap` because it archives the *whole* workspace; nothing in
+      # `-p codex-core`'s closure links either, verified by building and
+      # running these tests on a machine that had neither.
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: wiring
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # This is the job that can time out, and a timed-out job never
+          # reaches the save step — so without this one bad run leaves the
+          # cache cold for the next one, which then also times out.
+          cache-on-failure: true
+
+      # Two ways this job could report success without testing anything, both
+      # worth more than the seconds they cost to rule out.
+      #
+      # `skip_if_no_network!` returns early — and PASSES — if
+      # CODEX_SANDBOX_NETWORK_DISABLED is merely present, whatever its value.
+      # And libtest's filter is a substring match that exits 0 when it selects
+      # nothing, so renaming or `cfg`-gating the module turns this job green
+      # rather than red. The `--list` count is the guard against the second.
+      - name: Refuse to pass vacuously
+        run: |
+          if [[ -n "${CODEX_SANDBOX_NETWORK_DISABLED:-}" ]]; then
+            echo "::error::CODEX_SANDBOX_NETWORK_DISABLED is set; these tests would skip and still report success"
+            exit 1
+          fi
+
+      # Also where the aggregate binary gets built, so a compile error surfaces
+      # here rather than inside the run below.
+      - name: Check the filter still selects something
+        run: |
+          found=$(cargo test -p codex-core --test all --locked -- suite::file_snapshots --list \
+            | grep -c ': test$' || true)
+          echo "file-snapshot tests selected: $found"
+          if [[ "$found" -lt 3 ]]; then
+            echo "::error::expected at least 3 tests under suite::file_snapshots, the filter selected $found"
+            exit 1
+          fi
+
+      # `--test all` names the single aggregate integration binary; the filter
+      # is the module path, so only the file-snapshot tests run once it is
+      # built. Building it is the expensive part — there are ~1,140 other tests
+      # in that binary and no way to compile fewer of them.
+      - name: End-to-end file-snapshot tests
+        run: cargo test -p codex-core --test all --locked -- suite::file_snapshots
+
+      # `/rewind` and `/redo` — the entire user-facing surface of this feature —
+      # live in the TUI, and the app-server carries the restore and undo
+      # handlers. Neither is reachable from any test above, so a signature
+      # change during an upstream sync would break the thing users actually
+      # touch while every test here stayed green. Compile-only, and it reuses
+      # this job's warm target directory rather than paying for its own.
+      - name: The crates that consume it still compile
+        run: cargo check -p codex-tui -p codex-app-server --tests --locked
+
+  # --- The thing users actually run ------------------------------------------
+  launcher:
+    name: Launcher — ${{ matrix.os }} / node ${{ matrix.node }}
+    # The launcher picks a target triple from `process.platform`/`process.arch`
+    # and spawns a binary, so it can only be tested on the platform it is
+    # deciding for. Node 22 is what release.yml publishes with; 24 is what a
+    # user installing today is likely to be on; 20 is the oldest the repository
+    # claims to support that can still run `node --test`.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["22", "24"]
+        include:
+          - os: ubuntu-latest
+            node: "20"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Launcher tests
+        run: node --test codex-cli/test/launcher.test.mjs
+
+  # --- The package that carries it -------------------------------------------
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Everything release.yml does to the launcher package, minus the publish.
+      # The point is that the packaging script runs on a pull request at all:
+      # every bug it has had so far — a missing LICENSE, `npm pack --json`
+      # changing shape under it — was found by a release, which is the most
+      # expensive place to find one, because an npm version cannot be reused.
+      - name: Stage and pack the launcher
+        env:
+          VERSION: 0.0.0-ci.0
+        run: |
+          set -euo pipefail
+          python3 codex-cli/scripts/build_npm_package.py \
+            --package codex --version "$VERSION" \
+            --staging-dir "$RUNNER_TEMP/stage" \
+            --pack-output "$RUNNER_TEMP/launcher.tgz"
+
+          echo "tarball contents:"
+          tar -tzf "$RUNNER_TEMP/launcher.tgz" | sort
+
+      - name: Check what the tarball would ship
+        env:
+          VERSION: 0.0.0-ci.0
+          STAGE_DIR: ${{ runner.temp }}/stage
+          TARBALL: ${{ runner.temp }}/launcher.tgz
+        run: python3 .github/scripts/check_launcher_package.py
+
+      # The check above reads the tarball's file list and metadata. This runs
+      # the thing. Same stub as the launcher tests — a copy of the runner's own
+      # Node, the one executable certain to be present and executable — dropped
+      # where the launcher looks, which for Linux is the musl triple because
+      # that is what `build.yml` publishes.
+      - name: The staged launcher actually starts
+        run: |
+          set -euo pipefail
+          bin_dir="$RUNNER_TEMP/stage/vendor/x86_64-unknown-linux-musl/bin"
+          mkdir -p "$bin_dir"
+          cp "$(command -v node)" "$bin_dir/codexr"
+          chmod +x "$bin_dir/codexr"
+          node "$RUNNER_TEMP/stage/bin/codex.js" \
+            -e 'console.log("staged launcher reached its binary")'
+
+  # --- The one status to require ---------------------------------------------
+  all:
+    name: all
+    # The matrix jobs' names carry the OS and Node version in them, so requiring
+    # them individually in a ruleset means editing the ruleset every time the
+    # matrix changes. This is the stable name to require instead. `always()` so
+    # it still runs — and still fails — when a dependency failed rather than
+    # being quietly skipped along with it.
+    if: ${{ always() }}
+    needs: [snapshots, lint, wiring, launcher, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Shared with blocking-ci: a skipped or cancelled dependency counts as a
+      # failure, because only an explicit success is safe for a required check.
+      - name: Require successful dependencies
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/check_ci_results.py
