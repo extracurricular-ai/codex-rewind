@@ -109,19 +109,12 @@ impl RefStore {
     }
 
     fn log_path(&self, thread_id: &str) -> PathBuf {
-        // Thread ids are UUID-like; anything else is defensively mapped to
-        // a filename-safe character set.
-        let safe: String = thread_id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        self.root.join(format!("{safe}.json"))
+        // Shares `safe_file_name` with the restore log rather than repeating
+        // the mapping: two spellings of the same sanitiser could drift, and a
+        // thread whose log and restore log keyed to different filenames would
+        // lose its undo record without anything failing.
+        self.root
+            .join(format!("{}.json", safe_file_name(thread_id)))
     }
 }
 
@@ -197,23 +190,6 @@ impl TurnIndex {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(SnapshotError::io(&path, e)),
         }
-    }
-
-    /// Every thread's restore history, for GC marking.
-    pub fn restore_logs(&self) -> Result<Vec<RestoreLog>> {
-        let mut out = Vec::new();
-        let entries = fs::read_dir(&self.restores_root)
-            .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".json") {
-                continue;
-            }
-            let bytes = fs::read(entry.path()).map_err(|e| SnapshotError::io(entry.path(), e))?;
-            out.push(serde_json::from_slice(&bytes)?);
-        }
-        Ok(out)
     }
 
     pub fn all_manifest_ids(&self) -> Result<BTreeSet<String>> {
@@ -304,17 +280,30 @@ impl TurnIndex {
         }
     }
 
+    /// Every thread's restore history, which `live_manifest_ids` treats as a
+    /// GC root.
+    ///
+    /// Shaped like `thread_logs` and `retain_turns`, deliberately: publish
+    /// leftovers are skipped by extension, and everything else propagates. It
+    /// used to skip *any* unreadable or unparsable file, which looked like
+    /// tolerance and was really a missing extension filter — `write_atomic`
+    /// renames into place, so a crash leaves a `.tmp`, never a torn `.json`.
+    /// The cost of the looser form was that a genuinely corrupt log silently
+    /// stopped being a root, and the manifests a pending undo depends on
+    /// became collectable. A sweep that fails is retried; snapshots deleted
+    /// because their root could not be read are gone.
     fn all_restore_logs(&self) -> Result<Vec<RestoreLog>> {
         let mut out = Vec::new();
         let entries = fs::read_dir(&self.restores_root)
             .map_err(|e| SnapshotError::io(&self.restores_root, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| SnapshotError::io(&self.restores_root, e))?;
-            if let Ok(bytes) = fs::read(entry.path())
-                && let Ok(log) = serde_json::from_slice::<RestoreLog>(&bytes)
-            {
-                out.push(log);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".json") {
+                continue;
             }
+            let bytes = fs::read(entry.path()).map_err(|e| SnapshotError::io(entry.path(), e))?;
+            out.push(serde_json::from_slice(&bytes)?);
         }
         Ok(out)
     }
@@ -634,5 +623,206 @@ mod tests {
         assert_eq!(stats.blobs_removed, 1);
         assert_eq!(manifests.ids().unwrap().len(), 0);
         assert_eq!(blobs.hashes().unwrap().len(), 0);
+    }
+
+    /// The deletion sweep's retention half. `collect_garbage` has a grace
+    /// window to make an over-eager sweep unlikely; this one deliberately has
+    /// none, because someone deleting a conversation is asking for it to be
+    /// gone now. Reachability is therefore the *only* thing standing between a
+    /// fork and the manifests it shares with the conversation being deleted,
+    /// and the existing coverage only ever exercised the branch that removes.
+    #[test]
+    fn deleting_one_conversation_keeps_what_a_fork_still_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = RefStore::open(dir.path().join("refs")).unwrap();
+        let turns = TurnIndex::open(dir.path()).unwrap();
+        let manifests = ManifestStore::open(dir.path().join("manifests")).unwrap();
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+
+        let shared_hash = blobs.store_bytes(b"shared").unwrap();
+        let doomed_hash = blobs.store_bytes(b"doomed").unwrap();
+
+        let mut shared = crate::manifest::Manifest::default();
+        shared.entries.insert(
+            "/f".into(),
+            crate::manifest::FileEntry {
+                mode: 0o644,
+                size: 6,
+                mtime_secs: 1,
+                mtime_nanos: 0,
+                hash: shared_hash.clone(),
+            },
+        );
+        let shared_id = manifests.save(&shared).unwrap();
+
+        let mut doomed_only = shared.clone();
+        doomed_only.entries.get_mut("/f").unwrap().hash = doomed_hash.clone();
+        let doomed_only_id = manifests.save(&doomed_only).unwrap();
+
+        // The fork survives and still names the shared manifest. The deleted
+        // conversation's own log is already gone by the time the sweep runs —
+        // `forget_threads` reads the candidate set out of it first, then drops
+        // it — so the doomed set is all the sweep has to go on.
+        refs.append(
+            "fork",
+            SnapshotRef {
+                turn_id: "turn-1".into(),
+                manifest_id: shared_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let doomed = BTreeSet::from([shared_id.clone(), doomed_only_id.clone()]);
+        let stats = collect_garbage_for(&refs, &turns, &manifests, &blobs, &doomed).unwrap();
+
+        assert_eq!(
+            (stats.manifests_kept, stats.manifests_removed),
+            (1, 1),
+            "the shared manifest is spared and the exclusive one is taken"
+        );
+        assert!(
+            manifests.load(&shared_id).is_ok(),
+            "deleting one conversation must not destroy a fork's snapshots"
+        );
+        assert!(manifests.load(&doomed_only_id).is_err());
+
+        assert!(
+            blobs.contains(&shared_hash),
+            "a blob the surviving manifest still points at outlives the sweep"
+        );
+        assert!(!blobs.contains(&doomed_hash));
+        assert_eq!(stats.blobs_removed, 1);
+    }
+
+    /// Blobs dedupe by content hash across threads, so two conversations that
+    /// ever held the same bytes share one. Deleting either puts that blob into
+    /// the orphan set, and the un-orphan loop is the only thing that takes it
+    /// back out. Get it wrong and deleting conversation A destroys
+    /// conversation B's file *contents* while B's logs and manifests stay
+    /// intact — `/rewind` still offers the turn and then restores nothing.
+    ///
+    /// The sibling test above cannot see this: nothing in it puts a surviving
+    /// blob into the orphan set in the first place, so deleting the entire
+    /// un-orphan loop leaves it green.
+    #[test]
+    fn a_blob_two_manifests_share_outlives_the_removal_of_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = RefStore::open(dir.path().join("refs")).unwrap();
+        let turns = TurnIndex::open(dir.path()).unwrap();
+        let manifests = ManifestStore::open(dir.path().join("manifests")).unwrap();
+        let blobs = BlobStore::open(dir.path().join("blobs")).unwrap();
+
+        let shared = blobs.store_bytes(b"shared bytes").unwrap();
+        let exclusive = blobs.store_bytes(b"exclusive bytes").unwrap();
+        let extra = blobs.store_bytes(b"extra bytes").unwrap();
+
+        let entry = |hash: &str| crate::manifest::FileEntry {
+            mode: 0o644,
+            size: 12,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            hash: hash.to_string(),
+        };
+
+        // Doomed, and the only manifest naming `shared` among the doomed —
+        // so removing it is what puts `shared` into the orphan set.
+        let mut doomed_manifest = crate::manifest::Manifest::default();
+        doomed_manifest.entries.insert("/f".into(), entry(&shared));
+        let doomed_id = manifests.save(&doomed_manifest).unwrap();
+
+        // Survives, and names `shared` too. A different entry set so `save`
+        // yields a distinct id rather than deduping into the one above.
+        let mut survivor_manifest = crate::manifest::Manifest::default();
+        survivor_manifest
+            .entries
+            .insert("/f".into(), entry(&shared));
+        survivor_manifest.entries.insert("/g".into(), entry(&extra));
+        let survivor_id = manifests.save(&survivor_manifest).unwrap();
+
+        // Doomed and shares nothing, so its blob really is garbage.
+        let mut exclusive_manifest = crate::manifest::Manifest::default();
+        exclusive_manifest
+            .entries
+            .insert("/h".into(), entry(&exclusive));
+        let exclusive_id = manifests.save(&exclusive_manifest).unwrap();
+
+        refs.append(
+            "survivor",
+            SnapshotRef {
+                turn_id: "turn-1".into(),
+                manifest_id: survivor_id,
+            },
+        )
+        .unwrap();
+
+        // A candidate that no longer exists on disk. `forget_threads` retried
+        // after a partial sweep hands exactly this shape, and treating it as
+        // fatal would abandon the rest — leaving a deleted conversation's
+        // contents on disk for good, which is a privacy failure rather than a
+        // disk leak.
+        let missing = "0".repeat(64);
+
+        let doomed = BTreeSet::from([doomed_id.clone(), exclusive_id, missing]);
+        let stats = collect_garbage_for(&refs, &turns, &manifests, &blobs, &doomed).unwrap();
+
+        assert!(
+            blobs.contains(&shared),
+            "a blob a surviving manifest still names must outlive the removal \
+             of another manifest that named it"
+        );
+        assert!(
+            manifests.load(&doomed_id).is_err(),
+            "the doomed manifest is still removed — the test must not pass by \
+             keeping everything"
+        );
+        assert!(
+            !blobs.contains(&exclusive),
+            "a genuinely orphaned blob goes"
+        );
+        assert!(blobs.contains(&extra));
+        assert_eq!((stats.manifests_removed, stats.blobs_removed), (2, 1));
+    }
+
+    /// Undo reaches back exactly one restore, so the log is trimmed to a fixed
+    /// depth rather than grown forever. Which end it trims matters more than
+    /// the depth does: drop the newest instead of the oldest and the next undo
+    /// returns the user to the wrong workspace.
+    #[test]
+    fn a_thread_remembers_its_most_recent_restores_and_forgets_the_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = TurnIndex::open(dir.path()).unwrap();
+
+        let overflow = 5;
+        for i in 0..MAX_RESTORE_HISTORY + overflow {
+            turns
+                .push_restore(
+                    "t1",
+                    RestoreRecord {
+                        target_manifest_id: format!("target-{i}"),
+                        safety_manifest_id: format!("safety-{i}"),
+                    },
+                )
+                .unwrap();
+        }
+
+        let log = turns.restore_log("t1").unwrap();
+        assert_eq!(log.entries.len(), MAX_RESTORE_HISTORY);
+        assert_eq!(
+            log.entries.first().unwrap().target_manifest_id,
+            format!("target-{overflow}"),
+            "the oldest records are the ones dropped"
+        );
+        assert_eq!(
+            log.entries.last().unwrap().target_manifest_id,
+            format!("target-{}", MAX_RESTORE_HISTORY + overflow - 1),
+            "the newest record survives, because that is the one undo needs"
+        );
+
+        // And the same through the accessor a sweep uses, so a trimmed record
+        // stops pinning the manifests it named.
+        let named = turns.all_restores_for("t1").unwrap();
+        assert_eq!(named.len(), MAX_RESTORE_HISTORY * 2);
+        assert!(!named.contains(&"target-0".to_string()));
+        assert!(named.contains(&format!("target-{overflow}")));
     }
 }
