@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use ignore::WalkBuilder;
 use ignore::gitignore::Gitignore;
 use ignore::gitignore::GitignoreBuilder;
+use tracing::warn;
 
 /// Name of the dedicated snapshot ignore file (provisional; the final
 /// name is an open question in the RFC).
@@ -43,6 +44,21 @@ pub const SNAPSHOT_IGNORE_FILENAME: &str = ".codexsnapignore";
 /// A missing ignore file yields an empty matcher (nothing ignored).
 pub fn load_ignore(root: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
+    // Matched the way the filesystem resolves names, not the way bytes
+    // compare. NTFS and APFS are case-insensitive by default, so a rule
+    // written `secrets/**` has to cover `SECRETS/key.pem` — the OS considers
+    // them one directory, and a rule that does not is a rule the user
+    // reasonably believes is protecting them. git makes the same adjustment
+    // for the same reason (`core.ignorecase`, auto-detected at init).
+    //
+    // Keyed off the platform rather than probed: a macOS volume *can* be
+    // formatted case-sensitive, and being case-insensitive there costs only
+    // that a deliberately case-distinct pair is over-ignored. Failing to
+    // ignore is the direction that leaks.
+    // Infallible in practice — it only rejects a change made after globs have
+    // been added, and none have been — but this crate denies `expect`, and a
+    // capture must not fail over an ignore-matcher setting either way.
+    let _ = builder.case_insensitive(cfg!(any(windows, target_os = "macos")));
     builder.add(root.join(SNAPSHOT_IGNORE_FILENAME));
     // An unparsable ignore file degrades to "nothing ignored" rather than
     // failing the checkpoint; restores stay conservative either way.
@@ -50,7 +66,22 @@ pub fn load_ignore(root: &Path) -> Gitignore {
 }
 
 /// Symmetric protection check: is `path` invisible to snapshot operations?
+///
+/// A path outside the matcher's own root answers *no*, and the bounds check
+/// that decides it is not defensive tidiness. `matched_path_or_any_parents` is
+/// documented to panic when asked about a path it does not cover, and a
+/// non-empty matcher reaches that assert — so the edit hook, which is handed
+/// absolute paths from wherever the agent wrote, would abort mid-batch on the
+/// first edit above the session's root.
+///
+/// *No* is also the right answer rather than merely the safe one: these rules
+/// describe one directory, they say nothing about anything else, and the
+/// tombstone for a file the agent created outside the workspace is the only
+/// evidence that licenses a later rewind to remove it.
 pub fn is_ignored(ignore: &Gitignore, path: &Path) -> bool {
+    if !path.starts_with(ignore.path()) {
+        return false;
+    }
     ignore.matched_path_or_any_parents(path, false).is_ignore()
 }
 
@@ -154,7 +185,16 @@ pub fn tracked_files(
 ) -> BTreeSet<PathBuf> {
     let ignores: Vec<Gitignore> = roots.iter().map(|root| load_ignore(root)).collect();
 
-    let mut files: BTreeSet<PathBuf> = already_known.into_iter().collect();
+    // `already_known` is filtered like everything else. It arrives from a
+    // thread's own history, so it can carry a path that was tracked before the
+    // user excluded it — and rule 5 says the *current* ignore file governs.
+    // Left unfiltered, one such path would be handed back on every later turn
+    // and captured for the life of the session. A path under none of the roots
+    // survives: `is_ignored` answers for its own root and nothing else.
+    let mut files: BTreeSet<PathBuf> = already_known
+        .into_iter()
+        .filter(|path| !ignores.iter().any(|ignore| is_ignored(ignore, path)))
+        .collect();
     for (root, ignore) in roots.iter().zip(&ignores) {
         files.extend(git_tracked_files(root, ignore));
     }
@@ -190,8 +230,20 @@ pub fn git_tracked_files(root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
     let Ok(repo) = gix::discover(root) else {
         return Vec::new();
     };
-    let Ok(index) = repo.index_or_empty() else {
-        return Vec::new();
+    let index = match repo.index_or_empty() {
+        Ok(index) => index,
+        Err(err) => {
+            // The one failure here a user can act on, and the only place in
+            // this file where saying so is worth a line. Everything else that
+            // returns empty is a legitimate "no repository", but an index this
+            // crate cannot read means a rewind comes back with far less than
+            // the project holds — silently, and looking exactly like the
+            // feature not working.
+            warn!(
+                "file_snapshots: could not read the git index at {root:?}, so the git-tracked partition is empty: {err}"
+            );
+            return Vec::new();
+        }
     };
     // A bare repository has nothing checked out, so it has nothing to snapshot.
     let Some(workdir) = repo.workdir() else {
@@ -217,9 +269,21 @@ pub fn git_tracked_files(root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
         return Vec::new();
     };
 
+    // Built from components rather than from `to_string_lossy`, because the
+    // git index is `/`-separated on every platform while the native rendering
+    // is not. On Windows a session two directories down yields `app\deep`,
+    // which matches nothing in the index — so `prefixed_entries` returns None
+    // and this partition silently contributes zero files, leaving the recency
+    // budget to carry a whole repository. One level down has no separator in
+    // it at all, which is why this survived a test that only went that far.
+    //
     // The trailing separator is what stops `app` from also matching
     // `app-extra/…`. An empty prefix means `root` *is* the repository root.
-    let mut prefix = relative.to_string_lossy().into_owned();
+    let mut prefix = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
     if !prefix.is_empty() && !prefix.ends_with('/') {
         prefix.push('/');
     }
@@ -244,7 +308,19 @@ pub fn git_tracked_files(root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
                 return None;
             }
             let rel = std::str::from_utf8(entry.path(&index)).ok()?;
-            let path = root.join(rel.strip_prefix(prefix.as_str())?);
+            // Folded component by component, not joined as one string. `join`
+            // inserts a single native separator and then copies the rest
+            // verbatim, so on Windows the index's own `/` would survive inside
+            // the result: `C:\repo\src/main.rs`. That path is *equal* to the
+            // native spelling as a `Path` — components compare separator-blind
+            // — so the scan's own set dedupes it and nothing here notices. But
+            // the manifest key is `to_string_lossy`, a raw string, so the key
+            // for one file would then depend on which partition found it, and
+            // `attach_pre_edit`'s `entries.contains_key` would stop matching.
+            let path = rel
+                .strip_prefix(prefix.as_str())?
+                .split('/')
+                .fold(root.to_path_buf(), |acc, component| acc.join(component));
             (!is_ignored(ignore, &path)).then_some(path)
         })
         .collect()
@@ -349,6 +425,27 @@ mod tests {
             touch(&path, "content");
         }
         git(&["add", "-A"]).then_some((root, dir))
+    }
+
+    /// The module doc states the ignore rule without qualification, and the
+    /// two partition loops below honour it — but `already_known` is collected
+    /// straight into the set above them. A path that entered the session
+    /// before it was ignored would then be handed back on every later turn.
+    #[test]
+    fn an_ignored_path_is_not_re_admitted_by_what_a_session_already_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("app.log"), "noise");
+        touch(&root.join(SNAPSHOT_IGNORE_FILENAME), "*.log\n");
+
+        let known = vec![root.join("app.log")];
+        let files = tracked_files(&[root.to_path_buf()], known, /*include_hidden*/ false);
+
+        assert!(
+            !files.contains(&root.join("app.log")),
+            "the current ignore file governs, whatever the session learned \
+             before it: {files:?}"
+        );
     }
 
     #[test]
@@ -509,9 +606,54 @@ mod tests {
              swept in"
         );
 
+        // Two levels down, which is where a native path separator first
+        // appears in the prefix. The git index is `/`-separated on every
+        // platform, so a prefix rendered natively matches nothing on Windows
+        // and this partition would come back empty — silently, with the
+        // recency budget left holding a whole repository. Passing one level
+        // down proves nothing about that, because `app` has no separator in
+        // it. This assertion is identical on Unix before and after the fix; it
+        // is the Windows CI leg that it exists for.
+        let deep = repo.join("app").join("deep");
+        let ignore = load_ignore(&deep);
+        let found = git_tracked_files(&deep, &ignore);
+        assert_eq!(
+            found,
+            vec![repo.join("app/deep/util.rs")],
+            "a session opened two directories down still sees what git tracks"
+        );
+        // On the *string* form, deliberately. `PathBuf` equality compares
+        // components, which treats `/` and `\` as the same separator — so the
+        // assertion above is structurally incapable of seeing a path that
+        // carried the index's forward slashes through. Manifest keys are
+        // `to_string_lossy`, so the string is what actually has to match. A
+        // tautology on Unix; the whole point on the Windows leg.
+        assert_eq!(
+            found[0].to_string_lossy(),
+            repo.join("app")
+                .join("deep")
+                .join("util.rs")
+                .to_string_lossy(),
+            "and spells it the way every other partition spells it"
+        );
+
         // From the repository root the same call sees the whole index.
         let ignore = load_ignore(&repo);
         assert_eq!(git_tracked_files(&repo, &ignore).len(), 4);
+
+        // A session opened in a subdirectory the index tracks nothing under —
+        // an everyday case, and the only untested exit from the prefix logic.
+        // Falling through to `index.entries()` instead would re-anchor
+        // top-level index paths as `root.join(rel)`, and those fabricated
+        // paths would be recorded in `manifest.absent`, making a file the user
+        // later creates at one of those invented names deletable by a rewind.
+        let untracked = repo.join("scratch");
+        fs::create_dir_all(&untracked).unwrap();
+        let ignore = load_ignore(&untracked);
+        assert!(
+            git_tracked_files(&untracked, &ignore).is_empty(),
+            "nothing tracked under it means nothing from this partition"
+        );
     }
 
     #[test]
