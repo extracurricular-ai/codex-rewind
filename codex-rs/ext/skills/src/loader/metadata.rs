@@ -1,6 +1,8 @@
 use std::io;
 
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::GetMetadataOptions;
+use codex_exec_server::ReadFileOptions;
 use codex_protocol::protocol::Product;
 use codex_skills::SkillDependencies;
 use codex_skills::SkillInterface;
@@ -62,6 +64,14 @@ struct DependencyTool {
     transport: Option<String>,
     command: Option<String>,
     url: Option<String>,
+    oauth: Option<DependencyOAuth>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DependencyOAuth {
+    #[serde(alias = "callback_port")]
+    callback_port: Option<u16>,
 }
 
 pub(super) async fn load_host_skill_metadata(
@@ -78,7 +88,10 @@ pub(super) async fn load_host_skill_metadata(
         SkillMetadataDiscovery::Present(path) => path,
         SkillMetadataDiscovery::Absent => return LoadedSkillMetadata::default(),
         SkillMetadataDiscovery::Probe(path) => {
-            match file_system.get_metadata(path, /*sandbox*/ None).await {
+            match file_system
+                .get_metadata(path, GetMetadataOptions::default(), /*sandbox*/ None)
+                .await
+            {
                 Ok(metadata) if metadata.is_file => {}
                 Ok(_) => return LoadedSkillMetadata::default(),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -97,7 +110,11 @@ pub(super) async fn load_host_skill_metadata(
     };
 
     let contents = match file_system
-        .read_file_text(metadata_path, /*sandbox*/ None)
+        .read_file_text(
+            metadata_path,
+            ReadFileOptions::default(),
+            /*sandbox*/ None,
+        )
         .await
     {
         Ok(contents) => contents,
@@ -186,6 +203,7 @@ fn resolve_dependency_tool(tool: DependencyTool) -> Option<SkillToolDependency> 
         "dependencies.tools.command",
     );
     let url = resolve_str(tool.url, MAX_DEPENDENCY_URL_LEN, "dependencies.tools.url");
+    let oauth_callback_port = tool.oauth.and_then(|oauth| oauth.callback_port);
 
     Some(SkillToolDependency {
         r#type,
@@ -194,6 +212,7 @@ fn resolve_dependency_tool(tool: DependencyTool) -> Option<SkillToolDependency> 
         transport,
         command,
         url,
+        oauth_callback_port,
     })
 }
 

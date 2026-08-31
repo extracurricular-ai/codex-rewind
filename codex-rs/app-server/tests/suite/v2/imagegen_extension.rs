@@ -7,6 +7,7 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::write_chatgpt_auth;
+use codex_app_server_protocol::ImageGenerationFailure;
 use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ThreadItem;
@@ -32,6 +33,9 @@ use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+use super::analytics::mount_analytics_capture;
+use super::analytics::wait_for_analytics_event;
 
 const RESULT: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 const TINY_PNG_BYTES: &[u8] = &[
@@ -86,11 +90,7 @@ async fn standalone_image_generation_returns_saved_path_hint_to_model() -> Resul
 
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), ImagegenTestMode::Direct)?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt"),
-        AuthCredentialsStoreMode::File,
-    )?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -180,6 +180,17 @@ async fn standalone_image_generation_returns_saved_path_hint_to_model() -> Resul
             .iter()
             .any(|text| text.contains("Generated images are saved to")),
         "standalone image generation should not emit the legacy developer-message hint"
+    );
+
+    let event = wait_for_analytics_event(
+        &server,
+        DEFAULT_READ_TIMEOUT,
+        "codex_image_generation_event",
+    )
+    .await?;
+    assert_eq!(
+        event["event_params"]["imagegen_request_id"],
+        json!("req-imagegen-123")
     );
 
     Ok(())
@@ -416,7 +427,9 @@ async fn standalone_image_generation_failure_emits_terminal_item() -> Result<()>
             revised_prompt: Some("paint a blue whale".to_string()),
             result: String::new(),
             transparent_background: None,
+            failure: None,
             saved_path: None,
+            imagegen_request_id: None,
         })
     );
 
@@ -430,10 +443,145 @@ async fn standalone_image_generation_failure_emits_terminal_item() -> Result<()>
     let (output, _) = requests[1]
         .function_call_output_content_and_success(call_id)
         .context("image generation function output should be present")?;
-    assert!(
-        output
-            .as_deref()
-            .is_some_and(|text| text.contains("image generation failed"))
+    assert_eq!(
+        output.as_deref(),
+        Some(
+            "image generation failed: http 500 Internal Server Error: Some(\"image backend failed\")"
+        )
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_generation_usage_limit_preserves_correlated_failure_metadata() -> Result<()> {
+    let call_id = "image-run-limited";
+    let reset_at = 1_786_150_800;
+    let server = responses::start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/codex/images/generations"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("x-codex-active-limit", "image_gen")
+                .insert_header("x-image-gen-primary-used-percent", "100")
+                .insert_header("x-image-gen-primary-window-minutes", "1440")
+                .insert_header("x-image-gen-primary-reset-at", reset_at.to_string())
+                .set_body_json(json!({
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "image limit reached",
+                        "resets_at": reset_at,
+                        "plan_type": "plus"
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("resp-1"),
+                responses::ev_function_call_with_namespace(
+                    call_id,
+                    "image_gen",
+                    "imagegen",
+                    &json!({"prompt": "paint a blue whale"}).to_string(),
+                ),
+                responses::ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("msg-1", "The image limit was reached."),
+                responses::ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), ImagegenTestMode::Direct)?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-chatgpt"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    start_image_generation_turn(&mut mcp, ThreadStartParams::default()).await?;
+
+    let completed = timeout(
+        DEFAULT_READ_TIMEOUT,
+        wait_for_image_generation_completed(&mut mcp),
+    )
+    .await??;
+    let thread_id = completed.thread_id.clone();
+    let ThreadItem::ImageGeneration(image) = completed.item else {
+        panic!("expected failed image-generation item");
+    };
+    assert_eq!(image.status, "failed");
+    assert_eq!(
+        image.failure,
+        Some(ImageGenerationFailure::UsageLimitExceeded {
+            limit_id: "image_gen".to_string(),
+            resets_at: Some(reset_at),
+        })
+    );
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let read_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread_id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let ThreadReadResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(read_id)).await??;
+    let persisted_failure = thread
+        .turns
+        .iter()
+        .flat_map(|turn| turn.items.iter())
+        .find_map(|item| match item {
+            ThreadItem::ImageGeneration(item) => item.failure.as_ref(),
+            _ => None,
+        });
+    assert_eq!(
+        persisted_failure,
+        Some(&ImageGenerationFailure::UsageLimitExceeded {
+            limit_id: "image_gen".to_string(),
+            resets_at: Some(reset_at),
+        })
+    );
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id,
+            ..Default::default()
+        })
+        .await?;
+    let ThreadResumeResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+    let resumed_failure = thread
+        .turns
+        .iter()
+        .flat_map(|turn| turn.items.iter())
+        .find_map(|item| match item {
+            ThreadItem::ImageGeneration(item) => item.failure.as_ref(),
+            _ => None,
+        });
+    assert_eq!(
+        resumed_failure,
+        Some(&ImageGenerationFailure::UsageLimitExceeded {
+            limit_id: "image_gen".to_string(),
+            resets_at: Some(reset_at),
+        })
     );
 
     Ok(())
@@ -785,11 +933,15 @@ async fn mount_image_response(server: &MockServer) {
 async fn mount_image_response_with_background(server: &MockServer, background: &str) {
     Mock::given(method("POST"))
         .and(path("/api/codex/images/generations"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "created": 1,
-            "background": background,
-            "data": [{"b64_json": RESULT}],
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-imagegen-request-id", "req-imagegen-123")
+                .set_body_json(json!({
+                    "created": 1,
+                    "background": background,
+                    "data": [{"b64_json": RESULT}],
+                })),
+        )
         .expect(1)
         .mount(server)
         .await;

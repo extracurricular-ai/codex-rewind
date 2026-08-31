@@ -5,15 +5,22 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::io;
 
+use crate::CapabilityRootsDiscoverParams;
+use crate::CapabilityRootsDiscoverResponse;
 use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
 use crate::ExecutorFileSystem;
+use crate::GetMetadataOptions;
+use crate::ReadFileOptions;
 use crate::RemoveOptions;
+use crate::WriteFileOptions;
 use crate::local_file_system::DirectFileSystem;
+use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
 use crate::protocol::FS_CANONICALIZE_METHOD;
 use crate::protocol::FS_COPY_METHOD;
 use crate::protocol::FS_CREATE_DIRECTORY_METHOD;
 use crate::protocol::FS_GET_METADATA_METHOD;
+use crate::protocol::FS_OPEN_METHOD;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_READ_FILE_METHOD;
 use crate::protocol::FS_REMOVE_METHOD;
@@ -47,6 +54,10 @@ pub const CODEX_FS_HELPER_ARG1: &str = "--codex-run-as-fs-helper";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "params")]
 pub(crate) enum FsHelperRequest {
+    #[serde(rename = "capabilityRoots/discoverV1")]
+    DiscoverCapabilityRoots(CapabilityRootsDiscoverParams),
+    #[serde(rename = "fs/open")]
+    Open(FsReadFileParams),
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileParams),
     #[serde(rename = "fs/writeFile")]
@@ -75,8 +86,23 @@ pub(crate) enum FsHelperResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FsHelperOpenResponse {
+    // Windows duplicates the handle from the helper process.
+    #[cfg(windows)]
+    pub(crate) process_id: u32,
+    // Unix passes the fd directly instead.
+    #[cfg(windows)]
+    pub(crate) file_handle: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "response")]
 pub(crate) enum FsHelperPayload {
+    #[serde(rename = "capabilityRoots/discoverV1")]
+    DiscoverCapabilityRoots(CapabilityRootsDiscoverResponse),
+    #[serde(rename = "fs/open")]
+    Open(FsHelperOpenResponse),
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileResponse),
     #[serde(rename = "fs/writeFile")]
@@ -100,6 +126,8 @@ pub(crate) enum FsHelperPayload {
 impl FsHelperPayload {
     fn operation(&self) -> &'static str {
         match self {
+            Self::DiscoverCapabilityRoots(_) => CAPABILITY_ROOTS_DISCOVER_METHOD,
+            Self::Open(_) => FS_OPEN_METHOD,
             Self::ReadFile(_) => FS_READ_FILE_METHOD,
             Self::WriteFile(_) => FS_WRITE_FILE_METHOD,
             Self::CreateDirectory(_) => FS_CREATE_DIRECTORY_METHOD,
@@ -109,6 +137,18 @@ impl FsHelperPayload {
             Self::Walk(_) => FS_WALK_METHOD,
             Self::Remove(_) => FS_REMOVE_METHOD,
             Self::Copy(_) => FS_COPY_METHOD,
+        }
+    }
+
+    pub(crate) fn expect_capability_roots_discover(
+        self,
+    ) -> Result<CapabilityRootsDiscoverResponse, JSONRPCErrorError> {
+        match self {
+            Self::DiscoverCapabilityRoots(response) => Ok(response),
+            other => Err(unexpected_response(
+                CAPABILITY_ROOTS_DISCOVER_METHOD,
+                other.operation(),
+            )),
         }
     }
 
@@ -203,9 +243,24 @@ pub(crate) async fn run_direct_request(
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
     let file_system = DirectFileSystem;
     match request {
+        FsHelperRequest::DiscoverCapabilityRoots(params) => {
+            let response = crate::discover_capability_roots(&file_system, params)
+                .await
+                .map_err(|error| invalid_request(error.to_string()))?;
+            Ok(FsHelperPayload::DiscoverCapabilityRoots(response))
+        }
+        FsHelperRequest::Open(_) => Err(invalid_request(
+            "opening a file requires descriptor handoff".to_string(),
+        )),
         FsHelperRequest::ReadFile(params) => {
             let data = file_system
-                .read_file(&params.path, /*sandbox*/ None)
+                .read_file(
+                    &params.path,
+                    ReadFileOptions {
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    /*sandbox*/ None,
+                )
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::ReadFile(FsReadFileResponse {
@@ -219,7 +274,14 @@ pub(crate) async fn run_direct_request(
                 ))
             })?;
             file_system
-                .write_file(&params.path, bytes, /*sandbox*/ None)
+                .write_file(
+                    &params.path,
+                    bytes,
+                    WriteFileOptions {
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    /*sandbox*/ None,
+                )
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::WriteFile(FsWriteFileResponse {}))
@@ -230,6 +292,7 @@ pub(crate) async fn run_direct_request(
                     &params.path,
                     CreateDirectoryOptions {
                         recursive: params.recursive.unwrap_or(true),
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
                     },
                     /*sandbox*/ None,
                 )
@@ -241,7 +304,13 @@ pub(crate) async fn run_direct_request(
         }
         FsHelperRequest::GetMetadata(params) => {
             let metadata = file_system
-                .get_metadata(&params.path, /*sandbox*/ None)
+                .get_metadata(
+                    &params.path,
+                    GetMetadataOptions {
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                    },
+                    /*sandbox*/ None,
+                )
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::GetMetadata(FsGetMetadataResponse {
@@ -292,6 +361,7 @@ pub(crate) async fn run_direct_request(
                     RemoveOptions {
                         recursive: params.recursive.unwrap_or(true),
                         force: params.force.unwrap_or(true),
+                        follow_symlinks: params.follow_symlinks.unwrap_or(true),
                     },
                     /*sandbox*/ None,
                 )
@@ -316,7 +386,7 @@ pub(crate) async fn run_direct_request(
     }
 }
 
-fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
+pub(crate) fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
         io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
@@ -350,6 +420,7 @@ mod tests {
             let request = serde_json::to_value(FsHelperRequest::WriteFile(FsWriteFileParams {
                 path: path.clone(),
                 data_base64: String::new(),
+                follow_symlinks: None,
                 sandbox: None,
             }))?;
             assert_eq!(

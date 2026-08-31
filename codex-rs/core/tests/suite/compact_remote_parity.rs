@@ -1,15 +1,20 @@
+use super::compact::allow_echo_commands;
+use codex_core::TurnInputRequest;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
@@ -510,6 +515,7 @@ async fn build_harness_inner(
     fs::create_dir_all(FIXED_CWD)?;
     let mut builder = test_codex()
         .with_auth(settings.auth.build())
+        .with_pre_build_hook(allow_echo_commands)
         .with_pre_build_hook(|home| {
             fs::write(home.join("AGENTS.md"), USER_INSTRUCTIONS)
                 .expect("write global instructions");
@@ -605,13 +611,13 @@ async fn capture_from_requests(
 
 async fn submit_user_input(codex: &codex_core::CodexThread, items: Vec<UserInput>) -> Result<()> {
     codex
-        .submit(Op::UserInput {
-            items,
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(items).with_thread_settings(
+            ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                permission_profile: Some(PermissionProfile::Disabled),
+                ..Default::default()
+            },
+        ))
         .await?;
     wait_for_turn_complete(codex).await;
     Ok(())
@@ -686,7 +692,7 @@ fn response_bodies_for_step(scenario_name: &str, idx: usize, step: Step) -> Vec<
         ],
         Step::ShellTool => vec![
             responses::sse(vec![
-                responses::ev_shell_command_call(
+                responses::ev_exec_command_call(
                     &format!("{response_id}-shell-call"),
                     &format!("echo {scenario_name}_{idx}_SHELL_TOOL"),
                 ),
@@ -794,7 +800,7 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Value> {
         {
             let values = items
                 .into_iter()
-                .map(|item| serde_json::to_value(item).expect("serialize replacement item"))
+                .map(|item| serde_json::to_value(item.item).expect("serialize replacement item"))
                 .collect::<Vec<_>>();
             replacement_history = Some(Value::Array(values));
         }
@@ -943,6 +949,22 @@ fn normalize_string(value: &str) -> String {
     let mut text = value.to_string();
     normalize_tmp_prefix_before_marker(&mut text, "/skills/");
     normalize_tmp_prefix_before_marker(&mut text, "\\skills\\");
+
+    let mut search_start = 0;
+    let chunk_id_prefix = "Chunk ID: ";
+    while let Some(relative_start) = text[search_start..].find(chunk_id_prefix) {
+        let value_start = search_start + relative_start + chunk_id_prefix.len();
+        let value_end = text[value_start..]
+            .find('\n')
+            .map_or(text.len(), |offset| value_start + offset);
+        let value = &text[value_start..value_end];
+        if !value.is_empty() && value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            text.replace_range(value_start..value_end, "<CHUNK_ID>");
+            search_start = value_start + "<CHUNK_ID>".len();
+        } else {
+            search_start = value_end;
+        }
+    }
 
     let skills_open_tag = "<skills_instructions>";
     let skills_close_tag = "</skills_instructions>";

@@ -13,16 +13,15 @@ use crate::Cli;
 use crate::app_server_session::AppServerSession;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::ConfigOverrides;
-use crate::legacy_core::config::bootstrap_auth_config;
 use crate::legacy_core::config::load_config_toml_with_layer_stack;
 use crate::legacy_core::config::resolve_oss_provider;
 use crate::legacy_core::config::resolve_profile_v2_config_path;
 use crate::named_session_lookup::NamedSessionCandidates;
 use crate::named_session_lookup::SessionCollection;
 use crate::named_session_lookup::SessionNameLookupMode;
+use crate::named_session_lookup::current_name_is_compatible;
 use codex_app_server_protocol::Thread as AppServerThread;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_config::cloud_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadOptions;
 use codex_config::LoaderOverrides;
@@ -57,6 +56,12 @@ pub struct SessionArchiveCommandOptions {
     pub explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionNameMatch {
+    First,
+    FirstIncludingNonInteractive,
+}
+
 fn success_message(
     action: SessionArchiveAction,
     session_id: ThreadId,
@@ -85,7 +90,7 @@ pub async fn run_session_archive_command(
 ) -> Result<String> {
     let codex_home = find_codex_home().wrap_err("failed to find Codex home")?;
     let mut app_server =
-        start_app_server_for_archive_command(options, codex_home.to_path_buf()).await?;
+        start_app_server_for_session_command(options, codex_home.to_path_buf()).await?;
     run_session_archive_action_with_app_server(
         &mut app_server,
         codex_home.as_path(),
@@ -162,8 +167,14 @@ async fn resolve_session_target(
         SessionArchiveAction::Unarchive => ("archived", &[true]),
     };
     for &archived in archived_values {
-        if let Some(thread) =
-            lookup_session_by_exact_name(app_server, codex_home, target, archived).await?
+        if let Some(thread) = lookup_session_by_exact_name(
+            app_server,
+            codex_home,
+            target,
+            archived,
+            SessionNameMatch::First,
+        )
+        .await?
         {
             return session_target_from_app_server_thread(thread);
         }
@@ -173,11 +184,12 @@ async fn resolve_session_target(
     ))
 }
 
-async fn lookup_session_by_exact_name(
+pub(super) async fn lookup_session_by_exact_name(
     app_server: &mut AppServerSession,
     codex_home: &Path,
     name: &str,
     archived: bool,
+    match_policy: SessionNameMatch,
 ) -> Result<Option<AppServerThread>> {
     // Remote workspaces stay on their existing server-side path. Local workspaces trust SQLite
     // names, then scan and repair only after a miss or an unusable rollout path.
@@ -189,26 +201,73 @@ async fn lookup_session_by_exact_name(
             SessionNameLookupMode::ScanAndRepair,
         ][..]
     };
+    let source_kind_filters = if match_policy == SessionNameMatch::FirstIncludingNonInteractive {
+        // An empty filter includes Atlas/ChatGPT sessions; explicit kinds additionally include exec.
+        vec![
+            super::resume_source_kinds(/*include_non_interactive*/ true),
+            Vec::new(),
+        ]
+    } else {
+        vec![super::resume_source_kinds(
+            /*include_non_interactive*/ false,
+        )]
+    };
     for &lookup_mode in lookup_modes {
+        let sort_by_recency = lookup_mode == SessionNameLookupMode::StateDbOnly
+            && app_server.uses_embedded_app_server();
         // Search is the fast path, but legacy stores attach renamed titles after filtering.
         for search_term in [Some(name), None] {
-            let mut candidates = NamedSessionCandidates::new(
-                name,
-                codex_home,
-                if archived {
-                    SessionCollection::Archived
-                } else {
-                    SessionCollection::Active
-                },
-                lookup_mode,
-                search_term,
-            );
-            if let Some(candidate) = candidates
-                .next(app_server)
-                .await
-                .wrap_err("failed to list sessions while resolving session name")?
-            {
-                return Ok(Some(candidate.thread));
+            let mut first_match: Option<AppServerThread> = None;
+            for source_kinds in &source_kind_filters {
+                let mut candidates = NamedSessionCandidates::new(
+                    name,
+                    codex_home,
+                    if archived {
+                        SessionCollection::Archived
+                    } else {
+                        SessionCollection::Active
+                    },
+                    lookup_mode,
+                    search_term,
+                    source_kinds.clone(),
+                );
+                while let Some(candidate) = candidates
+                    .next(app_server)
+                    .await
+                    .wrap_err("failed to list sessions while resolving session name")?
+                {
+                    let thread = if match_policy == SessionNameMatch::FirstIncludingNonInteractive
+                        && lookup_mode == SessionNameLookupMode::ScanAndRepair
+                        && !app_server.uses_remote_workspace()
+                    {
+                        let thread = app_server
+                            .thread_read(
+                                ThreadId::from_string(&candidate.thread.id)?,
+                                /*include_turns*/ false,
+                            )
+                            .await?;
+                        if !current_name_is_compatible(&thread, name) {
+                            continue;
+                        }
+                        thread
+                    } else {
+                        candidate.thread
+                    };
+                    if first_match.as_ref().is_none_or(|existing| {
+                        if sort_by_recency {
+                            thread.recency_at.unwrap_or(thread.updated_at)
+                                > existing.recency_at.unwrap_or(existing.updated_at)
+                        } else {
+                            thread.updated_at > existing.updated_at
+                        }
+                    }) {
+                        first_match = Some(thread);
+                    }
+                    break;
+                }
+            }
+            if first_match.is_some() {
+                return Ok(first_match);
             }
         }
     }
@@ -253,7 +312,7 @@ fn confirm_session_delete(target: &ResolvedSessionTarget) -> Result<bool> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-async fn start_app_server_for_archive_command(
+pub(super) async fn start_app_server_for_session_command(
     options: SessionArchiveCommandOptions,
     codex_home: PathBuf,
 ) -> Result<AppServerSession> {
@@ -278,12 +337,14 @@ async fn start_app_server_for_archive_command(
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
     }
 
-    let reuse_implicit_local_daemon = super::can_reuse_implicit_local_daemon(
-        &cli_kv_overrides,
-        &launch_loader_overrides,
-        strict_config,
-        cli.bypass_hook_trust || cli.psp,
-    );
+    let workload_identity_selected = codex_login::is_workload_identity_selected();
+    let reuse_implicit_local_daemon = !workload_identity_selected
+        && super::can_reuse_implicit_local_daemon(
+            &cli_kv_overrides,
+            &launch_loader_overrides,
+            strict_config,
+            cli.bypass_hook_trust,
+        );
     let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
         super::maybe_probe_default_daemon_socket(codex_home.as_path()).await
     } else {
@@ -293,7 +354,8 @@ async fn start_app_server_for_archive_command(
         explicit_remote_endpoint,
         default_daemon,
         reuse_implicit_local_daemon,
-    );
+        workload_identity_selected,
+    )?;
     let remote_cwd_override = cli
         .cwd
         .clone()
@@ -337,14 +399,12 @@ async fn start_app_server_for_archive_command(
     .await
     .wrap_err("failed to load config.toml")?;
     let config_toml = &bootstrap_config.config_toml;
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
-        app_server_target.auth_config_for_cloud_loader(bootstrap_auth_config(
-            codex_home.as_path(),
-            &bootstrap_config,
-        )?),
-        /*enable_codex_api_key_env*/ false,
+    let cloud_config_bundle = super::cloud_config_bundle_for_app_server_target(
+        &app_server_target,
+        &bootstrap_config,
+        codex_home.as_path(),
     )
-    .await;
+    .await?;
 
     let model_provider = if cli.oss {
         resolve_oss_provider(cli.oss_provider.as_deref(), config_toml)
@@ -373,7 +433,6 @@ async fn start_app_server_for_archive_command(
             main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
             show_raw_agent_reasoning: cli.oss.then_some(true),
             bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
-            psp: Some(cli.psp),
             ..Default::default()
         })
         .loader_overrides(loader_overrides.clone())

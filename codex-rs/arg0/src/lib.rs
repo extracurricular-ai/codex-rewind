@@ -129,8 +129,13 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
                     Err(_) => std::process::exit(1),
                 };
                 let cwd = cwd.into();
-                match runtime.block_on(codex_apply_patch::apply_patch(
+                let update_file_mode = codex_apply_patch::apply_patch_file_update_mode_from_env();
+                match runtime.block_on(codex_apply_patch::apply_patch_with_options(
                     &patch_arg,
+                    codex_apply_patch::ApplyPatchOptions {
+                        update_file_mode,
+                        ..Default::default()
+                    },
                     &cwd,
                     &mut stdout,
                     &mut stderr,
@@ -398,7 +403,7 @@ fn prepare_path_entry_for_codex_aliases(
         #[cfg(windows)]
         {
             let batch_script = path.join(format!("{filename}.bat"));
-            let exe = exe.display();
+            let exe = windows_batch_executable_path(&exe, path);
             std::fs::write(
                 &batch_script,
                 format!(
@@ -440,6 +445,14 @@ fn prepare_path_entry_for_codex_aliases(
         Arg0PathEntryGuard::new(temp_dir, lock_file, paths),
         updated_path_env_var,
     ))
+}
+
+#[cfg(windows)]
+fn windows_batch_executable_path(executable: &Path, alias_directory: &Path) -> String {
+    pathdiff::diff_paths(executable, alias_directory)
+        .filter(|relative_path| relative_path.is_relative())
+        .map(|relative_path| format!("%~dp0{}", relative_path.display()))
+        .unwrap_or_else(|| executable.display().to_string())
 }
 
 fn path_env_with_package_path_dir(
@@ -535,6 +548,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::fs;
     use std::fs::File;
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -586,6 +601,50 @@ mod tests {
             install_context,
             path_dir,
         })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_alias_preserves_unicode_executable_paths() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let profile = root.path().join("用户");
+        let alias_directory = profile.join(".codex").join("tmp").join("arg0");
+        let executable_directory = profile.join("bin");
+        fs::create_dir_all(&alias_directory)?;
+        fs::create_dir_all(&executable_directory)?;
+
+        let system_root = std::env::var_os("SystemRoot")
+            .ok_or_else(|| anyhow::anyhow!("missing Windows system root"))?;
+        let command_shell = PathBuf::from(system_root).join("System32").join("cmd.exe");
+        let executable = executable_directory.join("cmd.exe");
+        fs::copy(&command_shell, &executable)?;
+
+        let batch_path = alias_directory.join("apply_patch.bat");
+        let executable_path = super::windows_batch_executable_path(&executable, &alias_directory);
+        fs::write(
+            &batch_path,
+            format!("@echo off\r\n\"{executable_path}\" /d /c exit 37\r\n"),
+        )?;
+
+        let output = std::process::Command::new(command_shell)
+            .args(["/d", "/c"])
+            .raw_arg(format!("chcp 437>nul & call \"{}\"", batch_path.display()))
+            .output()?;
+
+        assert_eq!(output.status.code(), Some(37));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_alias_preserves_cross_volume_executable_paths() {
+        assert_eq!(
+            super::windows_batch_executable_path(
+                Path::new(r"D:\Tools\codex.exe"),
+                Path::new(r"C:\Users\person\.codex\tmp\arg0"),
+            ),
+            r"D:\Tools\codex.exe",
+        );
     }
 
     #[test]

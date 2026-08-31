@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_extension_api::ExtensionRegistry;
@@ -10,6 +11,9 @@ use codex_features::Feature;
 use codex_image_generation_extension::install as install_image_generation_extension;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
@@ -22,6 +26,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
@@ -112,7 +117,7 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
         .entries
         .push(FileSystemSandboxEntry {
             path: FileSystemPath::Path {
-                path: denied_path.clone(),
+                path: denied_path.clone().into(),
             },
             access: FileSystemAccessMode::Deny,
             missing_path_behavior: None,
@@ -144,7 +149,8 @@ async fn extension_tool_receives_turn_environment_sandbox() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn extension_tool_uses_granted_turn_permissions_without_local_persistence() -> Result<()> {
+async fn extension_tool_uses_granted_turn_permissions_without_host_local_persistence() -> Result<()>
+{
     skip_if_no_network!(Ok(()));
     skip_if_sandbox!(Ok(()));
 
@@ -196,7 +202,9 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
     std::fs::write(&image_path, TINY_PNG_BYTES)?;
     let requested_permissions = RequestPermissionProfile {
         file_system: Some(FileSystemPermissions::from_read_write_roots(
-            Some(vec![image_dir.path().canonicalize()?.try_into()?]),
+            Some(vec![AbsolutePathBuf::try_from(
+                image_dir.path().canonicalize()?,
+            )?]),
             Some(Vec::new()),
         )),
         ..RequestPermissionProfile::default()
@@ -244,31 +252,28 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(base_permission_profile, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "request access and edit the image".to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(AskForApproval::OnRequest),
                 approvals_reviewer: Some(ApprovalsReviewer::User),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
     let event = wait_for_event(&test.codex, |event| {
         matches!(
@@ -300,13 +305,25 @@ async fn extension_tool_uses_granted_turn_permissions_without_local_persistence(
         .last_request()
         .context("missing request containing extension output")?;
     let output = request.function_call_output(image_call_id);
+    let expected_path = test
+        .config
+        .cwd
+        .join("generated_images")
+        .join("image-edit-granted.png");
     assert_eq!(
-        output["output"],
-        json!([{
+        output["output"][0],
+        json!({
             "type": "input_image",
             "image_url": TINY_PNG_DATA_URL,
-        }])
+        })
     );
+    assert_eq!(output["output"].as_array().map(Vec::len), Some(2));
+    assert!(
+        output["output"][1]["text"]
+            .as_str()
+            .is_some_and(|hint| hint.contains(&expected_path.display().to_string()))
+    );
+    assert_eq!(std::fs::read(expected_path.as_path())?, TINY_PNG_BYTES);
     assert!(!test.config.codex_home.join("generated_images").exists());
 
     Ok(())

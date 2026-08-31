@@ -4,8 +4,8 @@
 //! `ItemCompleted(TurnItem)` records, not legacy event-only rollouts.
 
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 
 use crate::protocol::thread_history::ThreadHistoryChangeSet;
 use crate::protocol::thread_history::ThreadHistoryItemChange;
@@ -40,6 +40,7 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
                     TurnStatus::Completed
                 },
                 error: event.error.as_ref().map(|error| TurnError {
+                    misalignment: error.misalignment.clone().map(Into::into),
                     message: error.message.clone(),
                     codex_error_info: error.codex_error_info.clone().map(Into::into),
                     additional_details: None,
@@ -82,6 +83,8 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::SecurityRiskScore(_)
         | RolloutItem::EventMsg(_) => ThreadHistoryChangeSet::default(),
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_login::CodexAuth;
 use codex_models_manager::manager::RefreshStrategy;
@@ -9,7 +10,6 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::PermissionMessages;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed;
@@ -31,6 +31,7 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent() -> Resul
     let model_slug = "remote-catalog-permissions-model";
     let mut model = model_info_from_slug(model_slug);
     model.model_messages = Some(ModelMessages {
+        persistent_instructions: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
@@ -41,7 +42,10 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent() -> Resul
             workspace_write: None,
             read_only: Some("remote catalog permissions: {{ network_access }}".to_string()),
         }),
+        multi_agent: None,
         token_budget: None,
+        confirmation_policies: None,
+        guardian_v2: None,
     });
     let models_mock = mount_models_once(
         &server,
@@ -82,16 +86,10 @@ async fn catalog_permission_message_loaded_from_remote_models_is_sent() -> Resul
     )
     .await?;
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

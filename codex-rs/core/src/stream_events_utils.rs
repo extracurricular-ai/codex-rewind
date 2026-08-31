@@ -100,7 +100,7 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
         || {
             completed_item_defers_mailbox_delivery_to_next_turn(
                 item,
-                turn_context.mode == ModeKind::Plan,
+                turn_context.mode() == ModeKind::Plan,
             )
         },
         |facts| facts.defers_mailbox_delivery_to_next_turn,
@@ -135,6 +135,7 @@ fn response_item_may_include_external_context(item: &ResponseItem) -> bool {
         ResponseItem::ToolSearchCall { .. }
             | ResponseItem::ToolSearchOutput { .. }
             | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::FunctionCallOutput { call_id: None, .. }
     )
 }
 
@@ -291,7 +292,7 @@ pub(crate) async fn handle_output_item_done(
     previously_active_item: Option<TurnItem>,
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
-    let plan_mode = ctx.turn_context.mode == ModeKind::Plan;
+    let plan_mode = ctx.turn_context.mode() == ModeKind::Plan;
 
     match ToolRouter::build_tool_call(item.clone()) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
@@ -504,7 +505,9 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
         ResponseInputItem::FunctionCallOutput { call_id, output } => {
             Some(ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: call_id.clone(),
+                call_id: Some(call_id.clone()),
+                name: None,
+                namespace: None,
                 output: output.clone(),
                 internal_chat_message_metadata_passthrough: None,
             })
@@ -524,7 +527,9 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
             let output = output.as_function_call_output_payload();
             Some(ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: call_id.clone(),
+                call_id: Some(call_id.clone()),
+                name: None,
+                namespace: None,
                 output,
                 internal_chat_message_metadata_passthrough: None,
             })

@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use crate::McpConfig;
 use crate::mcp::McpPermissionPromptAutoApproveContext;
 use crate::mcp::mcp_permission_prompt_is_auto_approved;
 use anyhow::Context;
@@ -21,9 +22,10 @@ use async_channel::Sender;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_TOOL_SUGGESTION;
 use codex_protocol::mcp_approval_meta::APPROVALS_REVIEWER_KEY;
 use codex_protocol::mcp_approval_meta::STRICT_AUTO_REVIEW_KEY;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -39,8 +41,7 @@ use tokio::sync::oneshot;
 
 static NEXT_ELICITATION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
-const STRICT_AUTO_REVIEW_DECLINE_MESSAGE: &str =
-    "Strict automated review failed. Do not proceed or ask the user for approval.";
+const STRICT_AUTO_REVIEW_DECLINE_MESSAGE: &str = "Automated review of this operation failed. Do not proceed without asking the user for explicit approval.";
 
 #[derive(Debug, Clone)]
 pub struct ElicitationReviewRequest {
@@ -94,6 +95,7 @@ struct ActiveElicitation {
 pub(crate) struct ElicitationRequestRouter {
     requests: Arc<StdMutex<ResponderMap>>,
     auto_deny: Arc<AtomicBool>,
+    full_access_form_input_enabled: Arc<AtomicBool>,
 }
 
 struct PendingElicitationRequest {
@@ -122,6 +124,15 @@ impl ElicitationRequestRouter {
         self.auto_deny.store(auto_deny, Ordering::Relaxed);
     }
 
+    pub(crate) fn full_access_form_input_enabled(&self) -> bool {
+        self.full_access_form_input_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn enable_full_access_form_input(&self) {
+        self.full_access_form_input_enabled
+            .store(true, Ordering::Release);
+    }
+
     pub(crate) async fn resolve(
         &self,
         server_name: String,
@@ -142,53 +153,48 @@ impl ElicitationRequestRouter {
 
 #[derive(Clone)]
 pub(crate) struct ElicitationAuthority {
-    pub(crate) approval_policy: AskForApproval,
-    pub(crate) permission_profile: PermissionProfile,
+    pub(crate) config: Arc<McpConfig>,
     reviewer: Option<ElicitationReviewerHandle>,
     lifecycle: Option<ElicitationLifecycle>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct ElicitationRequestManager {
     router: ElicitationRequestRouter,
-    pub(crate) authority: Arc<StdMutex<ElicitationAuthority>>,
+    pub(crate) authority: Arc<StdMutex<Option<ElicitationAuthority>>>,
 }
 
 impl ElicitationRequestManager {
     pub(crate) fn new(
-        approval_policy: AskForApproval,
-        permission_profile: PermissionProfile,
+        config: Arc<McpConfig>,
         reviewer: Option<ElicitationReviewerHandle>,
         lifecycle: Option<ElicitationLifecycle>,
         router: ElicitationRequestRouter,
     ) -> Self {
         Self {
             router,
-            authority: Arc::new(StdMutex::new(ElicitationAuthority {
-                approval_policy,
-                permission_profile,
+            authority: Arc::new(StdMutex::new(Some(ElicitationAuthority {
+                config,
                 reviewer,
                 lifecycle,
-            })),
+            }))),
         }
     }
 
     pub(crate) fn update(
         &self,
-        approval_policy: AskForApproval,
-        permission_profile: PermissionProfile,
+        config: Arc<McpConfig>,
         reviewer: Option<ElicitationReviewerHandle>,
         lifecycle: Option<ElicitationLifecycle>,
     ) -> bool {
         let Ok(mut authority) = self.authority.lock() else {
             return false;
         };
-        *authority = ElicitationAuthority {
-            approval_policy,
-            permission_profile,
+        *authority = Some(ElicitationAuthority {
+            config,
             reviewer,
             lifecycle,
-        };
+        });
         true
     }
 
@@ -213,7 +219,21 @@ impl ElicitationRequestManager {
                     });
                 }
 
-                let Ok(authority) = authority.lock().map(|authority| authority.clone()) else {
+                if elicitation
+                    .meta()
+                    .and_then(|meta| meta.get(APPROVAL_KIND_KEY))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(APPROVAL_KIND_TOOL_SUGGESTION)
+                {
+                    return Ok(ElicitationResponse {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
+                }
+
+                let Ok(Some(authority)) = authority.lock().map(|authority| authority.clone())
+                else {
                     return Ok(ElicitationResponse {
                         action: ElicitationAction::Decline,
                         content: None,
@@ -221,11 +241,19 @@ impl ElicitationRequestManager {
                     });
                 };
                 let ElicitationAuthority {
-                    approval_policy,
-                    permission_profile,
+                    config,
                     reviewer,
                     lifecycle,
                 } = authority;
+                let approval_policy = config.approval_policy.value();
+                let Some(permission_profile) = config.permission_profile_for_server(&server_name)
+                else {
+                    return Ok(ElicitationResponse {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
+                };
 
                 match elicitation
                     .meta()
@@ -253,8 +281,12 @@ impl ElicitationRequestManager {
                                 .await
                             {
                                 Ok(Some(response))
-                                    if response.action == ElicitationAction::Accept
+                                    if (response.action == ElicitationAction::Accept
                                         && response.content == Some(serde_json::json!({}))
+                                        || matches!(
+                                            response.action,
+                                            ElicitationAction::Decline | ElicitationAction::Cancel
+                                        ) && response.content.is_none())
                                         && response
                                             .meta
                                             .as_ref()
@@ -273,12 +305,12 @@ impl ElicitationRequestManager {
                     Some(_) => return Ok(strict_auto_review_decline()),
                 }
 
-                if mcp_permission_prompt_is_auto_approved(
+                let permission_prompt_is_auto_approved = mcp_permission_prompt_is_auto_approved(
                     approval_policy,
-                    &permission_profile,
+                    permission_profile,
                     McpPermissionPromptAutoApproveContext::default(),
-                ) && can_auto_accept_elicitation(&elicitation)
-                {
+                );
+                if permission_prompt_is_auto_approved && can_auto_accept_elicitation(&elicitation) {
                     return Ok(ElicitationResponse {
                         action: ElicitationAction::Accept,
                         content: Some(serde_json::json!({})),
@@ -286,22 +318,40 @@ impl ElicitationRequestManager {
                     });
                 }
 
-                if elicitation_is_rejected_by_policy(approval_policy) {
-                    return Ok(ElicitationResponse {
-                        action: ElicitationAction::Decline,
-                        content: None,
-                        meta: None,
-                    });
-                }
+                let should_surface_form_in_full_access = router.full_access_form_input_enabled()
+                    && permission_prompt_is_auto_approved
+                    && matches!(
+                        &elicitation,
+                        Elicitation::Mcp(
+                            rmcp::model::ElicitRequestParams::FormElicitationParams {
+                                meta,
+                                requested_schema,
+                                ..
+                            }
+                        ) if !requested_schema.properties.is_empty()
+                            && !meta
+                                .as_ref()
+                                .is_some_and(|meta| meta.contains_key(APPROVAL_KIND_KEY))
+                    );
 
-                if let Some(reviewer) = reviewer {
-                    let request = ElicitationReviewRequest {
-                        server_name: server_name.clone(),
-                        request_id: id.clone(),
-                        elicitation: elicitation.clone(),
-                    };
-                    if let Some(response) = reviewer.review(request).await? {
-                        return Ok(response);
+                if !should_surface_form_in_full_access {
+                    if elicitation_is_rejected_by_policy(approval_policy) {
+                        return Ok(ElicitationResponse {
+                            action: ElicitationAction::Decline,
+                            content: None,
+                            meta: None,
+                        });
+                    }
+
+                    if let Some(reviewer) = reviewer {
+                        let request = ElicitationReviewRequest {
+                            server_name: server_name.clone(),
+                            request_id: id.clone(),
+                            elicitation: elicitation.clone(),
+                        };
+                        if let Some(response) = reviewer.review(request).await? {
+                            return Ok(response);
+                        }
                     }
                 }
 
@@ -375,7 +425,7 @@ impl ElicitationRequestManager {
                     router: router.clone(),
                     key: request_key,
                 };
-                let _ = tx_event
+                tx_event
                     .send(Event {
                         id: "mcp_elicitation_request".to_string(),
                         msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
@@ -385,7 +435,8 @@ impl ElicitationRequestManager {
                             request,
                         }),
                     })
-                    .await;
+                    .await
+                    .context("failed to deliver MCP elicitation request")?;
                 rx.await
                     .context("elicitation request channel closed unexpectedly")
             }

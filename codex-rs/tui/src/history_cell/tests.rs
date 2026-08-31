@@ -50,6 +50,244 @@ fn test_cwd() -> PathBuf {
 }
 
 #[test]
+fn patch_preview_shows_minified_prefix_but_preserves_full_views() {
+    let changes = HashMap::from([(
+        PathBuf::from("metrics.json"),
+        FileChange::Add {
+            content: format!("[{}0]", "123,".repeat(/*n*/ 10_000)),
+        },
+    )]);
+    let cwd = test_cwd();
+    let cell = new_patch_event(changes.clone(), &cwd);
+
+    insta::assert_snapshot!(render_lines(&cell.display_lines(/*width*/ 80)).join("\n"), @"
+    • Added metrics.json (+1 -0)
+        1 +[123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,
+           123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,1
+           23,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,12
+           3,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123
+           ,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,
+           123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,1
+           23,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,12
+           3,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123
+           ,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,
+           123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,1
+           23,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,12
+           3,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123,123
+      … Diff preview limited (ctrl + t to view transcript).
+    ");
+    assert_eq!(
+        cell.transcript_lines(/*width*/ 80),
+        create_diff_summary(&changes, &cwd, /*wrap_cols*/ 80),
+    );
+    assert_eq!(
+        cell.raw_lines(),
+        plain_lines(create_diff_summary(&changes, &cwd, RAW_DIFF_SUMMARY_WIDTH)),
+    );
+}
+
+#[test]
+fn patch_preview_limits_add_delete_and_update_content() {
+    for content in [
+        "value\n".repeat(/*n*/ 20),
+        format!("short\n{}\ntail\n", "界123\t".repeat(/*n*/ 100)),
+    ] {
+        for change in [
+            FileChange::Add {
+                content: content.clone(),
+            },
+            FileChange::Delete {
+                content: content.clone(),
+            },
+            FileChange::Update {
+                unified_diff: diffy::create_patch("", &content).to_string(),
+                move_path: Some(PathBuf::from("renamed.txt")),
+            },
+            FileChange::Update {
+                unified_diff: diffy::create_patch(&content, "").to_string(),
+                move_path: None,
+            },
+            FileChange::Update {
+                unified_diff: diffy::DiffOptions::new()
+                    .set_context_len(/*context_len*/ 20)
+                    .create_patch(&content, &format!("{content}new\n"))
+                    .to_string(),
+                move_path: None,
+            },
+        ] {
+            let changes = HashMap::from([(PathBuf::from("values.txt"), change)]);
+            let cwd = test_cwd();
+            let cell = new_patch_event(changes.clone(), &cwd);
+            let full = create_diff_summary(&changes, &cwd, /*wrap_cols*/ 80);
+            let mut expected = full[..13].to_vec();
+            expected.push(
+                "  … Diff preview limited (ctrl + t to view transcript)."
+                    .dim()
+                    .into(),
+            );
+            assert_eq!(cell.display_lines(/*width*/ 80), expected);
+            assert_eq!(cell.transcript_lines(/*width*/ 80), full);
+        }
+    }
+}
+
+#[test]
+fn patch_preview_shares_content_budget_and_keeps_file_summaries() {
+    let changes = HashMap::from([
+        (
+            PathBuf::from("a.txt"),
+            FileChange::Add {
+                content: "a\n".repeat(/*n*/ 11) + &"©️ ".repeat(/*n*/ 36),
+            },
+        ),
+        (
+            PathBuf::from("b.txt"),
+            FileChange::Add {
+                content: "b\n".repeat(/*n*/ 10),
+            },
+        ),
+        (
+            PathBuf::from("c.txt"),
+            FileChange::Add {
+                content: "c\n".into(),
+            },
+        ),
+    ]);
+    let cell = new_patch_event(changes, &test_cwd());
+    insta::assert_snapshot!(render_lines(&cell.display_lines(/*width*/ 80)).join("\n"), @"
+    • Edited 3 files (+23 -0)
+      └ a.txt (+12 -0)
+         1 +a
+         2 +a
+         3 +a
+         4 +a
+         5 +a
+         6 +a
+         7 +a
+         8 +a
+         9 +a
+        10 +a
+        11 +a
+        12 +©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️ ©️
+
+      └ b.txt (+10 -0)
+
+      └ c.txt (+1 -0)
+      … Diff preview limited (ctrl + t to view transcript).
+    ");
+}
+
+#[test]
+fn patch_preview_budgets_wrapped_rows_at_narrow_widths() {
+    for content in [
+        "0123456789".repeat(/*n*/ 1_000),
+        "ｶﾞ".repeat(/*n*/ 1_000),
+        "0123456789\n".repeat(/*n*/ 20),
+        format!("{}\n", "界\tvalue".repeat(/*n*/ 100)).repeat(/*n*/ 20),
+        format!("{}\n", "\u{a9}\u{fe0f}".repeat(/*n*/ 50)).repeat(/*n*/ 20),
+    ] {
+        let changes = HashMap::from([(PathBuf::from("values.txt"), FileChange::Add { content })]);
+        let cell = new_patch_event(changes, &test_cwd());
+        for width in [8, 16, 40, 80] {
+            let lines = cell.display_lines(width);
+            let body = lines[1..lines.len() - 1].to_vec();
+            let rows = Paragraph::new(body)
+                .wrap(Wrap { trim: false })
+                .line_count(width);
+            assert_eq!(rows, 12);
+        }
+    }
+}
+
+#[test]
+fn patch_preview_preserves_small_diffs_and_exact_budget() {
+    for count in [1, 12] {
+        let mut changes = HashMap::from([(
+            PathBuf::from("small.rs"),
+            FileChange::Add {
+                content: "let value = 1;\n".repeat(count),
+            },
+        )]);
+        changes.extend([
+            (
+                PathBuf::from("z-empty"),
+                FileChange::Add {
+                    content: String::new(),
+                },
+            ),
+            (
+                PathBuf::from("z-renamed"),
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: Some(PathBuf::from("renamed")),
+                },
+            ),
+        ]);
+        let cwd = test_cwd();
+        let cell = new_patch_event(changes.clone(), &cwd);
+        assert_eq!(
+            cell.display_lines(/*width*/ 80),
+            create_diff_summary(&changes, &cwd, /*wrap_cols*/ 80),
+        );
+    }
+}
+
+#[test]
+fn patch_preview_caps_zero_width_source_before_later_content() {
+    let make_changes: [fn(String) -> FileChange; 3] = [
+        |content| FileChange::Add { content },
+        |content| FileChange::Delete { content },
+        |content| FileChange::Update {
+            unified_diff: diffy::create_patch("", &content).to_string(),
+            move_path: None,
+        },
+    ];
+    let cwd = test_cwd();
+    let content = format!("head\nxy{}\ntail\n", "\u{301}".repeat(/*n*/ 40_000));
+    let mut summaries = Vec::new();
+    for make_change in make_changes {
+        let changes = HashMap::from([
+            (PathBuf::from("a.txt"), make_change(content.clone())),
+            (PathBuf::from("b.txt"), make_change("later\n".into())),
+        ]);
+        let cell = new_patch_event(changes.clone(), &cwd);
+        let preview = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+        // The next two-byte combining mark straddles the 64 KiB boundary.
+        assert_eq!(preview.matches('\u{301}').count(), 32_764);
+        summaries.push(preview.replace('\u{301}', ""));
+        assert_eq!(
+            cell.transcript_lines(/*width*/ 80),
+            create_diff_summary(&changes, &cwd, /*wrap_cols*/ 80)
+        );
+    }
+    insta::assert_snapshot!(summaries.join("\n\n"), @"
+    • Edited 2 files (+4 -0)
+      └ a.txt (+3 -0)
+        1 +head
+        2 +xy
+
+      └ b.txt (+1 -0)
+      … Diff preview limited (ctrl + t to view transcript).
+
+    • Edited 2 files (+0 -4)
+      └ a.txt (+0 -3)
+        1 -head
+        2 -xy
+
+      └ b.txt (+0 -1)
+      … Diff preview limited (ctrl + t to view transcript).
+
+    • Edited 2 files (+4 -0)
+      └ a.txt (+3 -0)
+        1 +head
+        2 +xy
+
+      └ b.txt (+1 -0)
+      … Diff preview limited (ctrl + t to view transcript).
+    ");
+}
+
+#[test]
 fn streaming_agent_tail_blank_line_uses_one_viewport_row() {
     let cell = StreamingAgentTailCell::new(
         vec![
@@ -752,7 +990,14 @@ fn ps_output_multiline_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_snapshot() {
-    let cell = new_cyber_policy_error_event();
+    let cell = new_cyber_policy_error_event(/*plan_type*/ None);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    insta::assert_snapshot!(rendered);
+}
+
+#[test]
+fn cyber_policy_error_event_individual_snapshot() {
+    let cell = new_cyber_policy_error_event(Some(PlanType::Pro));
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -766,7 +1011,7 @@ fn safety_access_block_event_snapshot() {
 
 #[test]
 fn cyber_policy_error_event_narrow_snapshot() {
-    let cell = new_cyber_policy_error_event();
+    let cell = new_cyber_policy_error_event(/*plan_type*/ None);
     let rendered = render_lines(&cell.display_lines(/*width*/ 36)).join("\n");
     insta::assert_snapshot!(rendered);
 }
@@ -964,6 +1209,8 @@ async fn mcp_tools_output_lists_tools_for_hyphenated_server_names() {
 fn mcp_tools_output_from_statuses_renders_status_only_servers() {
     let statuses = vec![McpServerStatus {
         name: "plugin_docs".to_string(),
+        runtime_status: None,
+        plugin_id: None,
         server_info: None,
         tools: HashMap::from([(
             "lookup".to_string(),
@@ -994,6 +1241,8 @@ fn mcp_tools_output_from_statuses_renders_status_only_servers() {
 fn mcp_tools_output_from_statuses_renders_verbose_inventory() {
     let statuses = vec![McpServerStatus {
         name: "plugin_docs".to_string(),
+        runtime_status: None,
+        plugin_id: None,
         server_info: None,
         tools: HashMap::from([(
             "lookup".to_string(),
@@ -1301,6 +1550,97 @@ fn active_mcp_tool_call_snapshot() {
 }
 
 #[test]
+fn code_mode_tool_call_uses_title_and_preserves_full_transcript() {
+    let output = format!("{} transcript tail", "0123456789".repeat(20));
+    let mut cell = new_active_mcp_tool_call(
+        "call-code-mode".into(),
+        McpInvocation {
+            server: "node_repl".into(),
+            tool: "js".into(),
+            arguments: Some(json!({
+                "title": "Inspect Spotify workspace",
+                "code": "await tools.exec_command({ cmd: 'git status' })",
+            })),
+        },
+        /*animations_enabled*/ false,
+    );
+    cell.complete(
+        Duration::ZERO,
+        Ok(CallToolResult {
+            content: vec![
+                text_block("Script completed\nWall time 0.1 seconds\nOutput:\n"),
+                text_block(
+                    &json!({"chunk_id": "chunk-1", "output": output, "exit_code": 0}).to_string(),
+                ),
+            ],
+            is_error: None,
+            structured_content: None,
+            meta: None,
+        }),
+    );
+
+    let history = render_lines(&cell.display_lines(/*width*/ 40)).join("\n");
+    let transcript = render_lines(&cell.transcript_lines(/*width*/ 180)).join("\n");
+    insta::assert_snapshot!(format!("history:\n{history}\n\ntranscript:\n{transcript}"), @r#"
+    history:
+    • Called Inspect Spotify workspace
+      └ 012345678901234567890123456789012345
+            67890123456789012345678901234567
+            89012345678901234567890123456789
+            01234567890123456789012345678901
+            23456789012345678901234567890123
+            45678901...
+
+    transcript:
+    • Called node_repl.js({"title":"Inspect Spotify workspace","code":"await tools.exec_command({ cmd: 'git status' })"})
+      └ Script completed
+        Wall time 0.1 seconds
+        Output:
+        {"chunk_id":"chunk-
+            1","output":"012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678
+            90123456789012345678901234567890123456789 transcript tail","exit_code":0}
+    "#);
+}
+
+#[test]
+fn code_mode_tool_call_preserves_failure_details() {
+    let mut cell = new_active_mcp_tool_call(
+        "call-code-mode-failed".into(),
+        McpInvocation {
+            server: "node_repl".into(),
+            tool: "js".into(),
+            arguments: Some(json!({"title": "Inspect workspace", "code": "throw Error('denied')"})),
+        },
+        /*animations_enabled*/ false,
+    );
+    cell.complete(
+        Duration::ZERO,
+        Ok(CallToolResult {
+            content: vec![text_block("Script failed\nOutput:\npermission denied")],
+            is_error: Some(true),
+            structured_content: None,
+            meta: None,
+        }),
+    );
+
+    let history = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    let transcript = render_lines(&cell.transcript_lines(/*width*/ 120)).join("\n");
+    insta::assert_snapshot!(format!("history:\n{history}\n\ntranscript:\n{transcript}"), @r#"
+    history:
+    • Called Inspect workspace
+      └ Script failed
+        Output:
+        permission denied
+
+    transcript:
+    • Called node_repl.js({"title":"Inspect workspace","code":"throw Error('denied')"})
+      └ Script failed
+        Output:
+        permission denied
+    "#);
+}
+
+#[test]
 fn mcp_inventory_loading_snapshot() {
     let cell = new_mcp_inventory_loading(/*animations_enabled*/ true);
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
@@ -1316,6 +1656,14 @@ fn mcp_inventory_loading_without_animations_is_stable() {
 
     assert_eq!(first, second);
     assert_eq!(first, vec!["• Loading MCP inventory…".to_string()]);
+}
+
+#[test]
+fn thread_recap_loading_without_animations_snapshot() {
+    let cell = ThreadRecapLoadingCell::new(/*animations_enabled*/ false);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+
+    insta::assert_snapshot!(rendered, @"• Generating conversation recap…");
 }
 
 #[test]
@@ -2133,6 +2481,61 @@ fn user_history_cell_wraps_and_prefixes_each_line_snapshot() {
 }
 
 #[test]
+fn user_history_cell_wraps_long_urls_inside_the_message_gutter() {
+    let url = "https://example.test/forwarded/threads/10930?page=1&search=&filter=all&queue=customer_support_unprocessed&sort=latest_desc&forwardedScope=all";
+    let message = format!(
+        "Skip tests.\n\nI just reprocessed\n{url}\ncan you check where we are with it?\n\n[Image #1]"
+    );
+    let image_start = message.find("[Image #1]").unwrap();
+    let cell = UserHistoryCell {
+        message,
+        text_elements: vec![TextElement::new(
+            (image_start..image_start + "[Image #1]".len()).into(),
+            Some("[Image #1]".to_string()),
+        )],
+        local_image_paths: Vec::new(),
+        remote_image_urls: Vec::new(),
+    };
+    let width = 64;
+    let hyperlink_lines = cell.display_hyperlink_lines(width);
+
+    assert!(
+        hyperlink_lines
+            .iter()
+            .all(|line| line.width() <= usize::from(width)),
+        "every user-message row must fit its viewport: {hyperlink_lines:?}"
+    );
+
+    let linked_rows = hyperlink_lines
+        .iter()
+        .filter(|line| !line.hyperlinks.is_empty())
+        .collect::<Vec<_>>();
+    assert!(linked_rows.len() > 1, "expected the long URL to wrap");
+    assert!(
+        linked_rows.iter().all(|line| {
+            line.line
+                .spans
+                .first()
+                .is_some_and(|span| span.content == "  ")
+        }),
+        "wrapped URL rows must retain the user-message gutter: {linked_rows:?}"
+    );
+    assert!(
+        linked_rows.iter().all(|line| {
+            line.hyperlinks
+                .iter()
+                .all(|hyperlink| hyperlink.destination == url)
+        }),
+        "each wrapped URL fragment must preserve the complete clickable destination"
+    );
+
+    insta::assert_snapshot!(
+        "user_history_cell_wraps_long_urls_inside_the_message_gutter",
+        render_lines(&cell.display_lines(width)).join("\n")
+    );
+}
+
+#[test]
 fn user_history_cell_renders_remote_image_urls() {
     let cell = UserHistoryCell {
         message: "describe these".to_string(),
@@ -2271,7 +2674,7 @@ fn render_uses_wrapping_for_long_url_like_line() {
         .map(|y| {
             (0..area.width)
                 .map(|x| {
-                    let symbol = buf[(x, y)].symbol();
+                    let symbol = crate::terminal_hyperlinks::strip_osc8(buf[(x, y)].symbol());
                     if symbol.is_empty() {
                         ' '
                     } else {
@@ -2282,10 +2685,22 @@ fn render_uses_wrapping_for_long_url_like_line() {
         })
         .collect::<Vec<_>>();
     let rendered_blob = rendered.join("\n");
+    let rendered_url = rendered
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .enumerate()
+        .map(|(index, row)| {
+            if index == 0 {
+                row.strip_prefix("› ").unwrap().trim()
+            } else {
+                row.trim()
+            }
+        })
+        .collect::<String>();
 
-    assert!(
-        rendered_blob.contains("session_id=abc123"),
-        "expected URL tail to be visible after wrapping, got:\n{rendered_blob}"
+    assert_eq!(
+        rendered_url, url,
+        "wrapped URL must preserve every character"
     );
 
     let non_empty_rows = rendered.iter().filter(|row| !row.trim().is_empty()).count() as u16;

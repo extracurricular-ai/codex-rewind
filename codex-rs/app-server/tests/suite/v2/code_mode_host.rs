@@ -25,25 +25,25 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 60);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn app_server_shares_flag_selected_code_mode_host_across_threads() -> Result<()> {
+async fn app_server_shares_flag_selected_grpc_code_mode_host_across_threads() -> Result<()> {
     let host_program = codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?;
-    let mut websocket_host = Command::new(host_program)
-        .args(["--listen", "ws://127.0.0.1:0"])
+    let mut code_mode_host = Command::new(host_program)
+        .args(["--listen", "grpc://127.0.0.1:0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .context("failed to start websocket code-mode host")?;
-    let stdout = websocket_host
+        .context("failed to start remote code-mode host")?;
+    let stdout = code_mode_host
         .stdout
         .take()
-        .context("websocket code-mode host stdout was not captured")?;
+        .context("remote code-mode host stdout was not captured")?;
     let mut lines = BufReader::new(stdout).lines();
-    let websocket_url = timeout(DEFAULT_READ_TIMEOUT, lines.next_line())
+    let host_url = timeout(DEFAULT_READ_TIMEOUT, lines.next_line())
         .await
-        .context("timed out waiting for websocket code-mode host URL")??
-        .context("websocket code-mode host exited before publishing its URL")?;
+        .context("timed out waiting for remote code-mode host URL")??
+        .context("remote code-mode host exited before publishing its URL")?;
 
     let model_server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_sequence(
@@ -82,11 +82,12 @@ async fn app_server_shares_flag_selected_code_mode_host_across_threads() -> Resu
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&model_server.uri())
         .enable_feature(Feature::CodeModeOnly)
+        .enable_feature(Feature::CodeModePrewarm)
         .write(codex_home.path())?;
     let original_config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .with_args(&["--code-mode-host", &websocket_url])
+        .with_args(&["--code-mode-host", &host_url])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
 
@@ -133,5 +134,34 @@ async fn app_server_shares_flag_selected_code_mode_host_across_threads() -> Resu
         original_config
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_prewarms_flag_selected_grpc_code_mode_host_before_first_turn() -> Result<()> {
+    let model_server = responses::start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&model_server.uri())
+        .enable_feature(Feature::CodeModePrewarm)
+        .write(codex_home.path())?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let host_url = format!("http://{}", listener.local_addr()?);
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_args(&["--code-mode-host", &host_url])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    app_server
+        .start_thread(ThreadStartParams::default())
+        .await?;
+
+    let (_stalled_connection, _) = timeout(DEFAULT_READ_TIMEOUT, listener.accept())
+        .await
+        .context("code-mode host was not contacted before the first turn")??;
+    let status = timeout(Duration::from_secs(5), app_server.shutdown_gracefully())
+        .await
+        .context("stalled code-mode prewarm blocked thread shutdown")??;
+    assert!(status.success(), "app-server did not exit successfully");
     Ok(())
 }

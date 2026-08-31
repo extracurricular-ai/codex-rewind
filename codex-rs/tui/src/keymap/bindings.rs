@@ -8,6 +8,7 @@ use super::RuntimeKeymap;
 use crate::key_hint::KeyBinding;
 use codex_config::types::KeybindingsSpec;
 use codex_config::types::TuiKeymap;
+use std::sync::Arc;
 
 /// Config context in which a keymap action is active.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -21,6 +22,7 @@ pub(crate) enum KeymapContext {
     VimTextObject,
     Pager,
     List,
+    Agents,
     Approval,
 }
 
@@ -36,6 +38,7 @@ impl KeymapContext {
             Self::VimTextObject => "vim_text_object",
             Self::Pager => "pager",
             Self::List => "list",
+            Self::Agents => "agents",
             Self::Approval => "approval",
         }
     }
@@ -56,6 +59,8 @@ impl KeymapContext {
             (self, other),
             (Self::List, Self::Approval)
                 | (Self::Approval, Self::List)
+                | (Self::List, Self::Agents)
+                | (Self::Agents, Self::List)
                 | (Self::Chat, Self::List)
                 | (Self::List, Self::Chat)
         ) || self.is_shared_main() && other.is_main_editor()
@@ -92,6 +97,15 @@ impl KeymapActionId {
 pub(super) struct RuntimeActionBinding<'a> {
     pub(super) id: KeymapActionId,
     pub(super) bindings: &'a [KeyBinding],
+}
+
+macro_rules! runtime_group_mut {
+    ($runtime_keymap:expr, editor) => {
+        Arc::make_mut(&mut $runtime_keymap.editor)
+    };
+    ($runtime_keymap:expr, $group:ident) => {
+        &mut $runtime_keymap.$group
+    };
 }
 
 macro_rules! define_runtime_action_bindings {
@@ -176,7 +190,7 @@ macro_rules! define_runtime_action_bindings {
                 $(
                     $(
                         ($context, stringify!($action)) => {
-                            runtime_keymap.$group.$action.push(binding);
+                            runtime_group_mut!(runtime_keymap, $group).$action.push(binding);
                             true
                         }
                     )+
@@ -211,6 +225,7 @@ macro_rules! define_runtime_action_bindings {
 
 define_runtime_action_bindings! {
     "global" => Global, app, global [
+        open_agents,
         open_transcript,
         open_external_editor,
         copy,
@@ -224,6 +239,8 @@ define_runtime_action_bindings! {
         interrupt_turn,
         decrease_reasoning_effort,
         increase_reasoning_effort,
+        previous_permission_mode,
+        next_permission_mode,
         edit_queued_message,
     ],
     "composer" => Composer, composer, composer [
@@ -268,7 +285,15 @@ define_runtime_action_bindings! {
         move_word_end,
         move_line_start,
         move_line_end,
+        find_forward,
+        find_backward,
+        till_forward,
+        till_backward,
+        jump_top,
+        jump_bottom,
         delete_char,
+        replace_char,
+        repeat_last_change,
         substitute_char,
         delete_to_line_end,
         change_to_line_end,
@@ -291,6 +316,12 @@ define_runtime_action_bindings! {
         motion_word_end,
         motion_line_start,
         motion_line_end,
+        motion_find_forward,
+        motion_find_backward,
+        motion_till_forward,
+        motion_till_backward,
+        motion_jump_top,
+        motion_jump_bottom,
         select_inner_text_object,
         select_around_text_object,
         cancel,
@@ -329,6 +360,13 @@ define_runtime_action_bindings! {
         jump_bottom,
         accept,
         cancel,
+    ],
+    "agents" => Agents, agents, agents [
+        search,
+        new_task,
+        rename,
+        stop,
+        toggle_grouping,
     ],
     "approval" => Approval, approval, approval [
         open_fullscreen,

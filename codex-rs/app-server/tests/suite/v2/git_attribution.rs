@@ -14,6 +14,7 @@ use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadRollbackParams;
@@ -25,8 +26,8 @@ use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_rollout::RolloutItem;
+use codex_rollout::RolloutLine;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
@@ -147,6 +148,7 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
                 "chatgpt_base_url".to_string(),
                 json!(format!("{}/backend-api", settings_server.uri())),
             )])),
+            history_mode: Some(ThreadHistoryMode::Legacy),
             ..Default::default()
         })
         .await?;
@@ -333,8 +335,8 @@ fn replace_attribution_fragment_with_legacy(
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let mut line = serde_json::from_str::<RolloutLine>(line)?;
-            if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) =
-                &mut line.item
+            if let RolloutItem::ResponseItem(response_item) = &mut line.item
+                && let ResponseItem::Message { role, content, .. } = &mut response_item.item
                 && role == "developer"
             {
                 for item in content {
@@ -354,8 +356,7 @@ fn replace_attribution_fragment_with_legacy(
                 }
             }
             if let RolloutItem::WorldState(world_state) = &mut line.item
-                && let Some(state) = world_state.state.as_object_mut()
-                && state.remove("git_attribution").is_some()
+                && world_state.state.remove("git_attribution").is_some()
             {
                 removed_saved_attribution = true;
             }

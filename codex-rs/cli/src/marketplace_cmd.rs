@@ -3,10 +3,10 @@ use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
 use codex_core::config::Config;
-use codex_core::config::find_codex_home;
+use codex_core::config::LoaderOverrides;
+use codex_core::plugins_manager_for_config;
 use codex_core_plugins::PluginMarketplaceUpgradeOutcome;
 use codex_core_plugins::PluginsConfigInput;
-use codex_core_plugins::PluginsManager;
 use codex_core_plugins::installed_marketplaces::marketplace_install_root;
 use codex_core_plugins::installed_marketplaces::resolve_configured_marketplace_root;
 use codex_core_plugins::marketplace::marketplace_root_dir;
@@ -23,10 +23,11 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::cloud_config;
 use crate::plugin_cmd::JsonMarketplaceSource;
 use crate::plugin_cmd::configured_marketplace_snapshot_issues;
 use crate::plugin_cmd::configured_marketplace_sources;
-use crate::plugin_cmd::load_cli_auth_mode;
+use crate::plugin_cmd::load_cli_auth_manager;
 
 #[derive(Debug, Parser)]
 #[command(bin_name = "codex plugin marketplace")]
@@ -127,22 +128,21 @@ impl MarketplaceCli {
             subcommand,
         } = self;
 
-        let overrides = config_overrides
-            .parse_overrides()
-            .map_err(anyhow::Error::msg)?;
+        let config =
+            cloud_config::load_config(&config_overrides, LoaderOverrides::default()).await?;
 
         match subcommand {
-            MarketplaceSubcommand::Add(args) => run_add(overrides, args).await?,
-            MarketplaceSubcommand::List(args) => run_list(overrides, args).await?,
-            MarketplaceSubcommand::Upgrade(args) => run_upgrade(overrides, args).await?,
-            MarketplaceSubcommand::Remove(args) => run_remove(args).await?,
+            MarketplaceSubcommand::Add(args) => run_add(config, args).await?,
+            MarketplaceSubcommand::List(args) => run_list(config, args).await?,
+            MarketplaceSubcommand::Upgrade(args) => run_upgrade(config, args).await?,
+            MarketplaceSubcommand::Remove(args) => run_remove(config, args).await?,
         }
 
         Ok(())
     }
 }
 
-async fn run_add(overrides: Vec<(String, toml::Value)>, args: AddMarketplaceArgs) -> Result<()> {
+async fn run_add(config: Config, args: AddMarketplaceArgs) -> Result<()> {
     let AddMarketplaceArgs {
         source,
         ref_name,
@@ -150,9 +150,6 @@ async fn run_add(overrides: Vec<(String, toml::Value)>, args: AddMarketplaceArgs
         json,
     } = args;
 
-    let config = Config::load_with_cli_overrides(overrides)
-        .await
-        .context("failed to load configuration")?;
     let outcome = add_marketplace(
         config.codex_home.to_path_buf(),
         config.config_layer_stack.requirements().clone(),
@@ -207,12 +204,8 @@ impl JsonMarketplaceAddOutput {
     }
 }
 
-async fn run_list(overrides: Vec<(String, toml::Value)>, args: ListMarketplaceArgs) -> Result<()> {
-    let config = Config::load_with_cli_overrides(overrides)
-        .await
-        .context("failed to load configuration")?;
-    let manager = PluginsManager::new(config.codex_home.to_path_buf());
-    manager.set_auth_mode(load_cli_auth_mode(&config).await);
+async fn run_list(config: Config, args: ListMarketplaceArgs) -> Result<()> {
+    let manager = plugins_manager_for_config(&config, load_cli_auth_manager(&config).await?);
     let plugins_input = config.plugins_config_input();
     let marketplace_listing = manager
         .discover_marketplaces_for_config(&plugins_input, &[])
@@ -342,10 +335,8 @@ fn configured_marketplace_sources_by_root(
     plugins_input: &PluginsConfigInput,
 ) -> HashMap<PathBuf, JsonMarketplaceSource> {
     let marketplace_sources = configured_marketplace_sources(plugins_input, codex_home);
-    let Some(user_config) = plugins_input.config_layer_stack.effective_user_config() else {
-        return HashMap::new();
-    };
-    let Some(marketplaces) = user_config
+    let effective_config = plugins_input.config_layer_stack.effective_config();
+    let Some(marketplaces) = effective_config
         .get("marketplaces")
         .and_then(toml::Value::as_table)
     else {
@@ -367,19 +358,12 @@ fn configured_marketplace_sources_by_root(
         .collect()
 }
 
-async fn run_upgrade(
-    overrides: Vec<(String, toml::Value)>,
-    args: UpgradeMarketplaceArgs,
-) -> Result<()> {
+async fn run_upgrade(config: Config, args: UpgradeMarketplaceArgs) -> Result<()> {
     let UpgradeMarketplaceArgs {
         marketplace_name,
         json,
     } = args;
-    let config = Config::load_with_cli_overrides(overrides)
-        .await
-        .context("failed to load configuration")?;
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
-    let manager = PluginsManager::new(codex_home.to_path_buf());
+    let manager = plugins_manager_for_config(&config, load_cli_auth_manager(&config).await?);
     let plugins_input = config.plugins_config_input();
     let outcome = manager
         .upgrade_configured_marketplaces_for_config(&plugins_input, marketplace_name.as_deref())
@@ -391,14 +375,14 @@ async fn run_upgrade(
     }
 }
 
-async fn run_remove(args: RemoveMarketplaceArgs) -> Result<()> {
+async fn run_remove(config: Config, args: RemoveMarketplaceArgs) -> Result<()> {
     let RemoveMarketplaceArgs {
         marketplace_name,
         json,
     } = args;
-    let codex_home = find_codex_home().context("failed to resolve CODEX_HOME")?;
     let outcome = remove_marketplace(
-        codex_home.to_path_buf(),
+        config.codex_home.to_path_buf(),
+        config.config_layer_stack,
         MarketplaceRemoveRequest { marketplace_name },
     )
     .await?;

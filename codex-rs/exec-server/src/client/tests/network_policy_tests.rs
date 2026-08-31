@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCMessage;
+use codex_exec_server_protocol::JSONRPCNotification;
 use codex_exec_server_protocol::JSONRPCRequest;
 use codex_exec_server_protocol::JSONRPCResponse;
 use codex_exec_server_protocol::RequestId;
@@ -10,15 +12,25 @@ use codex_http_client::OutboundProxyPolicy;
 use codex_network_proxy::NetworkDecision;
 use codex_network_proxy::NetworkPolicyDecider;
 use codex_network_proxy::NetworkPolicyRequest;
+use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_utils_path_uri::PathUri;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::InMemorySpanExporter;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use pretty_assertions::assert_eq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::prelude::*;
 
 use super::super::LazyRemoteExecServerClient;
+use super::super::NetworkPolicyAuditContext;
 use super::super::NetworkPolicyDecisionController;
+use super::super::SessionState;
+use super::super::handle_server_notification;
 use super::accept_websocket;
 use super::complete_websocket_initialize;
 use super::read_jsonrpc_websocket;
@@ -31,7 +43,9 @@ use crate::protocol::ExecParams;
 use crate::protocol::ExecServerNetworkPolicyDecision;
 use crate::protocol::ExecServerNetworkPolicyRequest;
 use crate::protocol::ExecServerNetworkProtocol;
+use crate::protocol::NETWORK_POLICY_DECISION_METHOD;
 use crate::protocol::NETWORK_POLICY_REQUEST_METHOD;
+use crate::protocol::NetworkPolicyDecisionNotification;
 use crate::protocol::NetworkPolicyRequestParams;
 use crate::protocol::NetworkPolicyRequestResponse;
 use crate::rpc_server_requests::MAX_IN_FLIGHT_SERVER_CALLS;
@@ -74,6 +88,130 @@ async fn read_decision(
     serde_json::from_value::<NetworkPolicyRequestResponse>(response.result)
         .expect("policy response should deserialize")
         .decision
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn policy_decisions_reject_forged_process_and_use_trusted_controller_metadata() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let websocket_url = format!("ws://{}", listener.local_addr().expect("listener address"));
+    let (release_tx, release_rx) = oneshot::channel();
+    let (initialized_tx, initialized_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut websocket = accept_websocket(&listener).await;
+        complete_websocket_initialize(
+            &mut websocket,
+            "audit-session",
+            /*expected_resume_session_id*/ None,
+        )
+        .await;
+        initialized_tx
+            .send(())
+            .expect("client should await completed WebSocket initialization");
+        release_rx.await.expect("server should be released");
+    });
+
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer_logs = Arc::clone(&logs);
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || AuditLogWriter(Arc::clone(&writer_logs))),
+    );
+    async move {
+        let client = LazyRemoteExecServerClient::new(
+            ExecServerTransportParams::websocket_url(websocket_url, Duration::from_secs(1)),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .get()
+        .await
+        .expect("client should connect");
+        initialized_rx
+            .await
+            .expect("server should complete WebSocket initialization");
+        let mut state = SessionState::new(/*recoverable*/ true);
+        state.network_policy.audit = Some(NetworkPolicyAuditContext {
+            metadata: NetworkProxyAuditMetadata {
+                conversation_id: Some("trusted-conversation".to_string()),
+                user_account_id: Some("trusted-account".to_string()),
+                ..NetworkProxyAuditMetadata::default()
+            },
+            execution_id: Some("trusted-execution".to_string()),
+        });
+        client
+            .inner
+            .insert_session(&ProcessId::from("trusted-process"), Arc::new(state))
+            .expect("trusted process should register");
+        for (process_id, host) in [
+            ("forged-process", "forged.example"),
+            ("trusted-process", "trusted.example"),
+        ] {
+            handle_server_notification(
+                &client.inner,
+                JSONRPCNotification {
+                    method: NETWORK_POLICY_DECISION_METHOD.to_string(),
+                    params: Some(
+                        serde_json::to_value(NetworkPolicyDecisionNotification {
+                            process_id: ProcessId::from(process_id),
+                            timestamp: "2026-08-11T12:00:00.000Z".to_string(),
+                            scope: "domain".to_string(),
+                            decision: "deny".to_string(),
+                            source: "baseline_policy".to_string(),
+                            reason: "not_allowed".to_string(),
+                            protocol: ExecServerNetworkProtocol::HttpsConnect,
+                            host: host.to_string(),
+                            port: 443,
+                            method: None,
+                            client: None,
+                            policy_override: false,
+                        })
+                        .expect("network policy decision should serialize"),
+                    ),
+                },
+            )
+            .await
+            .expect("controller should handle network policy notification");
+        }
+        let output = String::from_utf8(
+            logs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("audit log should be UTF-8");
+        assert!(!output.contains("forged.example"));
+        for expected in [
+            "codex_otel.log_only",
+            "trusted-conversation",
+            "trusted-account",
+            "trusted-execution",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing `{expected}` in {output}"
+            );
+        }
+        release_tx.send(()).expect("server should be released");
+    }
+    .with_subscriber(subscriber)
+    .await;
+    server.await.expect("server should finish");
+}
+
+struct AuditLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for AuditLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -132,6 +270,7 @@ async fn abandoned_process_start_unregisters_and_cleans_up() {
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                 .expect("cwd URI"),
+            shell_snapshot: None,
             env_policy: None,
             env: Default::default(),
             tty: false,
@@ -155,7 +294,8 @@ async fn abandoned_process_start_unregisters_and_cleans_up() {
         Arc::new(|_request: NetworkPolicyRequest| async { NetworkDecision::Allow });
     let decider_weak = Arc::downgrade(&decider);
     state
-        .network_policy_controller
+        .network_policy
+        .controller
         .store(Some(Arc::new(NetworkPolicyDecisionController {
             decider,
             timeout: Duration::from_secs(30),
@@ -163,7 +303,7 @@ async fn abandoned_process_start_unregisters_and_cleans_up() {
 
     start.abort();
     assert!(start.await.is_err_and(|error| error.is_cancelled()));
-    assert!(state.network_policy_cancelled.is_cancelled());
+    assert!(state.network_policy.cancelled.is_cancelled());
     assert!(client.inner.get_session(&process_id).is_none());
     assert!(decider_weak.upgrade().is_none());
 
@@ -173,6 +313,18 @@ async fn abandoned_process_start_unregisters_and_cleans_up() {
 
 #[tokio::test]
 async fn policy_requests_use_process_decider_and_cancel_on_unregister() {
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer_provider.tracer("exec-server-test"))
+            .with_filter(filter_fn(codex_otel::OtelProvider::trace_export_filter)),
+    );
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -293,6 +445,13 @@ async fn policy_requests_use_process_decider_and_cancel_on_unregister() {
         let started_tx = started_tx.clone();
         let dropped_tx = dropped_tx.clone();
         async move {
+            assert_eq!(
+                tracing::Span::current()
+                    .metadata()
+                    .map(tracing::Metadata::name),
+                Some("codex.exec_server.request"),
+                "network policy decisions must run inside the inbound request span"
+            );
             match request.host.as_str() {
                 "allowed.example" => NetworkDecision::Allow,
                 "denied.example" => NetworkDecision::deny("blocked"),
@@ -305,7 +464,7 @@ async fn policy_requests_use_process_decider_and_cancel_on_unregister() {
             }
         }
     });
-    session.state.network_policy_controller.store(Some(Arc::new(
+    session.state.network_policy.controller.store(Some(Arc::new(
         NetworkPolicyDecisionController {
             decider,
             timeout: Duration::from_secs(30),
@@ -343,4 +502,40 @@ async fn policy_requests_use_process_decider_and_cancel_on_unregister() {
         .await
         .expect("policy routing should finish")
         .expect("server task should finish");
+
+    tracer_provider.force_flush().expect("flush traces");
+    let spans = span_exporter.get_finished_spans().expect("span export");
+    let policy_spans = spans
+        .iter()
+        .filter(|span| span.name.as_ref() == NETWORK_POLICY_REQUEST_METHOD)
+        .collect::<Vec<_>>();
+    assert!(
+        !policy_spans.is_empty(),
+        "network policy requests should export server spans"
+    );
+    let outcomes = policy_spans
+        .iter()
+        .map(|span| {
+            span.attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == "result")
+                .map(|attribute| attribute.value.as_str().into_owned())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        outcomes.iter().all(Option::is_some),
+        "completed, rejected, and cancelled policy requests must all record an outcome"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| outcome.as_deref() == Some("success")),
+        "completed and capacity-rejected requests should record successful responses"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| outcome.as_deref() == Some("disconnected")),
+        "cancelled requests should record disconnection"
+    );
 }

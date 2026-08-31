@@ -8,10 +8,12 @@ use crate::git_action_directives::parse_assistant_markdown;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
+use crate::history_cell::PrefixedWrappedHistoryCell;
 use crate::history_cell::ReasoningSummaryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::history_cell::split_reasoning_summary_parts;
 use crate::inline_visualization::InlineVisualizationContext;
+use crate::legacy_core::config::Config;
 use crate::multi_agents::sub_agent_activity_summary;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadItem;
@@ -34,7 +36,7 @@ pub(crate) async fn load_session_transcript(
     app_server: &mut AppServerSession,
     thread_id: ThreadId,
     raw_reasoning_visibility: RawReasoningVisibility,
-    codex_home: Option<&std::path::Path>,
+    config: Option<&Config>,
 ) -> std::io::Result<TranscriptCells> {
     let mut thread = app_server
         .thread_read(thread_id, /*include_turns*/ false)
@@ -53,14 +55,14 @@ pub(crate) async fn load_session_transcript(
     Ok(thread_to_transcript_cells(
         thread,
         raw_reasoning_visibility,
-        codex_home,
+        config,
     ))
 }
 
 pub(crate) fn thread_to_transcript_cells(
     thread: Thread,
     raw_reasoning_visibility: RawReasoningVisibility,
-    codex_home: Option<&std::path::Path>,
+    config: Option<&Config>,
 ) -> TranscriptCells {
     let cwd = thread.cwd;
     let thread_id = ThreadId::from_string(&thread.id).ok();
@@ -69,7 +71,7 @@ pub(crate) fn thread_to_transcript_cells(
         &cwd,
         thread.turns.into_iter().flat_map(|turn| turn.items),
         raw_reasoning_visibility,
-        codex_home,
+        config,
     );
     if cells.is_empty() {
         cells.push(Arc::new(PlainHistoryCell::new(vec![
@@ -84,10 +86,10 @@ pub(crate) fn thread_items_to_transcript_cells(
     cwd: &AbsolutePathBuf,
     items: impl IntoIterator<Item = ThreadItem>,
     raw_reasoning_visibility: RawReasoningVisibility,
-    codex_home: Option<&std::path::Path>,
+    config: Option<&Config>,
 ) -> TranscriptCells {
-    let inline_visualization_context = codex_home.and_then(|codex_home| {
-        thread_id.and_then(|thread_id| InlineVisualizationContext::new(codex_home, thread_id))
+    let inline_visualization_context = config.and_then(|config| {
+        thread_id.and_then(|thread_id| InlineVisualizationContext::from_config(config, thread_id))
     });
     let mut cells: TranscriptCells = Vec::new();
     for item in items {
@@ -130,6 +132,26 @@ pub(crate) fn thread_items_to_transcript_cells(
                         parsed.visible_markdown,
                         cwd.as_path(),
                         inline_visualization_context.clone(),
+                    )));
+                }
+            }
+            ThreadItem::FunctionCallOutput {
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                if let Some((source_thread_id, prompt)) =
+                    crate::dynamic_tools::parse_delegated_tool_output(
+                        &name,
+                        namespace.as_deref(),
+                        &output,
+                    )
+                {
+                    cells.push(Arc::new(PrefixedWrappedHistoryCell::new(
+                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
+                        "• ".dim(),
+                        "  ",
                     )));
                 }
             }
@@ -280,6 +302,7 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
         }
         ThreadItem::UserMessage { .. }
         | ThreadItem::AgentMessage { .. }
+        | ThreadItem::FunctionCallOutput { .. }
         | ThreadItem::Plan { .. }
         | ThreadItem::Reasoning { .. }
         | ThreadItem::Sleep(_) => return None,

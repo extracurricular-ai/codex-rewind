@@ -39,37 +39,47 @@ fn app_server_accepts_cli_config_overrides() {
 }
 
 #[test]
-fn app_server_accepts_process_scoped_code_mode_host() {
+fn app_server_accepts_process_scoped_grpc_code_mode_host() {
     let args = AppServerArgs::try_parse_from([
         "codex-app-server",
         "--code-mode-host",
-        "wss://example.test/code-mode",
+        "https://example.test",
         "--listen",
         "off",
-        "--psp",
     ])
-    .expect("parse app-server args");
+    .expect("parse gRPC app-server args");
 
     assert_eq!(
         args.code_mode_host.code_mode_host,
-        Some(Url::parse("wss://example.test/code-mode").expect("test endpoint should parse"))
+        Some(Url::parse("https://example.test").expect("test endpoint should parse"))
     );
     assert_eq!(args.listen, AppServerTransport::Off);
-    assert!(args.psp);
-    assert_eq!(args.config_overrides.raw_overrides, Vec::<String>::new());
 }
 
 #[test]
 fn app_server_rejects_invalid_code_mode_host() {
     for endpoint in [
-        "http://127.0.0.1:8765",
+        "ftp://127.0.0.1:8765",
         "ws://",
+        "ws://127.0.0.1:8765",
+        "wss://example.test/code-mode",
+        "ws://alice:secret@example.test/code-mode",
+        "wss://alice:secret@example.test/code-mode",
         "wss://example.test/code-mode#fragment",
+        "http://",
+        "https://example.test/#fragment",
+        "https://example.test/code-mode",
+        "http://alice:secret@example.test",
+        "https://alice:secret@example.test",
+        "http://example.test/?token=secret",
     ] {
         let error =
             AppServerArgs::try_parse_from(["codex-app-server", "--code-mode-host", endpoint])
                 .expect_err("invalid code-mode host endpoint should fail startup argument parsing");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        let rendered_error = error.to_string();
+        assert!(!rendered_error.contains("alice"));
+        assert!(!rendered_error.contains("secret"));
     }
 }

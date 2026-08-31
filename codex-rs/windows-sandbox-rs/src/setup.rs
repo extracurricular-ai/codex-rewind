@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
+use crate::deny_read_resolver::resolve_windows_deny_read_paths;
 use crate::helper_materialization::bundled_executable_path_for_exe;
 use crate::helper_materialization::helper_bin_dir;
 use crate::identity::sandbox_setup_is_complete;
@@ -233,6 +234,8 @@ pub fn run_setup_refresh(
     else {
         return Ok(());
     };
+    let deny_read_paths =
+        setup_refresh_deny_read_paths(permission_profile, workspace_roots, command_cwd)?;
     run_setup_refresh_inner(
         SandboxSetupRequest {
             permissions: &permissions,
@@ -241,7 +244,10 @@ pub fn run_setup_refresh(
             codex_home,
             proxy_enforced,
         },
-        SetupRootOverrides::default(),
+        SetupRootOverrides {
+            deny_read_paths: Some(deny_read_paths),
+            ..SetupRootOverrides::default()
+        },
         /*offline_proxy_settings_override*/ None,
     )
 }
@@ -271,6 +277,8 @@ pub fn run_setup_refresh_with_extra_read_roots(
     else {
         return Ok(());
     };
+    let deny_read_paths =
+        setup_refresh_deny_read_paths(permission_profile, workspace_roots, command_cwd)?;
     let mut read_roots = gather_read_roots(command_cwd, &permissions, env_map, codex_home);
     read_roots.extend(extra_read_roots);
     run_setup_refresh_inner(
@@ -285,11 +293,30 @@ pub fn run_setup_refresh_with_extra_read_roots(
             read_roots: Some(read_roots),
             read_roots_include_platform_defaults: false,
             write_roots: Some(Vec::new()),
-            deny_read_paths: None,
+            deny_read_paths: Some(deny_read_paths),
             deny_write_paths: None,
         },
         /*offline_proxy_settings_override*/ None,
     )
+}
+
+fn setup_refresh_deny_read_paths(
+    permission_profile: &PermissionProfile,
+    workspace_roots: &[AbsolutePathBuf],
+    command_cwd: &Path,
+) -> Result<Vec<PathBuf>> {
+    let (mut file_system, _) = permission_profile.to_runtime_permissions();
+    file_system.remove_skip_missing_path_entries();
+    let file_system = file_system.materialize_project_roots_with_workspace_roots(workspace_roots);
+    let command_cwd = AbsolutePathBuf::from_absolute_path(command_cwd)?;
+    resolve_windows_deny_read_paths(&file_system, &command_cwd)
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(AbsolutePathBuf::into_path_buf)
+                .collect()
+        })
+        .map_err(|err| anyhow!(err))
 }
 
 fn run_setup_refresh_inner(
@@ -548,6 +575,12 @@ fn gather_full_read_roots_for_permissions(
             .into_iter()
             .map(|root| root.root),
     );
+    roots.extend(
+        permissions
+            .readable_roots_for_cwd(command_cwd)
+            .into_iter()
+            .filter(|root| root.parent().is_some() || !command_cwd.starts_with(root)),
+    );
     canonical_existing(&roots)
 }
 
@@ -557,7 +590,7 @@ pub(crate) fn gather_read_roots(
     env_map: &HashMap<String, String>,
     codex_home: &Path,
 ) -> Vec<PathBuf> {
-    if permissions.has_full_disk_read_access() {
+    if permissions.has_symbolic_root_read_access(command_cwd) {
         return gather_full_read_roots_for_permissions(
             command_cwd,
             permissions,
@@ -884,6 +917,7 @@ fn run_setup_exe_payload(
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
     use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::UI::Shell::SEE_MASK_NOASYNC;
     use windows_sys::Win32::UI::Shell::SEE_MASK_NOCLOSEPROCESS;
     use windows_sys::Win32::UI::Shell::SHELLEXECUTEINFOW;
     use windows_sys::Win32::UI::Shell::ShellExecuteExW;
@@ -940,7 +974,9 @@ fn run_setup_exe_payload(
     let verb_w = crate::winutil::to_wide("runas");
     let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    // Sandbox setup runs on a Tokio worker without a Windows message loop.
+    // ShellExecuteEx requires synchronous activation on such threads.
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     sei.lpVerb = verb_w.as_ptr();
     sei.lpFile = exe_w.as_ptr();
     sei.lpParameters = params_w.as_ptr();
@@ -1051,6 +1087,24 @@ pub fn run_elevated_provisioning_setup(
     real_user: &str,
     settings: crate::WindowsSandboxProvisioningSettings,
 ) -> Result<()> {
+    if !codex_home.is_absolute()
+        || !matches!(
+            codex_home.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(
+                    prefix.kind(),
+                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                )
+        )
+    {
+        return Err(failure(
+            SetupErrorCode::OrchestratorSandboxDirCreateFailed,
+            format!(
+                "sandbox provisioning CODEX_HOME must be an absolute local disk path: {}",
+                codex_home.display()
+            ),
+        ));
+    }
     let sbx_dir = sandbox_dir(codex_home);
     std::fs::create_dir_all(&sbx_dir).map_err(|err| {
         failure(
@@ -1089,7 +1143,7 @@ pub fn run_elevated_provisioning_setup(
     run_setup_exe(&payload, /*needs_elevation*/ false, codex_home)
 }
 
-fn build_payload_roots(
+pub(crate) fn build_payload_roots(
     request: &SandboxSetupRequest<'_>,
     overrides: &SetupRootOverrides,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -1126,11 +1180,29 @@ fn build_payload_roots(
     read_roots = filter_user_profile_root_exclusions(read_roots);
     read_roots = filter_ssh_config_dependency_roots(read_roots);
     let write_root_set: HashSet<PathBuf> = write_roots.iter().cloned().collect();
-    read_roots.retain(|root| !write_root_set.contains(root));
+    let deny_read_keys: Vec<String> = overrides
+        .deny_read_paths
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|path| canonical_path_key(path))
+        .collect();
+    read_roots.retain(|root| {
+        if write_root_set.contains(root) {
+            return false;
+        }
+        if deny_read_keys.is_empty() {
+            return true;
+        }
+        let root_key = canonical_path_key(root);
+        !deny_read_keys
+            .iter()
+            .any(|denied| Path::new(&root_key).starts_with(denied))
+    });
     (read_roots, write_roots)
 }
 
-fn build_payload_deny_write_paths(
+pub(crate) fn build_payload_deny_write_paths(
     request: &SandboxSetupRequest<'_>,
     explicit_deny_write_paths: Option<Vec<PathBuf>>,
 ) -> Vec<PathBuf> {
@@ -1298,8 +1370,14 @@ mod tests {
     use crate::setup_error::SetupErrorReport;
     use crate::setup_error::extract_failure;
     use crate::setup_error::write_setup_error_report;
+    use codex_protocol::models::ManagedFileSystemPermissions;
     use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::permissions::NetworkSandboxPolicy;
+    use codex_protocol::permissions::project_roots_glob_pattern;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
@@ -1554,6 +1632,93 @@ mod tests {
             )
             .expect("unsupported profiles do not need setup refresh");
         }
+    }
+
+    #[test]
+    fn setup_refresh_preserves_workspace_scoped_deny_read_paths() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace_root = tmp.path().join("workspace");
+        let command_cwd = tmp.path().join("command-cwd");
+        let denied_glob_match = workspace_root.join("app").join("secret.env");
+        fs::create_dir_all(&command_cwd).expect("create command cwd");
+        fs::create_dir_all(denied_glob_match.parent().expect("glob parent"))
+            .expect("create glob parent");
+        fs::write(&denied_glob_match, "secret").expect("write denied glob match");
+        let permission_profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![
+                    FileSystemSandboxEntry::new(
+                        FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        FileSystemAccessMode::Read,
+                    ),
+                    FileSystemSandboxEntry::new(
+                        FileSystemPath::Special {
+                            value: FileSystemSpecialPath::project_roots(Some(
+                                "private".to_string(),
+                            )),
+                        },
+                        FileSystemAccessMode::Deny,
+                    ),
+                    FileSystemSandboxEntry::new(
+                        FileSystemPath::GlobPattern {
+                            pattern: project_roots_glob_pattern(Path::new("**/*.env")),
+                        },
+                        FileSystemAccessMode::Deny,
+                    ),
+                ],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+
+        let deny_read_paths = super::setup_refresh_deny_read_paths(
+            &permission_profile,
+            workspace_roots_for(&workspace_root).as_slice(),
+            &command_cwd,
+        )
+        .expect("resolve refresh deny-read paths");
+
+        assert_eq!(
+            deny_read_paths.into_iter().collect::<HashSet<_>>(),
+            [
+                dunce::canonicalize(&workspace_root)
+                    .expect("canonicalize workspace root")
+                    .join("private"),
+                denied_glob_match,
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn setup_refresh_rejects_invalid_deny_read_globs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace_root = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let permission_profile = PermissionProfile::Managed {
+            file_system: ManagedFileSystemPermissions::Restricted {
+                entries: vec![FileSystemSandboxEntry::new(
+                    FileSystemPath::GlobPattern {
+                        pattern: project_roots_glob_pattern(Path::new("[z-a]")),
+                    },
+                    FileSystemAccessMode::Deny,
+                )],
+                glob_scan_max_depth: None,
+            },
+            network: NetworkSandboxPolicy::Restricted,
+        };
+
+        let err = super::setup_refresh_deny_read_paths(
+            &permission_profile,
+            workspace_roots_for(&workspace_root).as_slice(),
+            &workspace_root,
+        )
+        .expect_err("invalid deny-read glob");
+
+        assert!(err.to_string().contains("invalid deny-read glob pattern"));
     }
 
     #[test]

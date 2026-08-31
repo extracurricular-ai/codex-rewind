@@ -16,6 +16,8 @@
 //!
 //! If the keyring is not available or fails, we fall back to CODEX_HOME/.credentials.json which is consistent with other coding CLI agents.
 
+mod ema_identity;
+mod issuer_binding;
 mod refresh_lock;
 mod refresh_transaction;
 mod resolved_store;
@@ -23,7 +25,7 @@ mod store_lock;
 
 #[cfg(test)]
 #[path = "oauth/test_support.rs"]
-mod test_support;
+pub(crate) mod test_support;
 
 use anyhow::Context;
 use anyhow::Error;
@@ -51,6 +53,7 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,9 +72,15 @@ use tokio::sync::Mutex;
 
 use codex_utils_home_dir::find_codex_home;
 
+pub(crate) use self::ema_identity::stored_oidc_identity;
+pub(crate) use self::issuer_binding::validate_authorization_server_endpoints;
+pub(crate) use self::issuer_binding::validate_refresh_token_issuer;
+pub(crate) use self::refresh_lock::RefreshCredentialLock;
+pub(crate) use self::refresh_transaction::install_tokens_in_manager;
 pub(crate) use self::resolved_store::ResolvedOAuthCredentialStore;
 pub(crate) use self::resolved_store::ResolvedOAuthTokens;
 pub(crate) use self::resolved_store::resolve_oauth_tokens_from_store_policy;
+use self::resolved_store::try_resolve_oauth_tokens_from_store_policy;
 
 const KEYRING_SERVICE: &str = "Codex MCP Credentials";
 const MCP_OAUTH_SECRET_PREFIX: &str = "MCP_OAUTH";
@@ -81,10 +90,142 @@ const REFRESH_SKEW_MILLIS: u64 = 30_000;
 pub struct StoredOAuthTokens {
     pub server_name: String,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
     pub client_id: String,
     pub token_response: WrappedOAuthTokenResponse,
     #[serde(default)]
     pub expires_at: Option<u64>,
+}
+
+impl StoredOAuthTokens {
+    pub(crate) fn has_refresh_token(&self) -> bool {
+        self.token_response
+            .0
+            .refresh_token()
+            .is_some_and(|refresh_token| !refresh_token.secret().trim().is_empty())
+    }
+
+    pub(crate) fn bound_issuer(&self) -> Option<&str> {
+        self.issuer
+            .as_deref()
+            .filter(|issuer| !issuer.trim().is_empty())
+    }
+
+    pub(crate) fn access_token_is_usable_without_refresh(&self) -> bool {
+        !token_needs_refresh(self.expires_at)
+            && !self
+                .token_response
+                .0
+                .access_token()
+                .secret()
+                .trim()
+                .is_empty()
+    }
+}
+
+/// OAuth credentials paired with the concrete store selected for their client lifecycle.
+#[derive(Debug, Clone)]
+pub struct StoredOAuthCredentialSnapshot {
+    credentials: StoredOAuthTokens,
+    store: ResolvedOAuthCredentialStore,
+    store_was_contended: bool,
+}
+
+impl PartialEq for StoredOAuthCredentialSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.credentials == other.credentials && self.store == other.store
+    }
+}
+
+impl StoredOAuthCredentialSnapshot {
+    pub(crate) fn new(
+        mut credentials: StoredOAuthTokens,
+        store: ResolvedOAuthCredentialStore,
+    ) -> Self {
+        credentials.token_response.0.set_expires_in(None);
+        Self {
+            credentials,
+            store,
+            store_was_contended: false,
+        }
+    }
+
+    /// Returns the normalized credentials originally read from the selected store.
+    pub fn credentials(&self) -> &StoredOAuthTokens {
+        &self.credentials
+    }
+
+    /// Returns whether this snapshot was retained because its store could not be read.
+    pub fn store_was_contended(&self) -> bool {
+        self.store_was_contended
+    }
+
+    /// Refreshes a runtime snapshot without waiting or discarding its last known authority.
+    pub fn for_runtime_refresh(
+        previous: Option<&Self>,
+        server_name: &str,
+        url: &str,
+        store_mode: OAuthCredentialsStoreMode,
+        keyring_backend_kind: AuthKeyringBackendKind,
+    ) -> Result<Option<Self>> {
+        match try_resolve_oauth_tokens_from_store_policy(
+            &DefaultKeyringStore,
+            server_name,
+            url,
+            store_mode,
+            keyring_backend_kind,
+        ) {
+            Ok(Some(mut resolved)) => {
+                resolved.tokens.token_response.0.set_expires_in(None);
+                Ok(Some(Self {
+                    credentials: resolved.tokens,
+                    store: resolved.store,
+                    store_was_contended: false,
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(error) if oauth_store_is_contended(&error) => Ok(previous
+                .filter(|previous| {
+                    previous.credentials.server_name == server_name
+                        && previous.credentials.url == url
+                })
+                .map(|previous| Self {
+                    store_was_contended: true,
+                    ..previous.clone()
+                })),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Rereads the selected authority without waiting for a contended credential-store lock.
+    pub fn reload(
+        &self,
+        server_name: &str,
+        url: &str,
+        store_mode: OAuthCredentialsStoreMode,
+        keyring_backend_kind: AuthKeyringBackendKind,
+    ) -> Result<Option<StoredOAuthTokens>> {
+        if self.store == ResolvedOAuthCredentialStore::File
+            && store_mode == OAuthCredentialsStoreMode::Auto
+        {
+            return Self::for_runtime_refresh(
+                /*previous*/ None,
+                server_name,
+                url,
+                store_mode,
+                keyring_backend_kind,
+            )
+            .map(|snapshot| snapshot.map(|snapshot| snapshot.credentials));
+        }
+
+        let credentials = match self.store.try_load(&DefaultKeyringStore, server_name, url) {
+            Ok(credentials) => credentials,
+            Err(error) if oauth_store_is_contended(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(normalized_oauth_credentials(credentials.as_ref()))
+    }
 }
 
 /// Wrap OAuthTokenResponse to allow for partial equality comparison.
@@ -93,7 +234,7 @@ pub struct WrappedOAuthTokenResponse(pub OAuthTokenResponse);
 
 impl PartialEq for WrappedOAuthTokenResponse {
     fn eq(&self, other: &Self) -> bool {
-        match (serde_json::to_string(self), serde_json::to_string(other)) {
+        match (serde_json::to_value(self), serde_json::to_value(other)) {
             (Ok(s1), Ok(s2)) => s1 == s2,
             _ => false,
         }
@@ -134,6 +275,19 @@ pub fn stored_oauth_credentials(
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Result<Option<StoredOAuthTokens>> {
+    Ok(
+        stored_oauth_credential_snapshot(server_name, url, store_mode, keyring_backend_kind)?
+            .map(|snapshot| snapshot.credentials),
+    )
+}
+
+/// Loads OAuth credentials together with the concrete authority selected by store policy.
+pub fn stored_oauth_credential_snapshot(
+    server_name: &str,
+    url: &str,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+) -> Result<Option<StoredOAuthCredentialSnapshot>> {
     let Some(resolved) = resolve_oauth_tokens_from_store_policy(
         &DefaultKeyringStore,
         server_name,
@@ -144,7 +298,18 @@ pub fn stored_oauth_credentials(
     else {
         return Ok(None);
     };
-    Ok(normalized_oauth_credentials(Some(&resolved.tokens)))
+    Ok(Some(StoredOAuthCredentialSnapshot::new(
+        resolved.tokens,
+        resolved.store,
+    )))
+}
+
+fn oauth_store_is_contended(error: &Error) -> bool {
+    matches!(
+        error.downcast_ref::<OAuthStoreLockFailure>(),
+        Some(OAuthStoreLockFailure::Timeout { acquire_timeout, .. })
+            if acquire_timeout.is_zero()
+    )
 }
 
 fn normalized_oauth_credentials(tokens: Option<&StoredOAuthTokens>) -> Option<StoredOAuthTokens> {
@@ -160,14 +325,11 @@ fn oauth_tokens_are_usable(tokens: &StoredOAuthTokens) -> bool {
         return false;
     }
 
-    let token_response = &tokens.token_response.0;
     if token_needs_refresh(tokens.expires_at) {
-        return token_response
-            .refresh_token()
-            .is_some_and(|token| !token.secret().trim().is_empty());
+        return tokens.bound_issuer().is_some() && tokens.has_refresh_token();
     }
 
-    !token_response.access_token().secret().trim().is_empty()
+    tokens.access_token_is_usable_without_refresh()
 }
 
 fn refresh_expires_in_from_timestamp(tokens: &mut StoredOAuthTokens) {
@@ -232,7 +394,15 @@ fn load_oauth_tokens_from_secrets_keyring<K: KeyringStore + Clone + 'static>(
     server_name: &str,
     url: &str,
 ) -> std::result::Result<Option<StoredOAuthTokens>, OAuthKeyringLoadError> {
-    let _store_lock = OAuthStoreLock::acquire(OAuthStore::Secrets)?;
+    let _store_lock = OAuthStoreLock::acquire_for_read(OAuthStore::Secrets)?;
+    load_oauth_tokens_from_secrets_keyring_with_lock_held(keyring_store, server_name, url)
+}
+
+fn load_oauth_tokens_from_secrets_keyring_with_lock_held<K: KeyringStore + Clone + 'static>(
+    keyring_store: &K,
+    server_name: &str,
+    url: &str,
+) -> std::result::Result<Option<StoredOAuthTokens>, OAuthKeyringLoadError> {
     let codex_home = find_codex_home().map_err(anyhow::Error::from)?;
     let manager = SecretsManager::new_with_keyring_store_and_namespace(
         codex_home.to_path_buf(),
@@ -336,7 +506,7 @@ fn save_oauth_tokens_to_secrets_keyring<K: KeyringStore + Clone + 'static>(
     tokens: &StoredOAuthTokens,
 ) -> Result<()> {
     let serialized = serde_json::to_string(tokens).context("failed to serialize OAuth tokens")?;
-    let _store_lock = OAuthStoreLock::acquire(OAuthStore::Secrets)?;
+    let _store_lock = OAuthStoreLock::acquire_for_write(OAuthStore::Secrets)?;
     save_oauth_tokens_to_secrets_keyring_with_lock_held(
         keyring_store,
         server_name,
@@ -491,7 +661,7 @@ fn delete_oauth_tokens_from_secrets_keyring<K: KeyringStore + Clone + 'static>(
     server_name: &str,
     url: &str,
 ) -> Result<bool> {
-    let _store_lock = OAuthStoreLock::acquire(OAuthStore::Secrets)?;
+    let _store_lock = OAuthStoreLock::acquire_for_write(OAuthStore::Secrets)?;
     let codex_home = find_codex_home()?;
     let manager = SecretsManager::new_with_keyring_store_and_namespace(
         codex_home.to_path_buf(),
@@ -573,6 +743,9 @@ impl OAuthPersistor {
                 let stored = StoredOAuthTokens {
                     server_name: self.inner.server_name.clone(),
                     url: self.inner.url.clone(),
+                    issuer: last_credentials
+                        .as_ref()
+                        .and_then(|previous| previous.issuer.clone()),
                     client_id,
                     token_response: new_token_response,
                     expires_at,
@@ -617,6 +790,8 @@ type FallbackFile = BTreeMap<String, FallbackTokenEntry>;
 struct FallbackTokenEntry {
     server_name: String,
     server_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issuer: Option<String>,
     client_id: String,
     access_token: String,
     #[serde(default)]
@@ -631,7 +806,14 @@ struct FallbackTokenEntry {
 }
 
 fn load_oauth_tokens_from_file(server_name: &str, url: &str) -> Result<Option<StoredOAuthTokens>> {
-    let _store_lock = OAuthStoreLock::acquire(OAuthStore::File)?;
+    let _store_lock = OAuthStoreLock::acquire_for_read(OAuthStore::File)?;
+    load_oauth_tokens_from_file_with_lock_held(server_name, url)
+}
+
+fn load_oauth_tokens_from_file_with_lock_held(
+    server_name: &str,
+    url: &str,
+) -> Result<Option<StoredOAuthTokens>> {
     let Some(store) = read_fallback_file_unlocked()? else {
         return Ok(None);
     };
@@ -674,6 +856,7 @@ fn load_oauth_tokens_from_file(server_name: &str, url: &str) -> Result<Option<St
         let mut stored = StoredOAuthTokens {
             server_name: entry.server_name.clone(),
             url: entry.server_url.clone(),
+            issuer: entry.issuer.clone(),
             client_id: entry.client_id.clone(),
             token_response: WrappedOAuthTokenResponse(token_response),
             expires_at: entry.expires_at,
@@ -689,7 +872,7 @@ fn load_oauth_tokens_from_file(server_name: &str, url: &str) -> Result<Option<St
 /// Saves one credential while holding the File aggregate-store lock across the full
 /// read-modify-write operation.
 fn save_oauth_tokens_to_file(tokens: &StoredOAuthTokens) -> Result<()> {
-    let _store_lock = OAuthStoreLock::acquire(OAuthStore::File)?;
+    let _store_lock = OAuthStoreLock::acquire_for_write(OAuthStore::File)?;
     save_oauth_tokens_to_file_with_lock_held(tokens)
 }
 
@@ -716,6 +899,7 @@ fn save_oauth_tokens_to_file_with_lock_held(tokens: &StoredOAuthTokens) -> Resul
     let entry = FallbackTokenEntry {
         server_name: tokens.server_name.clone(),
         server_url: tokens.url.clone(),
+        issuer: tokens.issuer.clone(),
         client_id: tokens.client_id.clone(),
         access_token: token_response.access_token().secret().to_string(),
         expires_at,
@@ -729,7 +913,7 @@ fn save_oauth_tokens_to_file_with_lock_held(tokens: &StoredOAuthTokens) -> Resul
 }
 
 fn delete_oauth_tokens_from_file(key: &str) -> Result<bool> {
-    let _store_lock = OAuthStoreLock::acquire(OAuthStore::File)?;
+    let _store_lock = OAuthStoreLock::acquire_for_write(OAuthStore::File)?;
     let mut store = match read_fallback_file_unlocked()? {
         Some(store) => store,
         None => return Ok(false),
@@ -793,6 +977,7 @@ fn token_needs_refresh(expires_at: Option<u64>) -> bool {
 
 fn compute_store_key(server_name: &str, server_url: &str) -> Result<String> {
     let executor_owned = server_name.starts_with("executor:");
+    let enterprise_owned = server_name.starts_with("ema-idp:");
     let server_name = server_name.strip_prefix("local:").unwrap_or(server_name);
     let mut payload = JsonMap::new();
     payload.insert(
@@ -801,8 +986,21 @@ fn compute_store_key(server_name: &str, server_url: &str) -> Result<String> {
     );
     payload.insert("url".to_string(), Value::String(server_url.to_string()));
     payload.insert("headers".to_string(), Value::Object(JsonMap::new()));
-
-    let truncated = sha_256_prefix(&Value::Object(payload))?;
+    let payload = if enterprise_owned {
+        // The OS keyring is shared across homes. Keep enterprise sessions
+        // isolated by Codex profile as well as authenticated user and workspace.
+        let codex_home = find_codex_home()?;
+        fs::create_dir_all(&codex_home)?;
+        payload.insert(
+            "codex_home".to_string(),
+            serde_json::to_value(codex_home.as_path().canonicalize()?)?,
+        );
+        // Different binaries can enable different serde_json ordering features.
+        serde_json::to_value(payload.into_iter().collect::<BTreeMap<_, _>>())?
+    } else {
+        Value::Object(payload)
+    };
+    let truncated = sha_256_prefix(&payload)?;
     let separator = if executor_owned { ':' } else { '|' };
     Ok(format!("{server_name}{separator}{truncated}"))
 }
@@ -848,6 +1046,30 @@ fn read_fallback_file_unlocked() -> Result<Option<FallbackFile>> {
     }
 }
 
+fn open_fallback_file_for_write(path: &std::path::Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "credentials path is not a regular file"
+    );
+    Ok(file)
+}
+
 fn write_fallback_file(store: &FallbackFile) -> Result<()> {
     let path = fallback_file_path()?;
 
@@ -858,19 +1080,20 @@ fn write_fallback_file(store: &FallbackFile) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .context("credentials file path has no parent directory")?;
+    fs::create_dir_all(parent)?;
 
     let serialized = serde_json::to_string(store)?;
-    fs::write(&path, serialized)?;
-
+    let mut file = open_fallback_file_for_write(&path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&path, perms)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    file.set_len(/*size*/ 0)?;
+    file.write_all(serialized.as_bytes())?;
 
     Ok(())
 }
@@ -1093,6 +1316,91 @@ mod tests {
             tokens.token_response.0.access_token().secret().as_str()
         );
         assert!(store.saved_value(&key).is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_file_is_private_at_creation() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "CODEX_TEST_OAUTH_PERMISSIVE_UMASK";
+
+        if std::env::var_os(CHILD).is_none() {
+            // Change umask only in the child running this one test.
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", "umask 000; exec \"$@\"", "sh"])
+                .arg(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "oauth::tests::fallback_file_is_private_at_creation",
+                ])
+                .env(CHILD, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "creation-permissions test failed");
+            return Ok(());
+        }
+
+        let _env = TempCodexHome::new();
+        let path = fallback_file_path()?;
+        let file = open_fallback_file_for_write(&path)?;
+        assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_file_updates_the_existing_file() -> Result<()> {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let env = TempCodexHome::new();
+        save_oauth_tokens_to_file(&sample_tokens())?;
+        let path = fallback_file_path()?;
+        let original = env.path().join("original-file");
+        fs::hard_link(&path, &original)?;
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+
+        let mut store = read_fallback_file_unlocked()?.expect("saved credentials");
+        store.values_mut().next().unwrap().access_token = "new".to_string();
+        write_fallback_file(&store)?;
+
+        let expected = serde_json::to_vec(&store)?;
+        assert_eq!(
+            [fs::read(original)?, fs::read(&path)?],
+            [expected.clone(), expected]
+        );
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fallback_file_write_does_not_follow_symlinks() -> Result<()> {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
+
+        let env = TempCodexHome::new();
+        let path = fallback_file_path()?;
+        let target = env.path().join("symlink-target");
+        fs::write(&target, "synthetic credentials")?;
+        let linked = symlink(&target, &path);
+        #[cfg(windows)]
+        if linked
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(1314))
+        {
+            eprintln!("Skipping symlink test: Windows symlink privilege unavailable");
+            return Ok(());
+        }
+        linked?;
+
+        assert!(open_fallback_file_for_write(&path).is_err());
+
+        assert_eq!(fs::read_to_string(target)?, "synthetic credentials");
+        assert!(fs::symlink_metadata(path)?.file_type().is_symlink());
         Ok(())
     }
 
@@ -1427,6 +1735,7 @@ mod tests {
     ) {
         assert_eq!(actual.server_name, expected.server_name);
         assert_eq!(actual.url, expected.url);
+        assert_eq!(actual.issuer, expected.issuer);
         assert_eq!(actual.client_id, expected.client_id);
         assert_eq!(actual.expires_at, expected.expires_at);
         assert_token_response_match_without_expiry(
@@ -1480,6 +1789,7 @@ mod tests {
         StoredOAuthTokens {
             server_name: "test-server".to_string(),
             url: "https://example.test".to_string(),
+            issuer: Some("https://issuer.example.test".to_string()),
             client_id: "client-id".to_string(),
             token_response: WrappedOAuthTokenResponse(response),
             expires_at,

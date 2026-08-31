@@ -103,7 +103,10 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
         })
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let ToolInvocation {
                 payload,
@@ -123,7 +126,7 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
             let already_ready = step_context
                 .environments
                 .turn_environments()
-                .any(|environment| environment.environment_id == environment_id);
+                .any(|environment| environment.selection.environment_id == environment_id);
             if !already_ready {
                 let Some(environment) = step_context
                     .environments

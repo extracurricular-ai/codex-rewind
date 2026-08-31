@@ -84,7 +84,7 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
     items: &[ExternalAgentConfigMigrationItem],
     selected_items: &[ExternalAgentConfigMigrationItem],
     error: Option<&str>,
-) -> ExternalAgentConfigMigrationOutcome {
+) -> std::io::Result<ExternalAgentConfigMigrationOutcome> {
     let mut screen = ExternalAgentConfigMigrationScreen::new(
         tui.frame_requester(),
         items,
@@ -92,10 +92,14 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
         error.map(str::to_owned),
     );
 
-    let _ = tui.draw(u16::MAX, |frame| {
+    if let Err(err) = tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
-    });
+    }) {
+        tracing::warn!("failed to draw config migration prompt: {err}");
+        return Ok(ExternalAgentConfigMigrationOutcome::Skip);
+    }
 
+    tui.discard_pending_input_before_interactive_screen()?;
     let events = tui.event_stream();
     tokio::pin!(events);
 
@@ -104,8 +108,8 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
             let _ = tui.screen_size_for_event(&event);
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
-                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
+                TuiEvent::Paste(_) | TuiEvent::FocusLost => {}
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     let _ = tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     });
@@ -117,7 +121,7 @@ pub(crate) async fn run_external_agent_config_migration_prompt(
         }
     }
 
-    screen.outcome()
+    Ok(screen.outcome())
 }
 
 struct ExternalAgentConfigMigrationScreen {

@@ -1,14 +1,41 @@
 //! Transcript and active-cell bookkeeping for `ChatWidget`.
 
 use super::HistoryCell;
+use super::HistoryRenderMode;
+use std::cell::Cell;
+
+/// Identifies the render state that determines an active cell's viewport height.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActiveCellLayoutCacheKey {
+    pub(super) cell_identity: usize,
+    pub(super) revision: u64,
+    pub(super) width: u16,
+    pub(super) render_mode: HistoryRenderMode,
+    pub(super) syntax_theme_revision: u64,
+}
+
+/// Retains the active cell's semantic and actual wrapped heights independently.
+///
+/// History cells may override their desired height, so it cannot be substituted for the rendered
+/// row count used to keep overflowing content anchored to the bottom of the viewport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActiveCellLayoutCache {
+    pub(super) key: ActiveCellLayoutCacheKey,
+    pub(super) desired_height: Option<u16>,
+    pub(super) rendered_height: Option<usize>,
+}
 
 #[derive(Default)]
 pub(super) struct TranscriptState {
     pub(super) active_cell: Option<Box<dyn HistoryCell>>,
     /// Monotonic-ish counter used to invalidate transcript overlay caching.
     pub(super) active_cell_revision: u64,
-    /// Raw markdown of the most recently completed agent response.
+    /// One bounded entry shared by layout and paint across unchanged active-cell frames.
+    pub(super) active_cell_layout: Cell<Option<ActiveCellLayoutCache>>,
+    /// Markdown of the most recently completed agent response for whole-response copying.
     pub(super) last_agent_markdown: Option<String>,
+    /// Original source of that response, before display sanitization, for exact block copying.
+    pub(super) last_agent_source: Option<String>,
     pub(super) last_completed_agent_message: Option<(String, String)>,
     /// Raw markdown of the most recently completed proposed plan.
     pub(super) latest_proposed_plan_markdown: Option<String>,
@@ -43,15 +70,27 @@ impl TranscriptState {
         // Wrapping avoids overflow; wraparound would require 2^64 bumps and at
         // worst causes a one-time cache-key collision.
         self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+        self.active_cell_layout.set(None);
     }
 
-    pub(super) fn record_agent_markdown(&mut self, markdown: String) {
+    /// Remove the active cell and invalidate its layout before its address can be reused.
+    pub(super) fn take_active_cell(&mut self) -> Option<Box<dyn HistoryCell>> {
+        let active_cell = self.active_cell.take();
+        if active_cell.is_some() {
+            self.active_cell_layout.set(None);
+        }
+        active_cell
+    }
+
+    pub(super) fn record_agent_markdown(&mut self, markdown: String, source: String) {
         self.last_agent_markdown = Some(markdown);
+        self.last_agent_source = Some(source);
         self.saw_copy_source_this_turn = true;
     }
 
     pub(super) fn reset_copy_history(&mut self) {
         self.last_agent_markdown = None;
+        self.last_agent_source = None;
         self.saw_copy_source_this_turn = false;
     }
 

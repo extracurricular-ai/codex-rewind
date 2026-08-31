@@ -1,9 +1,9 @@
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use app_test_support::create_escalated_command_execution_sse_response;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
-use app_test_support::create_shell_command_sse_response;
 use app_test_support::format_with_current_shell_display;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
@@ -18,6 +18,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
@@ -60,7 +61,10 @@ async fn thread_shell_command_history_responses_exclude_persisted_command_execut
     let ThreadStartResponse { thread, .. } = mcp
         .request(|request_id| ClientRequest::ThreadStart {
             request_id,
-            params: ThreadStartParams::default(),
+            params: ThreadStartParams {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..Default::default()
+            },
         })
         .await?;
     let (shell_command, expected_output) = current_shell_output_command("hello from bang")?;
@@ -202,7 +206,7 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     std::fs::create_dir(&workspace)?;
 
     let responses = vec![
-        create_shell_command_sse_response(
+        create_escalated_command_execution_sse_response(
             vec![
                 "python3".to_string(),
                 "-c".to_string(),
@@ -216,7 +220,7 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     ];
     let server = create_mock_responses_server_sequence(responses).await;
     MockResponsesConfig::new(&server.uri())
-        .with_approval_policy("untrusted")
+        .with_approval_policy("on-request")
         .write(&codex_home)?;
 
     let mut mcp = TestAppServer::builder()
@@ -228,7 +232,10 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     let ThreadStartResponse { thread, .. } = mcp
         .request(|request_id| ClientRequest::ThreadStart {
             request_id,
-            params: ThreadStartParams::default(),
+            params: ThreadStartParams {
+                history_mode: Some(ThreadHistoryMode::Legacy),
+                ..Default::default()
+            },
         })
         .await?;
     let (shell_command, expected_output) = current_shell_output_command("active turn bang")?;

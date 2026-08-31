@@ -1,11 +1,15 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::OPENAI_API_CURATED_MARKETPLACE_NAME;
 use crate::OPENAI_CURATED_MARKETPLACE_NAME;
 use crate::PluginsConfigInput;
+use crate::PluginsManager;
 use crate::http_client_selector::HttpClientSelector;
 use crate::remote::RemotePluginServiceConfig;
 use codex_config::LoaderOverrides;
@@ -17,12 +21,276 @@ use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_http_client::RouteAwareClientPool;
 use codex_http_client::RouteAwareRequestBuilder;
+use codex_login::AuthHeaders;
+use codex_login::AuthManager;
+use codex_login::CodexAuth;
+use codex_login::ExternalAuth;
+use codex_login::ExternalAuthFuture;
+use codex_login::ExternalAuthRefreshContext;
+use codex_login::auth::BedrockAccessKeysAuth;
+use codex_login::auth::BedrockApiKeyAuth;
+use codex_login::test_support::auth_manager_from_optional_auth;
+use codex_protocol::auth::AuthMode;
+use codex_protocol::protocol::Product;
+use codex_protocol::protocol::SkillScope;
+use codex_skills::LoadedSkillRoot;
+use codex_skills::LoadedSkills;
+use codex_skills::SkillError;
+use codex_skills::SkillLoadFuture;
+use codex_skills::SkillMetadata;
+use codex_skills::SkillRootLoadRequest;
+use codex_skills::SkillRootLoader;
+use codex_skills::parse_skill_frontmatter_metadata;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_plugins::PluginSkillRoot;
+use codex_utils_plugins::SkillDiscoveryMode;
+use codex_utils_plugins::migrated_command_skills_root;
 use http::Method;
 use toml::Value;
 
 pub(crate) const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 pub(crate) const TEST_CURATED_PLUGIN_CACHE_VERSION: &str = "01234567";
+
+pub(crate) fn test_plugins_manager(codex_home: PathBuf) -> PluginsManager {
+    PluginsManager::new(
+        codex_home,
+        test_auth_manager(/*auth_mode*/ None),
+        test_skill_root_loader(),
+    )
+}
+
+pub(crate) fn test_plugins_manager_with_options(
+    codex_home: PathBuf,
+    restriction_product: Option<Product>,
+    auth_mode: Option<AuthMode>,
+) -> PluginsManager {
+    PluginsManager::new_with_options(
+        codex_home,
+        restriction_product,
+        test_auth_manager(auth_mode),
+        test_skill_root_loader(),
+    )
+}
+
+pub(crate) fn test_plugins_manager_with_auth_manager(
+    codex_home: PathBuf,
+    restriction_product: Option<Product>,
+    auth_manager: Arc<AuthManager>,
+) -> PluginsManager {
+    PluginsManager::new_with_options(
+        codex_home,
+        restriction_product,
+        auth_manager,
+        test_skill_root_loader(),
+    )
+}
+
+pub(crate) fn test_auth_manager(auth_mode: Option<AuthMode>) -> Arc<AuthManager> {
+    auth_manager_from_optional_auth(test_codex_auth(auth_mode))
+}
+
+pub(crate) async fn set_test_auth_mode(auth_manager: &AuthManager, auth_mode: Option<AuthMode>) {
+    set_test_auth(auth_manager, test_codex_auth(auth_mode)).await;
+}
+
+pub(crate) async fn set_test_auth(auth_manager: &AuthManager, auth: Option<CodexAuth>) {
+    let Some(auth) = auth else {
+        auth_manager.clear_external_auth();
+        return;
+    };
+    auth_manager
+        .set_external_auth(Arc::new(StaticExternalAuth(auth)))
+        .await
+        .expect("test auth should update");
+}
+
+fn test_codex_auth(auth_mode: Option<AuthMode>) -> Option<CodexAuth> {
+    auth_mode.map(|auth_mode| match auth_mode {
+        AuthMode::ApiKey => CodexAuth::from_api_key("test-api-key"),
+        AuthMode::Chatgpt => CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        AuthMode::ChatgptAuthTokens => CodexAuth::from_external_chatgpt_tokens(
+            "header.e30.test",
+            "test-account",
+            /*chatgpt_plan_type*/ None,
+        )
+        .expect("test ChatGPT tokens should parse"),
+        AuthMode::Headers => CodexAuth::Headers(AuthHeaders::new(http::HeaderMap::new())),
+        AuthMode::BedrockApiKey => CodexAuth::BedrockApiKey(BedrockApiKeyAuth {
+            api_key: "test-api-key".to_string(),
+            region: "us-east-1".to_string(),
+        }),
+        AuthMode::BedrockAccessKeys => CodexAuth::BedrockAccessKeys(BedrockAccessKeysAuth {
+            access_key_id: "test-access-key-id".to_string(),
+            secret_access_key: "test-secret-access-key".to_string(),
+            session_token: None,
+        }),
+        AuthMode::AgentIdentity | AuthMode::PersonalAccessToken => {
+            panic!("test auth mode requires a purpose-built CodexAuth")
+        }
+    })
+}
+
+struct StaticExternalAuth(CodexAuth);
+
+impl ExternalAuth for StaticExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.0.clone()) })
+    }
+}
+
+pub(crate) fn test_skill_root_loader() -> Arc<dyn SkillRootLoader<PluginSkillRoot>> {
+    Arc::new(TestSkillRootLoader)
+}
+
+struct TestSkillRootLoader;
+
+impl SkillRootLoader<PluginSkillRoot> for TestSkillRootLoader {
+    fn load_roots(
+        &self,
+        request: SkillRootLoadRequest<PluginSkillRoot>,
+    ) -> SkillLoadFuture<'_, LoadedSkills> {
+        Box::pin(async move {
+            let mut loaded_roots = Vec::new();
+            for root in request.roots {
+                let cached = request
+                    .snapshots
+                    .as_ref()
+                    .and_then(|cache| cache.get(&root));
+                let snapshot = match cached {
+                    Some(snapshot) => snapshot,
+                    None => {
+                        let snapshot = load_test_skill_root(&root);
+                        if let Some(snapshots) = &request.snapshots {
+                            snapshots.insert(root.clone(), snapshot.clone());
+                        }
+                        snapshot
+                    }
+                };
+                let migrated_root = migrated_command_skills_root(&root.plugin_root);
+                let canonical_migrated_root = fs::canonicalize(migrated_root.as_path())
+                    .ok()
+                    .and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok())
+                    .unwrap_or(migrated_root);
+                loaded_roots.push((snapshot.root == canonical_migrated_root, snapshot));
+            }
+
+            let native_names = loaded_roots
+                .iter()
+                .filter(|(migrated, _)| !migrated)
+                .flat_map(|(_, snapshot)| &snapshot.skills)
+                .map(|skill| (skill.plugin_id.clone(), skill.name.clone()))
+                .collect::<HashSet<_>>();
+            let mut seen_paths = HashSet::new();
+            let mut outcome = LoadedSkills::default();
+            for (migrated, snapshot) in loaded_roots {
+                outcome
+                    .skills
+                    .extend(snapshot.skills.into_iter().filter(|skill| {
+                        (!migrated
+                            || !native_names
+                                .contains(&(skill.plugin_id.clone(), skill.name.clone())))
+                            && skill.matches_product_restriction_for_product(
+                                request.restriction_product,
+                            )
+                            && seen_paths.insert(skill.path_to_skills_md.clone())
+                    }));
+                outcome.errors.extend(snapshot.errors);
+            }
+            outcome.skills.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.path_to_skills_md.cmp(&right.path_to_skills_md))
+            });
+            outcome
+        })
+    }
+}
+
+fn load_test_skill_root(root: &PluginSkillRoot) -> LoadedSkillRoot {
+    let canonical_root = fs::canonicalize(root.path.as_path())
+        .ok()
+        .and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok())
+        .unwrap_or_else(|| root.path.clone());
+    let mut skills = Vec::new();
+    let mut errors = Vec::new();
+    let mut discovery_paths = HashMap::new();
+    let mut directories = vec![root.path.clone()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = fs::read_dir(directory.as_path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if (root.discovery_mode == SkillDiscoveryMode::Recursive || directory == root.path)
+                    && let Ok(path) = AbsolutePathBuf::from_absolute_path_checked(path)
+                {
+                    directories.push(path);
+                }
+                continue;
+            }
+            if path.file_name().is_none_or(|name| name != "SKILL.md")
+                || (root.discovery_mode == SkillDiscoveryMode::DirectChildren
+                    && directory == root.path)
+            {
+                continue;
+            }
+            let Ok(path) = AbsolutePathBuf::from_absolute_path_checked(path) else {
+                continue;
+            };
+            let canonical_path = fs::canonicalize(path.as_path())
+                .ok()
+                .and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok())
+                .unwrap_or_else(|| path.clone());
+            let parsed = fs::read_to_string(path.as_path())
+                .map_err(|error| error.to_string())
+                .and_then(|contents| {
+                    parse_skill_frontmatter_metadata(&contents, || {
+                        directory
+                            .as_path()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .map_err(|error| error.to_string())
+                });
+            match parsed {
+                Ok(parsed) => {
+                    discovery_paths.insert(canonical_path.clone(), path);
+                    skills.push(SkillMetadata {
+                        name: format!("{}:{}", root.plugin_namespace, parsed.name),
+                        description: parsed.description,
+                        short_description: parsed.short_description,
+                        interface: None,
+                        dependencies: None,
+                        policy: None,
+                        path_to_skills_md: canonical_path,
+                        scope: SkillScope::User,
+                        plugin_id: Some(root.plugin_identity.plugin_id.clone()),
+                        remote_plugin_id: root.plugin_identity.remote_plugin_id.clone(),
+                    });
+                }
+                Err(message) => errors.push(SkillError {
+                    path: canonical_path,
+                    message,
+                }),
+            }
+        }
+    }
+
+    LoadedSkillRoot {
+        root: canonical_root,
+        skills,
+        skill_discovery_path_by_path: Arc::new(discovery_paths),
+        errors,
+        is_agent_plugin: root.discovery_mode == SkillDiscoveryMode::DirectChildren,
+    }
+}
 
 pub(crate) fn test_http_client_factory() -> HttpClientFactory {
     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)

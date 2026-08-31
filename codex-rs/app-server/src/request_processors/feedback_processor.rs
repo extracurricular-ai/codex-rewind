@@ -241,30 +241,44 @@ impl FeedbackRequestProcessor {
         }
 
         let mut extra_attachments = Vec::new();
-        if include_logs
-            && let Some(doctor_report) =
-                super::feedback_doctor_report::doctor_feedback_report(&self.config).await
-        {
-            extra_attachments.push(doctor_report.attachment);
-            for (key, value) in doctor_report.tags {
-                upload_tags.entry(key).or_insert(value);
+        if include_logs {
+            let doctor_cwd = feedback_cwd(
+                &self.thread_manager,
+                self.state_db.as_ref(),
+                conversation_id,
+                self.config.cwd.as_path(),
+            )
+            .await;
+            if let Some(doctor_report) =
+                super::feedback_doctor_report::doctor_feedback_report(&self.config, &doctor_cwd)
+                    .await
+            {
+                extra_attachments.push(doctor_report.attachment);
+                for (key, value) in doctor_report.tags {
+                    upload_tags.entry(key).or_insert(value);
+                }
             }
         }
 
         let session_source = self.thread_manager.session_source();
+        let http_client_factory = self.config.http_client_factory();
+        let runtime_handle = tokio::runtime::Handle::current();
 
         let upload_result = tokio::task::spawn_blocking(move || {
             let tags = (!upload_tags.is_empty()).then_some(&upload_tags);
-            snapshot.upload_feedback(FeedbackUploadOptions {
-                classification: &classification,
-                reason: reason.as_deref(),
-                tags,
-                include_logs,
-                extra_attachments: &extra_attachments,
-                extra_attachment_paths: &attachment_paths,
-                session_source: Some(session_source),
-                logs_override: sqlite_feedback_logs,
-            })
+            runtime_handle.block_on(snapshot.upload_feedback(
+                FeedbackUploadOptions {
+                    classification: &classification,
+                    reason: reason.as_deref(),
+                    tags,
+                    include_logs,
+                    extra_attachments: &extra_attachments,
+                    extra_attachment_paths: &attachment_paths,
+                    session_source: Some(session_source),
+                    logs_override: sqlite_feedback_logs,
+                },
+                &http_client_factory,
+            ))
         })
         .await;
 
@@ -277,7 +291,8 @@ impl FeedbackRequestProcessor {
             }
         };
 
-        upload_result.map_err(|err| internal_error(format!("failed to upload feedback: {err}")))?;
+        upload_result
+            .map_err(|err| internal_error(format!("failed to upload feedback: {err:#}")))?;
         Ok(FeedbackUploadResponse { thread_id })
     }
 
@@ -300,6 +315,33 @@ impl FeedbackRequestProcessor {
                 warn!("failed to resolve rollout path for thread_id={conversation_id}: {err}");
                 None
             })
+    }
+}
+
+async fn feedback_cwd(
+    thread_manager: &ThreadManager,
+    state_db: Option<&StateDbHandle>,
+    conversation_id: Option<ThreadId>,
+    fallback_cwd: &Path,
+) -> PathBuf {
+    let Some(conversation_id) = conversation_id else {
+        return fallback_cwd.to_path_buf();
+    };
+
+    if let Ok(conversation) = thread_manager.get_thread(conversation_id).await {
+        return conversation.config_snapshot().await.cwd().to_path_buf();
+    }
+
+    let Some(state_db) = state_db else {
+        return fallback_cwd.to_path_buf();
+    };
+    match state_db.get_thread(conversation_id).await {
+        Ok(Some(metadata)) => metadata.cwd,
+        Ok(None) => fallback_cwd.to_path_buf(),
+        Err(err) => {
+            warn!("failed to resolve cwd for feedback thread_id={conversation_id}: {err}");
+            fallback_cwd.to_path_buf()
+        }
     }
 }
 
@@ -432,9 +474,31 @@ fn windows_sandbox_log_attachment(_codex_home: &Path) -> Option<FeedbackAttachme
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_protocol::protocol::RolloutLine;
     use codex_protocol::protocol::TurnContextItem;
+    use codex_rollout::RolloutLine;
+    use core_test_support::responses::start_mock_server;
+    use core_test_support::test_codex::test_codex;
+    use http::HeaderMap;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn doctor_uses_loaded_feedback_thread_cwd() -> anyhow::Result<()> {
+        let server = start_mock_server().await;
+        let test = test_codex().build_with_auto_env(&server).await?;
+        let daemon_workspace = tempfile::tempdir()?;
+
+        let cwd = feedback_cwd(
+            &test.thread_manager,
+            /*state_db*/ None,
+            Some(test.session_configured.thread_id),
+            daemon_workspace.path(),
+        )
+        .await;
+
+        assert_eq!(cwd, test.cwd_path());
+        Ok(())
+    }
+
     #[test]
     fn feedback_tags_drop_unverified_client_prompt_tags() {
         let mut upload_tags = BTreeMap::from([
@@ -624,6 +688,7 @@ mod tests {
                     cwd: tempdir.path().to_path_buf(),
                     base_instructions: Some(codex_protocol::models::BaseInstructions {
                         text: "actual developer prompt".to_string(),
+                        provenance: None,
                     }),
                     ..Default::default()
                 },
@@ -645,6 +710,7 @@ mod tests {
                     approvals_reviewer: None,
                     sandbox_policy: codex_protocol::protocol::SandboxPolicy::new_read_only_policy(),
                     permission_profile: None,
+                    active_permission_profile: None,
                     network: None,
                     file_system_sandbox_policy: None,
                     model: (*model).to_string(),
@@ -654,6 +720,7 @@ mod tests {
                     multi_agent_version: None,
                     multi_agent_mode: None,
                     realtime_active: None,
+                    cyber_access_program: None,
                     effort: effort.clone(),
                     summary: ReasoningSummary::Auto,
                 }),
@@ -725,9 +792,7 @@ mod tests {
     #[test]
     fn tool_cache_feedback_attachments_include_directory_cache_without_account_id() {
         let codex_home = tempfile::tempdir().expect("create tempdir");
-        let auth = CodexAuth::Headers(codex_login::AuthHeaders::new(
-            reqwest::header::HeaderMap::new(),
-        ));
+        let auth = CodexAuth::Headers(codex_login::AuthHeaders::new(HeaderMap::new()));
         let directory_cache_context = ConnectorDirectoryCacheContext::new(
             codex_home.path().to_path_buf(),
             ConnectorDirectoryCacheKey::new(

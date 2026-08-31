@@ -1,13 +1,13 @@
 #![allow(warnings, clippy::all)]
 
 use super::*;
+use crate::RolloutLine;
 use crate::list::parse_cursor;
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 use chrono::Timelike;
 use chrono::Utc;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -84,6 +84,7 @@ async fn list_threads_db_rejects_mismatched_sqlite_config_without_cleanup() -> a
         /*relation_filter*/ None,
         /*archived*/ false,
         /*section*/ None,
+        /*project_id*/ None,
         /*search_term*/ None,
     )
     .await;
@@ -200,6 +201,66 @@ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn filesystem_repair_preserves_existing_rollout_path() -> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let thread_id = ThreadId::new();
+    let initial_rollout_path = write_rollout_with_user_message(
+        home.path(),
+        thread_id,
+        "Old",
+        ThreadHistoryMode::Paginated,
+    )?;
+    let old_rollout_path = initial_rollout_path
+        .with_file_name(format!("rollout-2026-06-01T14-26-25-{thread_id}_old.jsonl"));
+    std::fs::rename(initial_rollout_path, old_rollout_path.as_path())?;
+    let active_rollout_path = write_rollout_with_user_message(
+        home.path(),
+        thread_id,
+        "Current",
+        ThreadHistoryMode::Paginated,
+    )?;
+    let runtime = codex_state::StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await?;
+    let active_metadata =
+        metadata::extract_metadata_from_rollout(active_rollout_path.as_path(), "test-provider")
+            .await?
+            .metadata;
+    runtime.upsert_thread(&active_metadata).await?;
+    let active_metadata = runtime
+        .get_thread(thread_id)
+        .await?
+        .expect("thread should exist");
+
+    read_repair_rollout_path(
+        Some(runtime.as_ref()),
+        Some(thread_id),
+        /*archived_only*/ None,
+        old_rollout_path.as_path(),
+    )
+    .await;
+    assert_eq!(
+        runtime.get_thread(thread_id).await?,
+        Some(active_metadata.clone())
+    );
+
+    reconcile_rollout(
+        Some(runtime.as_ref()),
+        old_rollout_path.as_path(),
+        "test-provider",
+        /*builder*/ None,
+        &[],
+        /*archived_only*/ None,
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
+    assert_eq!(runtime.get_thread(thread_id).await?, Some(active_metadata));
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconcile_rollout_preserves_existing_paginated_memory_mode() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let thread_id = ThreadId::new();
@@ -267,6 +328,7 @@ fn write_rollout_with_user_message(
                     session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
                     timestamp: "2026-06-01T14:26:25Z".to_string(),
                     cwd: home.to_path_buf(),

@@ -98,6 +98,7 @@ impl ExternalAgentConfigRequestProcessor {
         } = args;
         let migration_service = ExternalAgentConfigService::new(
             codex_home.clone(),
+            thread_manager.auth_manager(),
             analytics_events_client.clone(),
             state_db.clone(),
         );

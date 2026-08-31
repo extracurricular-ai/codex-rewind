@@ -21,7 +21,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         description: Some(preset.description.clone()),
         default_reasoning_level: Some(preset.default_reasoning_effort.clone()),
         supported_reasoning_levels: preset.supported_reasoning_efforts.clone(),
-        shell_type: ConfigShellToolType::ShellCommand,
+        shell_type: ConfigShellToolType::UnifiedExec,
         visibility: if preset.show_in_picker {
             ModelVisibility::List
         } else {
@@ -34,13 +34,17 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         default_service_tier: preset.default_service_tier.clone(),
         upgrade: preset.upgrade.as_ref().map(Into::into),
         model_messages: Some(ModelMessages {
+            persistent_instructions: None,
             instructions_template: Some("base instructions".to_string()),
             instructions_variables: None,
             approvals: None,
             collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            multi_agent: None,
             token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
         }),
         include_skills_usage_instructions: false,
         include_plugin_usage_instructions: false,
@@ -53,7 +57,6 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: None,
@@ -65,10 +68,13 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
+        node_repl_auto_review_required: false,
+        node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
-        multi_agent_version: None,
+        multi_agent_version: preset.multi_agent_version,
+        multi_agent_reasoning_effort: None,
     }
 }
 

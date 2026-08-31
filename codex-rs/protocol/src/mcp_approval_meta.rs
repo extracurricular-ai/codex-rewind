@@ -1,9 +1,15 @@
+/// Identifies privileged Codex approvals. Changing this key or adding another
+/// privileged discriminator requires updating the MCP elicitation router's
+/// form-forwarding safeguards.
 pub const APPROVAL_KIND_KEY: &str = "codex_approval_kind";
 pub const APPROVAL_KIND_MCP_TOOL_CALL: &str = "mcp_tool_call";
 pub const APPROVAL_KIND_TOOL_SUGGESTION: &str = "tool_suggestion";
 pub const REQUEST_TYPE_KEY: &str = "codex_request_type";
 pub const REQUEST_TYPE_APPROVAL_REQUEST: &str = "approval_request";
 pub const STRICT_AUTO_REVIEW_KEY: &str = "codex_strict_auto_review";
+/// Marks a sensitive action requiring synchronous review when routed to automatic review.
+/// Absent or false preserves the existing approval path; this does not opt into review.
+pub const SENSITIVE_ACTION_KEY: &str = "codex_sensitive_action";
 pub const APPROVALS_REVIEWER_KEY: &str = "approvals_reviewer";
 pub const PERSIST_KEY: &str = "persist";
 pub const PERSIST_SESSION: &str = "session";

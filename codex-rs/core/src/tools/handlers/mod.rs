@@ -23,7 +23,7 @@ mod request_plugin_install;
 pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
 pub(crate) mod request_user_input_spec;
-mod shell;
+mod send_user_message_async;
 pub(crate) mod shell_spec;
 mod sleep;
 mod test_sync;
@@ -35,7 +35,7 @@ mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
 
-use codex_sandboxing::policy_transforms::intersect_permission_profiles;
+use codex_sandboxing::policy_transforms::materialize_additional_permissions;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -68,8 +68,7 @@ pub use plan::PlanHandler;
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
-pub use shell::ShellCommandHandler;
-pub(crate) use shell::ShellCommandHandlerOptions;
+pub use send_user_message_async::SendUserMessageAsyncHandler;
 pub use sleep::SleepHandler;
 pub use test_sync::TestSyncHandler;
 pub(crate) use tool_search::ToolSearchHandlerCache;
@@ -154,18 +153,6 @@ where
     parse_arguments(arguments)
 }
 
-fn resolve_workdir_base_path(
-    arguments: &str,
-    default_cwd: &AbsolutePathBuf,
-) -> Result<AbsolutePathBuf, FunctionCallError> {
-    let arguments: Value = parse_arguments(arguments)?;
-    Ok(arguments
-        .get("workdir")
-        .and_then(Value::as_str)
-        .filter(|workdir| !workdir.is_empty())
-        .map_or_else(|| default_cwd.clone(), |workdir| default_cwd.join(workdir)))
-}
-
 fn resolve_tool_environment<'a>(
     environments: &'a TurnEnvironmentSnapshot,
     environment_id: Option<&str>,
@@ -175,7 +162,7 @@ fn resolve_tool_environment<'a>(
         |environment_id| {
             environments
                 .turn_environments()
-                .find(|environment| environment.environment_id == environment_id)
+                .find(|environment| environment.selection.environment_id == environment_id)
                 .map(Some)
                 .ok_or_else(|| {
                     FunctionCallError::RespondToModel(format!(
@@ -291,12 +278,19 @@ pub(super) async fn apply_granted_turn_permissions(
         additional_permissions.as_ref(),
         granted_permissions.as_ref(),
     );
-    let permissions_preapproved = match (effective_permissions.as_ref(), granted_permissions) {
-        (Some(effective_permissions), Some(granted_permissions)) => {
-            permissions_are_preapproved(effective_permissions, granted_permissions, cwd)
+    let preapproved_permissions = granted_permissions.as_ref().and_then(|granted| {
+        if additional_permissions.is_none() {
+            Some(granted.clone())
+        } else {
+            effective_permissions
+                .as_ref()
+                .and_then(|effective| preapproved_permission_profile(effective, granted, cwd))
         }
-        _ => false,
-    };
+    });
+    let permissions_preapproved = preapproved_permissions.is_some();
+    // A preapproved command must execute with the stored authority, never an
+    // unchecked merge that could reopen one of the grant's denied paths.
+    let effective_permissions = preapproved_permissions.or(effective_permissions);
 
     let sandbox_permissions =
         if effective_permissions.is_some() && !sandbox_permissions.uses_additional_permissions() {
@@ -312,26 +306,45 @@ pub(super) async fn apply_granted_turn_permissions(
     }
 }
 
-fn permissions_are_preapproved(
+fn preapproved_permission_profile(
     effective_permissions: &AdditionalPermissionProfile,
-    granted_permissions: AdditionalPermissionProfile,
+    granted_permissions: &AdditionalPermissionProfile,
     cwd: &Path,
-) -> bool {
-    let materialized_effective_permissions = intersect_permission_profiles(
-        effective_permissions.clone(),
-        effective_permissions.clone(),
-        cwd,
-    );
-    intersect_permission_profiles(effective_permissions.clone(), granted_permissions, cwd)
-        == materialized_effective_permissions
+) -> Option<AdditionalPermissionProfile> {
+    let (Ok(effective), Ok(granted)) = (
+        materialize_additional_permissions(effective_permissions.clone(), cwd),
+        materialize_additional_permissions(granted_permissions.clone(), cwd),
+    ) else {
+        return None;
+    };
+    if effective.network != granted.network {
+        return None;
+    }
+    let unchanged = match (effective.file_system, granted.file_system) {
+        (Some(effective), Some(granted)) => {
+            effective.glob_scan_max_depth == granted.glob_scan_max_depth
+                && effective.entries.len() == granted.entries.len()
+                && effective
+                    .entries
+                    .iter()
+                    .all(|entry| granted.entries.contains(entry))
+        }
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    };
+    unchanged.then(|| granted_permissions.clone())
 }
+
+#[cfg(test)]
+#[path = "permission_preapproval_tests.rs"]
+mod permission_preapproval_tests;
 
 #[cfg(test)]
 mod tests {
     use super::EffectiveAdditionalPermissions;
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;
-    use super::permissions_are_preapproved;
+    use super::preapproved_permission_profile;
     use crate::sandboxing::SandboxPermissions;
     use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
@@ -481,10 +494,9 @@ mod tests {
             merge_permission_profiles(Some(&requested_permissions), Some(&stored_grant))
                 .expect("merged permissions");
 
-        assert!(permissions_are_preapproved(
-            &effective_permissions,
-            stored_grant,
-            cwd.path(),
-        ));
+        assert_eq!(
+            preapproved_permission_profile(&effective_permissions, &stored_grant, cwd.path()),
+            Some(stored_grant)
+        );
     }
 }

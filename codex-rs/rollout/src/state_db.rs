@@ -1,3 +1,4 @@
+use crate::RolloutItem;
 use crate::config::RolloutConfig;
 use crate::config::RolloutConfigView;
 use crate::list::Cursor;
@@ -9,7 +10,6 @@ use anyhow::Context;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 pub use codex_state::LogEntry;
@@ -362,6 +362,7 @@ pub async fn list_threads_db(
     relation_filter: Option<codex_state::ThreadRelationFilter>,
     archived: bool,
     section: Option<Option<&str>>,
+    project_id: Option<Option<&str>>,
     search_term: Option<&str>,
 ) -> Option<codex_state::ThreadsPage> {
     let ctx = context?;
@@ -407,6 +408,7 @@ pub async fn list_threads_db(
             allowed_sources: allowed_sources.as_slice(),
             model_providers: model_providers.as_deref(),
             cwd_filters: normalized_cwd_filters.as_deref(),
+            project_id,
             anchor: anchor.as_ref(),
             sort_key: state_sort_key,
             sort_direction: state_sort_direction,
@@ -434,6 +436,7 @@ pub async fn list_threads_db(
             allowed_sources: allowed_sources.as_slice(),
             model_providers: model_providers.as_deref(),
             cwd_filters: normalized_cwd_filters.as_deref(),
+            project_id,
             anchor: anchor.as_ref(),
             sort_key: state_sort_key,
             sort_direction: state_sort_direction,
@@ -554,6 +557,15 @@ pub async fn reconcile_rollout(
     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
     let existing_metadata = ctx.get_thread(metadata.id).await.ok().flatten();
+    // Filesystem repair may seed a missing row, but it must not change an existing row's
+    // selected rollout path. After `thread/revert`, a scan can find multiple immutable
+    // rollouts for one thread and cannot know which one SQLite selected.
+    if existing_metadata
+        .as_ref()
+        .is_some_and(|existing| existing.rollout_path.as_path() != rollout_path)
+    {
+        return;
+    }
     // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
     // missing row, then keep the value from SQLite.
     let restore_memory_mode_from_rollout =
@@ -607,6 +619,12 @@ pub async fn read_repair_rollout_path(
     if let Some(thread_id) = thread_id
         && let Ok(Some(metadata)) = ctx.get_thread(thread_id).await
     {
+        // Filesystem repair may seed a missing row, but it must not change an existing row's
+        // selected rollout path. After `thread/revert`, a scan can find multiple immutable
+        // rollouts for one thread and cannot know which one SQLite selected.
+        if metadata.rollout_path.as_path() != rollout_path {
+            return;
+        }
         saw_existing_metadata = true;
         let mut repaired = metadata.clone();
         repaired.rollout_path = rollout_path.to_path_buf();

@@ -4,9 +4,9 @@ use super::CheckStatus;
 use super::Config;
 use super::DoctorCheck;
 use super::DoctorIssue;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::protocol::InternalSessionSource;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_state::ThreadStateAuditRow;
@@ -674,6 +674,7 @@ fn source_category(source: &str) -> &'static str {
         SessionSource::Internal(InternalSessionSource::MemoryConsolidation) => {
             "internal:memory_consolidation"
         }
+        SessionSource::Internal(InternalSessionSource::Guardian) => "internal:guardian",
         SessionSource::SubAgent(SubAgentSource::Review) => "subagent:review",
         SessionSource::SubAgent(SubAgentSource::Compact) => "subagent:compact",
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. }) => "subagent:thread_spawn",

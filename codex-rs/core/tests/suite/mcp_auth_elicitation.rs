@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::approvals::ElicitationRequest;
@@ -135,16 +136,10 @@ default_tools_approval_mode = "auto"
     let test = builder.build(&server).await?;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "Use [$calendar](app://calendar) to create a calendar event.".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Use [$calendar](app://calendar) to create a calendar event.".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let EventMsg::ElicitationRequest(request) = wait_for_event(&test.codex, |event| {
@@ -204,13 +199,17 @@ default_tools_approval_mode = "auto"
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    let output = requests[1]
-        .function_call_output_text(call_id)
-        .expect("follow-up request should contain the auth elicitation result");
-    assert!(output.contains(
-        "Authentication for Calendar was requested and accepted. Retry this tool call now."
-    ));
-    assert!(!output.contains("Connector reauthentication required"));
+    let output = requests[1].function_call_output(call_id);
+    let items = output["output"]
+        .as_array()
+        .expect("auth elicitation result should contain content items");
+    assert_eq!(
+        &items[1..],
+        &[json!({
+            "type": "input_text",
+            "text": "Authentication for Calendar was requested and accepted. Retry this tool call now.",
+        })]
+    );
 
     Ok(())
 }
