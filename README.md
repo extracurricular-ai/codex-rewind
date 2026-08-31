@@ -122,7 +122,7 @@ nothing.
 
 ## Clean uninstall
 
-Two commands remove the program and every byte of data it created:
+Two commands remove the program and all of the data it created:
 
 ```shell
 npm uninstall -g codex-rewind     # the program
@@ -136,14 +136,20 @@ you can check rather than take the two commands on faith:
 
 | Path | What it is | Removed by |
 | --- | --- | --- |
-| `~/.codex/file_snapshots/` | the whole snapshot store: `blobs/`, `manifests/`, `refs/`, `turns/`, `restores/` | `rm -rf` above |
-| `<npm prefix>/lib/node_modules/codex-rewind/` | the `codexr` launcher | `npm uninstall` above |
-| `<npm prefix>/lib/node_modules/codex-rewind-<platform>/` | the native binary and its helpers, pulled in as an optional dependency | `npm uninstall` above |
+| `~/.codex/file_snapshots/` | the snapshot store: `blobs/`, `manifests/`, `refs/`, `turns/`, `restores/` | `rm -rf` above |
+| `<npm prefix>/lib/node_modules/codex-rewind/` | the launcher, and the native binary nested inside it under `node_modules/` — about 300 MB together | `npm uninstall` above |
 | `<npm prefix>/bin/codexr` | the symlink that puts `codexr` on your PATH | `npm uninstall` above |
 | `[features] file_snapshots` in `config.toml` | the on switch | by hand, below |
 | `[file_snapshots]` in `config.toml` | tuning, only if you set any | by hand, below |
+| `~/.npm/_cacache` entries | npm's own download cache, which `npm uninstall` never clears | `npm cache clean --force`, which clears it for *every* package |
 
-`/status` shows the store's size, if you want to see what you are deleting first.
+Two details worth stating rather than letting you find them:
+
+- `~/.codex/file_snapshots/` is created the first time you run `codexr`, **whether or
+  not you ever enabled the feature** — the store is opened before the check that
+  decides whether this session tracks anything. If you never turned it on, the
+  directory is there and empty.
+- `/status` shows the store's size, but only when the feature is on.
 
 Two more live in your **project**, not in `~/.codex`, and neither is created without
 you:
@@ -173,8 +179,10 @@ file_snapshots = true    # this line
 track_hidden_files = true
 ```
 
-Leaving them costs one log line: the official build warns `unknown feature key in
-config: file_snapshots` and ignores the rest.
+Leaving them normally costs one log line: the official build warns `unknown feature
+key in config: file_snapshots` and ignores the `[file_snapshots]` table silently.
+The exception is `codex --strict-config`, which rejects unknown configuration fields
+outright — under that flag the leftover key is a hard error, not a warning.
 
 **Do not delete `~/.codex` itself.** The official build uses the same directory —
 your login, your config and every conversation you have ever had live there.
@@ -192,9 +200,11 @@ takes away the ability to rewind those turns, and nothing else.
 
 One thing worth knowing because it is visible: `/rewind` **archives** the
 conversation it supersedes rather than deleting it, into
-`~/.codex/archived_sessions/`. That directory and the archiving are upstream's own
-rather than something added here, so the official build understands them — but an
-archived conversation is archived, not in the active list.
+`~/.codex/archived_sessions/`. The directory and the archive mechanism are upstream's,
+so the official build reads them and `codex unarchive <id>` brings one back — but
+archiving *on rewind* is this build's own decision, and uninstalling does not undo it.
+So after removing this, conversations you rewound are still there and still yours,
+and they are in the archive rather than in `/resume`'s list until you unarchive them.
 
 ## "Why not just commit before every turn?"
 

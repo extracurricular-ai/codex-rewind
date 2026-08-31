@@ -111,7 +111,7 @@ CODEX_HOME=~/.codex-rewind codexr
 
 ## 干净卸载
 
-两条命令,程序和它产生的每一个字节都没了:
+两条命令,程序和它产生的数据都没了:
 
 ```shell
 npm uninstall -g codex-rewind     # 程序本身
@@ -125,14 +125,19 @@ rm -rf ~/.codex/file_snapshots    # 快照数据
 
 | 路径 | 是什么 | 被谁删掉 |
 | --- | --- | --- |
-| `~/.codex/file_snapshots/` | 整个快照存储:`blobs/`、`manifests/`、`refs/`、`turns/`、`restores/` | 上面的 `rm -rf` |
-| `<npm 前缀>/lib/node_modules/codex-rewind/` | `codexr` 启动器 | 上面的 `npm uninstall` |
-| `<npm 前缀>/lib/node_modules/codex-rewind-<平台>/` | 原生二进制及其辅助程序,作为可选依赖装进来 | 上面的 `npm uninstall` |
+| `~/.codex/file_snapshots/` | 快照存储:`blobs/`、`manifests/`、`refs/`、`turns/`、`restores/` | 上面的 `rm -rf` |
+| `<npm 前缀>/lib/node_modules/codex-rewind/` | 启动器,以及**嵌套在它里面** `node_modules/` 下的原生二进制,合计约 300 MB | 上面的 `npm uninstall` |
 | `<npm 前缀>/bin/codexr` | 把 `codexr` 放进 PATH 的软链 | 上面的 `npm uninstall` |
 | `config.toml` 里的 `[features] file_snapshots` | 开关 | 手动,见下 |
 | `config.toml` 里的 `[file_snapshots]` | 调优项,只有你设过才有 | 手动,见下 |
+| `~/.npm/_cacache` 里的条目 | npm 自己的下载缓存,`npm uninstall` 从不清理它 | `npm cache clean --force`,但它会清掉**所有**包的缓存 |
 
-想先看看要删掉多大,`/status` 会告诉你。
+有两点与其让你自己发现,不如直说:
+
+- `~/.codex/file_snapshots/` 在你**第一次运行 `codexr` 时就会创建,不管你有没有启用过这
+  个功能** —— 存储的打开发生在"这次会话要不要追踪"那个判断**之前**。如果你从没开过,
+  这个目录也在,只是空的。
+- `/status` 能看到存储有多大,但只在功能开启时。
 
 还有两样在你的**项目里**而不在 `~/.codex`,而且都不会背着你产生:
 
@@ -157,8 +162,10 @@ file_snapshots = true    # 这一行
 track_hidden_files = true
 ```
 
-留着的代价只有一行日志:官方版会 warn 一句 `unknown feature key in config:
-file_snapshots`,然后忽略其余的。
+正常情况下留着的代价只有一行日志:官方版会 warn 一句 `unknown feature key in config:
+file_snapshots`,而 `[file_snapshots]` 那一段是被静默忽略的。例外是
+`codex --strict-config` —— 它会直接拒绝未知配置字段,在那个开关下残留的 key 是**硬错误**
+而不是警告。
 
 **不要删 `~/.codex` 本身。** 官方版用的是同一个目录 —— 你的登录、配置,以及你有过的
 每一段对话都在里面。
@@ -173,8 +180,10 @@ file_snapshots`,然后忽略其余的。
 卸载前后都是。删掉 `file_snapshots/` 失去的只是回退那些轮次的能力,别的什么都不影响。
 
 有一件事值得知道,因为它看得见:`/rewind` 会把被它取代的那段对话**归档**而不是删除,放进
-`~/.codex/archived_sessions/`。那个目录和归档机制都是**上游自己的**,不是这里加的,所以
-官方版认得它们 —— 但归档了的对话就是归档状态,不在活跃列表里。
+`~/.codex/archived_sessions/`。目录和归档机制是**上游的**,所以官方版读得了它,
+`codex unarchive <id>` 也能把对话取回来 —— 但**"rewind 时归档"这个决定是这个构建自己做
+的**,而且卸载不会把它撤销。也就是说:卸载之后,你 rewind 过的对话仍然在、仍然是你的,
+只是在归档里而不在 `/resume` 的列表里,除非你 unarchive 它。
 
 ## 「为什么不每轮 commit 一次?」
 
