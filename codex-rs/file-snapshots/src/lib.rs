@@ -40,7 +40,6 @@ pub use restore::WriteAction;
 pub use restore::apply_plan;
 pub use restore::plan_restore;
 pub use scope::SNAPSHOT_IGNORE_FILENAME;
-pub use scope::find_workspace_root;
 pub use scope::git_tracked_files;
 pub use scope::is_ignored;
 pub use scope::load_ignore;

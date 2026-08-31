@@ -39,21 +39,6 @@ use ignore::gitignore::GitignoreBuilder;
 /// name is an open question in the RFC).
 pub const SNAPSHOT_IGNORE_FILENAME: &str = ".codexsnapignore";
 
-/// Git-style marker walk-up: return the nearest ancestor of `start`
-/// (inclusive) containing one of `markers`.
-pub fn find_workspace_root(start: &Path, markers: &[String]) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        for marker in markers {
-            if d.join(marker).exists() {
-                return Some(d.to_path_buf());
-            }
-        }
-        dir = d.parent();
-    }
-    None
-}
-
 /// Compile the ignore matcher for `root` from its snapshot ignore file.
 /// A missing ignore file yields an empty matcher (nothing ignored).
 pub fn load_ignore(root: &Path) -> Gitignore {
@@ -364,24 +349,6 @@ mod tests {
             touch(&path, "content");
         }
         git(&["add", "-A"]).then_some((root, dir))
-    }
-
-    #[test]
-    fn walk_up_finds_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("proj");
-        let deep = root.join("a/b/c");
-        fs::create_dir_all(&deep).unwrap();
-        fs::create_dir_all(root.join(".codex")).unwrap();
-
-        let markers = vec![".codex".to_string()];
-        assert_eq!(
-            find_workspace_root(&deep, &markers),
-            Some(root),
-            "nearest ancestor with marker wins"
-        );
-        let elsewhere = tempfile::tempdir().unwrap();
-        assert_eq!(find_workspace_root(elsewhere.path(), &markers), None);
     }
 
     #[test]
