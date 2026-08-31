@@ -57,14 +57,7 @@ codex           # 官方版(如果你装了)
 提供 macOS、Linux、Windows 的预编译二进制,x64 和 arm64 都有,和上游的目标平台一致。
 需要 Node 16 或更高。
 
-卸载:
-
-```shell
-npm uninstall -g codex-rewind
-rm -rf ~/.codex/file_snapshots      # 可选:连快照一起删掉
-```
-
-**不要删 `~/.codex` 本身** —— 官方版用的是同一个目录,你的登录和历史都在里面。
+卸载只要两条命令,而且不动你的对话 —— 见[干净卸载](#干净卸载)。
 
 版本号格式是 `<上游版本>-rewind.<n>` —— `0.147.0-rewind.1` 表示它构建自上游
 `rust-v0.147.0`,每个版本的基线都写在版本号里。它们在 semver 里属于 prerelease,
@@ -115,6 +108,50 @@ CODEX_HOME=~/.codex-rewind codexr
 ```
 
 在那个目录里你需要重新登录一次,之后两个版本就什么都不共享了。
+
+## 干净卸载
+
+两条命令,程序和它产生的每一个字节都没了:
+
+```shell
+npm uninstall -g codex-rewind     # 程序本身
+rm -rf ~/.codex/file_snapshots    # 快照数据
+```
+
+`~/.codex/file_snapshots/` 是这个发行版创建的**唯一**目录。删之前想知道有多大,`/status`
+会告诉你。
+
+npm 是它唯一的分发渠道。仓库里那些独立安装脚本是**上游的** —— 它们从
+releases.openai.com 装官方的 `codex` 二进制,和这个构建无关。
+
+可选:再从 `~/.codex/config.toml` 里删掉两处:
+
+```toml
+[features]
+file_snapshots = true    # 这一行
+
+[file_snapshots]         # 以及这一段,如果你在里面设过东西
+track_hidden_files = true
+```
+
+留着的代价只有一行日志:官方版会 warn 一句 `unknown feature key in config:
+file_snapshots`,然后忽略其余的。
+
+**不要删 `~/.codex` 本身。** 官方版用的是同一个目录 —— 你的登录、配置,以及你有过的
+每一段对话都在里面。
+
+### 你的对话不属于这个东西
+
+历史是按上游自己的格式写的,这个发行版**不往里面加任何东西**:没有新增事件类型,没有新增
+字段,没有 schema 变更。快照完全存在 `file_snapshots/` 下面,以会话 id 和轮次 id 为键
+—— 它们**指向**你的历史,而不是你历史的一部分。
+
+所以一段在这里跑过的对话,包括被 rewind 过的,在官方 `codex` 里打开和别的对话完全一样,
+卸载前后都是。删掉 `file_snapshots/` 失去的只是回退那些轮次的能力,别的什么都不影响。
+
+有一件事值得知道,因为它看得见:`/rewind` 会把被它取代的那段对话**归档**而不是删除,放进
+`~/.codex/archived_sessions/`。那个目录和归档机制都是**上游自己的**,不是这里加的,所以
+官方版认得它们 —— 但归档了的对话就是归档状态,不在活跃列表里。
 
 ## 「为什么不每轮 commit 一次?」
 
