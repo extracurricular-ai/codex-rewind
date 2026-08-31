@@ -509,6 +509,30 @@ mod tests {
              swept in"
         );
 
+        // Two levels down, which is where a native path separator first
+        // appears in the prefix — one level (`app`) has none, which is why the
+        // assertion above proves nothing about it. Asserted on the *string*
+        // form as well, because `PathBuf` equality compares components and
+        // treats `/` and `\` alike, so a `Vec<PathBuf>` assertion is
+        // structurally incapable of seeing a separator. Both are tautologies
+        // on Unix; they exist for the Windows leg.
+        let deep = repo.join("app").join("deep");
+        let ignore = load_ignore(&deep);
+        let found = git_tracked_files(&deep, &ignore);
+        assert_eq!(
+            found,
+            vec![repo.join("app/deep/util.rs")],
+            "a session opened two directories down still sees what git tracks"
+        );
+        assert_eq!(
+            found[0].to_string_lossy(),
+            repo.join("app")
+                .join("deep")
+                .join("util.rs")
+                .to_string_lossy(),
+            "and spells it the way every other partition spells it"
+        );
+
         // From the repository root the same call sees the whole index.
         let ignore = load_ignore(&repo);
         assert_eq!(git_tracked_files(&repo, &ignore).len(), 4);
