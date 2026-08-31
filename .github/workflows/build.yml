@@ -293,6 +293,15 @@ jobs:
             python_bin="python"
           fi
 
+          # Upstream's builder reads the repository root from the environment
+          # and refuses to run without it (`scripts/codex_package/targets.py`).
+          # It is normally set by the `justfile`'s global export or by
+          # `setup-ci`, and this workflow uses neither — it calls the script
+          # directly, and deliberately avoids `setup-ci` because that action
+          # points CARGO_TARGET_DIR outside the checkout. So it is set here,
+          # where the call is.
+          export CODEX_REPO_ROOT="$GITHUB_WORKSPACE"
+
           "$python_bin" scripts/build_codex_package.py \
             --variant codexr \
             --target "$triple" \
