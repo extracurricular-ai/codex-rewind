@@ -202,6 +202,24 @@ command changes not tracked" and "external changes not tracked" come from.</sub>
   merge. Use a worktree or a separate checkout.
 - **Work on remote environments.** Local only.
 
+## If you would rather check than trust
+
+This runs against your files, so scepticism is the correct posture. Two documents
+are kept so you can audit the reasoning rather than take a README's word for it:
+
+- **[RFC](https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/rfc-file-snapshot-rewind.md)**
+  — what the system is: the correctness rules, the three-partition bound and the
+  measurements behind it, and why deletion needs positive evidence.
+- **[Decision log](https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/file-snapshots-decision-log.zh.md)**
+  — what it is *not*, and why. Every approach that was tried and overturned, with
+  dates, the reason it was overturned, and explicit **"do not revert to this"**
+  markers on the ones that still look reasonable. It records the bugs found in
+  this code and the platform traps behind them, including the ones found by its
+  own author. In Chinese.
+
+The second one is the more useful of the two if what you want to know is whether
+anybody thought hard about the ways this could lose your work.
+
 ## Disk use
 
 Snapshots live in `~/.codex/file_snapshots/`, content-addressed, so identical file
