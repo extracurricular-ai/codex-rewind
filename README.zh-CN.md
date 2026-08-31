@@ -118,8 +118,31 @@ npm uninstall -g codex-rewind     # 程序本身
 rm -rf ~/.codex/file_snapshots    # 快照数据
 ```
 
-`~/.codex/file_snapshots/` 是这个发行版创建的**唯一**目录。删之前想知道有多大,`/status`
-会告诉你。
+### 它在你磁盘上放了什么
+
+完整清单 —— 相对官方版**多出来**的每一样东西,这样你可以自己核对,而不是听信上面那两条
+命令:
+
+| 路径 | 是什么 | 被谁删掉 |
+| --- | --- | --- |
+| `~/.codex/file_snapshots/` | 整个快照存储:`blobs/`、`manifests/`、`refs/`、`turns/`、`restores/` | 上面的 `rm -rf` |
+| `<npm 前缀>/lib/node_modules/codex-rewind/` | `codexr` 启动器 | 上面的 `npm uninstall` |
+| `<npm 前缀>/lib/node_modules/codex-rewind-<平台>/` | 原生二进制及其辅助程序,作为可选依赖装进来 | 上面的 `npm uninstall` |
+| `<npm 前缀>/bin/codexr` | 把 `codexr` 放进 PATH 的软链 | 上面的 `npm uninstall` |
+| `config.toml` 里的 `[features] file_snapshots` | 开关 | 手动,见下 |
+| `config.toml` 里的 `[file_snapshots]` | 调优项,只有你设过才有 | 手动,见下 |
+
+想先看看要删掉多大,`/status` 会告诉你。
+
+还有两样在你的**项目里**而不在 `~/.codex`,而且都不会背着你产生:
+
+- `.codexsnapignore` —— 只有你自己写过才有。它是你的文件,和仓库里别的文件一样删就行。
+- `<文件名>.<pid>.<n>.codex-restore-tmp` —— 恢复过程的临时文件,不管恢复成功还是失败都
+  会被清掉。只有恢复到一半崩溃才可能残留,删掉是安全的。
+
+没有别的了。不改 shell 配置,不动 PATH(npm 自己那份除外),没有缓存,没有自己的状态目录,
+也不往二进制旁边写任何东西。`~/.codex/sessions/`、`~/.codex/archived_sessions/`、
+`~/.codex/log/` 以及 `~/.codex` 里其余的东西都是**上游的**、和官方版共用的 —— 别碰。
 
 npm 是它唯一的分发渠道。仓库里那些独立安装脚本是**上游的** —— 它们从
 releases.openai.com 装官方的 `codex` 二进制,和这个构建无关。
