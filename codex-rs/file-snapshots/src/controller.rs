@@ -46,11 +46,20 @@ struct TrackState {
     /// every checkpoint scan so post-edit states keep being observed.
     /// In-memory for v1: lost on resume (recorded manifests stay valid).
     extras: BTreeSet<PathBuf>,
-    /// Directory whose ignore rules scope this session's captures: the
-    /// workspace root when one was found, else the invocation directory.
-    /// Recorded by the turn-start checkpoint, which always precedes tool
-    /// execution within a turn.
-    ignore_root: Option<PathBuf>,
+    /// Directories whose ignore rules scope this session's captures: the
+    /// session's workspace roots, else the invocation directory. Recorded by
+    /// the turn-start checkpoint, which always precedes tool execution within
+    /// a turn.
+    ///
+    /// All of them rather than the first. A session can be configured with
+    /// several roots, `tracked_files` already applies every root's matcher to
+    /// the scan, and consulting only one here would leave a rule living in the
+    /// second root with no effect on edits made in the second root. Symmetric
+    /// ignore is achieved structurally on the restore side — nothing in
+    /// `restore` or `store` consults these rules — so a path that leaks into a
+    /// manifest is written back on rewind and its tombstone licenses a
+    /// deletion. The leak is the whole failure.
+    ignore_roots: Vec<PathBuf>,
 }
 
 impl FileSnapshotsController {
@@ -141,10 +150,9 @@ impl FileSnapshotsController {
         } else {
             related
         };
-        // Whichever directory scoped this capture also scopes the ignore rules
-        // applied to edit-hook captures (see `attach_pre_edits_blocking`).
-        let primary = roots.first().cloned().unwrap_or_else(|| cwd.to_path_buf());
-        self.lock_state().ignore_root = Some(primary);
+        // Whichever directories scoped this capture also scope the ignore
+        // rules applied to edit-hook captures (see `attach_pre_edits_blocking`).
+        self.lock_state().ignore_roots = roots.clone();
 
         // Three partitions, unioned (see `scope`), plus what the agent has
         // written this session — wherever it lives. Walking the subtree
@@ -180,22 +188,37 @@ impl FileSnapshotsController {
         // checkpoint would capture it as well — bypassing the scan's own
         // ignore filter. The rules are read fresh so the current ignore file
         // governs (rule 5).
-        let ignore = self.lock_state().ignore_root.as_deref().map(load_ignore);
+        let ignores: Vec<_> = self
+            .lock_state()
+            .ignore_roots
+            .iter()
+            .map(|root| load_ignore(root))
+            .collect();
         for (path, pre_content) in pre_images {
-            if ignore
-                .as_ref()
-                .is_some_and(|rules| is_ignored(rules, &path))
-            {
+            if ignores.iter().any(|rules| is_ignored(rules, &path)) {
                 continue;
             }
             // The edit-touched partition: unbounded on purpose, since its size
             // follows what the agent did rather than what is on disk.
             self.lock_state().extras.insert(path.clone());
             let key = path.to_string_lossy().into_owned();
-            if let Err(err) =
-                self.store
-                    .attach_pre_edit(&self.thread_id, turn_id, &key, pre_content.as_deref())
-            {
+            // Read before the edit lands, which is the whole reason this hook
+            // runs when it does. `symlink_metadata` rather than `metadata`
+            // because a symlink's own mode says nothing about the file a
+            // restore would write, and capture skips links for the same reason.
+            let mode = std::fs::symlink_metadata(&path)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map_or(crate::manifest::DEFAULT_MODE, |meta| {
+                    crate::manifest::mode_of(&meta)
+                });
+            if let Err(err) = self.store.attach_pre_edit(
+                &self.thread_id,
+                turn_id,
+                &key,
+                pre_content.as_deref(),
+                mode,
+            ) {
                 warn!("file_snapshots: pre-edit attach failed for {key}: {err}");
             }
         }
@@ -391,6 +414,281 @@ mod tests {
             "ignored path must never reach the store, not even via the edit hook: {paths:?}"
         );
         assert!(paths.contains(&tracked.to_string_lossy().into_owned()));
+    }
+
+    /// The edit hook is handed absolute paths from wherever the agent wrote,
+    /// which is not necessarily under the root that scoped the session. The
+    /// ignore matcher is built for one root, and `ignore`'s
+    /// `matched_path_or_any_parents` is documented to panic when asked about a
+    /// path outside it — so the first such edit would abort the whole batch,
+    /// losing the `absent` tombstones that are the only evidence licensing a
+    /// rewind to delete an agent-created file.
+    #[test]
+    fn an_edit_outside_the_ignore_root_still_records_its_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            /*include_hidden*/ false,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".git")).unwrap();
+        // Non-empty on purpose: an empty matcher short-circuits before the
+        // bounds check and would hide this entirely.
+        std::fs::write(
+            ws.path().join(crate::scope::SNAPSHOT_IGNORE_FILENAME),
+            "*.log\n",
+        )
+        .unwrap();
+        std::fs::write(ws.path().join("src.rs"), "code").unwrap();
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[]);
+
+        // A sibling directory: a real absolute path, under no snapshot root.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("created.txt");
+        let inside = ws.path().join("src.rs");
+
+        ctl.attach_pre_edits_blocking(
+            "turn-1",
+            vec![
+                (outside.clone(), None),
+                (inside.clone(), Some(b"code".to_vec())),
+            ],
+        );
+
+        let paths = ctl.store.tracked_paths("t1").unwrap();
+        assert!(
+            paths.contains(&outside.to_string_lossy().into_owned()),
+            "a path under no ignore root is not ignored, and its tombstone is \
+             what licenses a later rewind to remove the file: {paths:?}"
+        );
+        assert!(
+            paths.contains(&inside.to_string_lossy().into_owned()),
+            "one unmatchable path must not drop the rest of the batch"
+        );
+    }
+
+    /// The other half of the same rule. A session can be configured with more
+    /// than one workspace root, and each carries its own ignore file — so a
+    /// rule living in the second root has to govern edits made in the second
+    /// root. Consulting only the first leaves the second root's exclusions
+    /// with no effect on the edit hook at all, and nothing downstream catches
+    /// it: `restore` never consults these rules, so once a path is in a
+    /// manifest a rewind writes it back.
+    #[test]
+    fn every_workspace_root_ignore_file_governs_the_edit_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            /*include_hidden*/ false,
+        )
+        .unwrap();
+
+        // Two roots, both related to the cwd because the cwd is their parent.
+        let ws = tempfile::tempdir().unwrap();
+        let first = ws.path().join("first");
+        let second = ws.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join(crate::scope::SNAPSHOT_IGNORE_FILENAME), "*.a\n").unwrap();
+        std::fs::write(second.join(crate::scope::SNAPSHOT_IGNORE_FILENAME), "*.b\n").unwrap();
+        std::fs::write(first.join("keep.txt"), "keep").unwrap();
+
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[first.clone(), second.clone()]);
+
+        let ignored_by_first = first.join("x.a");
+        let ignored_by_second = second.join("x.b");
+        let kept = first.join("keep.txt");
+        ctl.attach_pre_edits_blocking(
+            "turn-1",
+            vec![
+                (ignored_by_first.clone(), Some(b"a".to_vec())),
+                (ignored_by_second.clone(), Some(b"b".to_vec())),
+                (kept.clone(), Some(b"keep".to_vec())),
+            ],
+        );
+
+        let paths = ctl.store.tracked_paths("t1").unwrap();
+        assert!(
+            !paths.contains(&ignored_by_first.to_string_lossy().into_owned()),
+            "the first root's rules apply: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&ignored_by_second.to_string_lossy().into_owned()),
+            "and so do the second root's — consulting only the first is the bug \
+             this pins: {paths:?}"
+        );
+        assert!(paths.contains(&kept.to_string_lossy().into_owned()));
+    }
+
+    /// `checkpoint_inner`'s `else { related }` arm is the **only** branch
+    /// production ever takes — `core/src/session/turn.rs` always passes the
+    /// environment's workspace roots — and until this test no test in the
+    /// crate had executed it: every other one passes `&[]` and exercises the
+    /// cwd fallback instead.
+    ///
+    /// Both directions are real. A stale root wrongly kept means the scan
+    /// writes `absent` tombstones for index entries missing from that tree,
+    /// and a later rewind may delete files there. A related root wrongly
+    /// dropped means files the sandbox lets the agent write are never
+    /// snapshotted, and `/rewind` silently restores nothing.
+    #[test]
+    fn a_capture_follows_the_session_workspace_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            /*include_hidden*/ false,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path().join("project");
+        let nested = root.join("crate-a");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("top.txt"), "at the root").unwrap();
+        std::fs::write(nested.join("inner.txt"), "below the cwd").unwrap();
+
+        // Configured but unrelated: neither contains the cwd nor sits under it.
+        let unrelated = ws.path().join("elsewhere");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(unrelated.join("stale.txt"), "different environment").unwrap();
+
+        // The turn runs in the nested directory; the root is above it.
+        ctl.checkpoint_turn_start_blocking("turn-1", &nested, &[root.clone(), unrelated.clone()]);
+
+        let manifest = ctl
+            .store
+            .latest_manifest("t1")
+            .unwrap()
+            .expect("the checkpoint recorded something");
+        let has = |path: &std::path::Path| {
+            manifest
+                .entries
+                .contains_key(&path.to_string_lossy().into_owned())
+        };
+
+        assert!(
+            has(&root.join("top.txt")),
+            "the root bounds the capture, not the turn's cwd — a file above \
+             the cwd but inside the configured root is in scope"
+        );
+        assert!(has(&nested.join("inner.txt")));
+        assert!(
+            !has(&unrelated.join("stale.txt")),
+            "a root that neither contains nor sits under the cwd describes a \
+             different environment, and scanning it is the over-capture this \
+             feature exists to avoid"
+        );
+        assert!(
+            !manifest
+                .absent
+                .iter()
+                .any(|path| path.contains("elsewhere")),
+            "and it must not leave tombstones there either — those are what \
+             license a later rewind to delete: {:?}",
+            manifest.absent
+        );
+    }
+
+    /// The sibling shape production actually emits: several roots, all
+    /// related, with the cwd inside one of them. Asserted explicitly so that
+    /// whether the *other* root is in scope is a decision on record rather
+    /// than something nobody noticed either way.
+    #[test]
+    fn every_related_workspace_root_is_in_scope_not_just_the_one_holding_the_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            /*include_hidden*/ false,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        let a = ws.path().join("a");
+        let b = ws.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("in-a.txt"), "a").unwrap();
+        std::fs::write(b.join("in-b.txt"), "b").unwrap();
+
+        // cwd is the parent, so both roots sit under it and both are related.
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[a.clone(), b.clone()]);
+
+        let manifest = ctl.store.latest_manifest("t1").unwrap().unwrap();
+        let has = |path: &std::path::Path| {
+            manifest
+                .entries
+                .contains_key(&path.to_string_lossy().into_owned())
+        };
+        assert!(has(&a.join("in-a.txt")));
+        assert!(
+            has(&b.join("in-b.txt")),
+            "every related root is scanned; the first is not privileged"
+        );
+    }
+
+    /// A pre-edit image used to record a constant `0o644`, on the stated
+    /// grounds that patch content carries no stat. It carries no stat for the
+    /// *content*; the file itself is still on disk when this hook runs, and
+    /// its mode is right there. The cost of the constant was that rewinding to
+    /// a turn where the agent edited a script restored the bytes and chmodded
+    /// the executable bit away in the same operation.
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_edit_image_records_the_file_permissions_it_actually_had() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let ctl = FileSnapshotsController::maybe_new(
+            home.path(),
+            true,
+            true,
+            "t1".into(),
+            /*include_hidden*/ false,
+        )
+        .unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        let script = ws.path().join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ctl.checkpoint_turn_start_blocking("turn-1", ws.path(), &[]);
+        // A path the turn-start scan did not reach, so the edit hook is what
+        // records it — which is the case the constant applied to.
+        let outside = ws.path().join("nested/tool.sh");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ctl.attach_pre_edits_blocking(
+            "turn-1",
+            vec![(outside.clone(), Some(b"#!/bin/sh\n".to_vec()))],
+        );
+
+        let manifest = ctl
+            .store
+            .latest_manifest("t1")
+            .unwrap()
+            .expect("the edit hook recorded something");
+        let entry = &manifest.entries[&outside.to_string_lossy().into_owned()];
+        assert_eq!(
+            entry.mode, 0o755,
+            "the executable bit is part of what a rewind has to put back"
+        );
     }
 
     #[test]

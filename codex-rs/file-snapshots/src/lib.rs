@@ -24,6 +24,7 @@ pub use checkpoint::capture;
 pub use controller::FileSnapshotsController;
 pub use error::Result;
 pub use error::SnapshotError;
+pub use manifest::DEFAULT_MODE;
 pub use manifest::FileEntry;
 pub use manifest::Manifest;
 pub use manifest::ManifestStore;

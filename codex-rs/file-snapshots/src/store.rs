@@ -136,6 +136,7 @@ impl SnapshotStore {
         turn_id: &str,
         path_key: &str,
         pre_content: Option<&[u8]>,
+        mode: u32,
     ) -> Result<Option<String>> {
         let latest = self.latest_manifest(thread_id)?.unwrap_or_default();
         if latest.entries.contains_key(path_key) {
@@ -168,10 +169,14 @@ impl SnapshotStore {
         manifest.entries.insert(
             path_key.to_string(),
             crate::manifest::FileEntry {
-                // Pre-edit images come from patch content, not the
-                // filesystem: no stat is available. The zero fingerprint
-                // simply disables the stat-cache fast path for this entry.
-                mode: 0o644,
+                // The *content* comes from the patch, so the zero fingerprint
+                // below disables the stat-cache fast path for this entry. The
+                // mode does not: the hook runs before the edit, so the file is
+                // still on disk and its permissions are readable. Recording a
+                // constant here meant a rewind actively chmodded an edited
+                // script down to 0o644 — restoring the bytes and destroying
+                // the executable bit in the same operation.
+                mode,
                 size: content.len() as u64,
                 mtime_secs: 0,
                 mtime_nanos: 0,
