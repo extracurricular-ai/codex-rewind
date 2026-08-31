@@ -7372,7 +7372,12 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
         app.chat_widget.remote_image_urls(),
         prompt.remote_image_urls
     );
-    assert_eq!(std::fs::read_to_string(&source_path)?, source_before);
+    // Upstream asserts the source rollout is unchanged *in place*. This build
+    // retires it instead: a rewind archives the thread it supersedes, so the
+    // file has moved out of `sessions/` by now and reading it here would fail.
+    // The property that matters is checked below — the thread survives, and it
+    // is simply no longer offered alongside its own continuation.
+    let _ = &source_before;
     assert_eq!(
         app_server
             .thread_read(source_thread_id, /*include_turns*/ true)
@@ -7392,6 +7397,241 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
             .map(|turn| turn.id.as_str())
             .collect::<Vec<_>>(),
         vec!["turn-1"]
+    );
+    // Kept on disk for /redo, but retired from the session list, so a rewind
+    // reads as one continuing conversation rather than as two branches the
+    // user has to tell apart.
+    let listed = app_server
+        .thread_list(codex_app_server_protocol::ThreadListParams {
+            // `archived: false` is the filter `/resume` itself applies, so this
+            // asks the same question the user's session list does.
+            archived: Some(false),
+            cursor: None,
+            limit: None,
+            sort_key: None,
+            sort_direction: None,
+            model_providers: None,
+            source_kinds: None,
+            section_id: None,
+            parent_thread_id: None,
+            ancestor_thread_id: None,
+            cwd: None,
+            use_state_db_only: false,
+            search_term: None,
+            project_id: None,
+        })
+        .await?
+        .data
+        .into_iter()
+        .map(|thread| thread.id)
+        .collect::<Vec<_>>();
+    assert!(
+        !listed.contains(&source_thread_id.to_string()),
+        "the rewound thread should not still be offered alongside its continuation: {listed:?}"
+    );
+
+    let history = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 120)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let retained_index = history
+        .iter()
+        .position(|line| line.contains("retained prompt"))
+        .expect("forked history should replay the retained prompt");
+    let notice_index = history
+        .iter()
+        .position(|line| line == "• You’re continuing from this point in a new conversation")
+        .expect("prompt edit should emit the branch notice");
+    assert!(retained_index < notice_index);
+    assert!(
+        !history
+            .iter()
+            .any(|line| line.contains("Thread forked from"))
+    );
+    app_server.shutdown().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rewind_works_when_the_in_memory_view_holds_no_turns_of_its_own() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let config = app.chat_widget.config_ref().clone();
+    let filename_ts = "2025-01-05T12-00-00";
+    let source_thread_id = app_test_support::create_fake_rollout(
+        config.codex_home.as_path(),
+        filename_ts,
+        "2025-01-05T12:00:00Z",
+        "unused preview",
+        Some("test-provider"),
+        /*git_info*/ None,
+    )
+    .expect("materialized rollout should be created");
+    let source_path =
+        app_test_support::rollout_path(config.codex_home.as_path(), filename_ts, &source_thread_id);
+    let session_meta = std::fs::read_to_string(&source_path)?
+        .lines()
+        .next()
+        .expect("fake rollout should have session metadata")
+        .to_string();
+    std::fs::write(&source_path, format!("{session_meta}\n"))?;
+    for (turn_id, message, images, local_images) in [
+        ("turn-1", "retained prompt", None, Vec::new()),
+        (
+            "turn-2",
+            "selected prompt [Image #1]",
+            Some(vec!["https://example.com/backtrack.png".to_string()]),
+            vec![PathBuf::from("/tmp/fake-image.png")],
+        ),
+    ] {
+        for item in [
+            RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_id: turn_id.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::default(),
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: message.to_string(),
+                images,
+                local_images,
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn_id.to_string(),
+                last_agent_message: None,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            })),
+        ] {
+            codex_rollout::append_rollout_item_to_path(&source_path, &item).await?;
+        }
+    }
+
+    let source_thread_id = ThreadId::from_string(&source_thread_id)?;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    let started = app_server
+        .resume_thread(
+            config.clone(),
+            source_thread_id,
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+        )
+        .await?;
+    // The one variable this test changes: attach with **no turns at all**.
+    //
+    // The in-memory view is filled when a thread arrives and never grows as
+    // turns accumulate, so a session that has only ever run forward holds none
+    // of its own — and a rewind used to report every prompt as missing from the
+    // persisted thread. The fix is that the fork path asks the server for the
+    // authoritative list rather than trusting this view.
+    //
+    // Written as its own test rather than by adapting the upstream one above:
+    // that test now covers the replay-buffer case, and mutating an upstream
+    // test guarantees a conflict on every sync.
+    app.enqueue_primary_thread_session(started.session, Vec::new())
+        .await?;
+    while app_event_rx.try_recv().is_ok() {}
+    let source_before = std::fs::read_to_string(&source_path)?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let prompt = crate::chatwidget::UserMessage {
+        text: "selected prompt [Image #1]".to_string(),
+        local_images: vec![crate::bottom_pane::LocalImageAttachment {
+            placeholder: "[Image #1]".to_string(),
+            path: PathBuf::from("/tmp/fake-image.png"),
+        }],
+        remote_image_urls: vec!["https://example.com/backtrack.png".to_string()],
+        text_elements: Vec::new(),
+        mention_bindings: Vec::new(),
+    };
+
+    let control = Box::pin(app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::ForkSessionForPromptEdit {
+            thread_id: source_thread_id,
+            nth_user_message: 1,
+            prompt: prompt.clone(),
+            // Upstream's own prompt-edit tests do not exercise file restore.
+            restore_files: false,
+        },
+    ))
+    .await?;
+
+    assert!(matches!(control, AppRunControl::Continue));
+    let forked_thread_id = app
+        .chat_widget
+        .thread_id()
+        .expect("prompt edit should switch to a forked thread");
+    assert_ne!(forked_thread_id, source_thread_id);
+    assert_eq!(app.chat_widget.composer_text_with_pending(), prompt.text);
+    assert_eq!(
+        app.chat_widget.remote_image_urls(),
+        prompt.remote_image_urls
+    );
+    // Upstream asserts the source rollout is unchanged *in place*. This build
+    // retires it instead: a rewind archives the thread it supersedes, so the
+    // file has moved out of `sessions/` by now and reading it here would fail.
+    // The property that matters is checked below — the thread survives, and it
+    // is simply no longer offered alongside its own continuation.
+    let _ = &source_before;
+    assert_eq!(
+        app_server
+            .thread_read(source_thread_id, /*include_turns*/ true)
+            .await?
+            .turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-1", "turn-2"]
+    );
+    assert_eq!(
+        app_server
+            .thread_read(forked_thread_id, /*include_turns*/ true)
+            .await?
+            .turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-1"]
+    );
+    // Kept on disk for /redo, but retired from the session list, so a rewind
+    // reads as one continuing conversation rather than as two branches the
+    // user has to tell apart.
+    let listed = app_server
+        .thread_list(codex_app_server_protocol::ThreadListParams {
+            // `archived: false` is the filter `/resume` itself applies, so this
+            // asks the same question the user's session list does.
+            archived: Some(false),
+            cursor: None,
+            limit: None,
+            sort_key: None,
+            sort_direction: None,
+            model_providers: None,
+            source_kinds: None,
+            section_id: None,
+            parent_thread_id: None,
+            ancestor_thread_id: None,
+            cwd: None,
+            use_state_db_only: false,
+            search_term: None,
+            project_id: None,
+        })
+        .await?
+        .data
+        .into_iter()
+        .map(|thread| thread.id)
+        .collect::<Vec<_>>();
+    assert!(
+        !listed.contains(&source_thread_id.to_string()),
+        "the rewound thread should not still be offered alongside its continuation: {listed:?}"
     );
 
     let history = std::iter::from_fn(|| app_event_rx.try_recv().ok())
