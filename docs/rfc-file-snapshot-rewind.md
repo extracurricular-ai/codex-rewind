@@ -5,6 +5,7 @@
 - **Cross-surface pain this addresses**: [#29388](https://github.com/openai/codex/issues/29388) (Desktop checkpoint blobs: 102 GB, no GC), [#28241](https://github.com/openai/codex/issues/28241) (Desktop turn-diff refs break libgit2 clients), [#4535](https://github.com/openai/codex/issues/4535) / [#15367](https://github.com/openai/codex/issues/15367) / [#2998](https://github.com/openai/codex/issues/2998) (IDE undo toolbar scope & reliability)
 - **History**: #8214 (undo data-loss incident), PR #8424 (un-ship undo), PR #19481 (remove ghost snapshots)
 - **Scope**: `codex-rs` (core + app-server capability; TUI as first consumer)
+- **Decision log**: [`file-snapshots-decision-log.zh.md`](./file-snapshots-decision-log.zh.md) — what was tried, what was overturned, and which reasonable-looking approaches are marked "do not revert to this". This RFC says what the system *is*; the log says what it is *not*, and why. Read the log before implementing.
 
 ---
 

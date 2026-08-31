@@ -179,6 +179,19 @@ Claude Code 有检查点功能已经有一段时间了。如果那是你的参�
   列出文件名**,但它不做合并。请用 worktree 或另一份 checkout。
 - **不支持远程环境。** 仅限本地。
 
+## 与其信,不如查
+
+这东西直接动你的文件,所以怀疑是正确的态度。有两份文档专门留着让你自己核,而不是听 README 说:
+
+- **[RFC](https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/rfc-file-snapshot-rewind.md)**
+  —— 系统**是**什么:正确性规则、三分区边界及其背后的实测数据、以及为什么删除必须有正面证据。
+- **[决策日志](https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/file-snapshots-decision-log.zh.md)**
+  —— 系统**不是**什么,以及为什么。每一个试过又被推翻的方案,都带日期、推翻理由,以及对那些
+  "看起来很合理但就是不行"的做法标注的 **不要改回**。里面也记着这份代码里发现过的 bug 和它们
+  背后的平台陷阱,包括作者自己踩的。
+
+如果你想知道的是"有没有人认真想过这东西会怎么弄丢我的工作",第二份比第一份有用。
+
 ## 磁盘占用
 
 快照存在 `~/.codex/file_snapshots/`,内容寻址——相同的文件内容只存一份,无论多少轮次或

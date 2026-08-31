@@ -1,6 +1,11 @@
 //! Git-free file snapshot storage for session rewind.
 //!
-//! See `docs/rfc-file-snapshot-rewind.md` for the full design. This crate
+//! See `docs/rfc-file-snapshot-rewind.md` for the full design, and
+//! `docs/file-snapshots-decision-log.zh.md` before changing anything here —
+//! it records what was tried and rejected, and carries explicit
+//! "**不要改回**" markers on the approaches that look reasonable and are not.
+//! Several bugs in this crate's history were re-derivations of decisions
+//! already made there. This crate
 //! implements Phase 1: content-addressed blobs, stat-cached manifests,
 //! per-thread snapshot logs with mark-and-sweep GC, and a restore planner
 //! implementing the safety-checkpoint and witnessed-birth rules — with no
