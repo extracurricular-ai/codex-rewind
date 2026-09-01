@@ -344,6 +344,7 @@
     3. **`cargo test` 跑本 fork 关心的那批测试**(rewind / redo / prompt-edit / file_snapshots),`check` 抓不住行为回归(决策 66)。**不要跑整个 tui 套件** —— 基线本身就是红的(决策 67)
     4. `grep -rn 'cargo_bin("codex")' --include=*.rs codex-rs/`
     5. 跑 `tests.yml`
+    6. **推正式 tag 之前先跑一次 `release.yml` 的 dry run** —— 发布路径不被上面任何一条覆盖(决策 69)
     - **第 2 条要特别强调**:`cargo test -p codex-file-snapshots` 和 schema 测试**全绿说明不了任何问题**,因为它们根本不编译 app-server 和 tui。这次就是最后那道检查才发现 11 处破坏的。
 
 61. **冲突要看边界切在哪里,不只是看两边内容。** 对 `thread_processor.rs` 用脚本统一"两边都保留",然后没有回读结果。第一处(import 撞 import)确实是相邻插入;**第二处不是** —— 上游的 `thread_revert` 和 fork 的 `thread_undo_file_restore` 跨在同一个函数体中间,机械拼接把 fork handler 的尾部(`.await; Ok(None) }`)吃掉了,报 `unclosed delimiter`。
@@ -397,6 +398,17 @@
     - **在 fork 里,merge commit 是记录"上游到 X 已并入"这个事实的唯一机制。**
     - 常见的反对意见是"那几个修冲突的 commit 会不会被埋" —— 不会。用 GitHub 的 "Create a merge commit" 之后,PR 里的每个 commit **都作为祖先落在 `main` 上**,`git log`/`git blame`/`cherry-pick` 一样够得着。
     - 补充:分支里含 merge commit 时,GitHub 的 "Rebase and merge" 通常直接不可用 —— 它没法把一个 merge 重放成线性提交。所以这多半不是二选一。
+
+69. **第 13 处语义漏网在发布路径上,而整套验收清单结构上抓不到它。** 决策 59 数了 11 处、决策 66 补了第 12 处(行为回归),这是第 13 处 —— 也是最该记的一处,因为它**逃过了决策 60 的全部四条**。
+    - 症状:推 tag 后 release 构建六个平台全部失败,30 分钟后报
+      `RuntimeError: CODEX_REPO_ROOT must point to the repository root`。
+    - 根因:上游给 `scripts/codex_package/targets.py` 加了硬性要求,读不到该环境变量就直接 raise。上游有**两处**设它 —— `justfile:3` 的全局 export、`.github/actions/setup-ci` —— 而本 fork 的 `build.yml` **两处都不走**:它直接调脚本,且**刻意不用 `setup-ci`**(那个 action 会把 `CARGO_TARGET_DIR` 指到 checkout 之外,破坏本工作流依赖的缓存)。
+    - 修法:在调用处 `export CODEX_REPO_ROOT="$GITHUB_WORKSPACE"`。
+    - **为什么清单抓不到**:它在 Python/YAML 里而不在 Rust 里,所以 `cargo check` 和 `cargo test` 结构上都看不见;而 `tests.yml` **根本不覆盖 `release.yml` / `build.yml`**。冲突标记也没有,自动合并干净。
+    - **最要命的一点**:`release.yml` 只在**推 tag** 时运行。也就是说 —— **同步对发布路径的影响,第一次执行就是正式发布本身。**
+    - **因此清单要加第 6 条**:同步之后、推正式 tag 之前,先跑一次 `release.yml` 的 **dry run**(`Actions → release → Run workflow`,`dry_run` 勾上)。它会完整走打包和 registry 校验而不上传,是唯一能在花掉一个版本号之前验证发布路径的手段。
+    - 这次的实际损失是零(build 失败 ⇒ publish 不会运行 ⇒ 版本号没被占用),但那是**运气好在失败点靠前**。若失败发生在第七个 publish,六个平台包已公开、版本号即作废。
+    - 附带发现:`.github/workflows/zstd`(上游的 DotSlash manifest)被 fork 裁剪 workflow 时一起删了。**目前无害** —— `build.yml` 不传 `--archive-output`,`write_archive` 不被调用;且 `resolve_zstd_command` 会先用 PATH 上的 `zstd`,runner 自带,DotSlash 只是兜底。记在这里是免得下次有人查到这条路又重新推导一遍。
 
 ## 四、已知但暂不处理
 
