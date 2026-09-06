@@ -29,8 +29,8 @@
 
 ![agent 删掉 notes.txt;/rewind 选中删除之前那一步;ls 显示文件回来了](https://raw.githubusercontent.com/extracurricular-ai/codex-rewind/main/.github/rewind.gif)
 
-▶ [完整讲解(22 分钟)](https://youtu.be/OpJI8NQ-mvY) —— 上面这段演示的完整版,
-以及它背后的设计:为什么 git 是错的地基、三个桶是什么、以及它到哪儿为止。
+▶ [完整讲解(21 分钟)](https://www.bilibili.com/video/BV1ZAtv6NEHh/) —— 上面这段演示的完整版,
+附安装教程,以及它背后的设计:为什么 git 是错的地基、三个桶是什么、以及它到哪儿为止。
 
 ```
 /rewind     选一条提示词,对话和文件一起回到那时
