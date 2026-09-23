@@ -1,7 +1,13 @@
+use codex_config::GuardianPolicyLoader;
+use codex_context_fragments::ContextualUserFragment;
+use codex_context_fragments::RenderedFragment;
 use codex_core::config::Config;
 use codex_features::FeatureToml;
 use codex_features::GuardianV2ConfigToml;
 use codex_features::GuardianV2TranscriptConfigToml;
+use codex_prompts::GuardianClassifierInstructions;
+use codex_prompts::ResolvedModelMessages;
+use codex_protocol::openai_models::GuardianModelPolicy;
 use codex_protocol::openai_models::GuardianV2ModelConfig;
 use codex_protocol::openai_models::ReasoningEffort;
 
@@ -12,7 +18,6 @@ use super::transcript::MAX_TOOL_ENTRY_TOKENS;
 use super::transcript::MAX_TOOL_TRANSCRIPT_TOKENS;
 use super::transcript::TranscriptConfig;
 use super::transcript::TranscriptSource;
-use super::transcript::truncate_entry;
 
 pub(crate) const DEFAULT_MODEL_CONTEXT_ITEM_TOKENS: usize = 10_000;
 pub(crate) const DEFAULT_PARENT_COMPACTION_TOKENS: usize = 25_000;
@@ -21,14 +26,7 @@ const MAX_MODEL_CONTEXT_ITEM_TOKENS: usize = 100_000;
 const DEFAULT_REVIEW_THRESHOLD: f64 = 0.5;
 const LEGACY_REVIEW_THRESHOLD: f64 = 0.8;
 const DEFAULT_MAX_TOOL_CALL_LAG: usize = 2;
-pub(crate) const DEFAULT_CLASSIFIER_INSTRUCTIONS: &str = include_str!("classifier_instructions.md");
 pub(crate) const CLASSIFICATION_OUTPUT_INSTRUCTIONS: &str = "Your first output token is the entire classification: `high` for high risk or `low` for low risk. Output that token immediately and nothing else.";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GuardianV2ReviewScope {
-    Standard { sandboxed_exec_commands: bool },
-    ComputerUseOnly,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GuardianV2Config {
@@ -43,7 +41,7 @@ pub(crate) struct GuardianV2Config {
     pub(crate) max_classifier_instruction_tokens: Option<usize>,
     pub(crate) reuse_parent_compaction: bool,
     pub(crate) max_parent_compaction_tokens: usize,
-    pub(crate) review_scope: GuardianV2ReviewScope,
+    pub(super) policy: GuardianPolicyLoader,
     pub(crate) transcript: TranscriptConfig,
 }
 
@@ -67,7 +65,22 @@ impl GuardianV2Config {
             None => GuardianV2ConfigToml::default(),
         };
 
-        Self::from_overrides(configured)
+        let mut resolved = Self::from_overrides(configured.clone())?;
+        // Config.features can be changed after loading, including for reviewer threads.
+        let legacy = FeatureToml::Config(GuardianV2ConfigToml {
+            enabled: Some(config.features.enabled(codex_features::Feature::GuardianV2)),
+            ..configured
+        });
+        resolved.policy =
+            GuardianPolicyLoader::new(Some(&legacy), config.config_layer_stack.requirements());
+        Ok(resolved)
+    }
+
+    pub(super) fn policy_for_model(
+        &self,
+        model: Option<&codex_protocol::openai_models::ModelInfo>,
+    ) -> GuardianModelPolicy {
+        self.policy.resolve(model)
     }
 
     pub(crate) fn with_model_defaults(
@@ -147,6 +160,7 @@ impl GuardianV2Config {
 
         let mut resolved = Self::from_overrides(configured)?;
         resolved.local_overrides = self.local_overrides.clone();
+        resolved.policy = self.policy.clone();
         Ok(resolved)
     }
 
@@ -228,12 +242,21 @@ impl GuardianV2Config {
             );
         }
 
+        let policy = GuardianPolicyLoader::new(
+            Some(&FeatureToml::Config(GuardianV2ConfigToml {
+                enabled: Some(true),
+                ..configured.clone()
+            })),
+            &codex_config::ConfigRequirements::default(),
+        );
         Ok(Self {
             local_overrides: configured.clone(),
             persist_scores: configured.persist_scores.unwrap_or(false),
-            classifier_instructions: configured
-                .classifier_instructions
-                .unwrap_or_else(|| DEFAULT_CLASSIFIER_INSTRUCTIONS.to_owned()),
+            classifier_instructions: configured.classifier_instructions.unwrap_or_else(|| {
+                ResolvedModelMessages::bundled()
+                    .guardian_classifier_instructions()
+                    .to_owned()
+            }),
             review_threshold,
             max_tool_call_lag: configured
                 .max_tool_call_lag
@@ -243,22 +266,7 @@ impl GuardianV2Config {
             max_classifier_instruction_tokens,
             reuse_parent_compaction: configured.reuse_parent_compaction.unwrap_or(true),
             max_parent_compaction_tokens,
-            review_scope: if configured
-                .review_scope
-                .as_ref()
-                .and_then(|review_scope| review_scope.computer_use_only)
-                .unwrap_or(true)
-            {
-                GuardianV2ReviewScope::ComputerUseOnly
-            } else {
-                GuardianV2ReviewScope::Standard {
-                    sandboxed_exec_commands: configured
-                        .review_scope
-                        .as_ref()
-                        .and_then(|review_scope| review_scope.sandboxed_exec_commands)
-                        .unwrap_or(false),
-                }
-            },
+            policy,
             transcript: TranscriptConfig {
                 sources: transcript_config
                     .and_then(|transcript| transcript.sources.clone())
@@ -277,31 +285,14 @@ impl GuardianV2Config {
         })
     }
 
-    pub(crate) fn render_classifier_instructions(&self, policy: &str) -> String {
-        let instructions = if self
-            .classifier_instructions
-            .contains("{{ tenant_policy_config }}")
-        {
-            self.classifier_instructions
-                .replace("{{ tenant_policy_config }}", policy)
-        } else {
-            format!(
-                "{}\n\n# Security Policy\n{policy}",
-                self.classifier_instructions
-            )
-        };
-        let instructions = if instructions
-            .trim_end()
-            .ends_with(CLASSIFICATION_OUTPUT_INSTRUCTIONS)
-        {
-            instructions
-        } else {
-            format!("{instructions}\n\n{CLASSIFICATION_OUTPUT_INSTRUCTIONS}")
-        };
-        match self.max_classifier_instruction_tokens {
-            Some(max_tokens) => truncate_entry(&instructions, max_tokens),
-            None => instructions,
-        }
+    pub(crate) fn render_classifier_instructions(&self, policy: &str) -> RenderedFragment {
+        GuardianClassifierInstructions::new(
+            &self.classifier_instructions,
+            policy,
+            CLASSIFICATION_OUTPUT_INSTRUCTIONS,
+            self.max_classifier_instruction_tokens,
+        )
+        .render_fragment()
     }
 }
 

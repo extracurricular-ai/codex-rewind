@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/tests/popups_and_settings.rs
+expression: popup
+---
+  Apps
+  Failed to load apps.
+
+
+     App directory unavailable  The app directory request failed. Retry, or
+                                press Esc to continue.
+› 1. Retry                      Reload installed and available apps.
+
+  enter select · esc back

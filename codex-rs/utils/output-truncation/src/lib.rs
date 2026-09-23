@@ -1,6 +1,8 @@
-//! Helpers for truncating tool and exec output using [`TruncationPolicy`](codex_protocol::protocol::TruncationPolicy).
+//! Shared byte/token truncation for tool and exec output.
 
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 pub use codex_utils_string::approx_bytes_for_tokens;
 pub use codex_utils_string::approx_token_count;
 pub use codex_utils_string::approx_tokens_from_byte_count;
@@ -8,6 +10,12 @@ use codex_utils_string::truncate_middle_chars;
 use codex_utils_string::truncate_middle_with_token_budget;
 
 pub use codex_protocol::protocol::TruncationPolicy;
+
+/// Adds the existing 20% allowance for serialization and headers.
+/// Saved history budgets already include this allowance.
+pub fn with_serialization_allowance(policy: TruncationPolicy) -> TruncationPolicy {
+    policy * 1.2
+}
 
 pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
     if content.len() <= policy.byte_budget() {
@@ -26,6 +34,24 @@ pub fn truncate_text(content: &str, policy: TruncationPolicy) -> String {
     match policy {
         TruncationPolicy::Bytes(bytes) => truncate_middle_chars(content, bytes),
         TruncationPolicy::Tokens(tokens) => truncate_middle_with_token_budget(content, tokens).0,
+    }
+}
+
+/// Applies the existing byte/token budget without changing success metadata or media ordering.
+pub fn truncate_function_output_payload(
+    output: &mut FunctionCallOutputPayload,
+    policy: TruncationPolicy,
+    estimate_audio_token_count: impl Fn(&str) -> usize,
+) {
+    match &mut output.body {
+        FunctionCallOutputBody::Text(text) => *text = truncate_text(text, policy),
+        FunctionCallOutputBody::ContentItems(items) => {
+            *items = truncate_function_output_items_with_policy(
+                items,
+                policy,
+                estimate_audio_token_count,
+            );
+        }
     }
 }
 
@@ -64,9 +90,9 @@ pub fn formatted_truncate_text_content_items_with_policy(
         text: formatted_truncate_text(&combined, policy),
     }];
     out.extend(items.iter().filter_map(|item| match item {
-        FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+        FunctionCallOutputContentItem::InputImage { image, detail } => {
             Some(FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
+                image: image.clone(),
                 detail: *detail,
             })
         }
@@ -133,9 +159,9 @@ pub fn truncate_function_output_items_with_policy(
                     remaining_budget = 0;
                 }
             }
-            FunctionCallOutputContentItem::InputImage { image_url, detail } => {
+            FunctionCallOutputContentItem::InputImage { image, detail } => {
                 out.push(FunctionCallOutputContentItem::InputImage {
-                    image_url: image_url.clone(),
+                    image: image.clone(),
                     detail: *detail,
                 });
             }

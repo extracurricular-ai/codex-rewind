@@ -124,6 +124,7 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
         parent_thread_id: None,
         timestamp: "2026-01-27T12:34:56Z".to_string(),
         cwd: dir.path().to_path_buf(),
+        runtime_workspace_roots: None,
         originator: "cli".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::default(),
@@ -223,6 +224,7 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
         parent_thread_id: None,
         timestamp: "2026-01-27T12:34:56Z".to_string(),
         cwd: dir.path().to_path_buf(),
+        runtime_workspace_roots: None,
         originator: "cli".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::default(),
@@ -291,11 +293,15 @@ fn builder_from_items_falls_back_to_filename() {
     let items = vec![RolloutItem::Compacted(CompactedItem {
         message: "noop".to_string(),
         replacement_history: None,
+        retained_context: None,
+        guardian_history: None,
         mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })];
 
     let builder = builder_from_items(items.as_slice(), path.as_path()).expect("builder");
@@ -564,6 +570,7 @@ fn write_rollout_in_sessions_with_cwd(
         parent_thread_id: None,
         timestamp: event_ts.to_string(),
         cwd,
+        runtime_workspace_roots: None,
         originator: "cli".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::default(),

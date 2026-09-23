@@ -1,0 +1,28 @@
+---
+source: tui/src/app/agents_overview_tests.rs
+expression: normalize_agent_center_snapshot(grouping)
+---
+  Agent command center  Group: Project  g
+   All 4   Needs you 0   Working 0   Ready 4   Inactive 0                                                                                 tab/shift+tab filter
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+      Tasks                                                                                   Status         Updated
+  /tmp/worktree-root/primary  2
+  › ○ Task                                                                                    Ready           2m ago
+    ○ Task                                                                                    Ready           2m ago
+
+  /tmp/worktree-root/primary/subdir/child  1
+    ○ Task                                                                                    Ready           2m ago
+
+  /tmp/worktree-root/primary/subdir/child  1
+    ○ Task                                                                                    Ready           2m ago
+
+
+
+
+
+
+
+
+
+
+  ? help  esc back  ↑/↓ move  enter open  n new

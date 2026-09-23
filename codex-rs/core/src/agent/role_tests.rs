@@ -232,26 +232,67 @@ async fn apply_role_preserves_unspecified_keys() {
 }
 
 #[tokio::test]
-async fn apply_role_regenerates_model_instructions_when_personality_changes() {
-    for (role_contents, provenance) in [
+async fn apply_role_refreshes_model_instructions_only_when_personality_opt_out_changes() {
+    for (parent_personality, role_contents, provenance, should_refresh) in [
         (
+            "friendly",
             "personality = \"none\"",
             BaseInstructionsProvenance::Model {
                 model: "parent-model".to_string(),
             },
+            true,
         ),
         (
+            "friendly",
             "[features]\npersonality = false",
             BaseInstructionsProvenance::Model {
                 model: "parent-model".to_string(),
             },
+            false,
         ),
-        ("personality = \"none\"", BaseInstructionsProvenance::Custom),
+        (
+            "none",
+            "[features]\npersonality = false",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            false,
+        ),
+        (
+            "friendly",
+            "personality = \"none\"\n[features]\npersonality = false",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            true,
+        ),
+        (
+            "friendly",
+            "personality = \"pragmatic\"",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            false,
+        ),
+        (
+            "none",
+            "personality = \"friendly\"",
+            BaseInstructionsProvenance::Model {
+                model: "parent-model".to_string(),
+            },
+            true,
+        ),
+        (
+            "friendly",
+            "personality = \"none\"",
+            BaseInstructionsProvenance::Custom,
+            false,
+        ),
     ] {
         let (home, mut config) = test_config_with_cli_overrides(vec![
             (
                 "personality".to_string(),
-                TomlValue::String("friendly".to_string()),
+                TomlValue::String(parent_personality.to_string()),
             ),
             ("features.personality".to_string(), TomlValue::Boolean(true)),
         ])
@@ -272,12 +313,10 @@ async fn apply_role_regenerates_model_instructions_when_personality_changes() {
             .await
             .expect("custom role should apply");
 
-        let expected = match provenance {
-            BaseInstructionsProvenance::Model { .. } => (None, None),
-            BaseInstructionsProvenance::Custom => (
-                Some("inherited instructions".to_string()),
-                Some(BaseInstructionsProvenance::Custom),
-            ),
+        let expected = if should_refresh {
+            (None, None)
+        } else {
+            (Some("inherited instructions".to_string()), Some(provenance))
         };
         assert_eq!(
             (
@@ -711,7 +750,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
 }
 
 #[test]
-fn spawn_tool_spec_marks_role_locked_service_tier() {
+fn spawn_tool_spec_omits_role_service_tier() {
     let tempdir = TempDir::new().expect("create temp dir");
     let role_path = tempdir.path().join("tiered.toml");
     fs::write(
@@ -730,9 +769,7 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
 
     let spec = spawn_tool_spec::build(&user_defined_roles);
 
-    assert!(spec.contains(
-        "Stay fast.\n- This role's service tier is set to `priority`. If it is supported by the resolved model, it takes precedence over a valid spawn request service tier."
-    ));
+    assert!(spec.contains("tiered: {\nStay fast.\n}"));
 }
 
 #[test]

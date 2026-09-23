@@ -1,10 +1,56 @@
 use super::*;
 use crate::session::tests::make_session_configuration_for_tests;
 use crate::state::AutoCompactWindowSnapshot;
+use codex_protocol::SessionId;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SpendControlLimitSnapshot;
+use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageRecord;
 use pretty_assertions::assert_eq;
+
+#[tokio::test]
+async fn record_token_usage_continues_restored_totals() {
+    let thread_id = ThreadId::new();
+    let session_id = SessionId::from(ThreadId::new());
+    let usage = |total_tokens| TokenUsage {
+        total_tokens,
+        ..TokenUsage::default()
+    };
+    let mut restored = SessionState::new(make_session_configuration_for_tests().await);
+    restored.latest_token_usage_record = Some(TokenUsageRecord {
+        thread_id,
+        turn_id: "turn-b".to_string(),
+        session_id,
+        root_turn_id: "root-turn".to_string(),
+        response_id: "response-c".to_string(),
+        usage: usage(30),
+        turn_token_usage: usage(30),
+        thread_token_usage: usage(230),
+    });
+    let after_resume = restored.record_token_usage(
+        thread_id,
+        "turn-b",
+        session_id,
+        "root-turn".to_string(),
+        "response-d".to_string(),
+        &usage(20),
+    );
+    assert_eq!(
+        after_resume,
+        TokenUsageRecord {
+            thread_id,
+            turn_id: "turn-b".to_string(),
+            session_id,
+            root_turn_id: "root-turn".to_string(),
+            response_id: "response-d".to_string(),
+            usage: usage(20),
+            turn_token_usage: usage(50),
+            thread_token_usage: usage(250),
+        }
+    );
+}
 
 #[tokio::test]
 // Verifies connector merging deduplicates repeated IDs.
@@ -43,6 +89,7 @@ async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 12.0,
             window_minutes: Some(60),
@@ -89,6 +136,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex_other".to_string()),
         limit_name: Some("codex_other".to_string()),
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 20.0,
             window_minutes: Some(60),
@@ -104,6 +152,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 30.0,
             window_minutes: Some(60),
@@ -134,6 +183,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex".to_string()),
         limit_name: Some("codex".to_string()),
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 10.0,
             window_minutes: Some(60),
@@ -159,6 +209,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex_other".to_string()),
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 30.0,
             window_minutes: Some(120),
@@ -177,6 +228,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
         Some(RateLimitSnapshot {
             limit_id: Some("codex_other".to_string()),
             limit_name: None,
+            normal_model_slug: None,
             primary: Some(RateLimitWindow {
                 used_percent: 30.0,
                 window_minutes: Some(120),
@@ -203,6 +255,7 @@ async fn set_rate_limits_carries_account_metadata_from_codex_to_codex_other() {
     state.set_rate_limits(RateLimitSnapshot {
         limit_id: Some("codex_other".to_string()),
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: None,

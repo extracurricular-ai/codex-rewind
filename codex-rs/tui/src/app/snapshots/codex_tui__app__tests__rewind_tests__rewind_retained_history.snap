@@ -1,0 +1,8 @@
+---
+source: tui/src/app/rewind_tests.rs
+expression: "history[retained_index..=notice_index].join(\"\\n\")"
+---
+
+› retained prompt
+
+• You’re continuing from this point in a new conversation

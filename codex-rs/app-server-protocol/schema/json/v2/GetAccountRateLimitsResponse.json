@@ -174,6 +174,13 @@
             "null"
           ]
         },
+        "normalModelSlug": {
+          "description": "Normal model whose display name and reasoning options describe this quota alias.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "planType": {
           "anyOf": [
             {
@@ -277,6 +284,20 @@
     }
   },
   "properties": {
+    "accountId": {
+      "description": "Account associated with this usage snapshot, when supplied by the backend.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "ordinaryUsageAllowed": {
+      "description": "Backend permission for ordinary included usage, validated against the active account. Null means unavailable; clients must not infer recovery from percentages or reset times.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "rateLimitResetCredits": {
       "anyOf": [
         {
@@ -286,6 +307,9 @@
           "type": "null"
         }
       ]
+    },
+    "rateLimitUpsell": {
+      "description": "Optional backend-owned banner from the same usage read. Its nested keys retain the backend's snake_case contract; an absent banner leaves the client's existing UI unchanged."
     },
     "rateLimits": {
       "allOf": [

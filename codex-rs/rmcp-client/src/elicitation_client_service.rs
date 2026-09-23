@@ -1,4 +1,10 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+
+use codex_protocol::mcp::OPENAI_ELICITATION_EXTENSION_ID;
 
 use rmcp::RoleClient;
 use rmcp::model::ClientInfo;
@@ -9,6 +15,7 @@ use rmcp::model::ElicitResult;
 use rmcp::model::ElicitationAction;
 use rmcp::model::MetaObject;
 use rmcp::model::ProtocolVersion;
+use rmcp::model::RequestId;
 use rmcp::model::RequestMetaObject;
 use rmcp::model::RequestParamsMeta;
 use rmcp::model::ServerNotification;
@@ -20,6 +27,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 use crate::logging_client_handler::LoggingClientHandler;
 use crate::rmcp_client::Elicitation;
@@ -30,6 +38,14 @@ use crate::rmcp_client::SendElicitation;
 const MCP_PROGRESS_TOKEN_META_KEY: &str = "progressToken";
 const MCP_ELICITATION_CREATE_METHOD: &str = "elicitation/create";
 const OPENAI_FORM_METHOD: &str = "openai/form";
+const OPENAI_ELICITATION_METHOD: &str = "openai/elicitation/create";
+
+#[derive(Deserialize)]
+#[serde(tag = "mode")]
+enum OpenAiElicitationRequestParams {
+    #[serde(rename = "form")]
+    Form(OpenAiFormRequestParams),
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,8 +60,37 @@ struct OpenAiFormRequestParams {
 pub(crate) struct ElicitationClientService {
     handler: LoggingClientHandler,
     supports_openai_form: bool,
+    supports_openai_elicitation_form: bool,
+    supports_user_verification: bool,
     send_elicitation: Arc<SendElicitation>,
     pause_state: ElicitationPauseState,
+    pending_verifications: Arc<Mutex<VerificationCancellations>>,
+}
+
+// A notification handler can run before its request handler. Never evict an early
+// cancellation: after saturation, cancel new elicitations for this connection.
+const MAX_EARLY_CANCELLATIONS: usize = 1024;
+
+#[derive(Default)]
+struct VerificationCancellations {
+    pending: HashMap<RequestId, oneshot::Sender<()>>,
+    early: HashSet<RequestId>,
+    saturated: bool,
+}
+
+struct PendingVerification {
+    request_id: RequestId,
+    cancellations: Arc<Mutex<VerificationCancellations>>,
+}
+
+impl Drop for PendingVerification {
+    fn drop(&mut self) {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .remove(&self.request_id);
+    }
 }
 
 impl ElicitationClientService {
@@ -59,15 +104,32 @@ impl ElicitationClientService {
             .extensions
             .as_ref()
             .is_some_and(|extensions| extensions.contains_key(OPENAI_FORM_METHOD));
+        let supports_openai_elicitation_form = client_info
+            .capabilities
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get(OPENAI_ELICITATION_EXTENSION_ID))
+            .and_then(|settings| settings.get("form"))
+            .is_some_and(Value::is_object);
         let send_elicitation = Arc::new(send_elicitation);
+        let supports_user_verification = client_info
+            .capabilities
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get(OPENAI_ELICITATION_EXTENSION_ID))
+            .and_then(|settings| settings.get("userVerification"))
+            .is_some_and(Value::is_object);
         Self {
             handler: LoggingClientHandler::new(
                 client_info,
                 clone_send_elicitation(Arc::clone(&send_elicitation)),
             ),
             supports_openai_form,
+            supports_openai_elicitation_form,
+            supports_user_verification,
             send_elicitation,
             pause_state,
+            pending_verifications: Arc::default(),
         }
     }
 
@@ -76,12 +138,53 @@ impl ElicitationClientService {
         request: Elicitation,
         context: RequestContext<RoleClient>,
     ) -> Result<ElicitationResponse, rmcp::ErrorData> {
-        let RequestContext { id, meta, .. } = context;
+        let RequestContext { id, meta, ct, .. } = context;
         let request = restore_context_meta(request, meta);
+        let user_verification = matches!(&request, Elicitation::UserVerification { .. });
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let _pending = {
+            let mut cancellations = self
+                .pending_verifications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if cancellations.saturated || cancellations.early.remove(&id) {
+                return Ok(ElicitationResponse {
+                    action: ElicitationAction::Cancel,
+                    content: None,
+                    meta: None,
+                });
+            }
+            cancellations.pending.insert(id.clone(), cancel_tx);
+            PendingVerification {
+                request_id: id.clone(),
+                cancellations: Arc::clone(&self.pending_verifications),
+            }
+        };
         let _pause = self.pause_state.enter();
-        (self.send_elicitation)(id, request)
-            .await
-            .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))
+        let response = tokio::select! {
+            biased;
+            _ = ct.cancelled() => {
+                return Ok(ElicitationResponse {
+                    action: ElicitationAction::Cancel,
+                    content: None,
+                    meta: None,
+                });
+            }
+            _ = cancel_rx => {
+                return Ok(ElicitationResponse {
+                    action: ElicitationAction::Cancel,
+                    content: None,
+                    meta: None,
+                });
+            }
+            response = (self.send_elicitation)(id, request) => response,
+        }
+        .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
+        Ok(if user_verification {
+            crate::user_verification::validate_response(response)
+        } else {
+            response
+        })
     }
 }
 
@@ -135,6 +238,23 @@ impl Service<RoleClient> for ElicitationClientService {
                 }
             }
             ServerRequest::CustomRequest(request)
+                if request.method == OPENAI_ELICITATION_METHOD
+                    && self.supports_user_verification
+                    && request
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("mode"))
+                        .and_then(Value::as_str)
+                        == Some(crate::user_verification::MODE) =>
+            {
+                let response = self
+                    .create_elicitation(crate::user_verification::parse_request(request)?, context)
+                    .await?;
+                Ok(ClientResult::CustomResult(elicitation_response_result(
+                    response,
+                )?))
+            }
+            ServerRequest::CustomRequest(request)
                 if request.method == OPENAI_FORM_METHOD && self.supports_openai_form =>
             {
                 let response = self
@@ -143,6 +263,26 @@ impl Service<RoleClient> for ElicitationClientService {
                 Ok(ClientResult::CustomResult(elicitation_response_result(
                     response,
                 )?))
+            }
+            ServerRequest::CustomRequest(request)
+                if request.method == OPENAI_ELICITATION_METHOD
+                    && self.supports_openai_elicitation_form =>
+            {
+                let response = self
+                    .create_elicitation(openai_elicitation_form(request)?, context)
+                    .await?;
+                Ok(ClientResult::CustomResult(elicitation_response_result(
+                    response,
+                )?))
+            }
+            ServerRequest::CustomRequest(request)
+                if request.method == OPENAI_ELICITATION_METHOD
+                    && self.supports_user_verification =>
+            {
+                Err(rmcp::ErrorData::invalid_params(
+                    "invalid elicitation mode",
+                    /*data*/ None,
+                ))
             }
             request => {
                 <LoggingClientHandler as Service<RoleClient>>::handle_request(
@@ -160,6 +300,27 @@ impl Service<RoleClient> for ElicitationClientService {
         notification: ServerNotification,
         context: NotificationContext<RoleClient>,
     ) -> Result<(), rmcp::ErrorData> {
+        if let ServerNotification::CancelledNotification(cancelled) = &notification
+            && let Some(request_id) = cancelled.params.request_id.as_ref()
+        {
+            let mut cancellations = self
+                .pending_verifications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(cancel) = cancellations.pending.remove(request_id) {
+                let _ = cancel.send(());
+            } else if !cancellations.saturated && !cancellations.early.contains(request_id) {
+                // Bound both the number and size of retained request IDs.
+                if cancellations.early.len() == MAX_EARLY_CANCELLATIONS
+                    || matches!(request_id, RequestId::String(id) if id.len() > 1024)
+                {
+                    cancellations.saturated = true;
+                    cancellations.early.clear();
+                } else {
+                    cancellations.early.insert(request_id.clone());
+                }
+            }
+        }
         <LoggingClientHandler as Service<RoleClient>>::handle_notification(
             &self.handler,
             notification,
@@ -194,6 +355,21 @@ fn openai_form_elicitation(request: CustomRequest) -> Result<Elicitation, rmcp::
     })
 }
 
+pub(crate) fn openai_elicitation_form(
+    request: CustomRequest,
+) -> Result<Elicitation, rmcp::ErrorData> {
+    let params = request
+        .params_as::<OpenAiElicitationRequestParams>()
+        .map_err(|err| rmcp::ErrorData::invalid_params(err.to_string(), /*data*/ None))?
+        .ok_or_else(|| rmcp::ErrorData::invalid_params("missing params", /*data*/ None))?;
+    let OpenAiElicitationRequestParams::Form(params) = params;
+    Ok(Elicitation::OpenAiElicitationForm {
+        meta: params.meta,
+        message: params.message,
+        requested_schema: params.requested_schema,
+    })
+}
+
 fn restore_context_meta(
     mut request: Elicitation,
     mut context_meta: RequestMetaObject,
@@ -209,7 +385,9 @@ fn restore_context_meta(
             .meta_mut()
             .get_or_insert_with(RequestMetaObject::new)
             .extend(context_meta),
-        Elicitation::OpenAiForm { meta, .. } => {
+        Elicitation::OpenAiForm { meta, .. }
+        | Elicitation::OpenAiElicitationForm { meta, .. }
+        | Elicitation::UserVerification { meta, .. } => {
             let meta = meta
                 .get_or_insert_with(|| Value::Object(Map::new()))
                 .as_object_mut();
@@ -516,3 +694,7 @@ mod tests {
         RequestMetaObject::from(map)
     }
 }
+
+#[cfg(test)]
+#[path = "user_verification_dispatch_tests.rs"]
+mod user_verification_dispatch_tests;

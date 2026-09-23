@@ -45,10 +45,13 @@ use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::local;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
 use wiremock::ResponseTemplate;
+
+use super::direct_tool_metadata::tool_call_metadata;
 
 fn tool_names(body: &Value) -> Vec<String> {
     body.get("tools")
@@ -80,6 +83,7 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {
         config.tool_registry.error_on_tool_collisions = true;
+        config.update_plan_enabled = true;
         if pre_compact {
             config.model_auto_compact_token_limit = Some(0);
         }
@@ -122,20 +126,25 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
             defer_loading: false,
         })]
     };
-    let thread = test
+    let codex_core::NewThread { thread, .. } = test
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools,
             ..StartThreadOptions::new(test.config.clone())
         })
-        .await?
-        .thread;
+        .await?;
 
     thread
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "use the planning tool".to_string(),
-            text_elements: Vec::new(),
-        }]))
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "use the planning tool".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .on_start(codex_core::TurnStartOptions {
+                root_turn_id: Some("root-turn".into()),
+                ..Default::default()
+            }),
+        )
         .await?;
 
     let EventMsg::Error(error) =
@@ -156,6 +165,18 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
         unreachable!("event predicate guarantees turn completion");
     };
     assert_eq!(completed.error, Some(error));
+    thread.flush_rollout().await?;
+    let history = thread.load_history(/*include_archived*/ false).await?;
+    let attribution = history.items.iter().find_map(|item| match item {
+        codex_history::RolloutItem::EventMsg(EventMsg::TurnStarted(event))
+            if event.turn_id == completed.turn_id =>
+        {
+            event.root_turn_id.as_deref()
+        }
+        _ => None,
+    });
+    assert_eq!(attribution, Some("root-turn"));
+
     assert!(
         server
             .received_requests()
@@ -231,6 +252,7 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
     .await;
 
     let mut builder = test_codex().with_config(|config| {
+        config.update_plan_enabled = true;
         config
             .features
             .enable(Feature::UnifiedExec)
@@ -428,6 +450,7 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
                         "name": format!("{namespace}__{tool_name}"),
                         "arguments": input,
                     }],
+                    "tool_calls_complete": true,
                 },
             }),
         )
@@ -464,12 +487,14 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
     .await?;
     let escaped_request = escaped_mock.single_request();
     assert_eq!(
-        escaped_request.custom_tool_call_output(call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        json!([{
-            "name": format!("{namespace}__{tool_name}"),
-            "arguments": input,
-        }]),
+        tool_call_metadata(escaped_request.custom_tool_call_output(call_id)),
+        json!({
+            "executed_tool_calls": [{
+                "name": format!("{namespace}__{tool_name}"),
+                "arguments": input,
+            }],
+            "tool_calls_complete": true,
+        }),
     );
     let expected_escaped_calls = json!([{
         "name": format!("{namespace}__{tool_name}"),
@@ -481,9 +506,8 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
         },
     }]);
     assert_eq!(
-        escaped_request.custom_tool_call_output(escaped_call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        expected_escaped_calls,
+        tool_call_metadata(escaped_request.custom_tool_call_output(escaped_call_id)),
+        json!({"executed_tool_calls": expected_escaped_calls}),
     );
 
     let direct_exec_call_id = "custom-direct-exec";
@@ -518,17 +542,12 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
 
     let direct_exec_request = direct_exec_mock.single_request();
     assert_eq!(
-        direct_exec_request.custom_tool_call_output(call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        json!([{
-            "name": format!("{namespace}__{tool_name}"),
-            "arguments": input,
-        }]),
+        tool_call_metadata(direct_exec_request.custom_tool_call_output(call_id)),
+        tool_call_metadata(escaped_request.custom_tool_call_output(call_id)),
     );
     assert_eq!(
-        direct_exec_request.custom_tool_call_output(escaped_call_id)["internal_chat_message_metadata_passthrough"]
-            ["executed_tool_calls"],
-        expected_escaped_calls,
+        tool_call_metadata(direct_exec_request.custom_tool_call_output(escaped_call_id)),
+        tool_call_metadata(escaped_request.custom_tool_call_output(escaped_call_id)),
     );
     let direct_exec_output = direct_exec_request.custom_tool_call_output(direct_exec_call_id);
     assert_eq!(
@@ -536,11 +555,14 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
         json!("unsupported custom tool call: exec"),
     );
     assert_eq!(
-        direct_exec_output["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
-        json!([{
-            "name": codex_code_mode::PUBLIC_TOOL_NAME,
-            "arguments": input,
-        }]),
+        tool_call_metadata(direct_exec_output),
+        json!({
+            "executed_tool_calls": [{
+                "name": codex_code_mode::PUBLIC_TOOL_NAME,
+                "arguments": input,
+            }],
+            "tool_calls_complete": true,
+        }),
     );
 
     Ok(())

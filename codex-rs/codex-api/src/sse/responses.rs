@@ -406,8 +406,12 @@ pub fn process_responses_event(
             }
         }
         "response.created" => {
-            if event.response.is_some() {
-                return Ok(Some(ResponseEvent::Created {}));
+            if let Some(response) = event.response {
+                let response_id = response
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                return Ok(Some(ResponseEvent::Created { response_id }));
             }
         }
         "response.failed" => {
@@ -425,6 +429,14 @@ pub fn process_responses_event(
                     } else if is_cyber_policy_error(&error) {
                         let message = cyber_policy_message(error.message);
                         response_error = ApiError::CyberPolicy { message };
+                    } else if error.code.as_deref() == Some("bio_policy") {
+                        let message = error
+                            .message
+                            .filter(|message| !message.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                "This content was flagged for possible biological risk.".to_string()
+                            });
+                        response_error = ApiError::BioPolicy { message };
                     } else if error.code.as_deref() == Some("misalignment_policy_violation") {
                         let message = error
                             .message
@@ -439,8 +451,7 @@ pub fn process_responses_event(
                                 serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
                             }),
                         };
-                    } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy"))
-                    {
+                    } else if error.code.as_deref() == Some("invalid_prompt") {
                         let message = error
                             .message
                             .unwrap_or_else(|| "Invalid request.".to_string());
@@ -451,7 +462,7 @@ pub fn process_responses_event(
                         let delay = try_parse_retry_after(&error);
                         let message = error.message.unwrap_or_default();
                         response_error = match error.code.as_deref() {
-                            Some("rate_limit_exceeded") => {
+                            Some("rate_limit_exceeded" | "slow_down") => {
                                 ApiError::RateLimitExceeded { message, delay }
                             }
                             _ => ApiError::Retryable { message, delay },
@@ -478,8 +489,15 @@ pub fn process_responses_event(
         }
         "response.completed" => {
             if let Some(resp_val) = event.response {
+                let metadata = resp_val
+                    .get("usage")
+                    .filter(|usage| !usage.is_null())
+                    .cloned();
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
-                    Ok(resp) => {
+                    Ok(mut resp) => {
+                        if let Some(metadata) = metadata {
+                            resp.usage_metadata.get_or_insert_default().metadata = Some(metadata);
+                        }
                         return Ok(Some(ResponseEvent::Completed {
                             response_id: resp.id,
                             token_usage: resp.usage.map(Into::into),
@@ -567,7 +585,11 @@ async fn process_sse_with_treatment(
 
     loop {
         let start = Instant::now();
-        let response = timeout(idle_timeout, stream.next()).await;
+        let response = tokio::select! {
+            biased;
+            _ = tx_event.closed() => return,
+            response = timeout(idle_timeout, stream.next()) => response,
+        };
         if let Some(t) = telemetry.as_ref() {
             t.on_sse_poll(&response, start.elapsed());
         }
@@ -668,7 +690,10 @@ async fn process_sse_with_treatment(
 }
 
 fn try_parse_retry_after(err: &Error) -> Option<Duration> {
-    if err.code.as_deref() != Some("rate_limit_exceeded") {
+    if !matches!(
+        err.code.as_deref(),
+        Some("rate_limit_exceeded" | "slow_down")
+    ) {
         return None;
     }
 
@@ -698,7 +723,15 @@ fn is_context_window_error(error: &Error) -> bool {
 }
 
 fn is_quota_exceeded_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("insufficient_quota")
+    matches!(
+        error.code.as_deref(),
+        Some(
+            "insufficient_quota"
+                | "credit_balance_exhausted"
+                | "organization_spend_limit_exceeded"
+                | "project_spend_limit_exceeded"
+        )
+    )
 }
 
 fn is_usage_not_included(error: &Error) -> bool {
@@ -711,7 +744,6 @@ fn is_cyber_policy_error(error: &Error) -> bool {
 
 fn is_server_overloaded_error(error: &Error) -> bool {
     error.code.as_deref() == Some("server_is_overloaded")
-        || error.code.as_deref() == Some("slow_down")
 }
 
 fn cyber_policy_fallback_message() -> String {
@@ -1103,6 +1135,7 @@ mod tests {
     async fn failed_response_classification_uses_error_code() {
         for (code, message) in [
             ("rate_limit_exceeded", "Temporary limit."),
+            ("slow_down", "Temporary limit."),
             (
                 "unknown_error",
                 "Rate limit reached. Please try again in 1s.",
@@ -1116,7 +1149,7 @@ mod tests {
             let events = collect_events(&[sse.as_bytes()]).await;
             match (code, events.as_slice()) {
                 (
-                    "rate_limit_exceeded",
+                    "rate_limit_exceeded" | "slow_down",
                     [
                         Err(ApiError::RateLimitExceeded {
                             message: actual,
@@ -1340,7 +1373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_policy_errors_without_type_are_invalid_requests() {
+    async fn content_policy_errors_without_type_preserve_their_classification() {
         for (code, expected_message) in [
             (
                 "invalid_prompt",
@@ -1370,11 +1403,34 @@ mod tests {
             let events = collect_events(&[sse1.as_bytes()]).await;
 
             assert_eq!(events.len(), 1);
-            match &events[0] {
-                Err(ApiError::InvalidRequest { message }) => {
+            match (code, &events[0]) {
+                ("invalid_prompt", Err(ApiError::InvalidRequest { message }))
+                | ("bio_policy", Err(ApiError::BioPolicy { message })) => {
                     assert_eq!(message, expected_message);
                 }
                 other => panic!("unexpected event for {code}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bio_policy_error_uses_fallback_for_missing_or_blank_message() {
+        for message in [None, Some(""), Some("  ")] {
+            let mut event = json!({
+                "type": "response.failed",
+                "response": { "error": { "code": "bio_policy" } },
+            });
+            if let Some(message) = message {
+                event["response"]["error"]["message"] = json!(message);
+            }
+            let sse = format!("event: response.failed\ndata: {event}\n\n");
+            let events = collect_events(&[sse.as_bytes()]).await;
+            match events.as_slice() {
+                [Err(ApiError::BioPolicy { message })] => assert_eq!(
+                    message,
+                    "This content was flagged for possible biological risk."
+                ),
+                other => panic!("unexpected events: {other:?}"),
             }
         }
     }
@@ -1389,7 +1445,7 @@ mod tests {
         }
 
         fn is_created(ev: &ResponseEvent) -> bool {
-            matches!(ev, ResponseEvent::Created)
+            matches!(ev, ResponseEvent::Created { .. })
         }
         fn is_output(ev: &ResponseEvent) -> bool {
             matches!(ev, ResponseEvent::OutputItemDone(_))
@@ -1571,7 +1627,7 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 2);
-        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[0], ResponseEvent::Created { .. });
         assert_matches!(
             &events[1],
             ResponseEvent::Completed {
@@ -1609,7 +1665,10 @@ mod tests {
             &events[0],
             ResponseEvent::ServerModel(model) if model == CYBER_RESTRICTED_MODEL_FOR_TESTS
         );
-        assert_matches!(&events[1], ResponseEvent::Created);
+        assert_matches!(
+            &events[1],
+            ResponseEvent::Created { response_id: Some(id) } if id == "resp-1"
+        );
         assert_matches!(
             &events[2],
             ResponseEvent::Completed {
@@ -1731,7 +1790,7 @@ mod tests {
         .await;
 
         assert_eq!(events.len(), 7);
-        assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[0], ResponseEvent::Created { .. });
         assert_matches!(
             &events[1],
             ResponseEvent::SafetyBuffering(buffering)

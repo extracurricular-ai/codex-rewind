@@ -2,7 +2,6 @@ use anyhow::Result;
 use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::config_types::CollaborationMode;
@@ -76,6 +75,7 @@ fn model_with_collaboration_messages(
     let mut model = model_info_from_slug(slug);
     let model_messages = model.model_messages.get_or_insert(ModelMessages {
         persistent_instructions: None,
+        tools: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: None,
@@ -169,8 +169,8 @@ async fn catalog_collaboration_messages_track_mode_changes() -> Result<()> {
     .await;
 
     let model_slug = "catalog-collaboration-model";
-    let default_text = "catalog default instructions";
-    let plan_text = "catalog plan instructions";
+    let default_text = "## Plan tool\nPreserve the custom default policy.\n";
+    let plan_text = "## `update_plan`\nPreserve the custom Plan Mode policy.\n";
     let model = model_with_collaboration_messages(model_slug, Some(default_text), Some(plan_text));
     let mut builder = test_codex()
         .with_model(model_slug)
@@ -615,46 +615,6 @@ async fn collaboration_instructions_omitted_when_disabled() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn override_then_next_turn_uses_updated_collaboration_instructions() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let req = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-
-    let test = test_codex().build(&server).await?;
-    let collab_text = "override instructions";
-    let collaboration_mode = collab_mode_with_instructions(Some(collab_text));
-
-    core_test_support::submit_thread_settings(
-        &test.codex,
-        ThreadSettingsOverrides {
-            collaboration_mode: Some(collaboration_mode),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    test.codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "hello".into(),
-            text_elements: Vec::new(),
-        }]))
-        .await?;
-    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let input = req.single_request().input();
-    let dev_texts = developer_texts(&input);
-    let collab_text = collab_xml(collab_text);
-    assert_eq!(count_messages_containing(&dev_texts, &collab_text), 1);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_turn_overrides_collaboration_instructions_after_override() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -991,13 +951,14 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     .await;
 
     let mut builder = test_codex();
-    let initial = builder.build(&server).await?;
+    let initial = builder.build_with_auto_env(&server).await?;
 
     let collab_text = "resume instructions";
+    let mode = collab_mode_for_model(ModeKind::Plan, "gpt-5.5", Some(collab_text));
     core_test_support::submit_thread_settings(
         &initial.codex,
         ThreadSettingsOverrides {
-            collaboration_mode: Some(collab_mode_with_instructions(Some(collab_text))),
+            collaboration_mode: Some(mode),
             ..Default::default()
         },
     )
@@ -1013,6 +974,15 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     wait_for_event(&initial.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let resumed = builder.restart(&server, &initial).await?;
+    assert_eq!(
+        resumed
+            .codex
+            .config_snapshot()
+            .await
+            .collaboration_mode
+            .mode,
+        ModeKind::Plan
+    );
     resumed
         .codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1076,7 +1046,7 @@ async fn cold_resume_refreshes_legacy_collaboration_snapshot_once(
     let legacy_rollout = std::fs::read_to_string(&rollout_path)?
         .lines()
         .map(|original_line| {
-            let mut line = serde_json::from_str::<RolloutLine>(original_line)?;
+            let mut line = codex_rollout::parse_rollout_line(original_line)?;
             if let RolloutItem::WorldState(world_state) = &mut line.item
                 && let Some(snapshot) = world_state.state.get_mut("collaboration_mode")
             {

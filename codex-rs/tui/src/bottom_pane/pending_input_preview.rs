@@ -26,9 +26,14 @@ pub(crate) struct PendingInputPreview {
     pub queued_messages: Vec<String>,
     /// Key combination rendered in the hint line.  Defaults to Alt+Up but may
     /// be overridden for terminals where that chord is unavailable.
-    edit_binding: Option<key_hint::ShortcutHint>,
+    pub(super) edit_binding: Option<key_hint::ShortcutHint>,
     /// Key combination rendered for immediately interrupting and sending steers.
     interrupt_binding: Option<key_hint::ShortcutHint>,
+}
+
+enum QuestionPresence {
+    Absent,
+    Present,
 }
 
 const PREVIEW_LINE_LIMIT: usize = 3;
@@ -76,10 +81,12 @@ impl PendingInputPreview {
         ));
     }
 
-    fn as_renderable(&self, width: u16) -> Box<dyn Renderable> {
+    fn as_renderable(&self, width: u16, questions: QuestionPresence) -> Box<dyn Renderable> {
+        let has_questions = matches!(questions, QuestionPresence::Present);
         if (self.pending_steers.is_empty()
             && self.rejected_steers.is_empty()
-            && self.queued_messages.is_empty())
+            && self.queued_messages.is_empty()
+            && !has_questions)
             || width < 4
         {
             return Box::new(());
@@ -90,11 +97,9 @@ impl PendingInputPreview {
         if !self.pending_steers.is_empty() {
             let mut header = vec!["Messages to be submitted after next tool call".into()];
             if let Some(interrupt_binding) = self.interrupt_binding {
-                header.extend(vec![
-                    " (press ".dim(),
-                    interrupt_binding.into(),
-                    " to interrupt and send immediately)".dim(),
-                ]);
+                header.push(" (press ".dim());
+                header.extend(interrupt_binding.spans());
+                header.push(" to interrupt and send immediately)".dim());
             }
             Self::push_section_header(&mut lines, width, Line::from(header));
 
@@ -136,7 +141,7 @@ impl PendingInputPreview {
             }
         }
 
-        if !self.queued_messages.is_empty() {
+        if !self.queued_messages.is_empty() || has_questions {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
@@ -161,16 +166,13 @@ impl PendingInputPreview {
         }
 
         if !self.queued_messages.is_empty()
+            && !has_questions
             && let Some(edit_binding) = self.edit_binding
         {
-            lines.push(
-                Line::from(vec![
-                    "    ".into(),
-                    edit_binding.into(),
-                    " edit last queued message".into(),
-                ])
-                .dim(),
-            );
+            let mut hint = Line::from("    ");
+            hint.spans.extend(edit_binding.spans());
+            hint.spans.push(" edit last queued message".dim());
+            lines.push(hint);
         }
 
         Paragraph::new(lines).into()
@@ -183,11 +185,30 @@ impl Renderable for PendingInputPreview {
             return;
         }
 
-        self.as_renderable(area.width).render(area, buf);
+        self.as_renderable(area.width, QuestionPresence::Absent)
+            .render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        self.as_renderable(width).desired_height(width)
+        self.as_renderable(width, QuestionPresence::Absent)
+            .desired_height(width)
+    }
+}
+
+/// Pending questions keep the follow-up group visible and provide its navigation hint.
+pub(super) struct PendingInputPreviewContent<'a>(pub(super) &'a PendingInputPreview);
+
+impl Renderable for PendingInputPreviewContent<'_> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.0
+            .as_renderable(area.width, QuestionPresence::Present)
+            .render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.0
+            .as_renderable(width, QuestionPresence::Present)
+            .desired_height(width)
     }
 }
 

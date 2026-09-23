@@ -165,8 +165,12 @@ async fn websocket_test_codex_shell_chain() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case(false; "update_plan disabled")]
+#[test_case::test_case(true; "update_plan enabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
+async fn websocket_first_turn_uses_startup_prewarm_and_create(
+    update_plan_enabled: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_websocket_server(vec![vec![
@@ -179,7 +183,12 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
     ]])
     .await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex()
+        .with_model("gpt-5.2")
+        .with_config(move |config| {
+            config.update_plan_enabled = update_plan_enabled;
+            config.analytics_enabled = Some(false);
+        });
     let test = builder.build_with_websocket_server(&server).await?;
     test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
         .await?;
@@ -192,6 +201,14 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
         .expect("missing warmup request")
         .body_json();
     let turn = connection.get(1).expect("missing turn request").body_json();
+    assert_eq!(warmup["instructions"], turn["instructions"]);
+    assert_eq!(
+        warmup["instructions"]
+            .as_str()
+            .expect("warmup base instructions")
+            .contains("update_plan"),
+        update_plan_enabled
+    );
     assert_eq!(warmup["type"].as_str(), Some("response.create"));
     assert_eq!(warmup["generate"].as_bool(), Some(false));
     let warmup_metadata: Value = serde_json::from_str(
@@ -200,6 +217,7 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
             .expect("warmup turn metadata"),
     )?;
     assert_eq!(warmup_metadata["request_kind"].as_str(), Some("prewarm"));
+    assert_eq!(warmup_metadata["analytics_enabled"].as_bool(), Some(false));
     assert_eq!(
         warmup_metadata["window_id"].as_str(),
         warmup["client_metadata"]["x-codex-window-id"].as_str()
@@ -211,12 +229,14 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
         "expected request tools to be populated"
     );
     assert_eq!(turn["type"].as_str(), Some("response.create"));
+    assert_eq!(turn.get("generate"), None);
     let turn_metadata: Value = serde_json::from_str(
         turn["client_metadata"]["x-codex-turn-metadata"]
             .as_str()
             .expect("turn metadata"),
     )?;
     assert_eq!(turn_metadata["request_kind"].as_str(), Some("turn"));
+    assert_eq!(turn_metadata["analytics_enabled"].as_bool(), Some(false));
     assert_eq!(warmup_metadata["window_number"].as_u64(), Some(0));
     assert_eq!(
         warmup_metadata["window_number"],

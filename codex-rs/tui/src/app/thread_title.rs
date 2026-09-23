@@ -1,4 +1,8 @@
 //! Structured-output schema and normalization for generated TUI thread titles.
+//!
+//! Automatic titles are persisted only after generation, including for inactive threads;
+//! the originating thread's saved name takes precedence over an automatic result. Manual
+//! renames cancel pending requests; canceled events cannot affect newer requests.
 
 use super::App;
 use super::thread_events::ThreadBufferedEvent;
@@ -8,8 +12,10 @@ use crate::app_server_session::AppServerSession;
 use crate::temporary_structured_request::TemporaryStructuredThreadOptions;
 use crate::temporary_structured_request::run_temporary_structured_turn;
 use crate::temporary_structured_request::start_temporary_thread;
+use crate::temporary_structured_request::unsubscribe_temporary_thread;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
 use codex_protocol::models::MessagePhase;
@@ -18,6 +24,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub(super) const THREAD_TITLE_MAX_CHARS: usize = 36;
 const THREAD_TITLE_MODEL: &str = "gpt-5.6-luna";
@@ -31,6 +38,38 @@ struct GeneratedThreadTitle {
 }
 
 impl App {
+    pub(super) fn sync_thread_title_progress(&mut self) {
+        let pending = self.chat_widget.thread_id().is_some_and(|thread_id| {
+            self.pending_thread_titles
+                .keys()
+                .any(|(id, _)| *id == thread_id)
+        });
+        self.chat_widget
+            .set_thread_title_generation_pending(pending);
+    }
+
+    pub(super) fn finish_thread_title_generation(
+        &mut self,
+        thread_id: ThreadId,
+        destination: ThreadTitleDestination,
+    ) {
+        self.pending_thread_titles.remove(&(thread_id, destination));
+        self.sync_thread_title_progress();
+    }
+
+    /// A saved manual name supersedes any pending title generation for that thread.
+    pub(super) fn cancel_thread_title_generation(&mut self, thread_id: ThreadId) {
+        self.pending_thread_titles.retain(|(id, _), cancellation| {
+            if *id == thread_id {
+                cancellation.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        self.sync_thread_title_progress();
+    }
+
     /// Start a hidden title-generation thread without blocking the UI loop.
     pub(super) fn generate_thread_title(
         &mut self,
@@ -39,6 +78,13 @@ impl App {
         destination: ThreadTitleDestination,
         prompt: String,
     ) {
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            self.pending_thread_titles.entry((thread_id, destination))
+        else {
+            return;
+        };
+        let cancellation = entry.insert(CancellationToken::new()).clone();
+        self.sync_thread_title_progress();
         let request_handle = app_server.request_handle();
         let model = if self.chat_widget.config_ref().model_provider_id == "openai"
             && self.chat_widget.has_chatgpt_account()
@@ -55,6 +101,7 @@ impl App {
         let effort = (model == THREAD_TITLE_MODEL).then_some(ReasoningEffort::Low);
         let config = self.chat_widget.config_ref();
         let options = TemporaryStructuredThreadOptions {
+            thread_source: ThreadSource::Feature("thread_title".to_string()),
             model,
             model_provider: config.model_provider_id.clone(),
             cwd: config.cwd.display().to_string(),
@@ -73,6 +120,7 @@ impl App {
                 .map_err(|error| error.to_string());
 
             event_sender.send(AppEvent::ThreadTitleStarted {
+                cancellation,
                 thread_id,
                 destination,
                 prompt,
@@ -83,6 +131,7 @@ impl App {
     }
 
     /// Register a started hidden thread and generate its structured title.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn on_thread_title_started(
         &mut self,
         app_server: &AppServerSession,
@@ -91,11 +140,22 @@ impl App {
         prompt: String,
         effort: Option<ReasoningEffort>,
         result: Result<String, String>,
+        cancellation: CancellationToken,
     ) {
+        if cancellation.is_cancelled() {
+            if let Ok(temporary_thread_id) = result {
+                let request_handle = app_server.request_handle();
+                tokio::spawn(async move {
+                    unsubscribe_temporary_thread(&request_handle, temporary_thread_id).await;
+                });
+            }
+            return;
+        }
         let temporary_thread_id_text = match result {
             Ok(thread_id) => thread_id,
             Err(error) => {
                 tracing::debug!(%error, "failed to start title-generation thread");
+                self.finish_thread_title_generation(thread_id, destination);
                 if let ThreadTitleDestination::RenameSuggestion { request_id } = destination {
                     self.chat_widget.apply_thread_name_suggestion(
                         thread_id, request_id, /*suggestion*/ None,
@@ -106,6 +166,7 @@ impl App {
         };
 
         let Ok(temporary_thread_id) = ThreadId::from_string(&temporary_thread_id_text) else {
+            self.finish_thread_title_generation(thread_id, destination);
             if let ThreadTitleDestination::RenameSuggestion { request_id } = destination {
                 self.chat_widget
                     .apply_thread_name_suggestion(thread_id, request_id, /*suggestion*/ None);
@@ -127,11 +188,13 @@ impl App {
                 thread_title_output_schema(),
                 effort,
                 receiver,
+                cancellation.clone(),
             )
             .await
             .map_err(|error| error.to_string());
 
             event_sender.send(AppEvent::GeneratedThreadTitle {
+                cancellation,
                 thread_id,
                 temporary_thread_id,
                 destination,

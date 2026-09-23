@@ -55,6 +55,7 @@ mod process;
 mod process_manager;
 mod process_state;
 mod shell_snapshot;
+mod stdin_approval;
 
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
@@ -66,6 +67,8 @@ pub(crate) use process::NoopSpawnLifecycle;
 pub(crate) use process::SpawnLifecycle;
 pub(crate) use process::SpawnLifecycleHandle;
 pub(crate) use process::UnifiedExecProcess;
+pub(crate) use stdin_approval::TerminalPermissions;
+pub(crate) use stdin_approval::TerminalSandboxSource;
 
 pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
 pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 10_000;
@@ -77,6 +80,12 @@ pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
+
+const MAX_TRACE_ID_BYTES: usize = 256;
+
+fn trace_id(id: &str) -> Option<&str> {
+    (!id.is_empty() && id.len() <= MAX_TRACE_ID_BYTES).then_some(id)
+}
 
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
@@ -151,7 +160,9 @@ pub(crate) struct ProcessStore {
 
 impl ProcessStore {
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
-        self.reserved_process_ids.remove(&process_id);
+        if !process_manager::should_use_deterministic_process_ids() {
+            self.reserved_process_ids.remove(&process_id);
+        }
         self.processes.remove(&process_id)
     }
 }
@@ -187,9 +198,7 @@ struct ProcessEntry {
     hook_command: String,
     tty: bool,
     environment_id: String,
-    // The successful launch bypassed sandboxing required by its ambient policy.
-    // Preserve this across turns so subsequent stdin writes can require approval.
-    escalated: bool,
+    permissions: TerminalPermissions,
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,

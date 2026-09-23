@@ -13,6 +13,7 @@ use super::VimTextObject;
 use super::VimTextObjectScope;
 use super::vim::VimFindMotion;
 use crate::key_hint::KeyBindingListExt;
+use crate::vim_search::SearchQuery;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -23,6 +24,13 @@ use unicode_segmentation::UnicodeSegmentation;
 pub(crate) enum VimEdit {
     Editor(VimEditorEdit),
     Text(String),
+}
+
+/// Vim command recording and searches preserved across same-draft restoration.
+#[derive(Debug, Default)]
+pub(crate) struct VimPersistentState {
+    pub(crate) commands: VimCommandState,
+    search: crate::vim_search::SearchQuery,
 }
 
 #[derive(Clone, Debug)]
@@ -38,12 +46,13 @@ pub(super) enum VimInsertPosition {
     OpenBelow,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum VimEditTarget {
     Character,
     Line,
     LineEnd,
     Motion(VimMotion),
+    Search(SearchQuery),
     TextObject {
         scope: VimTextObjectScope,
         object: VimTextObject,
@@ -57,9 +66,11 @@ pub(super) enum VimEditTarget {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum VimAction {
     Insert(VimInsertPosition),
+    EnterReplaceMode,
+    RestoreReplacedCharacter,
     Delete(VimEditTarget),
     Change(VimEditTarget),
     Replace(char),
@@ -82,28 +93,127 @@ pub(super) enum VimAction {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct VimCommandState {
-    pending_change: Vec<VimEdit>,
-    last_change: Vec<VimEdit>,
+pub(crate) struct VimCommandState {
+    pub(super) pending_change: Vec<VimEdit>,
+    pub(crate) last_change: Vec<VimEdit>,
     changed: bool,
-    replaying: bool,
+    pub(super) replaying: bool,
+    replace_steps: Vec<VimReplaceStep>,
+}
+
+#[derive(Debug)]
+struct VimReplaceStep {
+    // Backspace also retraces attachments skipped before the replacement.
+    cursor_before: usize,
+    start: usize,
+    inserted_len: usize,
+    original: String,
 }
 
 impl TextArea {
+    pub(crate) fn is_vim_replace_mode(&self) -> bool {
+        self.vim_enabled && self.vim_mode == VimMode::Replace
+    }
+
+    pub(super) fn clear_vim_replace_recovery(&mut self) {
+        self.vim_commands.replace_steps.clear();
+    }
+
+    pub(super) fn replace_vim_text(&mut self, text: &str) {
+        for grapheme in text.graphemes(/*is_extended*/ true) {
+            let cursor_before = self.cursor_pos;
+            while let Some(element) = self
+                .elements
+                .iter()
+                .find(|element| element.range.start == self.cursor_pos)
+            {
+                self.set_cursor(element.range.end);
+            }
+            let start = self.cursor_pos;
+            let end = if grapheme == "\n" || start >= self.end_of_current_line() {
+                start
+            } else {
+                self.next_atomic_boundary(start)
+            };
+            let original = self.text[start..end].to_string();
+            self.replace_range_preserving_recovery(start..end, grapheme);
+            self.vim_commands.replace_steps.push(VimReplaceStep {
+                cursor_before,
+                start,
+                inserted_len: grapheme.len(),
+                original,
+            });
+        }
+    }
+
+    pub(super) fn restore_vim_replaced_character(&mut self) -> bool {
+        let steps = &mut self.vim_commands.replace_steps;
+        let Some(step) = steps
+            .pop()
+            .filter(|step| self.cursor_pos == step.start + step.inserted_len)
+        else {
+            steps.clear();
+            return false;
+        };
+        // Replace skips existing elements, so an overlapping marker was added after typing.
+        // Unmark it before restoring one character; never expand recovery to the whole token.
+        self.elements.retain(|element| {
+            element.range.end <= step.start || element.range.start >= step.start + step.inserted_len
+        });
+        self.replace_range_preserving_recovery(
+            step.start..step.start + step.inserted_len,
+            &step.original,
+        );
+        self.set_cursor(step.cursor_before);
+        true
+    }
+
+    /// Retract a detected paste prefix without losing overwritten text or crossing attachments.
+    pub(crate) fn retract_paste_burst(&mut self, start: usize) -> bool {
+        if self.is_vim_replace_mode() {
+            let restored_start = self
+                .vim_commands
+                .replace_steps
+                .iter()
+                .rev()
+                .take_while(|step| step.start >= start)
+                .try_fold(self.cursor_pos, |cursor, step| {
+                    (step.start + step.inserted_len == cursor && step.cursor_before == step.start)
+                        .then_some(step.start)
+                });
+            if restored_start != Some(start) {
+                return false;
+            }
+            while self.cursor_pos > start {
+                self.apply_vim_insert_action(VimAction::RestoreReplacedCharacter);
+            }
+        } else {
+            self.replace_range(start..self.cursor_pos, "");
+        }
+        true
+    }
+
+    pub(crate) fn swap_vim_persistent_state(&mut self, state: &mut VimPersistentState) {
+        std::mem::swap(&mut self.vim_commands, &mut state.commands);
+        std::mem::swap(&mut self.vim_search.last, &mut state.search);
+    }
+
     pub(crate) fn vim_repeat_actions(&self) -> Option<Vec<VimEdit>> {
         (!self.vim_commands.last_change.is_empty()).then(|| self.vim_commands.last_change.clone())
     }
 
     pub(super) fn record_vim_inserted_text(&mut self, text: &str) {
         if !self.vim_enabled
-            || self.vim_mode != VimMode::Insert
+            || !matches!(self.vim_mode, VimMode::Insert | VimMode::Replace)
             || self.vim_commands.replaying
             || self.vim_commands.pending_change.is_empty()
             || text.is_empty()
         {
             return;
         }
-        if let Some(VimEdit::Text(pending)) = self.vim_commands.pending_change.last_mut() {
+        if self.vim_mode == VimMode::Insert
+            && let Some(VimEdit::Text(pending)) = self.vim_commands.pending_change.last_mut()
+        {
             pending.push_str(text);
         } else {
             self.vim_commands
@@ -113,14 +223,7 @@ impl TextArea {
         self.vim_commands.changed = true;
     }
 
-    pub(super) fn apply_vim_insert_action(&mut self, action: VimAction) {
-        let recording = self.vim_enabled
-            && self.vim_mode == VimMode::Insert
-            && !self.vim_commands.replaying
-            && !self.vim_commands.pending_change.is_empty();
-        let prior_len = self.text.len();
-        self.apply_vim_editor_action(action);
-        let changed = self.text.len() != prior_len;
+    pub(super) fn apply_vim_insert_action(&mut self, action: VimAction) -> bool {
         let deletion = matches!(
             action,
             VimAction::DeleteBackward
@@ -131,19 +234,40 @@ impl TextArea {
                 | VimAction::KillLine
                 | VimAction::KillLineEnd
         );
+        if deletion && let Some(range) = self.mouse_selection_range() {
+            self.vim_commands = VimCommandState::default();
+            if matches!(action, VimAction::DeleteBackward | VimAction::DeleteForward) {
+                self.replace_range(range, "");
+            } else {
+                self.kill_range(range);
+            }
+            return true;
+        }
+        self.mouse_selection = None;
+        let recording = self.vim_enabled
+            && matches!(self.vim_mode, VimMode::Insert | VimMode::Replace)
+            && !self.vim_commands.replaying
+            && !self.vim_commands.pending_change.is_empty();
+        let prior_len = self.text.len();
+        if !self.apply_vim_editor_action(action.clone()) {
+            return false;
+        }
+        let changed =
+            self.text.len() != prior_len || matches!(action, VimAction::RestoreReplacedCharacter);
         if recording && (changed || !deletion) {
             self.vim_commands
                 .pending_change
                 .push(VimEdit::Editor(VimEditorEdit(action)));
         }
         self.vim_commands.changed |= recording && changed;
+        true
     }
 
     pub(super) fn start_vim_edit(&mut self, action: VimAction) -> bool {
         let prior_len = self.text.len();
-        self.vim_commands.pending_change = vec![VimEdit::Editor(VimEditorEdit(action))];
+        self.vim_commands.pending_change = vec![VimEdit::Editor(VimEditorEdit(action.clone()))];
         self.vim_commands.changed = false;
-        if !self.apply_vim_editor_action(action) {
+        if !self.apply_vim_editor_action(action.clone()) {
             self.vim_commands.pending_change.clear();
             return false;
         }
@@ -171,7 +295,7 @@ impl TextArea {
     }
 
     pub(crate) fn finish_vim_repeat(&mut self) {
-        if self.vim_mode == VimMode::Insert {
+        if matches!(self.vim_mode, VimMode::Insert | VimMode::Replace) {
             self.leave_vim_insert_mode();
         }
         self.vim_pending = VimPending::None;
@@ -180,9 +304,9 @@ impl TextArea {
 
     pub(crate) fn apply_vim_edit(&mut self, edit: &VimEdit) -> bool {
         match edit {
-            VimEdit::Editor(VimEditorEdit(action)) => self.apply_vim_editor_action(*action),
+            VimEdit::Editor(VimEditorEdit(action)) => self.apply_vim_editor_action(action.clone()),
             VimEdit::Text(text) => {
-                if self.vim_mode != VimMode::Insert {
+                if !matches!(self.vim_mode, VimMode::Insert | VimMode::Replace) {
                     return false;
                 }
                 self.insert_str(text);
@@ -192,8 +316,19 @@ impl TextArea {
     }
 
     fn apply_vim_editor_action(&mut self, action: VimAction) -> bool {
+        // Editor actions invalidate contiguous Replace offsets, including during replay.
+        if !matches!(action, VimAction::RestoreReplacedCharacter) {
+            self.clear_vim_replace_recovery();
+        }
         let prior_len = self.text.len();
+        let is_change = matches!(action, VimAction::Change(_));
         match action {
+            VimAction::EnterReplaceMode => {
+                self.vim_mode = VimMode::Replace;
+            }
+            VimAction::RestoreReplacedCharacter => {
+                return self.restore_vim_replaced_character();
+            }
             VimAction::Insert(position) => {
                 match position {
                     VimInsertPosition::Cursor => {}
@@ -223,7 +358,7 @@ impl TextArea {
                 self.vim_mode = VimMode::Insert;
             }
             VimAction::Delete(target) | VimAction::Change(target) => {
-                let operator = if matches!(action, VimAction::Delete(_)) {
+                let operator = if !is_change {
                     VimOperator::Delete
                 } else {
                     VimOperator::Change
@@ -254,6 +389,11 @@ impl TextArea {
                         }
                     }
                     VimEditTarget::Motion(motion) => self.apply_vim_operator(operator, motion),
+                    VimEditTarget::Search(query) => {
+                        if !self.apply_vim_search(&query, Some(operator)) {
+                            return false;
+                        }
+                    }
                     VimEditTarget::TextObject { scope, object } => {
                         let Some(range) = self.text_object_range(object, scope) else {
                             return false;
@@ -311,6 +451,11 @@ impl TextArea {
     }
 
     pub(super) fn handle_vim_extra_command(&mut self, event: KeyEvent) -> bool {
+        if self.vim_normal_keymap.enter_replace_mode.is_pressed(event) {
+            self.start_vim_edit(VimAction::EnterReplaceMode);
+            return true;
+        }
+
         if self.vim_normal_keymap.replace_char.is_pressed(event)
             && self.cursor_pos < self.end_of_current_line()
         {
@@ -531,7 +676,7 @@ impl TextArea {
         self.set_cursor(self.first_non_blank_of_current_line());
     }
 
-    fn is_vim_command_target(&self, position: usize) -> bool {
+    pub(super) fn is_vim_command_target(&self, position: usize) -> bool {
         !self
             .elements
             .iter()

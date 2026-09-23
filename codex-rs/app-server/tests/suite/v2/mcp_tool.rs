@@ -1087,6 +1087,7 @@ async fn mcp_tool_call_completion_notification_contains_truncated_large_result()
         arguments: json!({ "message": LARGE_RESPONSE_MESSAGE }),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: None,
         result: Some(result),
@@ -1198,6 +1199,7 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
         arguments: json!({ "message": ELICITATION_TRIGGER_MESSAGE }),
         app_context: None,
         mcp_app_resource_uri: None,
+        mcp_app_ui: None,
         plugin_id: None,
         read_only_hint: Some(true),
         result: None,
@@ -1265,9 +1267,10 @@ async fn mcp_tool_call_hint_survives_mid_call_thread_read_and_resume() -> Result
     Ok(())
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ToolAppsMcpServer {
     sensitive_action: Option<bool>,
+    tool_names: &'static [&'static str],
 }
 
 impl ServerHandler for ToolAppsMcpServer {
@@ -1300,14 +1303,22 @@ impl ServerHandler for ToolAppsMcpServer {
         }))
         .map_err(|err| rmcp::ErrorData::internal_error(err.to_string(), None))?;
 
-        let mut tool = Tool::new(
-            Cow::Borrowed(TEST_TOOL_NAME),
-            Cow::Borrowed("Echo a message."),
-            Arc::new(input_schema),
-        );
-        tool.annotations = Some(ToolAnnotations::new().read_only(true));
+        let input_schema = Arc::new(input_schema);
+        let tools = self
+            .tool_names
+            .iter()
+            .map(|&name| {
+                let mut tool = Tool::new(
+                    Cow::Borrowed(name),
+                    Cow::Borrowed("Echo a message."),
+                    Arc::clone(&input_schema),
+                );
+                tool.annotations = Some(ToolAnnotations::new().read_only(true));
+                tool
+            })
+            .collect();
 
-        Ok(ListToolsResult::with_all_items(vec![tool]))
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
@@ -1315,7 +1326,10 @@ impl ServerHandler for ToolAppsMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        assert_eq!(request.name.as_ref(), TEST_TOOL_NAME);
+        assert!(self.tool_names.contains(&request.name.as_ref()));
+        if matches!(request.name.as_ref(), "js_reset" | "js_add_node_module_dir") {
+            return Ok(CallToolResult::success(vec![ContentBlock::text("setup complete")]).into());
+        }
         let message = request
             .arguments
             .as_ref()
@@ -1329,9 +1343,9 @@ impl ServerHandler for ToolAppsMcpServer {
             .get("threadId")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let client_capabilities = context.peer.peer_info().map(|request| {
+        let client_capabilities = context.client_capabilities().map(|capabilities| {
             json!({
-                "extensions": request.capabilities.extensions.clone().unwrap_or_default(),
+                "extensions": capabilities.extensions.unwrap_or_default(),
             })
         });
 
@@ -1349,11 +1363,18 @@ impl ServerHandler for ToolAppsMcpServer {
                 "codex_request_type": "approval_request",
                 "codex_approval_kind": "mcp_tool_call",
                 "codex_strict_auto_review": true,
-                "tool_name": TEST_TOOL_NAME,
+                "tool_name": request.name,
                 "tool_params": request.arguments,
                 "x-codex-turn-metadata": turn_metadata,
             });
-            if let Some(sensitive_action) = self.sensitive_action {
+            if request.name == "js" {
+                // Match the execution approval emitted by the real Node REPL server.
+                approval_meta["connector_id"] = json!("node_repl");
+            }
+            if let Some(sensitive_action) = self
+                .sensitive_action
+                .or((message == "sensitive").then_some(true))
+            {
                 approval_meta["codex_sensitive_action"] = json!(sensitive_action);
             }
             let result = context
@@ -1372,6 +1393,22 @@ impl ServerHandler for ToolAppsMcpServer {
                 .map_err(|err| {
                     rmcp::ErrorData::internal_error(err.to_string(), /*data*/ None)
                 })?;
+            if matches!(result.action, ElicitationAction::Decline) {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Tool execution was declined by Guardian.",
+                )])
+                .into());
+            }
+            if matches!(result.action, ElicitationAction::Cancel) {
+                assert_eq!(
+                    serde_json::to_value(result).expect("cancelled elicitation response"),
+                    json!({ "action": "cancel", "_meta": { "approvals_reviewer": "auto_review" } }),
+                );
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Tool execution was cancelled by Guardian.",
+                )])
+                .into());
+            }
             assert_eq!(
                 serde_json::to_value(result).expect("elicitation response"),
                 json!({
@@ -1492,10 +1529,22 @@ impl ServerHandler for ToolAppsMcpServer {
 pub(super) async fn start_mcp_server(
     sensitive_action: Option<bool>,
 ) -> Result<(String, JoinHandle<()>)> {
+    start_mcp_server_with_tools(&[TEST_TOOL_NAME], sensitive_action).await
+}
+
+pub(super) async fn start_mcp_server_with_tools(
+    tool_names: &'static [&'static str],
+    sensitive_action: Option<bool>,
+) -> Result<(String, JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let mcp_service = StreamableHttpService::new(
-        move || Ok(ToolAppsMcpServer { sensitive_action }),
+        move || {
+            Ok(ToolAppsMcpServer {
+                sensitive_action,
+                tool_names,
+            })
+        },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );

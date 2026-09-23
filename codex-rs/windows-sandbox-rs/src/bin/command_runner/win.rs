@@ -77,9 +77,6 @@ use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::TerminateProcess;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-// Kept in sync with codex_exec_server::CODEX_FS_HELPER_ARG1 without introducing
-// a dependency cycle.
-const FS_HELPER_ARG: &str = "--codex-run-as-fs-helper";
 const READ_ACL_MUTEX_NAME: &str = "Local\\CodexSandboxReadAcl";
 const TERMINATION_WAIT_MS: u32 = 5_000;
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
@@ -299,15 +296,11 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     }
 
     let effective_cwd = effective_cwd(&req.cwd, Some(log_dir.as_path()));
-    let desktop = if req.use_private_desktop {
-        LaunchDesktop::open_private(
-            req.private_desktop_name
-                .as_deref()
-                .context("runner: missing parent-owned private desktop")?,
-        )?
-    } else {
-        LaunchDesktop::prepare(/*use_private_desktop*/ false, Some(log_dir.as_path()))?
-    };
+    let desktop = LaunchDesktop::open_private(
+        req.private_desktop_name
+            .as_deref()
+            .context("runner: missing parent-owned private desktop")?,
+    )?;
 
     let mut conpty_owner = None;
     let mut hpc_handle: Option<HANDLE> = None;
@@ -355,11 +348,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
             &req.env,
             stdin_mode,
             StderrMode::Separate,
-            if req.command.get(1).is_some_and(|arg| arg == FS_HELPER_ARG) {
-                ConsoleMode::NoWindow
-            } else {
-                ConsoleMode::Inherit
-            },
+            ConsoleMode::NoWindow,
             desktop,
             Some(log_dir.as_path()),
         )?;

@@ -2,10 +2,12 @@ use super::PreviousSectionState;
 use super::WorldStateHash;
 use super::WorldStateSection;
 use crate::context::ContextualUserFragment;
+use codex_prompts::ResolvedCollaborationModeMessages;
+use codex_prompts::ResolvedModelMessages;
+use codex_prompts::without_update_plan_instructions;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ContentItemKind;
-use codex_protocol::openai_models::CollaborationModeMessages;
 use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
 use serde::Deserialize;
@@ -21,20 +23,43 @@ pub(crate) struct CollaborationModeState {
 impl CollaborationModeState {
     pub(crate) fn from_collaboration_mode(
         collaboration_mode: &CollaborationMode,
-        catalog_messages: Option<&CollaborationModeMessages>,
+        messages: ResolvedCollaborationModeMessages<'_>,
+        update_plan_enabled: bool,
+        custom_model_catalog: bool,
     ) -> Self {
-        let catalog_instructions =
-            catalog_messages.and_then(|messages| match collaboration_mode.mode {
-                ModeKind::Default => messages.default.as_ref(),
-                ModeKind::Plan => messages.plan.as_ref(),
-            });
+        let catalog_instructions = match collaboration_mode.mode {
+            ModeKind::Default => messages.default,
+            ModeKind::Plan => messages.plan,
+        }
+        .catalog_override();
 
-        let instructions = catalog_instructions.cloned().or_else(|| {
+        let instructions = catalog_instructions.map(str::to_string).or_else(|| {
             collaboration_mode
                 .settings
                 .developer_instructions
                 .clone()
                 .filter(|instructions| !instructions.is_empty())
+        });
+        let instructions = instructions.map(|instructions| {
+            if update_plan_enabled {
+                return instructions;
+            }
+            let builtin = match catalog_instructions {
+                Some(_) => !custom_model_catalog,
+                None => {
+                    // Without a catalog override, mode settings may contain a built-in
+                    // preset or custom text. Compare whole strings against bundled presets
+                    // only to recognize built-in text whose disabled update_plan guidance
+                    // we can strip; custom instructions stay unchanged.
+                    let bundled = ResolvedModelMessages::bundled().collaboration_modes();
+                    instructions == bundled.default.text() || instructions == bundled.plan.text()
+                }
+            };
+            if builtin {
+                without_update_plan_instructions(&instructions)
+            } else {
+                instructions
+            }
         });
         // Keep an empty-state snapshot so removing instructions clears retained history only once.
         let fragment = CollaborationModeInstructions {

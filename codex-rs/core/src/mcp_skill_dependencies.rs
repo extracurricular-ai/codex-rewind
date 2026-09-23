@@ -311,7 +311,7 @@ async fn should_install_mcp_dependencies(
             sess.notify_user_input_response(sub_id, empty.clone()).await;
             empty
         }
-        response = response_fut => response.unwrap_or_else(|| RequestUserInputResponse {
+        response = response_fut => response.map(|accepted| accepted.response).unwrap_or_else(|| RequestUserInputResponse {
             answers: HashMap::new(),
         }),
     };
@@ -431,6 +431,7 @@ fn mcp_dependency_to_server_config(
                     client_id: None,
                     callback_url: None,
                     callback_port: Some(callback_port),
+                    ..Default::default()
                 }),
             oauth_resource: None,
             tools: HashMap::new(),

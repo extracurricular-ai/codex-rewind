@@ -37,12 +37,36 @@ fn unified_exec_env_overrides_existing_values() {
     assert_eq!(env.get("PATH"), Some(&"/usr/bin".to_string()));
 }
 
+#[tokio::test]
+async fn deterministic_process_ids_are_not_reused_after_release() {
+    let manager = UnifiedExecProcessManager::default();
+    let first = manager.allocate_process_id().await;
+    manager.release_process_id(first).await;
+    let second = manager.allocate_process_id().await;
+
+    assert_eq!((first, second), (1000, 1001));
+}
+
+#[tokio::test]
+async fn deterministic_process_ids_are_not_reused_after_removal() {
+    let manager = UnifiedExecProcessManager::default();
+    let first = manager.allocate_process_id().await;
+    let _removed = manager.process_store.lock().await.remove(first);
+    let second = manager.allocate_process_id().await;
+
+    assert_eq!((first, second), (1000, 1001));
+}
+
 #[test]
 fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
     let local_policy_env = HashMap::from([
         ("HOME".to_string(), "/client-home".to_string()),
         ("PATH".to_string(), "/client-path".to_string()),
         ("SHELL_SET".to_string(), "policy".to_string()),
+        (
+            CODEX_VERSION_ENV_VAR.to_string(),
+            "client-version".to_string(),
+        ),
         (
             CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
             "current-profile".to_string(),
@@ -58,6 +82,10 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
         ("OpenAI_Federation_Rule_Id".to_string(), "rule".to_string()),
         ("SHELL_SET".to_string(), "policy".to_string()),
         ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+        (
+            CODEX_VERSION_ENV_VAR.to_string(),
+            "client-version".to_string(),
+        ),
         (
             CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
             "current-profile".to_string(),
@@ -78,6 +106,10 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
             (
+                CODEX_VERSION_ENV_VAR.to_string(),
+                "client-version".to_string()
+            ),
+            (
                 CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
                 "current-profile".to_string(),
             ),
@@ -97,6 +129,7 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
 fn exec_env_policy_excludes_non_inheritable_and_runtime_variables() {
     let policy = ShellEnvironmentPolicy {
         r#set: HashMap::from([
+            ("codex_version".to_string(), "stale-version".to_string()),
             (
                 "codex_permission_profile".to_string(),
                 "stale-profile".to_string(),
@@ -125,6 +158,7 @@ fn exec_env_policy_excludes_non_inheritable_and_runtime_variables() {
             ignore_default_excludes: policy.ignore_default_excludes,
             exclude: vec![
                 CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+                CODEX_VERSION_ENV_VAR.to_string(),
                 codex_apply_patch::CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_string(),
                 PLUGIN_METRICS_OUTPUT_ENV_VAR.to_string(),
             ],
@@ -144,6 +178,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     let managed_network = ManagedNetworkSandboxContext {
         loopback_ports: vec![43123],
         allow_local_binding: false,
+        ..Default::default()
     };
     let mut request = ExecRequest {
         command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
@@ -193,7 +228,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         windows_sandbox_policy_cwd: cwd.clone().into(),
         windows_sandbox_workspace_roots: vec![cwd],
         windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         permission_profile: permission_profile.clone(),
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
@@ -208,6 +242,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         exec_server_params_for_request(
             /*process_id*/ 123,
             request,
+            /*tool_ctx*/ None,
             proxy_settings_mode,
             /*tty*/ true,
         )
@@ -215,6 +250,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     let params = params_for_request(&request);
 
     assert_eq!(params.process_id.as_str(), "123");
+    assert_eq!(params.metadata, None);
     assert_eq!(params.cwd, request.cwd);
     assert!(params.enforce_managed_network);
     assert_eq!(params.managed_network, Some(managed_network));
@@ -244,7 +280,10 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     request.exec_server_shell_snapshot = None;
 
     request.exec_server_sandbox = Some(
-        codex_exec_server::FileSystemSandboxContext::from_permission_profile(permission_profile),
+        codex_exec_server::FileSystemSandboxContext::from_permission_profile(
+            permission_profile,
+            request.cwd.clone(),
+        ),
     );
     let first = params_for_request(&request);
     let second = params_for_request(&request);
@@ -424,7 +463,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         #[allow(deprecated)]
         sandbox_cwd: turn.cwd.clone().into(),
         turn_environment: turn
-            .environments
+            .initial_environments
             .primary()
             .cloned()
             .expect("primary environment"),
@@ -545,6 +584,7 @@ fn pruning_protects_recent_processes_even_if_exited() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing() {
+    let (_, turn) = crate::session::tests::make_session_and_context().await;
     let exited_process = Arc::new(
         crate::unified_exec::process_tests::remote_process(
             codex_exec_server::WriteStatus::Accepted,
@@ -590,7 +630,16 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 hook_command: format!("command-{process_id}"),
                 tty: false,
                 environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-                escalated: false,
+                permissions: super::super::TerminalPermissions::for_launch(
+                    turn.initial_environments
+                        .primary()
+                        .expect("turn environment"),
+                    &turn,
+                    super::super::TerminalSandboxSource::Native,
+                    crate::sandboxing::SandboxPermissions::UseDefault,
+                    /*additional_permissions*/ None,
+                    /*internal_permissions*/ None,
+                ),
                 network_approval: None,
                 session: std::sync::Weak::new(),
                 last_used: if is_exited {

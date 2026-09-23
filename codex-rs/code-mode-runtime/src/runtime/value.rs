@@ -4,6 +4,8 @@ use codex_code_mode_protocol::DEFAULT_IMAGE_DETAIL;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
 
+use super::audio::wav_duration_seconds;
+
 const IMAGE_HELPER_EXPECTS_MESSAGE: &str = "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block";
 const AUDIO_HELPER_EXPECTS_MESSAGE: &str = "audio expects a non-empty audio URL string, an object with audio_url, or a raw MCP audio block";
 const REMOTE_IMAGE_URL_ERROR: &str = "Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead";
@@ -214,6 +216,14 @@ pub(super) fn normalize_output_audio(
             return Err(INVALID_AUDIO_URL_ERROR.to_string());
         }
 
+        // Tiny tool-generated clips cannot be encoded reliably by audio models.
+        if wav_duration_seconds(&audio_url).is_some_and(|duration| duration < 0.025) {
+            return Ok(FunctionCallOutputContentItem::InputText {
+                text: "Audio output omitted because the clip is shorter than 25 ms; use a longer clip."
+                    .to_string(),
+            });
+        }
+
         Ok(FunctionCallOutputContentItem::InputAudio { audio_url })
     })();
 
@@ -287,6 +297,11 @@ pub(super) fn v8_value_to_json(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
 ) -> Result<Option<JsonValue>, String> {
+    // V8 stringifies undefined as the non-JSON text "undefined".
+    if value.is_undefined() {
+        return Ok(None);
+    }
+
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
     let Some(stringified) = v8::json::stringify(&tc, value) else {

@@ -7,6 +7,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -27,6 +28,7 @@ use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SESSION_RESOURCE_LIMITS_CAPABILITY;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WireWaitOutcome;
 use codex_code_mode_runtime::InProcessCodeModeSession;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -47,13 +49,7 @@ mod delegate;
 mod grpc;
 mod grpc_transport;
 mod peer;
-mod trace_transport;
 mod transport;
-
-pub use self::trace_transport::bind_otlp_trace_receiver;
-pub use self::trace_transport::run_otel_trace_listener;
-pub use self::trace_transport::run_otlp_trace_receiver;
-pub use self::trace_transport::trace_batch_channel;
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const MAX_ACTIVE_CELLS: usize = 128;
@@ -306,6 +302,8 @@ impl HostState {
         request_id: RequestId,
         request: HostRequest,
     ) -> Result<(), anyhow::Error> {
+        // Include host admission and scheduling before the runtime observes the request.
+        let received_at = Instant::now();
         let request_kind = RequestKind::from(&request);
         let cancellation = self
             .requests
@@ -324,7 +322,7 @@ impl HostState {
         let request_task = self.request_tasks.spawn(async move {
             let _permit = permit;
             state
-                .handle_request(request_id, request, cancellation)
+                .handle_request(request_id, request, cancellation, received_at)
                 .await;
             state.finish_request(request_id);
         });
@@ -357,6 +355,7 @@ impl HostState {
         request_id: RequestId,
         request: HostRequest,
         cancellation: CancellationToken,
+        received_at: Instant,
     ) {
         if let HostRequest::Execute { request, .. } = &request {
             tracing::Span::current().record("call_id", request.tool_call_id.as_str());
@@ -413,7 +412,11 @@ impl HostState {
                     );
                     return;
                 };
-                let result = session.execute(request).await;
+                let delegate = Arc::new(RemoteDelegate::new(
+                    session_id.clone(),
+                    Arc::clone(&self.peer),
+                ));
+                let result = session.execute(request, delegate).await;
                 match result {
                     Ok(started) => {
                         let cell_id = started.cell_id.clone();
@@ -428,6 +431,7 @@ impl HostState {
                             request_id,
                             started,
                             active_cell_permit,
+                            received_at,
                         );
                         let _ = initial_response_sent.await;
                     }
@@ -445,10 +449,12 @@ impl HostState {
                             _ = cancellation.cancelled() => {
                                 Err("code-mode request cancelled".to_string())
                             }
-                            result = session.wait(request.into()) => result.map(|outcome| {
-                                HostResponse::WaitCompleted {
-                                    outcome: outcome.into(),
-                                }
+                            result = session.wait(request.into()) => result.and_then(|outcome| {
+                                let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+                                Ok(HostResponse::WaitCompleted {
+                                    outcome: WireWaitOutcome::try_from(outcome)
+                                        .map_err(|error| error.to_string())?,
+                                })
                             }),
                         }
                     }
@@ -461,10 +467,12 @@ impl HostState {
                 cell_id,
             } => {
                 let result = match self.session(&session_id) {
-                    Ok(session) => session.terminate(cell_id.into()).await.map(|outcome| {
-                        HostResponse::WaitCompleted {
-                            outcome: outcome.into(),
-                        }
+                    Ok(session) => session.terminate(cell_id.into()).await.and_then(|outcome| {
+                        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
+                        Ok(HostResponse::WaitCompleted {
+                            outcome: WireWaitOutcome::try_from(outcome)
+                                .map_err(|error| error.to_string())?,
+                        })
                     }),
                     Err(err) => Err(err),
                 };
@@ -513,10 +521,6 @@ impl HostState {
         {
             return Err(format!("code-mode session ID `{session_id}` was reused"));
         }
-        let delegate = Arc::new(RemoteDelegate::new(
-            session_id.clone(),
-            Arc::clone(&self.peer),
-        ));
         let peer = Arc::downgrade(&self.peer);
         let task_failure_handler = Arc::new(move |reason| {
             if let Some(peer) = peer.upgrade() {
@@ -525,13 +529,10 @@ impl HostState {
         });
         sessions.insert(
             session_id,
-            Arc::new(
-                InProcessCodeModeSession::with_delegate_and_task_failure_handler(
-                    delegate,
-                    task_failure_handler,
-                    cell_execution_limits,
-                ),
-            ),
+            Arc::new(InProcessCodeModeSession::with_task_failure_handler(
+                task_failure_handler,
+                cell_execution_limits,
+            )),
         );
         Ok(())
     }

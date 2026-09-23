@@ -16,6 +16,7 @@ use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RuleMatch;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -84,7 +85,7 @@ fn approval_sandbox_permissions(
 
 pub(crate) async fn prepare_unified_exec_zsh_fork(
     req: &crate::tools::runtimes::unified_exec::UnifiedExecRequest,
-    _attempt: &SandboxAttempt<'_>,
+    attempt: &SandboxAttempt<'_>,
     ctx: &ToolCtx,
     exec_request: ExecRequest,
     shell_zsh_path: &std::path::Path,
@@ -128,6 +129,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         .to_abs_path()
         .map_err(|err| ToolError::Rejected(err.to_string()))?;
     let command_executor = CoreShellCommandExecutor {
+        sandbox_manager: attempt.manager.clone(),
         command: exec_request.command.clone(),
         cwd,
         permission_profile: exec_request.permission_profile.clone(),
@@ -280,7 +282,7 @@ impl CoreShellActionProvider {
         };
         match stopwatch
             .pause_for(async {
-                let (turn_context, step_settings, strict_auto_review) = self
+                let (turn_context, step_inputs, strict_auto_review) = self
                     .session
                     .active_turn_context_and_strict_auto_review()
                     .await
@@ -292,8 +294,9 @@ impl CoreShellActionProvider {
                     })?;
                 let approval_ctx = ApprovalContext {
                     review_context: GuardianReviewContext::from_resolved_settings(
-                        turn_context,
-                        &step_settings,
+                        Arc::clone(&turn_context),
+                        &step_inputs.settings,
+                        self.review_context.environments(),
                     ),
                     // The running process can outlive its launching tool or code-mode cell.
                     cancellation_token: None,
@@ -367,9 +370,12 @@ impl CoreShellActionProvider {
                             EscalationDecision::deny(Some(rejection))
                         }
                         ReviewDecision::TimedOut => EscalationDecision::deny(Some(
-                            crate::guardian::guardian_timeout_message(
+                            ResolvedModelMessages::from_model(
                                 self.review_context.turn().model_info(),
-                            ),
+                            )
+                            .auto_review()
+                            .timeout_instructions
+                            .to_string(),
                         )),
                         ReviewDecision::ApprovedMcpPolicyAmendment => {
                             error!("Shell escalation received ApprovedMcpPolicyAmendment");
@@ -565,6 +571,7 @@ fn commands_for_intercepted_exec_policy(
 // TODO(anp): Capture these Windows and Landlock settings from
 // TurnEnvironment::sandbox_context when preparing this executor, preserving its snapshot.
 struct CoreShellCommandExecutor {
+    sandbox_manager: SandboxManager,
     command: Vec<String>,
     cwd: AbsolutePathBuf,
     permission_profile: PermissionProfile,
@@ -650,7 +657,6 @@ impl CoreShellCommandExecutor {
                 windows_sandbox_policy_cwd: self.sandbox_policy_cwd.clone().into(),
                 windows_sandbox_workspace_roots: self.windows_sandbox_workspace_roots.clone(),
                 windows_sandbox_level: self.windows_sandbox_level,
-                windows_sandbox_private_desktop: false,
                 permission_profile: self.permission_profile.clone(),
                 windows_sandbox_filesystem_overrides: None,
                 arg0: self.arg0.clone(),
@@ -757,11 +763,11 @@ impl CoreShellCommandExecutor {
         let (program, args) = command
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("prepared command must not be empty"))?;
-        let sandbox_manager = SandboxManager::new();
+        let sandbox_manager = &self.sandbox_manager;
         let sandbox = sandbox_manager.select_initial(
             permission_profile,
             SandboxablePreference::Auto,
-            self.windows_sandbox_level,
+            SandboxType::None,
             self.network.is_some(),
         );
         let cwd = PathUri::from_abs_path(workdir);
@@ -786,10 +792,9 @@ impl CoreShellCommandExecutor {
             environment_id: self.network_environment_id.as_deref(),
             network: self.network.as_ref(),
             sandbox_policy_cwd: &sandbox_policy_cwd,
-            codex_linux_sandbox_exe: self.codex_linux_sandbox_exe.as_deref(),
+            sandbox_exe: self.codex_linux_sandbox_exe.as_deref(),
             use_legacy_landlock: self.use_legacy_landlock,
             windows_sandbox_level: self.windows_sandbox_level,
-            windows_sandbox_private_desktop: false,
         })?;
         let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
             exec_request,

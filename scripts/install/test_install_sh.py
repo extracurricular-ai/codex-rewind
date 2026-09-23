@@ -156,6 +156,195 @@ class InstallShTest(unittest.TestCase):
                 ],
             )
 
+    def test_daemon_install_preserves_visible_cli_and_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            archive, checksum, metadata = create_package_release(root)
+            options = dict(
+                metadata_json=metadata,
+                archive_path=archive,
+                checksum_path=checksum,
+                force_macos=True,
+            )
+            pinned, _ = run_installer_in(root, VERSION, **options)
+            self.assertEqual(pinned.returncode, 0, pinned.stderr)
+            visible = root / "install-bin/codex"
+            original = visible.resolve()
+            pending = visible.with_name(".codex.12345")
+            pending.symlink_to(original)
+            profile = root / "home/.profile"
+            profile.write_text("unchanged profile\n")
+
+            installed, _ = run_installer_in(root, "latest", daemon_only=True, **options)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            daemon = root / "codex-home/packages/app-server-daemon"
+            release_name = f"{VERSION}-aarch64-apple-darwin"
+            self.assertEqual(
+                (daemon / "current").resolve(), daemon / "releases" / release_name
+            )
+            self.assertEqual((daemon / "auto-update-version").read_text(), release_name)
+            options["daemon_only"] = True
+            local = daemon / "releases/local-development"
+            local.mkdir()
+            (daemon / "current").unlink()
+            (daemon / "current").symlink_to(local)
+            marker = daemon / "auto-update-version"
+            marker.unlink()
+
+            scheduled, _ = run_installer_in(
+                root, "latest", update_guard_from_release=local.name, **options
+            )
+            self.assertEqual(scheduled.returncode, 0, scheduled.stderr)
+            self.assertEqual((daemon / "current").resolve(), local)
+            self.assertFalse(marker.exists())
+
+            raced, _ = run_installer_in(
+                root,
+                "latest",
+                update_guard_from_release="a-different-release",
+                manual_update=True,
+                **options,
+            )
+            self.assertNotEqual(raced.returncode, 0, raced.stderr)
+            self.assertEqual((daemon / "current").resolve(), local)
+            self.assertFalse(marker.exists())
+
+            binary = daemon / "releases" / release_name / "bin/codex"
+            contents = binary.read_text()
+            binary.write_text(
+                '#!/bin/sh\n[ "$1" = "--version" ] || exit 2\n'
+                f"echo codex-cli {VERSION}\n"
+            )
+            incompatible, _ = run_installer_in(
+                root,
+                "latest",
+                update_guard_from_release=local.name,
+                manual_update=True,
+                **options,
+            )
+            self.assertNotEqual(incompatible.returncode, 0)
+            self.assertIn("does not support daemon-owned packages", incompatible.stderr)
+            self.assertEqual((daemon / "current").resolve(), local)
+            self.assertFalse(marker.exists())
+            binary.write_text(contents)
+
+            restored, _ = run_installer_in(
+                root,
+                "latest",
+                update_guard_from_release=local.name,
+                manual_update=True,
+                **options,
+            )
+            self.assertEqual(restored.returncode, 0, restored.stderr)
+            self.assertEqual(
+                (daemon / "current").resolve(), daemon / "releases" / release_name
+            )
+            self.assertEqual(marker.read_text(), release_name)
+            self.assertEqual(visible.resolve(), original)
+            self.assertTrue(pending.is_symlink())
+            self.assertEqual(profile.read_text(), "unchanged profile\n")
+            self.assertFalse(
+                (root / "codex-home/packages/standalone/auto-update-version").exists()
+            )
+
+    def test_explicit_release_pins_even_the_current_latest_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            options = dict(
+                metadata_json=metadata,
+                archive_path=archive,
+                checksum_path=checksum,
+                force_macos=True,
+            )
+            marker = root / "codex-home/packages/standalone/auto-update-version"
+            latest, _ = run_installer_in(root, "latest", **options)
+            self.assertEqual(latest.returncode, 0, latest.stderr)
+            release_name = f"{VERSION}-aarch64-apple-darwin"
+            self.assertEqual(marker.read_text(), release_name)
+
+            pinned, _ = run_installer_in(root, VERSION, **options)
+            self.assertEqual(pinned.returncode, 0, pinned.stderr)
+            self.assertFalse(marker.exists())
+
+            updater_record = (
+                root / "codex-home/app-server-daemon/app-server-updater.pid"
+            )
+            updater_record.parent.mkdir(parents=True)
+            updater_record.write_text(
+                json.dumps(
+                    {"pid": os.getpid(), "processStartTime": process_start_time()}
+                )
+            )
+            old_updater, _ = run_installer_in(
+                root, "latest", old_updater_parent_pid=os.getpid(), **options
+            )
+            self.assertEqual(old_updater.returncode, 0, old_updater.stderr)
+            self.assertFalse(marker.exists())
+
+            skipped, _ = run_installer_in(
+                root, "latest", update_guard_from_release=release_name, **options
+            )
+            self.assertEqual(skipped.returncode, 0, skipped.stderr)
+            self.assertFalse(marker.exists())
+
+            updater_record.write_text(
+                json.dumps({"pid": os.getpid(), "processStartTime": "stale"})
+            )
+            latest_again, _ = run_installer_in(
+                root, "latest", old_updater_parent_pid=os.getpid(), **options
+            )
+            self.assertEqual(latest_again.returncode, 0, latest_again.stderr)
+            self.assertEqual(marker.read_text(), release_name)
+
+            managed = (
+                root
+                / f"codex-home/packages/standalone/releases/{release_name}/bin/codex"
+            )
+            managed.unlink()
+            guarded, _ = run_installer_in(
+                root,
+                "latest",
+                update_guard_from_release=release_name,
+                **options,
+            )
+            self.assertEqual(guarded.returncode, 0, guarded.stderr)
+            self.assertTrue(managed.exists())
+
+    def test_uninspectable_legacy_updater_does_not_clear_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive, checksum, metadata = create_package_release(root)
+            options = dict(
+                metadata_json=metadata,
+                archive_path=archive,
+                checksum_path=checksum,
+                force_macos=True,
+            )
+            pinned, _ = run_installer_in(root, VERSION, **options)
+            self.assertEqual(pinned.returncode, 0, pinned.stderr)
+            updater_record = (
+                root / "codex-home/app-server-daemon/app-server-updater.pid"
+            )
+            updater_record.parent.mkdir(parents=True)
+            updater_record.write_text(
+                json.dumps(
+                    {"pid": os.getpid(), "processStartTime": process_start_time()}
+                )
+            )
+
+            attempted, _ = run_installer_in(
+                root,
+                "latest",
+                old_updater_parent_pid=os.getpid(),
+                fail_ps=True,
+                **options,
+            )
+            self.assertEqual(attempted.returncode, 0, attempted.stderr)
+            self.assertFalse(
+                (root / "codex-home/packages/standalone/auto-update-version").exists()
+            )
+
     def test_releases_unusable_metadata_falls_back_to_github(self) -> None:
         unusable_metadata = {
             "html": "<html>proxy error</html>",
@@ -536,6 +725,11 @@ def run_installer_in(
     force_macos: bool = False,
     use_mirror: bool | None = False,
     releases_mode: str = "",
+    update_guard_from_release: str | None = None,
+    old_updater_parent_pid: int | None = None,
+    fail_ps: bool = False,
+    daemon_only: bool = False,
+    manual_update: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     bin_dir = root / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -647,6 +841,19 @@ def run_installer_in(
             encoding="utf-8",
         )
         fake_uname.chmod(0o755)
+    if old_updater_parent_pid is not None:
+        fake_ps = bin_dir / "ps"
+        fake_ps.write_text(
+            "#!/bin/sh\nexit 1\n"
+            if fail_ps
+            else "#!/bin/sh\n"
+            'case "$*" in\n'
+            '  *lstart*) printf "S %s\\n" "$CODEX_TEST_PARENT_START" ;;\n'
+            '  *) printf "%s\\n" "$CODEX_TEST_PARENT_PID" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        fake_ps.chmod(0o755)
 
     home = root / "home"
     home.mkdir(exist_ok=True)
@@ -657,6 +864,7 @@ def run_installer_in(
             "CODEX_INSTALL_DIR": str(root / "install-bin"),
             "CODEX_NON_INTERACTIVE": "1",
             "CODEX_RELEASE": release,
+            "CODEX_INSTALL_DAEMON_ONLY": "1" if daemon_only else "0",
             "CODEX_TEST_ARCHIVE_PATH": str(archive_path or ""),
             "CODEX_TEST_CHECKSUM_PATH": str(checksum_path or ""),
             "CODEX_TEST_RELEASES_CHECKSUM_PATH": str(
@@ -681,6 +889,16 @@ def run_installer_in(
             "SHELL": "/bin/sh",
         }
     )
+    env["CODEX_INSTALL_IF_CURRENT"] = "1" if manual_update else "0"
+    if update_guard_from_release is None:
+        env.pop("CODEX_INSTALL_IF_LATEST", None)
+        env.pop("CODEX_UPDATE_FROM_RELEASE", None)
+    else:
+        env["CODEX_INSTALL_IF_LATEST"] = "0" if manual_update else "1"
+        env["CODEX_UPDATE_FROM_RELEASE"] = update_guard_from_release
+    if old_updater_parent_pid is not None:
+        env["CODEX_TEST_PARENT_PID"] = str(old_updater_parent_pid)
+        env["CODEX_TEST_PARENT_START"] = process_start_time()
     if use_mirror is None:
         env.pop("CODEX_INSTALLER_USE_RELEASES_OPENAI_COM", None)
     else:
@@ -700,6 +918,13 @@ def run_installer_in(
         else []
     )
     return result, requests
+
+
+def process_start_time() -> str:
+    details = subprocess.check_output(
+        ["ps", "-p", str(os.getpid()), "-o", "stat=", "-o", "lstart="], text=True
+    ).strip()
+    return details.split(maxsplit=1)[1]
 
 
 def create_package_release(

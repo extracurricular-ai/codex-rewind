@@ -37,9 +37,7 @@ use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use std::sync::Arc;
 use std::time::Instant;
 
-pub(crate) struct ToolOrchestrator {
-    sandbox: SandboxManager,
-}
+pub(crate) struct ToolOrchestrator;
 
 pub(crate) struct OrchestratorRunResult<Out> {
     pub output: Out,
@@ -48,9 +46,7 @@ pub(crate) struct OrchestratorRunResult<Out> {
 
 impl ToolOrchestrator {
     pub fn new() -> Self {
-        Self {
-            sandbox: SandboxManager::new(),
-        }
+        Self
     }
 
     async fn run_attempt<Rq, Out, T>(
@@ -66,6 +62,7 @@ impl ToolOrchestrator {
         let network_approval = match begin_network_approval(
             &tool_ctx.session,
             &tool_ctx.step_context.turn,
+            &tool_ctx.step_context.environments,
             attempt.enforce_managed_network,
             network_approval_spec,
         )
@@ -91,10 +88,10 @@ impl ToolOrchestrator {
             manager: attempt.manager,
             sandbox_cwd: attempt.sandbox_cwd,
             workspace_roots: attempt.workspace_roots,
-            codex_linux_sandbox_exe: attempt.codex_linux_sandbox_exe,
+            sandbox_exe: attempt.sandbox_exe,
             use_legacy_landlock: attempt.use_legacy_landlock,
+            windows_sandbox_type: attempt.windows_sandbox_type,
             windows_sandbox_level: attempt.windows_sandbox_level,
-            windows_sandbox_private_desktop: attempt.windows_sandbox_private_desktop,
             network_denial_cancellation_token: network_approval
                 .as_ref()
                 .map(ActiveNetworkApproval::cancellation_token),
@@ -145,18 +142,16 @@ impl ToolOrchestrator {
         let mut already_approved = false;
 
         let environment = tool.turn_environment(req);
+        let sandbox_manager = SandboxManager::new();
+        #[cfg(target_os = "macos")]
+        let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
+            environment
+                .environment
+                .local_runtime_paths()
+                .and_then(|paths| paths.allowed_symlinked_codex_home.clone()),
+        );
         let sandbox_config = environment.config();
         let owner_network_policy = sandbox_config.network_policy.is_some();
-        if owner_network_policy
-            && tool
-                .sandbox_permissions(req)
-                .requires_escalated_permissions()
-        {
-            return Err(ToolError::Rejected(
-                "attachment-owned network policy cannot be bypassed by sandbox escalation"
-                    .to_string(),
-            ));
-        }
         let workspace_roots = environment.workspace_roots();
         let executor_managed_process_sandbox = tool.uses_executor_managed_process_sandbox(req);
         let permission_profile = environment.permission_profile();
@@ -230,8 +225,7 @@ impl ToolOrchestrator {
         }
 
         // 2) First attempt under the selected sandbox.
-        let unsandboxed_allowed =
-            !owner_network_policy && unsandboxed_execution_allowed(&file_system_sandbox_policy);
+        let unsandboxed_allowed = unsandboxed_execution_allowed(&file_system_sandbox_policy);
         let sandbox_override = if unsandboxed_allowed {
             sandbox_override_for_first_attempt(
                 tool.sandbox_permissions(req),
@@ -244,6 +238,8 @@ impl ToolOrchestrator {
         let network_approval_spec = tool.network_approval_spec(req, tool_ctx);
         // Offline owner attachments stay offline unless approved command permissions grant
         // networking. Existing enabled controller proxies remain independently authoritative.
+        // Preserve this baseline even when escalation skips the execution proxy, so retained
+        // terminals still record that their launch bypassed network restrictions.
         let managed_network_active = if owner_network_policy {
             turn_ctx
                 .config
@@ -251,30 +247,38 @@ impl ToolOrchestrator {
                 .network
                 .as_ref()
                 .is_some_and(NetworkProxySpec::enabled)
-                || network_approval_spec.as_ref().is_some_and(|spec| {
-                    effective_network_sandbox_policy(
+                || (network_approval_spec.is_some()
+                    || tool
+                        .sandbox_permissions(req)
+                        .requires_escalated_permissions())
+                    && effective_network_sandbox_policy(
                         permission_profile.network_sandbox_policy(),
-                        spec.trigger.additional_permissions.as_ref(),
+                        network_approval_spec
+                            .as_ref()
+                            .and_then(|spec| spec.trigger.additional_permissions.as_ref()),
                     )
                     .is_enabled()
-                })
         } else {
             turn_ctx.network.is_some()
         };
         let sandbox_preference = tool.sandbox_preference();
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
-            SandboxOverride::NoOverride => self.sandbox.should_sandbox(
+            SandboxOverride::NoOverride => sandbox_manager.should_sandbox(
                 &permissions,
                 sandbox_preference,
                 managed_network_active,
             ),
         };
+        let windows_sandbox_type = codex_protocol::sandbox::effective_windows_sandbox_type(
+            sandbox_config.windows_sandbox_type,
+            sandbox_config.windows_sandbox_level,
+        );
         let initial_sandbox = if sandbox_requested && !executor_managed_process_sandbox {
-            self.sandbox.select_initial(
+            sandbox_manager.select_initial(
                 &permissions,
                 sandbox_preference,
-                sandbox_config.windows_sandbox_level,
+                windows_sandbox_type,
                 managed_network_active,
             )
         } else {
@@ -285,19 +289,24 @@ impl ToolOrchestrator {
             .sandbox_cwd(req)
             .cloned()
             .unwrap_or_else(|| environment.cwd().clone());
+        let codex_sandbox_exe = if cfg!(windows) {
+            turn_ctx.config.codex_self_exe.as_ref()
+        } else {
+            turn_ctx.config.codex_linux_sandbox_exe.as_ref()
+        };
         let initial_attempt = SandboxAttempt {
             sandbox: initial_sandbox,
             sandbox_requested,
             permissions: &permissions,
             exec_server_permissions: permission_profile,
             enforce_managed_network: managed_network_active,
-            manager: &self.sandbox,
+            manager: &sandbox_manager,
             sandbox_cwd: &sandbox_policy_cwd,
             workspace_roots,
-            codex_linux_sandbox_exe: turn_ctx.config.codex_linux_sandbox_exe.as_ref(),
+            sandbox_exe: codex_sandbox_exe,
             use_legacy_landlock: sandbox_config.use_legacy_landlock,
+            windows_sandbox_type,
             windows_sandbox_level: sandbox_config.windows_sandbox_level,
-            windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,
             network_denial_cancellation_token: None,
             network_proxy: None,
         };
@@ -438,26 +447,26 @@ impl ToolOrchestrator {
                 }
 
                 let retry_sandbox_requested = !unsandboxed_allowed
-                    && self.sandbox.should_sandbox(
+                    && sandbox_manager.should_sandbox(
                         &permissions,
                         sandbox_preference,
                         managed_network_active,
                     );
                 let retry_sandbox = if retry_sandbox_requested && !executor_managed_process_sandbox
                 {
-                    self.sandbox.select_initial(
+                    sandbox_manager.select_initial(
                         &permissions,
                         sandbox_preference,
-                        sandbox_config.windows_sandbox_level,
+                        windows_sandbox_type,
                         managed_network_active,
                     )
                 } else {
                     SandboxType::None
                 };
-                let retry_codex_linux_sandbox_exe = if unsandboxed_allowed {
+                let retry_sandbox_exe = if unsandboxed_allowed {
                     None
                 } else {
-                    turn_ctx.config.codex_linux_sandbox_exe.as_ref()
+                    codex_sandbox_exe
                 };
                 let retry_attempt = SandboxAttempt {
                     sandbox: retry_sandbox,
@@ -465,13 +474,13 @@ impl ToolOrchestrator {
                     permissions: &permissions,
                     exec_server_permissions: permission_profile,
                     enforce_managed_network: managed_network_active,
-                    manager: &self.sandbox,
+                    manager: &sandbox_manager,
                     sandbox_cwd: &sandbox_policy_cwd,
                     workspace_roots,
-                    codex_linux_sandbox_exe: retry_codex_linux_sandbox_exe,
+                    sandbox_exe: retry_sandbox_exe,
                     use_legacy_landlock: sandbox_config.use_legacy_landlock,
+                    windows_sandbox_type,
                     windows_sandbox_level: sandbox_config.windows_sandbox_level,
-                    windows_sandbox_private_desktop: sandbox_config.windows_sandbox_private_desktop,
                     network_denial_cancellation_token: None,
                     network_proxy: None,
                 };

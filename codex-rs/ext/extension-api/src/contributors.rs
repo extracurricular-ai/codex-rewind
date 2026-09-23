@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use codex_context_fragments::ContextualUserFragment;
 use codex_protocol::items::TurnItem;
-use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_tools::ToolCall;
 use codex_tools::ToolExecutor;
@@ -23,9 +22,10 @@ mod turn_input;
 mod turn_lifecycle;
 mod world_state;
 
-pub use approval_review::ApprovalAssessment;
-pub use approval_review::ApprovalReviewError;
-pub use approval_review::ApprovalReviewInput;
+pub use approval_review::ApprovalDecision;
+pub use approval_review::ApprovalDecisionInput;
+pub use approval_review::GuardianV2Enabled;
+pub use approval_review::SynchronousApprovalReviewer;
 pub use context::TurnContextContributionInput;
 pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
@@ -42,6 +42,7 @@ pub use thread_lifecycle::ThreadReadyInput;
 pub use thread_lifecycle::ThreadResumeInput;
 pub use thread_lifecycle::ThreadStartInput;
 pub use thread_lifecycle::ThreadStopInput;
+pub use tool_lifecycle::CommandStartInput;
 pub use tool_lifecycle::McpToolContext;
 pub use tool_lifecycle::McpToolResultInput;
 pub use tool_lifecycle::McpToolSource;
@@ -54,6 +55,7 @@ pub use turn_input::TurnInputEnvironment;
 pub use turn_lifecycle::TurnAbortInput;
 pub use turn_lifecycle::TurnErrorInput;
 pub use turn_lifecycle::TurnStartInput;
+pub use turn_lifecycle::TurnStartPhase;
 pub use turn_lifecycle::TurnStopInput;
 pub use world_state::PreviousWorldStateSection;
 pub use world_state::RenderedWorldStateFragment;
@@ -168,7 +170,8 @@ pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
         })
     }
 
-    /// Called before the host drops the thread runtime and thread-scoped store.
+    /// Called during runtime teardown, before the host closes persistent history.
+    /// Contributors must cancel and join their background work before returning.
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let _self = self;
@@ -183,13 +186,36 @@ pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
 /// extension-private turn state. The host exposes stable identifiers and
 /// extension stores instead of core runtime objects.
 pub trait TurnLifecycleContributor: Send + Sync {
-    /// Called after turn-scoped extension stores are created, before the task
-    /// for the turn starts running.
+    /// Selects the start phase using the current thread policy. Disabled callbacks
+    /// may retain the default phase and return without doing any work.
+    fn turn_start_phase(&self, _thread_store: &ExtensionData) -> TurnStartPhase {
+        TurnStartPhase::BeforeTaskRegistration
+    }
+
+    /// Whether regular-task startup must reconcile MCP before this callback runs.
+    /// Ignored before task registration; contributors unrelated to MCP keep the default.
+    fn requires_mcp_runtime(&self, _thread_store: &ExtensionData) -> bool {
+        false
+    }
+
+    /// Called once in the selected phase, before task-specific work begins.
+    /// Regular-task preparation may be cancelled before this callback completes;
+    /// stop and abort callbacks must tolerate missing or partial initialization.
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let _self = self;
             let _input = input;
         })
+    }
+
+    /// Observes a completed item without changing it or delaying streamed deltas.
+    fn on_item_completed<'a>(
+        &'a self,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+        _item: &'a TurnItem,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
     }
 
     /// Called before the host drops the completed turn runtime and turn store.
@@ -331,6 +357,14 @@ pub trait ToolLifecycleContributor: Send + Sync {
         Box::pin(std::future::ready(()))
     }
 
+    /// Called for a resolved builtin command before attribution and execution.
+    ///
+    /// This includes commands issued by code mode. It does not imply that
+    /// subsequent approval or process creation will succeed.
+    fn on_command_start<'a>(&'a self, _input: CommandStartInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
+
     /// Runs before the MCP result is sent to the client and model.
     fn on_mcp_tool_result<'a>(&'a self, _input: McpToolResultInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(std::future::ready(()))
@@ -345,28 +379,14 @@ pub trait ToolLifecycleContributor: Send + Sync {
     }
 }
 
-/// Extension contribution for fast approval decisions and full action reviews.
-///
-/// Implementations can provide a fast decision from existing evidence, perform
-/// a full structured review, or support both paths. Returning `None` leaves the
-/// request available to the next contributor or the host's fallback path.
+/// Owns the complete approval decision, including whether to consult a reviewer.
+/// Returning `None` leaves the request to the next contributor.
 pub trait ApprovalReviewContributor: Send + Sync {
-    /// Returns an available approval decision without performing a full review.
-    fn fast_decision<'a>(
+    /// Claims one request, including a handoff to the user.
+    fn decide<'a>(
         &'a self,
-        _session_store: &'a ExtensionData,
-        _thread_store: &'a ExtensionData,
-        _prompt: &'a str,
-        _extension_metrics: Option<Arc<dyn ExtensionMetrics>>,
-    ) -> ExtensionFuture<'a, Option<ReviewDecision>> {
-        Box::pin(std::future::ready(None))
-    }
-
-    /// Performs a full review of a structured host-owned approval request.
-    fn full_review<'a>(
-        &'a self,
-        _input: &'a ApprovalReviewInput<'_>,
-    ) -> ExtensionFuture<'a, Option<Result<ApprovalAssessment, ApprovalReviewError>>> {
+        _input: &'a ApprovalDecisionInput<'_>,
+    ) -> ExtensionFuture<'a, Option<ApprovalDecision>> {
         Box::pin(std::future::ready(None))
     }
 }

@@ -1,5 +1,6 @@
 use crate::FeatureConfig;
 use crate::FeatureToml;
+use codex_network_proxy::CredentialProviderConfig;
 use codex_protocol::openai_models::ReasoningEffort;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -25,6 +26,11 @@ pub struct CodeModeConfigToml {
     /// Default yield timeout for code-mode exec calls, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_exec_yield_time_ms: Option<u64>,
+    /// Show handler duration, code-mode host duration, and harness overhead
+    /// in each code-mode cell response.
+    /// Experimental: this option and the response format may change or be removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_show_cell_overhead: Option<bool>,
     /// Exact tool namespaces to omit from the code-mode nested tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_tool_namespaces: Option<Vec<String>>,
@@ -126,9 +132,13 @@ pub struct GuardianV2ReviewScopeConfigToml {
 pub struct GuardianV2ConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Route Guardian review and classification through the unmetered Codex endpoints.
+    /// Legacy setting retained for config compatibility; the backend now controls Guardian billing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_guardian: Option<bool>,
+    /// Use thread-owned context for sync and async Guardian. Defaults to false.
+    /// Independent of the Guardian v2 `enabled` toggle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_context: Option<bool>,
     /// Persist reviewed actions and risk scores to rollout files for debugging.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persist_scores: Option<bool>,
@@ -295,6 +305,20 @@ impl FeatureConfig for MultiAgentV2ConfigToml {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ContextManagementConfigToml {
+    /// Enables experimental context management.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_mode: Option<bool>,
+}
+
+impl FeatureConfig for ContextManagementConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.experimental_mode
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TokenBudgetConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -396,6 +420,32 @@ impl FeatureConfig for CurrentTimeReminderConfigToml {
     }
 }
 
+/// How the sleep tool is selected when its feature gate is enabled.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepToolMode {
+    /// Preserve the existing model and legacy clock configuration defaults.
+    #[default]
+    ModelDriven,
+    /// Register sleep regardless of the model or legacy clock configuration.
+    AlwaysOn,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SleepToolConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SleepToolMode>,
+}
+
+impl FeatureConfig for SleepToolConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RemovedAppsMcpPathOverrideConfigToml {
@@ -430,10 +480,15 @@ pub struct NetworkProxyConfigToml {
     pub domains: Option<BTreeMap<String, NetworkProxyDomainPermissionToml>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unix_sockets: Option<BTreeMap<String, NetworkProxyUnixSocketPermissionToml>>,
+    /// Permits local servers and direct host-loopback connections and skips the proxy's
+    /// additional private-network destination checks. Proxy domain rules still apply.
+    /// Defaults to true for MXC, which cannot enforce false; otherwise defaults to false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_local_binding: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_broker: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<BTreeMap<String, CredentialProviderConfig>>,
 }
 
 impl FeatureConfig for NetworkProxyConfigToml {

@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
+use app_test_support::ChatGptAuthFixture;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_apply_patch_sse_response;
@@ -12,8 +13,10 @@ use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::create_request_user_input_sse_response;
 use app_test_support::format_with_current_shell_display;
+use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use app_test_support::write_models_cache;
+use app_test_support::write_models_cache_with_models;
 use codex_app_server::INPUT_TOO_LARGE_ERROR_CODE;
 use codex_app_server::INVALID_PARAMS_ERROR_CODE;
 use codex_app_server_protocol::AdditionalContextEntry;
@@ -27,9 +30,11 @@ use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionStatus;
+use codex_app_server_protocol::CyberAccessProgram;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangePatchUpdatedNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
+use codex_app_server_protocol::ImageReference as V2ImageReference;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -50,6 +55,8 @@ use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
+use codex_app_server_protocol::ThreadMetadataUpdateParams;
+use codex_app_server_protocol::ThreadMetadataUpdateResponse;
 use codex_app_server_protocol::ThreadSettingsUpdateParams;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadShellCommandParams;
@@ -70,6 +77,9 @@ use codex_app_server_protocol::WarningNotification;
 use codex_core::test_support::all_model_presets;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
+use codex_login::AuthCredentialsStoreMode;
+use codex_models_manager::model_info::BASE_INSTRUCTIONS;
+use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::MultiAgentMode;
@@ -82,6 +92,9 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use codex_utils_absolute_path::test_support::PathExt;
+use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_LIST_TOOL;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
@@ -97,7 +110,12 @@ use tempfile::TempDir;
 use test_case::test_case;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::Request;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::body_partial_json;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 use super::analytics::mount_analytics_capture;
 use super::analytics::wait_for_analytics_event;
@@ -135,6 +153,9 @@ async fn run_local_image_turn(detail: Option<ImageDetail>) -> Result<Vec<Value>>
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let mut model = model_info_from_slug("mock-model");
+    model.supports_image_detail_original = true;
+    write_models_cache_with_models(codex_home.path(), vec![model]).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -214,6 +235,319 @@ async fn received_response_input_images(server: &wiremock::MockServer) -> Result
 }
 
 #[tokio::test]
+async fn turn_start_omits_notification_media_without_changing_model_input() -> Result<()> {
+    let responses = vec![create_final_assistant_message_sse_response("Done")?];
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .enable_feature(Feature::OmitAppServerNotificationMedia)
+        .write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            experimental_raw_events: true,
+            ..Default::default()
+        })
+        .await?;
+
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id,
+                input: vec![
+                    V2UserInput::Text {
+                        text: "Describe this image".to_string(),
+                        text_elements: Vec::new(),
+                    },
+                    V2UserInput::Image {
+                        image: V2ImageReference::Inline {
+                            url: TINY_PNG_DATA_URL.to_string(),
+                        },
+                        detail: None,
+                    },
+                    V2UserInput::Image {
+                        image: V2ImageReference::File {
+                            file_id: "file_123".to_string(),
+                        },
+                        detail: None,
+                    },
+                ],
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let mut user_message_notifications = Vec::new();
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_matching_notification(
+                    "item notification or turn completion",
+                    |notification| {
+                        matches!(
+                            notification.method.as_str(),
+                            "item/started"
+                                | "item/completed"
+                                | "rawResponseItem/completed"
+                                | "turn/completed"
+                        )
+                    },
+                )
+                .await?;
+            if notification.method == "turn/completed" {
+                return Ok::<(), anyhow::Error>(());
+            }
+
+            let params = notification.params.context("item notification params")?;
+            let item = &params["item"];
+            let item_type = item["type"].as_str();
+            if item_type == Some("userMessage")
+                || (item_type == Some("message") && item["role"] == "user")
+            {
+                let content = item["content"].as_array().context("user message content")?;
+                if !content
+                    .iter()
+                    .any(|item| item["text"] == "Describe this image")
+                {
+                    continue;
+                }
+                assert_eq!(content.len(), 1);
+                assert!(matches!(
+                    content[0]["type"].as_str(),
+                    Some("text" | "input_text")
+                ));
+                assert!(content[0].get("fileId").is_none());
+                assert!(content[0].get("file_id").is_none());
+                user_message_notifications.push(notification.method);
+            }
+        }
+    })
+    .await??;
+
+    user_message_notifications.sort();
+    assert_eq!(
+        user_message_notifications,
+        vec![
+            "item/completed",
+            "item/started",
+            "rawResponseItem/completed"
+        ]
+    );
+
+    let model_input_images = received_response_input_images(&server).await?;
+    assert_eq!(model_input_images.len(), 2);
+    assert!(
+        model_input_images
+            .iter()
+            .any(|image| image["image_url"] == TINY_PNG_DATA_URL)
+    );
+    assert!(
+        model_input_images
+            .iter()
+            .any(|image| image["file_id"] == "file_123")
+    );
+
+    Ok(())
+}
+
+#[test_case(None; "analytics_unset")]
+#[test_case(Some(true); "analytics_enabled")]
+#[test_case(Some(false); "analytics_disabled")]
+#[tokio::test]
+async fn tool_call_metadata_stays_out_of_raw_response_item_notifications(
+    analytics_enabled: Option<bool>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let arguments = json!({"query": "redaction"});
+    let result_metadata = json!({"provider/private": {"sentinel": "raw-result-metadata"}});
+    let responses = vec![
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_function_call_with_namespace(
+                "mcp-call",
+                SEARCH_CALENDAR_NAMESPACE,
+                SEARCH_CALENDAR_LIST_TOOL,
+                &arguments.to_string(),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+        create_final_assistant_message_sse_response("Done")?,
+    ];
+    let server = responses::start_mock_server().await;
+    let model = responses::mount_sse_sequence(&server, responses).await;
+    let apps = AppsTestServer::mount(&server).await?;
+    let tool_result = json!({
+        "content": [{"type": "text", "text": "Calendar result"}],
+        "_meta": result_metadata,
+        "isError": false,
+    });
+    Mock::given(method("POST"))
+        .and(path("/api/codex/ps/mcp"))
+        .and(body_partial_json(json!({
+            "method": "tools/call",
+            "params": {"name": "calendar_list_events", "arguments": arguments},
+        })))
+        .respond_with(move |request: &Request| {
+            let request: Value =
+                serde_json::from_slice(&request.body).expect("valid MCP tool call JSON");
+            ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": tool_result,
+            }))
+        })
+        .with_priority(/*p*/ 1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let codex_home = TempDir::new()?;
+    let mut config = MockResponsesConfig::new(&server.uri())
+        .with_provider_name("OpenAI")
+        .with_provider_config("supports_websockets = false")
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\ncli_auth_credentials_store = \"file\"",
+            apps.chatgpt_base_url
+        ))
+        .enable_feature(Feature::Apps)
+        .enable_feature(Feature::ExecutedToolCallMetadata);
+    if let Some(enabled) = analytics_enabled {
+        config = config.with_extra_config(&format!("[analytics]\nenabled = {enabled}"));
+    }
+    config.write(codex_home.path())?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-test-token")
+            .account_id("account-123")
+            .chatgpt_account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .email("employee@openai.com"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            experimental_raw_events: true,
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..Default::default()
+        })
+        .await?;
+    let rollout_path = thread.path.context("thread rollout path")?;
+    let _: TurnStartResponse = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id,
+                input: vec![V2UserInput::Text {
+                    text: "list calendar events".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    let raw_params = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_matching_notification("raw output or turn completion", |n| {
+                    matches!(
+                        n.method.as_str(),
+                        "rawResponseItem/completed" | "turn/completed"
+                    )
+                })
+                .await?;
+            if notification.method == "turn/completed" {
+                anyhow::bail!("missing raw tool output notification");
+            }
+            let params = notification.params.context("raw notification params")?;
+            let item = &params["item"];
+            if item["type"] == "function_call_output" && item["call_id"] == "mcp-call" {
+                return Ok::<Value, anyhow::Error>(params);
+            }
+        }
+    })
+    .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let follow_up = requests[1].body_json();
+    let output = follow_up["input"]
+        .as_array()
+        .context("follow-up model input")?
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "mcp-call")
+        .context("follow-up tool output")?;
+    assert!(serde_json::to_string(&output["output"])?.contains("Calendar result"));
+    assert_eq!(
+        output["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+        json!([{"name": "mcp__codex_apps__calendar_list_events", "arguments": arguments}]),
+    );
+    assert_eq!(
+        output["internal_chat_message_metadata_passthrough"]["tool_calls_complete"],
+        true,
+    );
+
+    let raw_output = &raw_params["item"];
+    assert_eq!(raw_output["output"], output["output"]);
+    assert!(!serde_json::to_string(&raw_params)?.contains("raw-result-metadata"));
+    let public_metadata = raw_output["internal_chat_message_metadata_passthrough"]
+        .as_object()
+        .context("public passthrough metadata")?;
+    assert_eq!(
+        public_metadata.get("turn_id").context("public turn id")?,
+        &output["internal_chat_message_metadata_passthrough"]["turn_id"],
+    );
+    for field in ["executed_tool_calls", "tool_calls_complete", "cell_id"] {
+        assert!(
+            public_metadata.get(field).is_none(),
+            "notification leaked {field}"
+        );
+    }
+
+    let status = timeout(DEFAULT_READ_TIMEOUT, mcp.shutdown_gracefully()).await??;
+    assert!(status.success());
+    // Read raw JSON: ResponseItem deserialization intentionally discards host-owned metadata.
+    let rollout = std::fs::read_to_string(rollout_path)?;
+    let entries = rollout
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let captured = entries
+        .iter()
+        .filter(|entry| entry["type"] == "response_item")
+        .map(|entry| &entry["payload"])
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "mcp-call")
+        .context("persisted MCP output")?;
+    assert_eq!(captured["output"], raw_output["output"]);
+    // The custom inference endpoint omits raw metadata, so verify capture in the rollout.
+    assert_eq!(
+        captured["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]
+            .get("tool_result_metadata"),
+        (analytics_enabled != Some(false)).then_some(&result_metadata),
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
     let responses = vec![create_final_assistant_message_sse_response("Done")?];
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
@@ -275,9 +609,9 @@ async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
     assert_eq!(
         (
             event["event_params"]["turn_id"].as_str(),
-            event["event_params"].get("root_turn_id"),
+            event["event_params"]["root_turn_id"].as_str(),
         ),
-        (Some(turn.id.as_str()), Some(&Value::Null))
+        (Some(turn.id.as_str()), Some(turn.id.as_str()))
     );
 
     let requests = server
@@ -335,9 +669,21 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
     ])
     .await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(server.uri()).write(codex_home.path())?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "model = \"gpt-5.5\"\napproval_policy = \"never\"\nopenai_base_url = \"{}/v1\"\ncli_auth_credentials_store = \"file\"\n[features]\nenable_request_compression = false\n",
+            server.uri()
+        ),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-test-token").plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .without_managed_config()
         .build_initialized()
         .await?;
 
@@ -357,7 +703,8 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
                     text: "start".to_string(),
                     text_elements: Vec::new(),
                 }],
-                turn_trigger: Some("user".to_string()),
+                turn_trigger: Some("goal".to_string()),
+                cyber_access_program: Some(CyberAccessProgram::DaybreakBlue),
                 ..Default::default()
             },
         })
@@ -367,6 +714,27 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
         mcp.read_stream_until_notification_message("turn/started"),
     )
     .await??;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/*count*/ 1),
+    )
+    .await?;
+
+    let updated: ThreadMetadataUpdateResponse = mcp
+        .request(|request_id| ClientRequest::ThreadMetadataUpdate {
+            request_id,
+            params: ThreadMetadataUpdateParams {
+                thread_id: thread.id.clone(),
+                project_id: None,
+                git_info: None,
+                daybreak_enabled: Some(false),
+            },
+        })
+        .await?;
+    assert_eq!(
+        (updated.thread.id, updated.thread.daybreak_enabled),
+        (thread.id.clone(), Some(false))
+    );
 
     let TurnStartResponse { turn: steered_turn } = mcp
         .request(|request_id| ClientRequest::TurnStart {
@@ -378,7 +746,8 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
                     text: "steer".to_string(),
                     text_elements: Vec::new(),
                 }],
-                turn_trigger: Some("goal".to_string()),
+                turn_trigger: Some("user".to_string()),
+                cyber_access_program: Some(CyberAccessProgram::Standard),
                 ..Default::default()
             },
         })
@@ -398,12 +767,13 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
     assert_eq!(requests.len(), 2);
     for request in requests {
         let body: Value = serde_json::from_slice(&request)?;
+        assert_eq!(body["access_programs"], json!({"cyber": "daybreak_blue"}));
         let turn_metadata: Value = serde_json::from_str(
             body["client_metadata"]["x-codex-turn-metadata"]
                 .as_str()
                 .context("expected x-codex-turn-metadata")?,
         )?;
-        assert_eq!(turn_metadata["turn_trigger"].as_str(), Some("user"));
+        assert_eq!(turn_metadata["turn_trigger"].as_str(), Some("goal"));
     }
     Ok(())
 }
@@ -480,9 +850,7 @@ async fn turn_start_sends_originator_header() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -549,9 +917,7 @@ async fn turn_start_emits_user_message_item_with_text_elements() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -627,10 +993,8 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     let cache_path = codex_home.path().join("models_cache.json");
     let mut cache: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cache_path)?)?;
@@ -727,7 +1091,7 @@ async fn turn_start_sends_service_tier_id_to_model_request() -> Result<()> {
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     let service_tier_model = all_model_presets()
         .iter()
         .find(|preset| preset.show_in_picker && !preset.service_tiers.is_empty())
@@ -799,19 +1163,24 @@ async fn turn_start_sends_service_tier_id_to_model_request() -> Result<()> {
     Ok(())
 }
 
-#[test_case(None, json!(null); "without_usage_metadata")]
-#[test_case(Some(json!({})), json!({ "amount": null }); "without_amount")]
-#[test_case(Some(json!({ "amount": null })), json!({ "amount": null }); "null_amount")]
-#[test_case(Some(json!({ "amount": "0" })), json!({ "amount": "0" }); "zero_amount")]
+#[test_case(None, None, None; "without_usage_metadata")]
+#[test_case(Some(json!({})), None, None; "without_amount")]
+#[test_case(Some(json!({ "amount": null })), None, None; "null_amount")]
+#[test_case(Some(json!({ "amount": "0" })), Some("0"), None; "zero_amount")]
 #[test_case(
     Some(json!({ "amount": "0.12345678901234567890" })),
-    json!({ "amount": "0.12345678901234567890" });
+    Some("0.12345678901234567890"),
+    Some(json!({ "label": "example", "items": [0, null, true] }));
     "exact_amount"
 )]
+#[test_case(None, None, Some(json!(null)); "null_extra")]
+#[test_case(None, None, Some(json!(0)); "zero_extra")]
+#[test_case(None, None, Some(json!({ "label": "example" })); "nested_extra")]
 #[tokio::test]
 async fn turn_start_emits_raw_response_completed_with_upstream_usage(
     upstream_metadata: Option<Value>,
-    expected_metadata: Value,
+    expected_amount: Option<&str>,
+    extra: Option<Value>,
 ) -> Result<()> {
     let server = responses::start_mock_server().await;
     let mut completed = json!({
@@ -830,6 +1199,13 @@ async fn turn_start_emits_raw_response_completed_with_upstream_usage(
     if let Some(metadata) = upstream_metadata {
         completed["response"]["usage_metadata"] = metadata;
     }
+    if let Some(extra) = extra {
+        completed["response"]["usage"]["extra"] = extra;
+    }
+    let expected_metadata = json!({
+        "amount": expected_amount,
+        "metadata": completed["response"]["usage"],
+    });
     let body = responses::sse(vec![
         responses::ev_response_created("resp-1"),
         responses::ev_assistant_message("msg-1", "Done"),
@@ -839,7 +1215,7 @@ async fn turn_start_emits_raw_response_completed_with_upstream_usage(
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1039,13 +1415,16 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
                 thread_id: thread.id.clone(),
                 client_user_message_id: None,
                 input: vec![V2UserInput::Image {
-                    url: TINY_PNG_DATA_URL.to_string(),
+                    image: V2ImageReference::Inline {
+                        url: TINY_PNG_DATA_URL.to_string(),
+                    },
                     detail: None,
                 }],
-                responsesapi_client_metadata: Some(HashMap::from([(
-                    "workspace_kind".to_string(),
-                    "projectless".to_string(),
-                )])),
+                turn_trigger: Some("user".to_string()),
+                responsesapi_client_metadata: Some(HashMap::from([
+                    ("workspace_kind".to_string(), "projectless".to_string()),
+                    ("source".to_string(), "composer".to_string()),
+                ])),
                 ..Default::default()
             },
         })
@@ -1062,6 +1441,26 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
     assert_eq!(event["event_params"]["session_id"], thread.session_id);
     assert_eq!(event["event_params"]["turn_id"], turn.id);
     assert_eq!(event["event_params"]["root_turn_id"], turn.id);
+    let request = response_mock.requests()[0].body_json();
+    let request_metadata: Value = serde_json::from_str(
+        request["client_metadata"]["x-codex-turn-metadata"]
+            .as_str()
+            .context("expected turn metadata")?,
+    )?;
+    assert_eq!(
+        json!({
+            "eventTrigger": event["event_params"]["turn_trigger"],
+            "eventSource": event["event_params"]["codex_turn_source"],
+            "requestTrigger": request_metadata["turn_trigger"],
+            "requestSource": request_metadata["source"],
+        }),
+        json!({
+            "eventTrigger": "user",
+            "eventSource": "composer",
+            "requestTrigger": "user",
+            "requestSource": "composer",
+        })
+    );
     assert_eq!(
         event["event_params"]["app_server_client"]["product_client_id"],
         "codex_work_desktop"
@@ -1245,7 +1644,10 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::Goals)
-        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\ntools.update_plan.enabled = true",
+            server.uri()
+        ))
         .write(codex_home.path())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
@@ -1426,9 +1828,7 @@ async fn turn_start_accepts_text_at_limit_with_mention_item() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1476,9 +1876,7 @@ async fn turn_start_accepts_text_at_limit_with_mention_item() -> Result<()> {
 #[tokio::test]
 async fn turn_start_rejects_combined_oversized_text_input() -> Result<()> {
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new("http://localhost/unused")
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new("http://localhost/unused").write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1569,9 +1967,7 @@ async fn turn_start_rejects_combined_oversized_text_input() -> Result<()> {
 #[tokio::test]
 async fn turn_start_rejects_invalid_permission_selection_before_starting_turn() -> Result<()> {
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new("http://localhost/unused")
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new("http://localhost/unused").write(codex_home.path())?;
     std::fs::write(
         codex_home.path().join("managed_config.toml"),
         "sandbox_mode = \"read-only\"\n",
@@ -2003,9 +2399,7 @@ async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<(
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -2245,8 +2639,29 @@ async fn turn_start_uses_thread_feature_overrides_for_request_user_input_tool_de
     Ok(())
 }
 
+fn assert_fallback_model_instructions(request: &responses::ResponsesRequest) {
+    let instructions = request.instructions_text();
+    let expected_intro = BASE_INSTRUCTIONS
+        .lines()
+        .next()
+        .expect("fallback prompt has an opening sentence");
+    let expected_personality = BASE_INSTRUCTIONS
+        .lines()
+        .find(|line| line.starts_with("Your default personality and tone"))
+        .expect("fallback prompt has a Friendly personality section");
+
+    assert!(
+        instructions.contains(expected_intro),
+        "expected fallback model identity instructions in the request"
+    );
+    assert!(
+        instructions.contains(expected_personality),
+        "expected baked Friendly instructions in the request"
+    );
+}
+
 #[tokio::test]
-async fn turn_start_accepts_personality_override_v2() -> Result<()> {
+async fn turn_start_accepts_deprecated_personality_override_v2() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -2258,9 +2673,7 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
     let response_mock = responses::mount_sse_once(&server, body).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -2297,6 +2710,7 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
     .await??;
 
     let request = response_mock.single_request();
+    assert_fallback_model_instructions(&request);
     let developer_texts = request.message_input_texts("developer");
     if developer_texts.is_empty() {
         eprintln!("request body: {}", request.body_json());
@@ -2305,8 +2719,8 @@ async fn turn_start_accepts_personality_override_v2() -> Result<()> {
     assert!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected personality update message in developer input, got {developer_texts:?}"
+            .all(|text| !text.contains("<personality_spec>")),
+        "deprecated personality override emitted a developer update: {developer_texts:?}"
     );
 
     Ok(())
@@ -2453,7 +2867,7 @@ async fn thread_start_ignores_deprecated_multi_agent_mode() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
+async fn turn_start_ignores_personality_change_mid_thread_v2() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -2470,9 +2884,7 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     let response_mock = responses::mount_sse_sequence(&server, vec![sse1, sse2]).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -2534,6 +2946,7 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     assert_eq!(requests.len(), 2, "expected two requests");
 
     let first_developer_texts = requests[0].message_input_texts("developer");
+    assert_fallback_model_instructions(&requests[0]);
     assert!(
         first_developer_texts
             .iter()
@@ -2542,11 +2955,12 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
     );
 
     let second_developer_texts = requests[1].message_input_texts("developer");
+    assert_fallback_model_instructions(&requests[1]);
     assert!(
         second_developer_texts
             .iter()
-            .any(|text| text.contains("<personality_spec>")),
-        "expected personality update message in second request, got {second_developer_texts:?}"
+            .all(|text| !text.contains("<personality_spec>")),
+        "deprecated personality change emitted a developer update: {second_developer_texts:?}"
     );
 
     Ok(())
@@ -3044,6 +3458,7 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
         .request(|request_id| ClientRequest::TurnStart {
             request_id,
             params: TurnStartParams {
+                disabled_plugin_ids: None,
                 environments: None,
                 thread_id: thread.id.clone(),
                 client_user_message_id: None,
@@ -3092,6 +3507,7 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
         .request(|request_id| ClientRequest::TurnStart {
             request_id,
             params: TurnStartParams {
+                disabled_plugin_ids: None,
                 environments: Some(vec![TurnEnvironmentParams {
                     environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                     cwd: second_cwd.abs().into(),
@@ -3795,7 +4211,7 @@ async fn turn_start_streams_apply_patch_change_updates_v2() -> Result<()> {
         .disable_feature(Feature::RemoteModels)
         .disable_feature(Feature::ShellSnapshot)
         .write(&codex_home)?;
-    write_models_cache(&codex_home)?;
+    write_models_cache(&codex_home).await?;
     let cache_path = codex_home.join("models_cache.json");
     let mut cache: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cache_path)?)?;
@@ -3875,7 +4291,7 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     const PARENT_PROMPT: &str = "spawn a child and continue";
     const SPAWN_CALL_ID: &str = "spawn-call-1";
     const CHILD_PLAN_CALL_ID: &str = "child-plan-call";
-    const REQUESTED_MODEL: &str = "gpt-5.2";
+    const REQUESTED_MODEL: &str = "gpt-5.5";
     const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 
     let server = responses::start_mock_server().await;
@@ -3939,7 +4355,10 @@ async fn turn_start_emits_spawn_agent_item_with_model_metadata_v2() -> Result<()
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::Collab)
-        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\ntools.update_plan.enabled = true",
+            server.uri()
+        ))
         .write(codex_home.path())?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
@@ -4180,10 +4599,9 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
     MockResponsesConfig::new(&server.uri())
         .enable_feature(Feature::MultiAgentV2)
         .enable_feature(Feature::Goals)
-        .enable_feature(Feature::RealtimeConversation)
         .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
         .write(codex_home.path())?;
-    write_models_cache(codex_home.path())?;
+    write_models_cache(codex_home.path()).await?;
     mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
@@ -4239,6 +4657,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: codex_app_server_protocol::ThreadListParams {
+                originators: None,
                 cursor: None,
                 limit: Some(10),
                 sort_key: None,
@@ -4380,6 +4799,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
         .send_thread_shell_command_request(ThreadShellCommandParams {
             thread_id: child_thread_id.clone(),
             command: "echo blocked".to_string(),
+            timeout_ms: None,
         })
         .await?;
     let direct_shell_error: JSONRPCError = timeout(
@@ -4400,7 +4820,6 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
             "turn/settings/update",
             json!({"turnId": "any-child-turn", "model": "gpt-5.4"}),
         ),
-        ("thread/rollback", json!({"numTurns": 1})),
         ("thread/revert", json!({"beforeTurnId": "any-child-turn"})),
         (
             "review/start",
@@ -4527,7 +4946,7 @@ async fn turn_start_emits_spawn_agent_item_with_effective_role_model_metadata_v2
     const CHILD_PROMPT: &str = "child: do work";
     const PARENT_PROMPT: &str = "spawn a child and continue";
     const SPAWN_CALL_ID: &str = "spawn-call-1";
-    const REQUESTED_MODEL: &str = "gpt-5.2";
+    const REQUESTED_MODEL: &str = "gpt-5.5";
     const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
     const ROLE_MODEL: &str = "gpt-5.4";
     const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
@@ -5333,9 +5752,7 @@ async fn turn_start_with_elevated_override_does_not_persist_project_trust() -> R
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let workspace = TempDir::new()?;
 

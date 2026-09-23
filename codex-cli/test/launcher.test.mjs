@@ -67,6 +67,7 @@ const report = {
   npm: process.env.CODEX_MANAGED_BY_NPM ?? null,
   pnpm: process.env.CODEX_MANAGED_BY_PNPM ?? null,
   bun: process.env.CODEX_MANAGED_BY_BUN ?? null,
+  vitePlus: process.env.CODEX_MANAGED_BY_VITE_PLUS ?? null,
 };
 console.log(JSON.stringify(report));
 process.exit(Number(process.env.PROBE_EXIT ?? "0"));
@@ -114,10 +115,14 @@ function cleanup(root) {
 }
 
 function runLauncher(root, args, env = {}) {
-  return spawnSync(process.execPath, [path.join(root, "bin", "codex.js"), ...args], {
-    encoding: "utf8",
-    env: { ...process.env, ...env },
-  });
+  return spawnSync(
+    process.execPath,
+    [path.join(root, "bin", "codex.js"), ...args],
+    {
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    },
+  );
 }
 
 const hostSupported = Boolean(TRIPLE);
@@ -132,17 +137,13 @@ test(
     const root = stagePackage();
     t.after(() => cleanup(root));
 
-    const result = runLauncher(
-      root,
-      ["-e", PROBE, "alpha", "beta"],
-      {
-        PROBE_EXIT: "7",
-        // Pre-set so the launcher has something to clear: it promises exactly
-        // one CODEX_MANAGED_BY_* is set, whatever the parent environment said.
-        CODEX_MANAGED_BY_BUN: "1",
-        CODEX_MANAGED_BY_PNPM: "1",
-      },
-    );
+    const result = runLauncher(root, ["-e", PROBE, "alpha", "beta"], {
+      PROBE_EXIT: "7",
+      // Pre-set so the launcher has something to clear: it promises exactly
+      // one CODEX_MANAGED_BY_* is set, whatever the parent environment said.
+      CODEX_MANAGED_BY_BUN: "1",
+      CODEX_MANAGED_BY_PNPM: "1",
+    });
 
     assert.equal(
       result.status,
@@ -173,7 +174,10 @@ test(
     const result = runLauncher(root, ["--version"]);
 
     assert.notEqual(result.status, 0, "a missing binary must not exit 0");
-    assert.match(result.stderr, new RegExp(`Missing optional dependency ${PACKAGE_BY_TRIPLE[TRIPLE]}`));
+    assert.match(
+      result.stderr,
+      new RegExp(`Missing optional dependency ${PACKAGE_BY_TRIPLE[TRIPLE]}`),
+    );
     assert.match(result.stderr, /codex-rewind@latest/);
   },
 );
@@ -202,3 +206,42 @@ test("the platform table maps every triple to the package that carries it", () =
     );
   }
 });
+
+for (const manager of ["pnpm", "vite-plus"]) {
+  test(
+    `recognizes ${manager} ownership of the rewind package`,
+    { skip },
+    (t) => {
+      const staged = stagePackage();
+      t.after(() => cleanup(staged));
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), "codexr-manager-"));
+      t.after(() => cleanup(base));
+      const packages = path.join(base, "packages");
+      const install =
+        manager === "pnpm"
+          ? base
+          : path.join(packages, "codex-rewind", "test-install");
+      const modules = path.join(install, "node_modules");
+      const root = path.join(modules, "codex-rewind");
+      fs.mkdirSync(modules, { recursive: true });
+      fs.cpSync(staged, root, { recursive: true });
+      if (manager === "pnpm") {
+        fs.writeFileSync(path.join(modules, ".modules.yaml"), "{}");
+      } else {
+        fs.writeFileSync(
+          path.join(packages, "codex-rewind.json"),
+          JSON.stringify({
+            name: "codex-rewind",
+            installId: "test-install",
+          }),
+        );
+      }
+      const result = runLauncher(root, ["-e", PROBE]);
+      assert.equal(result.status, 0, result.stderr);
+      const report = JSON.parse(result.stdout.trim());
+      assert.equal(report.npm, null);
+      assert.equal(report.pnpm, manager === "pnpm" ? "1" : null);
+      assert.equal(report.vitePlus, manager === "vite-plus" ? "1" : null);
+    },
+  );
+}

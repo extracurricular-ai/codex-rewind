@@ -2,6 +2,93 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn external_writer_view_quits_with_escape_ctrl_c_or_q() -> Result<()> {
+    let (mut app, mut events, _operations) = make_test_app_with_channels().await;
+    app.chat_widget.show_external_writer_thread();
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    while events.try_recv().is_ok() {}
+
+    app.keymap.app.open_external_editor = vec![crate::key_hint::ctrl(KeyCode::Char('g'))];
+    app.handle_key_event(
+        &mut tui,
+        &mut app_server,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+    )
+    .await;
+    assert_eq!(
+        app.chat_widget.external_editor_state(),
+        ExternalEditorState::Closed
+    );
+    assert!(
+        !events
+            .try_recv()
+            .is_ok_and(|event| matches!(event, AppEvent::LaunchExternalEditor))
+    );
+
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    ] {
+        app.handle_key_event(&mut tui, &mut app_server, key).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(AppEvent::Exit(ExitMode::Immediate))
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_writer_view_preserves_draft_from_keys_and_paste() -> Result<()> {
+    let (mut app, _events, _operations) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    app.enqueue_primary_thread_session(
+        test_thread_session(thread_id, test_path_buf("/tmp/project")),
+        Vec::new(),
+    )
+    .await?;
+    app.app_server_target = AppServerTarget::Remote {
+        endpoint: crate::RemoteAppServerEndpoint::WebSocket {
+            websocket_url: "wss://example.com/".to_string(),
+            auth_token: None,
+        },
+    };
+    app.ensure_thread_channel(thread_id).mark_external_writer();
+    app.chat_widget.insert_str("Retained draft");
+    app.chat_widget.show_external_writer_thread();
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    for offline in [false, true] {
+        app.reconnect.offline = offline;
+        app.handle_tui_event(
+            &mut tui,
+            &mut app_server,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        )
+        .await?;
+        app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Paste("pasted".into()))
+            .await?;
+        assert_eq!(
+            app.chat_widget.composer_text_with_pending(),
+            "Retained draft"
+        );
+    }
+
+    app.reconnect.offline = false;
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+    )
+    .await?;
+    assert!(app.overlay.is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_disconnect_exit_summary_includes_reconnect_and_stop_instructions() -> Result<()> {
     let (mut app, _, _) = make_test_app_with_channels().await;
     let thread_id = prepare_running_local_daemon(&mut app)?;
@@ -52,7 +139,7 @@ async fn remote_disconnect_exit_summary_does_not_require_a_local_rollout_or_prin
 #[tokio::test]
 async fn embedded_exit_keeps_the_session_summary() {
     let (mut app, _, _) = make_test_app_with_channels().await;
-    prepare_local_daemon_thread(&mut app).unwrap();
+    let thread_id = prepare_local_daemon_thread(&mut app).unwrap();
     app.app_server_target = AppServerTarget::Embedded;
     let mut exit_info = app.exit_info(ExitReason::UserRequested);
     exit_info.token_usage = TokenUsage {
@@ -60,18 +147,24 @@ async fn embedded_exit_keeps_the_session_summary() {
         total_tokens: 2,
         ..Default::default()
     };
-    exit_info.resume_hint = Some("codex resume THREAD_ID".to_string());
-    assert_eq!(
-        exit_info.format_exit_messages(/*color_enabled*/ false),
-        vec![
-            "Token usage: total=2 input=0 output=2",
-            "To continue this session, run codex resume THREAD_ID",
-        ]
-    );
+    exit_info.resume_hint = Some(ResumableThread {
+        thread_id,
+        thread_name: None,
+    });
+    let output = exit_info
+        .format_exit_messages(/*color_enabled*/ false)
+        .join("\n")
+        .replace(&thread_id.to_string(), "THREAD_ID");
+    assert_snapshot!(output, @"
+    Token usage: total=2 input=0 output=2
+    To continue this session, run:
+      codex resume THREAD_ID
+    ");
 }
 
 fn prepare_local_daemon_thread(app: &mut App) -> Result<ThreadId> {
     app.app_server_target = AppServerTarget::LocalDaemon {
+        allow_embedded_fallback: true,
         endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
             socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
         },
@@ -114,8 +207,7 @@ async fn prepare_background_exit_test(
 ) -> Result<(AppServerSession, tui::Tui)> {
     while app_event_rx.try_recv().is_ok() {}
     while op_rx.try_recv().is_ok() {}
-    let app_server =
-        crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
+    let app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
     Ok((app_server, crate::tui::test_support::make_test_tui()?))
 }
 
@@ -133,11 +225,12 @@ async fn daemon_ctrl_c_shows_background_exit_menu_and_escape_dismisses_it() -> R
       Task is still running
       Choose what happens to the current task.
 
+
     › 1. Cancel task        Stop the current task and stay in Codex
       2. Run in background  Exit Codex and leave the task running
       3. Exit               Stop the current task and exit Codex
 
-      Press enter to confirm or esc to go back
+      enter select · esc back
     ");
 
     app.handle_key_event(
@@ -214,14 +307,16 @@ async fn run_in_background_detaches_without_interrupting_main_or_side_threads() 
 #[tokio::test]
 async fn exit_interrupts_before_requesting_shutdown() -> Result<()> {
     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+    // The UI fixture's placeholder cwd does not exist on clean runners.
+    // This test starts a real shell, so keep its working directory alive.
+    let cwd = tempdir()?;
+    app.config.cwd = cwd.path().abs();
     prepare_running_local_daemon(&mut app)?;
     app.chat_widget
         .set_feature_enabled(Feature::Goals, /*enabled*/ true);
     let (mut app_server, mut tui) =
         prepare_background_exit_test(&app, &mut app_event_rx, &mut op_rx).await?;
-    let started = app_server
-        .start_thread(app.chat_widget.config_ref())
-        .await?;
+    let started = app_server.start_thread(&app.config).await?;
     let thread_id = started.session.thread_id;
     app.active_thread_id = Some(thread_id);
     app.chat_widget
@@ -248,26 +343,60 @@ async fn exit_interrupts_before_requesting_shutdown() -> Result<()> {
         ),
         /*replay_kind*/ None,
     );
+    // Keep the command alive until interruption, even on a busy runner. Dropping
+    // the directory also releases it if the test fails before reaching the exit.
+    let running = tempdir()?;
+    let running_path = running.path().to_string_lossy();
     let command = if cfg!(windows) {
-        "Start-Sleep -Seconds 30"
+        format!(
+            "Write-Output 'exit-test-ready'; while (Test-Path -LiteralPath '{}') {{ Start-Sleep -Milliseconds 100 }}",
+            running_path.replace('\'', "''"),
+        )
     } else {
-        "sleep 30"
+        format!(
+            "printf 'exit-test-ready\\n'; while [ -d {} ]; do sleep 0.1; done",
+            shlex::try_quote(&running_path)?,
+        )
     };
-    app_server
-        .thread_shell_command(thread_id, command.to_string())
-        .await?;
-    let turn_id = loop {
-        let event = time::timeout(Duration::from_secs(/*secs*/ 5), app_server.next_event())
-            .await
-            .expect("app-server should emit a turn/start event")
-            .expect("app-server event stream should remain open");
-        if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
-            && let ServerNotification::TurnStarted(notification) = notification.as_ref()
-            && notification.thread_id == thread_id.to_string()
-        {
-            break notification.turn.id.clone();
+    app_server.thread_shell_command(thread_id, command).await?;
+    let turn_id = time::timeout(Duration::from_secs(/*secs*/ 10), async {
+        let mut turn_id = None;
+        let mut output = String::new();
+        loop {
+            let event = app_server
+                .next_event()
+                .await
+                .expect("app-server event stream should remain open");
+            if let codex_app_server_client::AppServerEvent::ServerNotification(notification) = event
+            {
+                match notification.as_ref() {
+                    ServerNotification::TurnStarted(notification)
+                        if notification.thread_id == thread_id.to_string() =>
+                    {
+                        turn_id = Some(notification.turn.id.clone());
+                    }
+                    ServerNotification::CommandExecutionOutputDelta(notification)
+                        if notification.thread_id == thread_id.to_string() =>
+                    {
+                        output.push_str(&notification.delta);
+                    }
+                    ServerNotification::TurnCompleted(notification)
+                        if notification.thread_id == thread_id.to_string() =>
+                    {
+                        panic!("shell command ended before interruption: {notification:?}");
+                    }
+                    _ => {}
+                }
+            }
+            if output.contains("exit-test-ready")
+                && let Some(turn_id) = turn_id.as_ref()
+            {
+                break turn_id.clone();
+            }
         }
-    };
+    })
+    .await
+    .expect("shell command should be running before interruption");
     app.thread_event_channels.insert(
         thread_id,
         ThreadEventChannel::new_with_session(
@@ -319,9 +448,7 @@ async fn daemon_ctrl_c_closes_running_side_thread_and_returns_to_parent() -> Res
     let side_thread_id = prepare_running_local_daemon(&mut app)?;
     let (mut app_server, mut tui) =
         prepare_background_exit_test(&app, &mut app_event_rx, &mut op_rx).await?;
-    let started = app_server
-        .start_thread(app.chat_widget.config_ref())
-        .await?;
+    let started = app_server.start_thread(&app.config).await?;
     let parent_thread_id = started.session.thread_id;
     app.primary_thread_id = Some(parent_thread_id);
     app.side_threads
@@ -367,10 +494,11 @@ async fn daemon_ctrl_c_hides_background_exit_for_running_background_side_thread(
       Task is still running
       Choose what happens to the current task.
 
+
     › 1. Cancel task  Stop the current task and stay in Codex
       2. Exit         Stop the current task and exit Codex
 
-      Press enter to confirm or esc to go back
+      enter select · esc back
     ");
     app.chat_widget
         .handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));

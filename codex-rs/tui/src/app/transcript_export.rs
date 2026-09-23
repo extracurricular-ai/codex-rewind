@@ -93,6 +93,7 @@ pub(super) async fn load_export_transcript(
             /*turn_cursor*/ None,
             /*item_cursor*/ None,
             /*config*/ None,
+            /*local_settings*/ None,
             HistoryHydrationScope::Complete,
         )
         .await
@@ -161,7 +162,7 @@ fn export_activity_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
                             lines.extend(raw_lines_from_source(&text.text));
                         }
                         Ok(rmcp::model::ContentBlock::Image(_)) => {
-                            lines.push("<image content>".into());
+                            lines.push("Returned image".into());
                         }
                         Ok(rmcp::model::ContentBlock::Audio(_)) => {
                             lines.push("<audio content>".into());
@@ -236,6 +237,8 @@ fn render_markdown_transcript(cells: &[Arc<dyn HistoryCell>]) -> Result<String, 
             }
             lines.extend(image_labels.into_iter().map(Into::into));
             lines
+        } else if let Some(reasoning) = cell.as_any().downcast_ref::<ReasoningSummaryCell>() {
+            raw_lines_from_source(reasoning.markdown_source().trim())
         } else {
             cell.raw_lines()
         };
@@ -247,6 +250,7 @@ fn render_markdown_transcript(cells: &[Arc<dyn HistoryCell>]) -> Result<String, 
                     [
                         "• Saved conversation to ",
                         "• Copied conversation to clipboard",
+                        "• Copy unconfirmed; /export saves chat",
                         "■ Export failed: ",
                         "■ Copy failed: ",
                     ]

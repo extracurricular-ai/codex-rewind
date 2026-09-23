@@ -5,11 +5,14 @@ pub const ARTIFACT_OPERATION_STARTED_METRIC: &str = "codex.artifact.operation.st
 pub const ARTIFACT_OPERATION_EXPECTED_OUTPUT_COUNT_METRIC: &str =
     "codex.artifact.operation.expected_output_count";
 pub const PROCESS_START_METRIC: &str = "codex.process.start";
+/// Caller-side exec-server RPC attempts, including local admission and transport failures.
+pub const EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC: &str = "exec_server_client_requests_total";
 pub const API_CALL_COUNT_METRIC: &str = "codex.api_request";
 pub const API_CALL_DURATION_METRIC: &str = "codex.api_request.duration_ms";
 pub const SSE_EVENT_COUNT_METRIC: &str = "codex.sse_event";
 pub const SSE_EVENT_DURATION_METRIC: &str = "codex.sse_event.duration_ms";
 pub const WEBSOCKET_REQUEST_COUNT_METRIC: &str = "codex.websocket.request";
+pub const WEBSOCKET_CONTINUATION_COUNT_METRIC: &str = "codex.websocket.continuation";
 pub const WEBSOCKET_REQUEST_DURATION_METRIC: &str = "codex.websocket.request.duration_ms";
 pub const WEBSOCKET_EVENT_COUNT_METRIC: &str = "codex.websocket.event";
 pub const WEBSOCKET_EVENT_DURATION_METRIC: &str = "codex.websocket.event.duration_ms";

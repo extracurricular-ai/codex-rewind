@@ -13,7 +13,6 @@ use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::ExecuteToPendingOutcome;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
-use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
@@ -31,25 +30,18 @@ const YIELD_GRACE_PERIOD: Duration = Duration::from_secs(1);
 const MIN_YIELD_TIME_FOR_GRACE: Duration = Duration::from_secs(10);
 
 pub struct InProcessCodeModeSession {
-    runtime: SessionRuntime<ProtocolDelegate>,
+    runtime: SessionRuntime,
     cell_execution_limits: CodeModeSessionCellExecutionLimits,
 }
 
 impl InProcessCodeModeSession {
     pub fn new() -> Self {
-        Self::with_delegate(Arc::new(NoopCodeModeSessionDelegate))
+        Self::with_limits(CodeModeSessionCellExecutionLimits::default())
     }
 
-    pub fn with_delegate(delegate: Arc<dyn CodeModeSessionDelegate>) -> Self {
-        Self::with_delegate_and_limits(delegate, CodeModeSessionCellExecutionLimits::default())
-    }
-
-    pub fn with_delegate_and_limits(
-        delegate: Arc<dyn CodeModeSessionDelegate>,
-        cell_execution_limits: CodeModeSessionCellExecutionLimits,
-    ) -> Self {
+    pub fn with_limits(cell_execution_limits: CodeModeSessionCellExecutionLimits) -> Self {
         Self {
-            runtime: SessionRuntime::new(Arc::new(ProtocolDelegate { delegate })),
+            runtime: SessionRuntime::new(),
             cell_execution_limits: CodeModeSessionCellExecutionLimits {
                 max_heap_size_bytes: None,
                 ..cell_execution_limits
@@ -57,16 +49,12 @@ impl InProcessCodeModeSession {
         }
     }
 
-    pub fn with_delegate_and_task_failure_handler(
-        delegate: Arc<dyn CodeModeSessionDelegate>,
+    pub fn with_task_failure_handler(
         task_failure_handler: Arc<dyn Fn(String) + Send + Sync>,
         cell_execution_limits: CodeModeSessionCellExecutionLimits,
     ) -> Self {
         Self {
-            runtime: SessionRuntime::new_with_task_failure_handler(
-                Arc::new(ProtocolDelegate { delegate }),
-                Some(task_failure_handler),
-            ),
+            runtime: SessionRuntime::new_with_task_failure_handler(Some(task_failure_handler)),
             cell_execution_limits: CodeModeSessionCellExecutionLimits {
                 max_heap_size_bytes: None,
                 ..cell_execution_limits
@@ -74,13 +62,18 @@ impl InProcessCodeModeSession {
         }
     }
 
-    pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
+    pub async fn execute(
+        &self,
+        request: ExecuteRequest,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> Result<StartedCell, String> {
         let yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
         let started = self
             .runtime
             .execute(
                 runtime_request(request),
                 runtime::ObserveMode::YieldAfter(self.resolve_yield_timeout(yield_time_ms)),
+                Arc::new(ProtocolDelegate { delegate }),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -101,12 +94,14 @@ impl InProcessCodeModeSession {
     pub async fn execute_to_pending(
         &self,
         request: ExecuteRequest,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> Result<ExecuteToPendingOutcome, String> {
         let started = self
             .runtime
             .execute(
                 runtime_request(request),
                 runtime::ObserveMode::PendingFrontier,
+                Arc::new(ProtocolDelegate { delegate }),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -220,8 +215,9 @@ impl CodeModeSession for InProcessCodeModeSession {
     fn execute<'a>(
         &'a self,
         request: ExecuteRequest,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionResultFuture<'a, StartedCell> {
-        Box::pin(InProcessCodeModeSession::execute(self, request))
+        Box::pin(InProcessCodeModeSession::execute(self, request, delegate))
     }
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
@@ -242,6 +238,17 @@ struct ProtocolDelegate {
 }
 
 impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
+    #[tracing::instrument(
+        name = "code_mode.runtime.invoke_tool",
+        level = "info",
+        skip_all,
+        fields(
+            cell.id = %invocation.cell_id,
+            runtime_tool_call_id = invocation.runtime_tool_call_id.as_str(),
+            tool_name = invocation.tool_name.name.as_str(),
+            tool_namespace = invocation.tool_name.namespace.as_deref(),
+        )
+    )]
     async fn invoke_tool(
         &self,
         invocation: runtime::NestedToolCall,
@@ -347,6 +354,7 @@ fn runtime_response(
         runtime::CellEvent::Yielded { content_items } => Ok(RuntimeResponse::Yielded {
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
+            code_mode_host_duration: None,
         }),
         runtime::CellEvent::Completed {
             content_items,
@@ -355,10 +363,12 @@ fn runtime_response(
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
             error_text,
+            code_mode_host_duration: None,
         }),
         runtime::CellEvent::Terminated { content_items } => Ok(RuntimeResponse::Terminated {
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
+            code_mode_host_duration: None,
         }),
         runtime::CellEvent::Pending { .. } => {
             Err("cell returned a pending frontier unexpectedly".to_string())
@@ -391,6 +401,7 @@ fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
         error_text: Some(format!("exec cell {cell_id} not found")),
         cell_id,
         content_items: Vec::new(),
+        code_mode_host_duration: None,
     }
 }
 

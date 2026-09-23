@@ -1,7 +1,8 @@
+mod workspace_routing;
+
 use chrono::Utc;
 use http::StatusCode;
 use serde::Deserialize;
-use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
 use std::env;
@@ -12,7 +13,9 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -36,6 +39,8 @@ use super::agent_identity::record_needs_task_registration;
 use super::agent_identity::register_managed_chatgpt_agent_identity;
 use super::agent_identity::require_agent_identity_authapi_base_url;
 use super::agent_identity::verified_record_from_jwt;
+use super::change_state::AuthChangeState;
+use super::change_state::same_owner;
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
 use super::workload_identity::WorkloadIdentityExternalAuth;
@@ -52,11 +57,18 @@ pub use crate::auth::storage::AuthDotJson;
 pub use crate::auth::storage::AuthKeyringBackendKind;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
-use crate::auth::util::try_parse_error_message;
 use crate::default_client::create_client;
 use crate::default_client::create_default_auth_client;
+use crate::oauth::ErrorBodyLimit;
+use crate::oauth::OAuthClient;
+use crate::oauth::OAuthError;
+use crate::oauth::RefreshTokenGrant;
+use crate::oauth::TokenEncoding;
+use crate::oauth::TokenEndpoint;
+use crate::oauth::TokenErrorDetail;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::token_data::TokenData;
+use crate::token_data::parse_chatgpt_account_user_id;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use crate::token_data::parse_jwt_expiration;
 use codex_config::ManagedAuthPolicy;
@@ -69,8 +81,11 @@ use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::auth::RefreshTokenFailedError;
 use codex_protocol::auth::RefreshTokenFailedReason;
 use codex_protocol::protocol::SessionSource;
-use serde_json::Value;
 use thiserror::Error;
+pub use workspace_routing::WorkspaceRouting;
+pub use workspace_routing::WorkspaceRoutingRequest;
+pub use workspace_routing::WorkspaceRoutingResolver;
+pub use workspace_routing::WorkspaceRoutingSession;
 
 /// Authentication mechanism used by the current user.
 #[derive(Debug, Clone)]
@@ -627,6 +642,19 @@ impl CodexAuth {
                 .get_current_token_data()
                 .and_then(|t| t.id_token.chatgpt_user_id),
         }
+    }
+
+    /// Returns the access token's opaque account-user identity only when its workspace
+    /// matches the selected account. Missing claims never fall back to a user id.
+    /// Unlike `get_chatgpt_user_id`, this identifies one workspace membership, so keys
+    /// are not shared across a person's workspaces. Workload-identity exchange claims
+    /// describe an agent identity and cannot select a human verification credential.
+    /// This is local identity selection, not access-token or proof validation.
+    pub fn get_chatgpt_account_user_id(&self) -> Option<String> {
+        let tokens = self.get_current_token_data()?;
+        parse_chatgpt_account_user_id(&tokens.access_token, tokens.account_id.as_deref()?)
+            .ok()
+            .flatten()
     }
 
     /// Account-facing plan classification derived from the current auth.
@@ -1584,58 +1612,54 @@ async fn request_chatgpt_token_refresh(
     refresh_token: String,
     client: &HttpClient,
 ) -> Result<RefreshResponse, RefreshTokenError> {
-    let refresh_request = RefreshRequest {
-        client_id: oauth_client_id(),
-        grant_type: "refresh_token",
-        refresh_token,
-    };
+    let client_id = oauth_client_id();
     let endpoint = refresh_token_endpoint();
-
-    // Use shared client factory to include standard headers
-    let response = client
-        .post(endpoint.as_str())
-        .header("Content-Type", "application/json")
-        .json(&refresh_request)
-        .send()
+    let oauth = OAuthClient::new(
+        client,
+        TokenEndpoint {
+            url: &endpoint,
+            client_id: &client_id,
+            encoding: TokenEncoding::Json,
+            timeout: None,
+            error_body_limit: ErrorBodyLimit::Unlimited,
+        },
+    );
+    match oauth
+        .refresh(RefreshTokenGrant {
+            refresh_token: &refresh_token,
+            resource: None,
+        })
         .await
-        .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
-
-    let status = response.status();
-    if status.is_success() {
-        let refresh_response = response
-            .json::<RefreshResponse>()
-            .await
-            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
-        Ok(refresh_response)
-    } else {
-        let body = response.text().await.unwrap_or_default();
-        tracing::error!("Failed to refresh token: {status}: {body}");
-        let code = extract_refresh_token_error_code(&body);
-        // RFC 6749 reports an unusable refresh token as invalid_grant without preserving
-        // the legacy expired/reused/revoked subtype. Keep it terminal with the generic reason.
-        let is_invalid_grant_bad_request = status == StatusCode::BAD_REQUEST
-            && code
-                .as_deref()
-                .is_some_and(|code| code.eq_ignore_ascii_case("invalid_grant"));
-        let failed =
-            classify_refresh_token_failure(code.as_deref(), &body, is_invalid_grant_bad_request);
-        if status == StatusCode::UNAUTHORIZED
-            || failed.reason != RefreshTokenFailedReason::Other
-            || is_invalid_grant_bad_request
-        {
-            Err(RefreshTokenError::Permanent(failed))
-        } else {
-            let message = try_parse_error_message(&body);
-            Err(RefreshTokenError::Transient(std::io::Error::other(
-                format!("Failed to refresh token: {status}: {message}"),
-            )))
+    {
+        Ok(response) => Ok(response),
+        Err(OAuthError::Rejected(rejection)) => {
+            let status = rejection.status;
+            let detail = &rejection.detail;
+            tracing::error!(%status, ?detail, "Failed to refresh token");
+            let code = detail.error_code();
+            let is_invalid_grant_bad_request = status == StatusCode::BAD_REQUEST
+                && code.is_some_and(|code| code.eq_ignore_ascii_case("invalid_grant"));
+            let failed = classify_refresh_token_failure(code, detail, is_invalid_grant_bad_request);
+            if status == StatusCode::UNAUTHORIZED
+                || failed.reason != RefreshTokenFailedReason::Other
+                || is_invalid_grant_bad_request
+            {
+                Err(RefreshTokenError::Permanent(failed))
+            } else {
+                Err(RefreshTokenError::Transient(std::io::Error::other(
+                    format!("Failed to refresh token: {status}: {detail}"),
+                )))
+            }
+        }
+        Err(error @ (OAuthError::Transport(_) | OAuthError::InvalidResponse)) => {
+            Err(RefreshTokenError::Transient(std::io::Error::other(error)))
         }
     }
 }
 
 fn classify_refresh_token_failure(
     code: Option<&str>,
-    body: &str,
+    detail: &TokenErrorDetail,
     is_invalid_grant_bad_request: bool,
 ) -> RefreshTokenFailedError {
     let normalized_code = code.map(str::to_ascii_lowercase);
@@ -1648,8 +1672,7 @@ fn classify_refresh_token_failure(
 
     if reason == RefreshTokenFailedReason::Other && !is_invalid_grant_bad_request {
         tracing::warn!(
-            backend_code = normalized_code.as_deref(),
-            backend_body = body,
+            backend_detail = ?detail,
             "Encountered unknown response while refreshing token"
         );
     }
@@ -1662,39 +1685,6 @@ fn classify_refresh_token_failure(
     };
 
     RefreshTokenFailedError::new(reason, message)
-}
-
-fn extract_refresh_token_error_code(body: &str) -> Option<String> {
-    if body.trim().is_empty() {
-        return None;
-    }
-
-    let Value::Object(map) = serde_json::from_str::<Value>(body).ok()? else {
-        return None;
-    };
-
-    if let Some(error_value) = map.get("error") {
-        match error_value {
-            Value::Object(obj) => {
-                if let Some(code) = obj.get("code").and_then(Value::as_str) {
-                    return Some(code.to_string());
-                }
-            }
-            Value::String(code) => {
-                return Some(code.to_string());
-            }
-            _ => {}
-        }
-    }
-
-    map.get("code").and_then(Value::as_str).map(str::to_string)
-}
-
-#[derive(Serialize)]
-struct RefreshRequest {
-    client_id: String,
-    grant_type: &'static str,
-    refresh_token: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -2034,6 +2024,8 @@ pub struct AuthManager {
     codex_home: PathBuf,
     inner: RwLock<CachedAuth>,
     auth_change_tx: watch::Sender<u64>,
+    auth_change_state_tx: watch::Sender<AuthChangeState>,
+    workspace_routing_resolver: OnceLock<Weak<dyn WorkspaceRoutingResolver>>,
     enable_codex_api_key_env: bool,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
@@ -2080,6 +2072,13 @@ pub trait AuthManagerConfig {
 
     /// Returns route-selection settings for auth-owned clients.
     fn auth_route_config(&self) -> AuthRouteConfig;
+}
+
+/// Runtime storage and network policy shared by independent credential managers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthRuntimeConfig {
+    pub codex_home: PathBuf,
+    pub auth_route_config: AuthRouteConfig,
 }
 
 impl Debug for AuthManager {
@@ -2170,6 +2169,8 @@ impl AuthManager {
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
+            auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env,
             auth_credentials_store_mode,
             keyring_backend_kind,
@@ -2204,6 +2205,8 @@ impl AuthManager {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(cached),
             auth_change_tx,
+            auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2232,6 +2235,8 @@ impl AuthManager {
             codex_home,
             inner: RwLock::new(cached),
             auth_change_tx,
+            auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2264,6 +2269,8 @@ impl AuthManager {
             codex_home: PathBuf::from("non-existent"),
             inner: RwLock::new(cached),
             auth_change_tx,
+            auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2294,6 +2301,8 @@ impl AuthManager {
                 permanent_refresh_failure: None,
             }),
             auth_change_tx,
+            auth_change_state_tx: watch::channel(AuthChangeState::default()).0,
+            workspace_routing_resolver: OnceLock::new(),
             enable_codex_api_key_env: false,
             auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             keyring_backend_kind: AuthKeyringBackendKind::default(),
@@ -2326,6 +2335,11 @@ impl AuthManager {
     /// Subscribes to cached auth changes that can affect request recovery.
     pub fn auth_change_receiver(&self) -> watch::Receiver<u64> {
         self.auth_change_tx.subscribe()
+    }
+
+    /// Subscribes to credential and owner revisions published together, including when changes coalesce.
+    pub fn auth_change_state_receiver(&self) -> watch::Receiver<AuthChangeState> {
+        self.auth_change_state_tx.subscribe()
     }
 
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {
@@ -2575,12 +2589,20 @@ impl AuthManager {
             let changed = !AuthManager::auths_equal(previous, new_auth.as_ref());
             let auth_changed_for_refresh =
                 !Self::auths_equal_for_refresh(previous, new_auth.as_ref());
+            let owner_changed =
+                auth_changed_for_refresh && !same_owner(previous, new_auth.as_ref());
             if auth_changed_for_refresh {
                 guard.permanent_refresh_failure = None;
             }
             tracing::info!("Reloaded auth, changed: {changed}");
             guard.auth = new_auth;
             if auth_changed_for_refresh {
+                self.auth_change_state_tx.send_modify(|state| {
+                    state.generation += 1;
+                    if owner_changed {
+                        state.owner_generation += 1;
+                    }
+                });
                 self.auth_change_tx.send_modify(|revision| *revision += 1);
             }
             changed
@@ -2656,7 +2678,8 @@ impl AuthManager {
         )
     }
 
-    fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
+    /// Returns the login methods permitted by the current effective authentication policy.
+    pub fn allowed_login_methods(&self) -> Vec<ForcedLoginMethod> {
         self.managed_auth_policy.allowed_login_methods(
             self.forced_login_method,
             self.forced_chatgpt_workspace_id().as_deref(),
@@ -2679,6 +2702,14 @@ impl AuthManager {
 
     pub fn codex_api_key_env_enabled(&self) -> bool {
         self.enable_codex_api_key_env
+    }
+
+    /// Returns policy only; independent credential managers own their own state and lifecycle.
+    pub fn runtime_config(&self) -> AuthRuntimeConfig {
+        AuthRuntimeConfig {
+            codex_home: self.codex_home.clone(),
+            auth_route_config: self.auth_route_config.clone(),
+        }
     }
 
     /// Convenience constructor returning an `Arc` wrapper.
@@ -3045,3 +3076,11 @@ fn auth_config_from(config: &impl AuthManagerConfig) -> AuthConfig {
 #[cfg(test)]
 #[path = "auth_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "change_state_tests.rs"]
+mod change_state_tests;
+
+#[cfg(test)]
+#[path = "account_user_id_tests.rs"]
+mod account_user_id_tests;

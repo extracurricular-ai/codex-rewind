@@ -3,7 +3,9 @@
 use super::App;
 use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
+use crate::app_event::PermissionProfileSelection;
 use crate::app_server_session::AppServerSession;
+use crate::app_server_session::personality_opt_out_only;
 use crate::chatwidget::cyber_model_approval_reviewer;
 use crate::session_state::ThreadSessionState;
 use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
@@ -38,7 +40,25 @@ impl App {
                         .approval_policy
                         .value(),
                 ) != AppServerAskForApproval::OnRequest);
+        let pending_cyber_profile =
+            params
+                .permissions
+                .as_ref()
+                .map(|profile_id| PermissionProfileSelection {
+                    profile_id: profile_id.clone(),
+                    approval_policy: params.approval_policy,
+                    approvals_reviewer: params
+                        .approvals_reviewer
+                        .map(codex_app_server_protocol::ApprovalsReviewer::to_core),
+                    display_label: profile_id.clone(),
+                });
         let settings_updated = self.send_thread_settings_update(app_server, params).await;
+        if settings_updated
+            && let (Some(thread_id), Some(selection)) =
+                (self.active_thread_id, pending_cyber_profile)
+        {
+            self.pending_server_profiles.insert(thread_id, selection);
+        }
         if defaulted_to_auto_review && settings_updated {
             self.app_event_tx.send(AppEvent::CyberModelAutoReviewNotice);
         }
@@ -125,22 +145,6 @@ impl App {
         self.send_thread_settings_update(app_server, params).await;
     }
 
-    pub(super) async fn sync_active_thread_personality_setting(
-        &mut self,
-        app_server: &mut AppServerSession,
-        personality: codex_protocol::config_types::Personality,
-    ) {
-        let Some(thread_id) = self.active_thread_id else {
-            return;
-        };
-        let params = ThreadSettingsUpdateParams {
-            thread_id: thread_id.to_string(),
-            personality: Some(personality),
-            ..ThreadSettingsUpdateParams::default()
-        };
-        self.send_thread_settings_update(app_server, params).await;
-    }
-
     pub(super) async fn sync_override_turn_context_settings(
         &mut self,
         app_server: &mut AppServerSession,
@@ -153,9 +157,6 @@ impl App {
             approvals_reviewer,
             permission_profile: _,
             active_permission_profile,
-            // TODO(anp): Support Windows sandbox updates through environment configuration;
-            // thread/settings/update cannot currently represent this override.
-            windows_sandbox_level: _,
             model,
             effort,
             summary,
@@ -191,6 +192,9 @@ impl App {
         thread_id: ThreadId,
         settings: &ThreadSettings,
     ) {
+        if let Some(blank) = self.agents_overview.blank_sessions.get_mut(&thread_id) {
+            apply_thread_settings_to_session(&mut blank.session, settings);
+        }
         if self.primary_thread_id == Some(thread_id)
             && let Some(session) = self.primary_session_configured.as_mut()
         {
@@ -208,9 +212,21 @@ impl App {
     pub(super) async fn send_thread_settings_update(
         &mut self,
         app_server: &mut AppServerSession,
-        params: ThreadSettingsUpdateParams,
+        mut params: ThreadSettingsUpdateParams,
     ) -> bool {
+        params.personality = personality_opt_out_only(params.personality);
         if !thread_settings_update_has_changes(&params) {
+            return false;
+        }
+        if ThreadId::from_string(&params.thread_id)
+            .ok()
+            .is_some_and(|thread_id| self.pending_server_profiles.contains_key(&thread_id))
+            && (params.cwd.is_some()
+                || params.approval_policy.is_some()
+                || params.approvals_reviewer.is_some()
+                || params.sandbox_policy.is_some()
+                || params.permissions.is_some())
+        {
             return false;
         }
         match app_server.thread_settings_update(params).await {

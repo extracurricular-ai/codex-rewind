@@ -8,7 +8,6 @@ use codex_config::types::ResumeCwdMode;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_features::FEATURES;
-use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -39,8 +38,6 @@ pub enum ConfigEdit {
     },
     /// Update the service tier preference for future turns.
     SetServiceTier { service_tier: Option<String> },
-    /// Update the active (or default) model personality.
-    SetModelPersonality { personality: Option<Personality> },
     /// Toggle the acknowledgement flag under `[notice]`.
     SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
@@ -245,10 +242,6 @@ impl ConfigDocument {
                     value(config_value)
                 }),
             )),
-            ConfigEdit::SetModelPersonality { personality } => Ok(self.write_optional_value(
-                &["personality"],
-                personality.map(|personality| value(personality.to_string())),
-            )),
             ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
                 &[NOTICE_TABLE_KEY, "hide_full_access_warning"],
                 value(*acknowledged),
@@ -314,7 +307,7 @@ impl ConfigDocument {
                 &[NOTICE_TABLE_KEY, "model_migrations", from.as_str()],
                 value(to.clone()),
             )),
-            ConfigEdit::ReplaceMcpServers(servers) => Ok(self.replace_mcp_servers(servers)),
+            ConfigEdit::ReplaceMcpServers(servers) => self.replace_mcp_servers(servers),
             ConfigEdit::AddToolSuggestDisabledTool(disabled_tool) => {
                 Ok(self.add_tool_suggest_disabled_tool(disabled_tool))
             }
@@ -349,7 +342,10 @@ impl ConfigDocument {
                             item.as_table_like()?.get(segment)
                         })
                         .and_then(TomlItem::as_table_like)
-                        .is_some_and(|feature| feature.contains_key("credential_broker"));
+                        .is_some_and(|feature| {
+                            feature.contains_key("credential_broker")
+                                || feature.contains_key("credentials")
+                        });
                 if preserves_broker_settings {
                     let mut enabled_segments = segments.clone();
                     enabled_segments.push("enabled".to_string());
@@ -432,9 +428,12 @@ impl ConfigDocument {
         self.remove(segments)
     }
 
-    fn replace_mcp_servers(&mut self, servers: &BTreeMap<String, McpServerConfig>) -> bool {
+    fn replace_mcp_servers(
+        &mut self,
+        servers: &BTreeMap<String, McpServerConfig>,
+    ) -> anyhow::Result<bool> {
         if servers.is_empty() {
-            return self.clear(&["mcp_servers"]);
+            return Ok(self.clear(&["mcp_servers"]));
         }
 
         let root = self.doc.as_table_mut();
@@ -446,7 +445,7 @@ impl ConfigDocument {
         }
 
         let Some(item) = root.get_mut("mcp_servers") else {
-            return false;
+            return Ok(false);
         };
 
         if document_helpers::ensure_table_for_write(item).is_none() {
@@ -454,7 +453,7 @@ impl ConfigDocument {
         }
 
         let Some(table) = item.as_table_mut() else {
-            return false;
+            return Ok(false);
         };
 
         let keys_to_remove: Vec<String> = table
@@ -472,17 +471,17 @@ impl ConfigDocument {
                 if let TomlItem::Value(value) = existing
                     && let Some(inline) = value.as_inline_table_mut()
                 {
-                    let replacement = document_helpers::serialize_mcp_server_inline(config);
+                    let replacement = document_helpers::serialize_mcp_server_inline(config)?;
                     document_helpers::merge_inline_table(inline, replacement);
                 } else {
-                    *existing = document_helpers::serialize_mcp_server(config);
+                    *existing = document_helpers::serialize_mcp_server(config)?;
                 }
             } else {
-                table.insert(name, document_helpers::serialize_mcp_server(config));
+                table.insert(name, document_helpers::serialize_mcp_server(config)?);
             }
         }
 
-        true
+        Ok(true)
     }
 
     fn set_skill_config(&mut self, selector: SkillConfigSelector, enabled: bool) -> bool {

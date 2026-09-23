@@ -1,0 +1,28 @@
+---
+source: tui/src/app/agents_overview_tests.rs
+expression: rendered
+---
+  Agent command center  Group: Project  g
+   All 0   Needs you 0   Working 0           ›
+  ────────────────────────────────────────────
+  No tasks yet
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ? help  esc back  ↑/↓ move  enter open  n n…

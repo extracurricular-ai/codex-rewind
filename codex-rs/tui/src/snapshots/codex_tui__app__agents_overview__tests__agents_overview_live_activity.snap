@@ -1,0 +1,28 @@
+---
+source: tui/src/app/agents_overview_tests.rs
+expression: "render_bottom_popup(&app.chat_widget,\n96).replace(&format!(\"{project}  1\"),\n&normalized_group).replace(&project, \"/tmp/project\")"
+---
+  Agent command center  Group: Project  g
+   All 1   Needs you 0   Working 1   Ready 0   Inactive 0                 tab/shift+tab filter
+  ────────────────────────────────────────────────────────────────────────────────────────────
+      Tasks                                           │ Task details
+  /tmp/project  1                                     │
+  › ● Check startup performance                       │ Check startup performance
+                                                      │ ● Working
+                                                      │
+                                                      │ Latest activity
+                                                      │ Checking cold-start regressions
+                                                      │
+                                                      │ Project
+                                                      │ /tmp/project
+                                                      │ Model: Unknown
+                                                      │
+                                                      │ Prompt
+                                                      │ No prompt available.
+                                                      │
+                                                      │
+                                                      │
+                                                      │
+                                                      │
+                                                      │
+  ? help  esc back  ↑/↓ move  enter open  n new

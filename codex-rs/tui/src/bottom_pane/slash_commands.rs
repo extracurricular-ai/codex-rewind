@@ -61,7 +61,8 @@ pub(crate) struct BuiltinCommandFlags {
     pub(crate) token_activity_command_enabled: bool,
     pub(crate) service_tier_commands_enabled: bool,
     pub(crate) goal_command_enabled: bool,
-    pub(crate) personality_command_enabled: bool,
+    pub(crate) voice_command_enabled: bool,
+    pub(crate) worktrees_enabled: bool,
     pub(crate) allow_elevate_sandbox: bool,
     pub(crate) side_conversation_active: bool,
 }
@@ -76,7 +77,8 @@ pub(crate) fn builtins_for_input(flags: BuiltinCommandFlags) -> Vec<(&'static st
         .filter(|(_, cmd)| flags.plugins_command_enabled || *cmd != SlashCommand::Plugins)
         .filter(|(_, cmd)| flags.token_activity_command_enabled || *cmd != SlashCommand::Usage)
         .filter(|(_, cmd)| flags.goal_command_enabled || *cmd != SlashCommand::Goal)
-        .filter(|(_, cmd)| flags.personality_command_enabled || *cmd != SlashCommand::Personality)
+        .filter(|(_, cmd)| flags.worktrees_enabled || *cmd != SlashCommand::Worktree)
+        .filter(|(_, cmd)| flags.voice_command_enabled || *cmd != SlashCommand::Voice)
         .filter(|(_, cmd)| !flags.side_conversation_active || cmd.available_in_side_conversation())
         .collect()
 }
@@ -170,10 +172,23 @@ mod tests {
             token_activity_command_enabled: true,
             service_tier_commands_enabled: true,
             goal_command_enabled: true,
-            personality_command_enabled: true,
+            voice_command_enabled: true,
+            worktrees_enabled: true,
             allow_elevate_sandbox: true,
             side_conversation_active: false,
         }
+    }
+
+    #[test]
+    fn worktree_command_lookup_requires_feature() {
+        assert_eq!(
+            find_builtin_command("worktree", BuiltinCommandFlags::default()),
+            None
+        );
+        assert_eq!(
+            find_builtin_command("worktree", all_enabled_flags()),
+            Some(SlashCommand::Worktree)
+        );
     }
 
     #[test]
@@ -268,6 +283,13 @@ mod tests {
     }
 
     #[test]
+    fn voice_command_is_hidden_when_disabled() {
+        let mut flags = all_enabled_flags();
+        flags.voice_command_enabled = false;
+        assert_eq!(find_builtin_command("voice", flags), None);
+    }
+
+    #[test]
     fn usage_command_is_hidden_from_input_when_account_token_activity_is_disabled() {
         let mut flags = all_enabled_flags();
         flags.token_activity_command_enabled = false;
@@ -310,6 +332,8 @@ mod tests {
                 SlashCommand::Diff,
                 SlashCommand::Mention,
                 SlashCommand::Status,
+                SlashCommand::Daemon,
+                SlashCommand::Warnings,
                 SlashCommand::Pwd,
                 SlashCommand::Usage,
             ]

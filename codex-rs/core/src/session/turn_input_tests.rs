@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::Constrained;
 use crate::session::step_settings::StepSettingsUpdate;
+use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
@@ -105,6 +106,65 @@ async fn submit_steer_only(
     )
     .await
     .expect("steer-only submission should be valid")
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "simulate an in-flight realtime append while checking input admission"
+)]
+async fn steering_does_not_wait_for_realtime_history() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.realtime_history = Some(tokio::sync::Mutex::new(Default::default()));
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+
+    let history = session
+        .realtime_history
+        .as_ref()
+        .expect("realtime history")
+        .lock()
+        .await;
+    for mode in [
+        TurnInputMode::StartOrSteer,
+        TurnInputMode::Steer {
+            expected_turn_id: turn_context.sub_id.clone(),
+        },
+    ] {
+        let submission = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle(
+                &session,
+                TurnInputRequest::user_input(vec![UserInput::Text {
+                    text: "steer without waiting for persistence".to_string(),
+                    text_elements: Vec::new(),
+                }]),
+                mode,
+                "steer-submission".to_string(),
+            ),
+        )
+        .await
+        .expect("steering must not wait for the realtime recorder")
+        .expect("steering should succeed");
+        assert_eq!(
+            submission,
+            TurnInputSubmission::Steered {
+                turn_id: turn_context.sub_id.clone()
+            }
+        );
+    }
+    drop(history);
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test]
@@ -585,7 +645,7 @@ async fn automatic_admission_rechecks_plan_mode_without_committing_sparse_settin
         .await
         .expect("explicit settings update accepts the same patch");
     assert_eq!(
-        session.services.turn_environments.selections(),
+        session.configured_environment_selections().await,
         proposed_environments.environments
     );
     assert!(session.mcp_refresh.is_pending());
@@ -798,10 +858,14 @@ async fn steer_only_requires_active_turn() {
 #[tokio::test]
 async fn steer_only_enforces_expected_turn_id() {
     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    turn_context
+        .turn_metadata_state
+        .set_turn_trigger("composer".to_string());
     session
         .spawn_task(
             Arc::clone(&turn_context),
             vec![TurnInput::UserInput {
+                acceptance_order: None,
                 content: vec![UserInput::Text {
                     text: "hello".to_string(),
                     text_elements: Vec::new(),
@@ -843,7 +907,12 @@ async fn steer_only_enforces_expected_turn_id() {
 
     let submission = handle(
         &session,
-        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)),
+        TurnInputRequest::new(SubmittedTurnInput::ResponseItem(output)).on_start(
+            TurnStartOptions {
+                turn_trigger: Some("automation_cron_scheduled".to_string()),
+                ..Default::default()
+            },
+        ),
         TurnInputMode::StartOrSteer,
         "test-submission".to_string(),
     )
@@ -855,6 +924,13 @@ async fn steer_only_enforces_expected_turn_id() {
         TurnInputSubmission::Steered {
             turn_id: turn_context.sub_id.clone()
         }
+    );
+    assert_eq!(
+        turn_context
+            .turn_metadata_state
+            .current_turn_trigger()
+            .as_deref(),
+        Some("composer")
     );
     let turn_state = session
         .input_queue
@@ -891,6 +967,7 @@ async fn rejects_non_regular_turns() {
             .spawn_task(
                 Arc::clone(&turn_context),
                 vec![TurnInput::UserInput {
+                    acceptance_order: None,
                     content: vec![UserInput::Text {
                         text: "hello".to_string(),
                         text_elements: Vec::new(),

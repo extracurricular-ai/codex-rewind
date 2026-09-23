@@ -1,4 +1,7 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -8,8 +11,15 @@ use codex_config::types::McpServerTransportConfig;
 use codex_core::NewThread;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
+use codex_core::config::Config;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::RemoveOptions;
+use codex_extension_api::ExtensionFuture;
+use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::McpServerContribution;
+use codex_extension_api::McpServerContributionContext;
+use codex_extension_api::McpServerContributor;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_protocol::mcp::McpServerConnectionStatus;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -23,6 +33,9 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_CREATE_TOOL;
+use core_test_support::apps_test_server::SEARCH_CALENDAR_NAMESPACE;
+use core_test_support::apps_test_server::apps_enabled_builder;
 use core_test_support::is_remote_test_environment;
 use core_test_support::responses;
 use core_test_support::responses::ResponseMock;
@@ -30,18 +43,38 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::test_env;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
+use tracing::Subscriber;
+use tracing::span::Attributes;
+use tracing::span::Id;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context as LayerContext;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use super::rmcp_client::remote_aware_environment_id;
 use super::rmcp_client::remote_aware_stdio_server_bin;
 
 const SERVER_NAME: &str = "cached_rmcp";
 const NAMESPACE: &str = "mcp__cached_rmcp";
+
+struct McpBindingCaptureCounter(Arc<AtomicUsize>);
+
+impl<S: Subscriber> Layer<S> for McpBindingCaptureCounter {
+    fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: LayerContext<'_, S>) {
+        if attributes.metadata().target() == "codex_mcp::connection_manager::tool_catalog"
+            && attributes.metadata().name() == "capture_binding_with_metadata"
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
 
 fn user_turn(prompt: &str) -> TurnInputRequest {
     TurnInputRequest::user_input(vec![UserInput::Text {
@@ -116,10 +149,12 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
     let responses_server = responses::start_mock_server().await;
     let command = remote_aware_stdio_server_bin()?;
     let environment_id = remote_aware_environment_id();
+    let test_env = test_env().await?;
     let make_server = |marker| {
         serde_json::from_value::<McpServerConfig>(json!({
             "command": command,
             "environment_id": environment_id,
+            "cwd": test_env.cwd(),
             "env": {
                 "MCP_TEST_DYNAMIC_SERVER_METADATA": "1",
                 "MCP_TEST_VALUE": marker,
@@ -145,7 +180,7 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
                 .set(servers)
                 .expect("first thread should accept its MCP servers");
         })
-        .build_with_auto_env(&responses_server)
+        .build_with_environment(&responses_server, test_env)
         .await?;
 
     let mut second_config = fixture.config.clone();
@@ -248,6 +283,165 @@ async fn mcp_calls_stay_bound_to_each_thread() -> anyhow::Result<()> {
     second_thread.shutdown_and_wait().await?;
     responses_server.verify().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn apps_cache_filled_during_binding_capture_reaches_the_model() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    struct ChildAppsEndpoint(String);
+
+    impl McpServerContributor<Config> for ChildAppsEndpoint {
+        fn id(&self) -> &'static str {
+            "child_apps_cache_test"
+        }
+
+        fn contribute<'a>(
+            &'a self,
+            context: McpServerContributionContext<'a, Config>,
+        ) -> ExtensionFuture<'a, Vec<McpServerContribution>> {
+            Box::pin(async move {
+                if !matches!(context.session_source(), Some(SessionSource::SubAgent(_))) {
+                    return Vec::new();
+                }
+                vec![McpServerContribution::HostedApps {
+                    config: Box::new(
+                        serde_json::from_value(json!({ "url": self.0 }))
+                            .expect("child Apps MCP config"),
+                    ),
+                    protocol_mode: None,
+                }]
+            })
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = responses::start_mock_server().await;
+        let tools_available = Arc::new(AtomicBool::new(false));
+        let apps =
+            AppsTestServer::mount_with_tools_available_when(&server, Arc::clone(&tools_available))
+                .await?;
+        let waiting_server = responses::start_mock_server().await;
+        let (waiting, waiting_startup) =
+            AppsTestServer::mount_with_startup_control(&waiting_server).await?;
+        let pending_server = responses::start_mock_server().await;
+        let (pending_apps, pending_startup) =
+            AppsTestServer::mount_with_startup_control(&pending_server).await?;
+        // Gate only the child's MCP endpoint, leaving backend directory requests unblocked.
+        let mut extensions = ExtensionRegistryBuilder::new();
+        extensions.mcp_server_contributor(Arc::new(ChildAppsEndpoint(format!(
+            "{}/api/codex/ps/mcp",
+            pending_apps.chatgpt_base_url
+        ))));
+        let test = apps_enabled_builder(apps.chatgpt_base_url)
+            .with_model_info_override("gpt-5.5", |model| model.supports_search_tool = false)
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(move |config| {
+                // Keep the gated HTTP request on the app host. Wine's executor serializes RPCs,
+                // so blocking it here would also block the peer startup that releases this gate.
+                config
+                    .mcp_servers
+                    .set(std::collections::HashMap::from([(
+                        SERVER_NAME.to_string(),
+                        serde_json::from_value(json!({
+                            "url": format!("{}/api/codex/ps/mcp", waiting.chatgpt_base_url),
+                            "http_headers": { "Authorization": "Bearer cache-test-token" },
+                            "enabled_tools": ["calendar_list_events"],
+                        }))
+                        .expect("cacheable MCP config"),
+                    )]))
+                    .expect("test MCP config");
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        // Startup emits one summary for both servers, not one event per server.
+        let EventMsg::McpStartupComplete(startup) = wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::McpStartupComplete(_))
+        })
+        .await
+        else {
+            unreachable!("event predicate guarantees the startup summary");
+        };
+        assert_eq!(
+            startup
+                .ready
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                SERVER_NAME.to_string(),
+            ])
+        );
+
+        let release_apps = pending_startup.hold_next_successful_initialize();
+        let release_waiting = waiting_startup.hold_next_successful_initialize();
+        let NewThread { thread: child, .. } = test
+            .thread_manager
+            .start_thread(StartThreadOptions {
+                session_source: Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id: test.session_configured.thread_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                ..StartThreadOptions::new(test.config.clone())
+            })
+            .await?;
+        assert_eq!(waiting_startup.initialize_attempts(), 1);
+        let response = mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_response_created("cache-refresh"),
+                responses::ev_assistant_message("done", "done"),
+                responses::ev_completed("cache-refresh"),
+            ]),
+        )
+        .await;
+        child
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Mention {
+                name: SERVER_NAME.to_string(),
+                path: format!("mcp://{SERVER_NAME}"),
+            }]))
+            .await?;
+        wait_for_event(&child, |event| {
+            matches!(event, EventMsg::McpStartupUpdate(update)
+            if update.server == SERVER_NAME && matches!(update.status, McpStartupStatus::Starting))
+        })
+        .await;
+
+        // A peer fills the initially empty shared Apps cache while capture waits for the named server.
+        tools_available.store(true, Ordering::SeqCst);
+        let mut peer_config = test.config.clone();
+        peer_config
+            .mcp_servers
+            .set(std::collections::HashMap::new())?;
+        let NewThread { thread: peer, .. } = test
+            .thread_manager
+            .start_thread(StartThreadOptions::new(peer_config))
+            .await?;
+        wait_for_mcp_server(&peer, CODEX_APPS_MCP_SERVER_NAME).await?;
+        release_waiting.send(())?;
+        wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        // The child's own Apps client must still be pending when its request reaches inference.
+        release_apps.send(())?;
+        let body = response.single_request().body_json();
+        assert!(
+            responses::namespace_child_tool(
+                &body,
+                SEARCH_CALENDAR_NAMESPACE,
+                SEARCH_CALENDAR_CREATE_TOOL,
+            )
+            .is_some(),
+            "the first model request must include the peer's Apps tools: {body}"
+        );
+
+        child.shutdown_and_wait().await?;
+        peer.shutdown_and_wait().await?;
+        Ok(())
+    })
+    .await
+    .context("timed out exercising an Apps cache fill during binding capture")?
 }
 
 #[test_case(false, false, 1; "optional server uses cache")]
@@ -385,7 +579,8 @@ async fn cached_http_mcp_starts_lazily_for_subagents(
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Keep spawned tasks on the thread with the scoped tracing subscriber.
+#[tokio::test(flavor = "current_thread")]
 async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow::Result<()> {
     skip_if_wine_exec!(
         Ok(()),
@@ -393,12 +588,18 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
     );
     skip_if_no_network!(Ok(()));
 
+    let binding_captures = Arc::new(AtomicUsize::new(0));
+    let _tracing = tracing_subscriber::registry()
+        .with(McpBindingCaptureCounter(Arc::clone(&binding_captures)))
+        .set_default();
+
     let responses_server = responses::start_mock_server().await;
     let command = remote_aware_stdio_server_bin()?;
     let environment_id = remote_aware_environment_id();
     let fixture = test_codex()
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
         .with_config(move |config| {
+            config.update_plan_enabled = true;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
             config
                 .permissions
@@ -413,6 +614,7 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
                 serde_json::from_value(json!({
                     "command": command,
                     "environment_id": environment_id,
+                    "cwd": config.cwd,
                     "env": {
                         "MCP_TEST_APP_ONLY_CWD_MARKER_FILE": app_only_cwd_marker_file,
                         "MCP_TEST_INITIALIZE_BARRIER_FILE": barrier_file,
@@ -516,12 +718,26 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
         .await?;
     second_thread.submit(Op::Interrupt).await?;
 
+    binding_captures.store(0, Ordering::SeqCst);
     let unused_response = mount_sse_once(
         &responses_server,
         responses::sse(vec![
             responses::ev_response_created("unused"),
-            responses::ev_assistant_message("unused-message", "done"),
+            responses::ev_function_call(
+                "unused-plan",
+                "update_plan",
+                r#"{"plan":[{"step":"Work without MCP tools","status":"in_progress"}]}"#,
+            ),
             responses::ev_completed("unused"),
+        ]),
+    )
+    .await;
+    let unused_done_response = mount_sse_once(
+        &responses_server,
+        responses::sse(vec![
+            responses::ev_response_created("unused-done"),
+            responses::ev_assistant_message("unused-message", "done"),
+            responses::ev_completed("unused-done"),
         ]),
     )
     .await;
@@ -543,10 +759,17 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
         !reported_ready_before_startup,
         "a dormant MCP server must not be reported as ready"
     );
-    assert_definition(
-        &unused_response,
-        &format!("Use the tools from {cached_process}."),
-        &format!("Echo from {cached_process}."),
+    for response in [&unused_response, &unused_done_response] {
+        assert_definition(
+            response,
+            &format!("Use the tools from {cached_process}."),
+            &format!("Echo from {cached_process}."),
+        );
+    }
+    assert_eq!(
+        binding_captures.load(Ordering::SeqCst),
+        1,
+        "both model steps must share one binding while the cached server stays dormant"
     );
     let (mcp_config, _) = second_thread.current_mcp_config_and_runtime_context().await;
     assert_eq!(
@@ -672,6 +895,10 @@ async fn cached_mcp_startup_is_eager_for_root_and_lazy_for_subagents() -> anyhow
     .await?;
     let expected_error = format!("MCP tool `{SERVER_NAME}/cwd` is not available to the model");
     assert_eq!(cached_turn.await??, second_process);
+    assert!(
+        binding_captures.load(Ordering::SeqCst) > 1,
+        "starting the cached server must invalidate the dormant binding"
+    );
     assert_definition(
         &cached_done_response,
         &format!("Use the tools from {second_process}."),

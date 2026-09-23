@@ -19,7 +19,6 @@ use std::io;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -27,7 +26,6 @@ use std::sync::atomic::Ordering;
 use std::thread::sleep;
 #[cfg(unix)]
 use std::thread::spawn;
-#[cfg(unix)]
 use std::time::Duration;
 
 use anyhow::Result;
@@ -40,24 +38,22 @@ use codex_exec_server::ExecProcess;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
-#[cfg(all(unix, not(target_os = "macos")))]
+use codex_utils_pty::Command;
+use codex_utils_pty::ProcessMode;
+#[cfg(unix)]
 use codex_utils_pty::process_group::kill_process_group;
-#[cfg(target_os = "macos")]
-use codex_utils_pty::process_group::kill_process_group_with_member_fallback as kill_process_group;
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 use codex_utils_pty::process_group::terminate_process_group;
-#[cfg(target_os = "macos")]
-use codex_utils_pty::process_group::terminate_process_group_with_member_fallback as terminate_process_group;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rmcp::service::RoleClient;
 use rmcp::service::RxJsonRpcMessage;
 use rmcp::service::TxJsonRpcMessage;
 use rmcp::transport::Transport;
-use rmcp::transport::child_process::TokioChildProcess;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::process::Command;
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::info;
 use tracing::warn;
 
@@ -107,8 +103,7 @@ pub struct StdioServerTransport {
 }
 
 enum StdioServerTransportInner {
-    LocalLegacy(TokioChildProcess),
-    LocalModern(LocalStdioTransport),
+    Local(LocalStdioTransport),
     Executor(ExecutorProcessTransport),
 }
 
@@ -123,8 +118,7 @@ impl Transport<RoleClient> for StdioServerTransport {
         // wrapper keeps process placement private while leaving rmcp's send
         // semantics unchanged.
         match &mut self.inner {
-            StdioServerTransportInner::LocalLegacy(transport) => transport.send(item).boxed(),
-            StdioServerTransportInner::LocalModern(transport) => transport.send(item).boxed(),
+            StdioServerTransportInner::Local(transport) => transport.send(item).boxed(),
             StdioServerTransportInner::Executor(transport) => transport.send(item).boxed(),
         }
     }
@@ -134,8 +128,7 @@ impl Transport<RoleClient> for StdioServerTransport {
         // executor variant turns pushed process-output events back into the
         // line-delimited JSON stream expected by rmcp.
         match &mut self.inner {
-            StdioServerTransportInner::LocalLegacy(transport) => transport.receive().boxed(),
-            StdioServerTransportInner::LocalModern(transport) => transport.receive().boxed(),
+            StdioServerTransportInner::Local(transport) => transport.receive().boxed(),
             StdioServerTransportInner::Executor(transport) => transport.receive().boxed(),
         }
     }
@@ -143,8 +136,7 @@ impl Transport<RoleClient> for StdioServerTransport {
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
         self.process.terminate().await?;
         match &mut self.inner {
-            StdioServerTransportInner::LocalLegacy(transport) => transport.close().await,
-            StdioServerTransportInner::LocalModern(transport) => transport.close().await,
+            StdioServerTransportInner::Local(transport) => transport.close().await,
             StdioServerTransportInner::Executor(transport) => transport.close().await,
         }
     }
@@ -222,6 +214,10 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
+// Keep queued stderr diagnostics before closing the reader, even when an
+// escaped descendant prevents the pipe from reaching EOF.
+const STDERR_READER_DRAIN_GRACE_PERIOD: Duration = Duration::from_millis(250);
+
 #[cfg(unix)]
 struct LocalProcessTerminator {
     process_group_id: u32,
@@ -245,6 +241,8 @@ struct StdioServerProcessHandleInner {
     program_name: String,
     kind: StdioServerProcessKind,
     terminated: AtomicBool,
+    // An escaped descendant can keep stderr open after the MCP server exits.
+    stderr_reader: Option<watch::Sender<()>>,
 }
 
 enum StdioServerProcessKind {
@@ -279,16 +277,8 @@ impl LocalStdioServerLauncher {
 
         let build_command = || {
             let mut command = Command::new(&resolved_program);
-            command
-                .kill_on_drop(true)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .current_dir(&cwd)
-                .env_clear()
-                .envs(&envs)
-                .args(&args);
-            #[cfg(unix)]
-            command.process_group(0);
+            command.current_dir(&cwd).envs(&envs).args(&args);
+            command.process_mode(ProcessMode::NewGroup);
             command
         };
         #[cfg(windows)]
@@ -298,7 +288,7 @@ impl LocalStdioServerLauncher {
         #[cfg(windows)]
         let job = match codex_utils_pty::JobObject::create_without_breakaway() {
             Ok(job) => {
-                job.prepare_suspended_spawn(&mut command);
+                command.prepare_suspended_spawn(&job);
                 Some(job)
             }
             Err(error) => {
@@ -312,29 +302,14 @@ impl LocalStdioServerLauncher {
             Option<tokio::process::ChildStderr>,
             Option<u32>,
         )> {
-            match protocol_mode {
-                McpProtocolMode::Legacy => {
-                    let (transport, stderr) = TokioChildProcess::builder(command)
-                        .stderr(Stdio::piped())
-                        .spawn()?;
-                    let process_id = transport.id();
-                    Ok((
-                        StdioServerTransportInner::LocalLegacy(transport),
-                        stderr,
-                        process_id,
-                    ))
-                }
-                McpProtocolMode::V20260728 => {
-                    let (transport, stderr) =
-                        LocalStdioTransport::spawn(command, program_name.clone())?;
-                    let process_id = transport.id();
-                    Ok((
-                        StdioServerTransportInner::LocalModern(transport),
-                        stderr,
-                        process_id,
-                    ))
-                }
-            }
+            let (transport, stderr) =
+                LocalStdioTransport::spawn(command, program_name.clone(), protocol_mode)?;
+            let process_id = transport.id();
+            Ok((
+                StdioServerTransportInner::Local(transport),
+                stderr,
+                process_id,
+            ))
         };
         let (transport, stderr, process_id) = spawn_transport(command)?;
         #[cfg(windows)]
@@ -373,25 +348,44 @@ impl LocalStdioServerLauncher {
         };
         #[cfg(not(windows))]
         let terminator = process_id.map(LocalProcessTerminator::new);
-        let process = StdioServerProcessHandle::local(program_name.clone(), terminator);
-
-        if let Some(stderr) = stderr {
-            tokio::spawn(async move {
+        let stderr_reader = stderr.map(|stderr| {
+            let program_name = program_name.clone();
+            let (stop_tx, mut stop_rx) = watch::channel(());
+            std::mem::drop(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
+                // Give queued diagnostics time to reach the logs without waiting
+                // indefinitely for a descendant that still has stderr open.
+                let drain_deadline = tokio::time::sleep(STDERR_READER_DRAIN_GRACE_PERIOD);
+                tokio::pin!(drain_deadline);
+                let mut draining = false;
                 loop {
-                    match reader.next_line().await {
-                        Ok(Some(line)) => {
-                            info!("MCP server stderr ({program_name}): {line}");
+                    tokio::select! {
+                        biased;
+                        _ = &mut drain_deadline, if draining => break,
+                        _ = stop_rx.changed(), if !draining => {
+                            draining = true;
+                            drain_deadline.as_mut().reset(
+                                Instant::now() + STDERR_READER_DRAIN_GRACE_PERIOD
+                            );
                         }
-                        Ok(None) => break,
-                        Err(error) => {
-                            warn!("Failed to read MCP server stderr ({program_name}): {error}");
-                            break;
-                        }
+                        line = reader.next_line() => {
+                            match line {
+                                Ok(Some(line)) => {
+                                    info!("MCP server stderr ({program_name}): {line}");
+                                }
+                                Ok(None) => break,
+                                Err(error) => {
+                                    warn!("Failed to read MCP server stderr ({program_name}): {error}");
+                                    break;
+                                }
+                            }
+                        },
                     }
                 }
-            });
-        }
+            }));
+            stop_tx
+        });
+        let process = StdioServerProcessHandle::local(program_name, terminator, stderr_reader);
 
         Ok(StdioServerTransport {
             inner: transport,
@@ -452,12 +446,17 @@ impl LocalProcessTerminator {
 }
 
 impl StdioServerProcessHandle {
-    fn local(program_name: String, terminator: Option<LocalProcessTerminator>) -> Self {
+    fn local(
+        program_name: String,
+        terminator: Option<LocalProcessTerminator>,
+        stderr_reader: Option<watch::Sender<()>>,
+    ) -> Self {
         Self {
             inner: Arc::new(StdioServerProcessHandleInner {
                 program_name,
                 kind: StdioServerProcessKind::Local(terminator),
                 terminated: AtomicBool::new(false),
+                stderr_reader,
             }),
         }
     }
@@ -468,6 +467,7 @@ impl StdioServerProcessHandle {
                 program_name,
                 kind: StdioServerProcessKind::Executor(process),
                 terminated: AtomicBool::new(false),
+                stderr_reader: None,
             }),
         }
     }
@@ -477,7 +477,7 @@ impl StdioServerProcessHandle {
             return Ok(());
         }
 
-        match &self.inner.kind {
+        let result = match &self.inner.kind {
             StdioServerProcessKind::Local(Some(terminator)) => {
                 terminator.terminate();
                 Ok(())
@@ -490,7 +490,11 @@ impl StdioServerProcessHandle {
                     Err(io::Error::other(error))
                 }
             },
+        };
+        if let Some(stderr_reader) = &self.inner.stderr_reader {
+            stderr_reader.send_replace(());
         }
+        result
     }
 }
 
@@ -524,6 +528,9 @@ impl Drop for StdioServerProcessHandleInner {
                     }
                 }));
             }
+        }
+        if let Some(stderr_reader) = &self.stderr_reader {
+            stderr_reader.send_replace(());
         }
     }
 }
@@ -602,6 +609,7 @@ impl ExecutorStdioServerLauncher {
         // rmcp write JSON-RPC requests after the process starts.
         let started = exec_backend
             .start(ExecParams {
+                metadata: Default::default(),
                 process_id,
                 argv,
                 cwd,

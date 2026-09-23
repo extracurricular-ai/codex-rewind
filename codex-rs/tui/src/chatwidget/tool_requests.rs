@@ -58,7 +58,7 @@ impl ChatWidget {
                 Some(auto_review_denials::action_summary(action))
             }
             GuardianAssessmentAction::ApplyPatch { files, .. } => Some(if files.len() == 1 {
-                format!("apply_patch touching {}", files[0].display())
+                format!("apply_patch touching {}", files[0].render_for_ui())
             } else {
                 format!("apply_patch touching {} files", files.len())
             }),
@@ -142,12 +142,12 @@ impl ChatWidget {
                     status.details_max_lines,
                 );
             } else if self.status_state.current_status.is_guardian_review() {
-                self.set_status_header(String::from("Working"));
+                self.restore_reasoning_status_header();
             }
         } else if self.status_state.pending_guardian_review_status.is_empty()
             && self.status_state.current_status.is_guardian_review()
         {
-            self.set_status_header(String::from("Working"));
+            self.restore_reasoning_status_header();
         }
 
         if ev.status == GuardianAssessmentStatus::Approved {
@@ -173,7 +173,7 @@ impl ChatWidget {
                     GuardianAssessmentAction::ApplyPatch { files, .. } => {
                         let files = files
                             .iter()
-                            .map(|path| path.display().to_string())
+                            .map(codex_utils_path_uri::LegacyAppPathString::render_for_ui)
                             .collect::<Vec<_>>();
                         history_cell::new_guardian_timed_out_patch_request(files)
                     }
@@ -223,7 +223,7 @@ impl ChatWidget {
                 GuardianAssessmentAction::ApplyPatch { files, .. } => {
                     let files = files
                         .iter()
-                        .map(|path| path.display().to_string())
+                        .map(codex_utils_path_uri::LegacyAppPathString::render_for_ui)
                         .collect::<Vec<_>>();
                     history_cell::new_guardian_denied_patch_request(files)
                 }
@@ -282,7 +282,6 @@ impl ChatWidget {
 
     pub(crate) fn handle_exec_approval_now(&mut self, ev: ExecApprovalRequestEvent) {
         self.flush_answer_stream_with_separator();
-        self.flush_completed_command_activity();
         let command = shlex::try_join(ev.command.iter().map(String::as_str))
             .unwrap_or_else(|_| ev.command.join(" "));
         self.notify(Notification::ExecApprovalRequested { command });
@@ -311,7 +310,6 @@ impl ChatWidget {
 
     pub(crate) fn handle_apply_patch_approval_now(&mut self, ev: ApplyPatchApprovalRequestEvent) {
         self.flush_answer_stream_with_separator();
-        self.flush_completed_command_activity();
 
         let changed_paths = ev.changes.keys().cloned().collect();
         let request = ApprovalRequest::ApplyPatch(ApplyPatchApprovalRequest {
@@ -341,7 +339,6 @@ impl ChatWidget {
         params: McpServerElicitationRequestParams,
     ) {
         self.flush_answer_stream_with_separator();
-        self.flush_completed_command_activity();
 
         self.notify(Notification::ElicitationRequested {
             server_name: params.server_name.clone(),
@@ -376,7 +373,22 @@ impl ChatWidget {
                     self.bottom_pane
                         .push_approval_request(request, &self.config.features);
                 }
+                McpServerElicitationRequest::UserVerification {
+                    title, description, ..
+                } => {
+                    self.bottom_pane.push_user_verification_request(
+                        thread_id,
+                        crate::bottom_pane::user_verification::UserVerificationRequest {
+                            thread_label: None,
+                            server_name: params.server_name,
+                            request_id,
+                            title,
+                            description,
+                        },
+                    );
+                }
                 McpServerElicitationRequest::OpenAiForm { .. }
+                | McpServerElicitationRequest::OpenAiElicitationForm { .. }
                 | McpServerElicitationRequest::Url { .. } => {
                     self.app_event_tx.resolve_elicitation(
                         thread_id,
@@ -397,9 +409,23 @@ impl ChatWidget {
     }
 
     pub(crate) fn push_approval_request(&mut self, request: ApprovalRequest) {
-        self.flush_completed_command_activity();
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
+        self.set_ambient_pet_notification(
+            crate::pets::PetNotificationKind::Waiting,
+            /*body*/ None,
+        );
+        self.request_redraw();
+    }
+
+    pub(crate) fn push_user_verification_request(
+        &mut self,
+        thread_id: ThreadId,
+        request: crate::bottom_pane::user_verification::UserVerificationRequest,
+    ) {
+        // Inactive-thread prompts must leave the foreground stream and command activity intact.
+        self.bottom_pane
+            .push_user_verification_request(thread_id, request);
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Waiting,
             /*body*/ None,
@@ -411,7 +437,6 @@ impl ChatWidget {
         &mut self,
         request: McpServerElicitationFormRequest,
     ) {
-        self.flush_completed_command_activity();
         self.bottom_pane
             .push_mcp_server_elicitation_request(request);
         self.set_ambient_pet_notification(
@@ -423,7 +448,6 @@ impl ChatWidget {
 
     pub(crate) fn handle_request_user_input_now(&mut self, ev: ToolRequestUserInputParams) {
         self.flush_answer_stream_with_separator();
-        self.flush_completed_command_activity();
         let question_count = ev.questions.len();
         let summary = Notification::user_input_request_summary(&ev.questions);
         let title = match (question_count, summary.as_deref()) {
@@ -442,7 +466,6 @@ impl ChatWidget {
 
     pub(crate) fn handle_request_permissions_now(&mut self, ev: RequestPermissionsEvent) {
         self.flush_answer_stream_with_separator();
-        self.flush_completed_command_activity();
         let request = ApprovalRequest::Permissions(PermissionsApprovalRequest {
             thread_id: self.thread_id.unwrap_or_default(),
             thread_label: None,

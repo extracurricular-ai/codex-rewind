@@ -26,6 +26,7 @@ pub enum SessionStartSource {
     Resume,
     Clear,
     Compact,
+    Fork,
 }
 
 impl SessionStartSource {
@@ -35,6 +36,7 @@ impl SessionStartSource {
             Self::Resume => "resume",
             Self::Clear => "clear",
             Self::Compact => "compact",
+            Self::Fork => "fork",
         }
     }
 }
@@ -540,6 +542,7 @@ mod tests {
 
     fn handler_for(event_name: HookEventName) -> ConfiguredHandler {
         ConfiguredHandler {
+            builtin: false,
             event_name,
             matcher: None,
             timeout_sec: 600,

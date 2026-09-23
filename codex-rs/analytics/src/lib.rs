@@ -4,7 +4,9 @@ mod analytics_capture;
 mod client;
 mod events;
 mod facts;
+mod guardian_v2;
 mod reducer;
+mod thread_hint;
 
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -12,6 +14,7 @@ use std::time::UNIX_EPOCH;
 pub use accepted_lines::fingerprint_hash;
 pub use client::AnalyticsEventsClient;
 pub use events::AppServerRpcTransport;
+pub use events::GuardianAdditionalPermissions;
 pub use events::GuardianApprovalRequestSource;
 pub use events::GuardianReviewAnalyticsResult;
 pub use events::GuardianReviewDecision;
@@ -40,6 +43,7 @@ pub use facts::CompactionStrategy;
 pub use facts::CompactionTrigger;
 pub use facts::ControlToolCallFact;
 pub use facts::ControlToolCallStatus;
+pub use facts::ElicitationType;
 pub use facts::ExternalAgentConfigImportCompletedInput;
 pub use facts::ExternalAgentConfigImportFailureInput;
 pub use facts::GoalEventKind;
@@ -49,6 +53,7 @@ pub use facts::ImagePreparationFact;
 pub use facts::ImagePreparationMetadata;
 pub use facts::InputError;
 pub use facts::InvocationType;
+pub use facts::McpToolCallElicitation;
 pub use facts::PluginInstallRequestSource;
 pub use facts::PluginInstallRequested;
 pub use facts::PluginInstallRequestedPlugin;
@@ -71,9 +76,13 @@ pub use facts::TurnSteerRequestError;
 pub use facts::TurnSteerResult;
 pub use facts::TurnTokenUsageFact;
 pub use facts::build_track_events_context;
+pub use guardian_v2::GuardianV2Event;
+pub use guardian_v2::GuardianV2EventKind;
+pub use thread_hint::ThreadHintStatus;
+pub use thread_hint::ThreadHintStatusEvent;
 
 #[cfg(test)]
-mod analytics_client_tests;
+mod tests;
 
 pub fn now_unix_seconds() -> u64 {
     SystemTime::now()

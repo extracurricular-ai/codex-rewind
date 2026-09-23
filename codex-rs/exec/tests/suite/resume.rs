@@ -238,6 +238,18 @@ async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
     assert!(content.contains(&marker2));
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let body = request.body_json();
+        let metadata: Value = serde_json::from_str(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .context("canonical turn metadata")?,
+        )?;
+        assert_eq!(
+            (&metadata["thread_id"], &metadata["turn_trigger"]),
+            (&meta["payload"]["id"], &serde_json::json!("exec"))
+        );
+    }
     let resumed_request = requests[1].body_json().to_string();
     assert!(resumed_request.contains(&marker));
     assert!(resumed_request.contains(&marker2));
@@ -563,6 +575,14 @@ async fn exec_resume_last_respects_cwd_filter_and_all_flag() -> anyhow::Result<(
         resumed_path_all, path_b,
         "resume --last --all should pick newest session"
     );
+
+    // Selection must still use the latest turn's cwd when only the compressed rollout exists.
+    zstd::stream::copy_encode(
+        std::fs::File::open(&path_b)?,
+        std::fs::File::create(path_b.with_extension("jsonl.zst"))?,
+        /*level*/ 3,
+    )?;
+    std::fs::remove_file(&path_b)?;
 
     let marker_a2 = format!("resume-cwd-a-2-{}", Uuid::new_v4());
     let prompt_a2 = format!("echo {marker_a2}");

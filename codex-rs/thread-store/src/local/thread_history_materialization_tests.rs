@@ -232,6 +232,7 @@ async fn split_homes_support_backfill_listing_and_paginated_history() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -325,6 +326,7 @@ async fn paginated_live_append_materializes_turn_items_and_state() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 turn_completed("turn-1"),
@@ -480,6 +482,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     }),
                 ),
                 RolloutItem::RealtimeItem(RealtimeItem {
@@ -501,7 +504,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
     let expected_rows = fs::read_to_string(rollout_path.as_path())
         .expect("read canonical rollout")
         .lines()
-        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse rollout line"))
+        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
         .filter_map(|line| match line.item {
             RolloutItem::RealtimeItem(item) => Some((
                 item.id,
@@ -596,6 +599,7 @@ async fn paginated_realtime_items_materialize_separately_in_rollout_order() {
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: "window-1".to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(home.path().to_path_buf()),
                 model_provider: "test-provider".to_string(),
@@ -908,6 +912,19 @@ async fn active_turn_stores_only_its_start_position() {
     assert!(prepared.model_context.iter().any(|item| {
         matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(event)) if event.turn_id == "turn-1")
     }));
+    // Another store may fork the persisted prefix while this store keeps the source writer open.
+    let other_store = projection_store(home.path()).await;
+    let other_prepared =
+        prepare_paginated_fork(&other_store, thread_id, ForkBoundary::Latest).await;
+    assert_eq!(
+        serde_json::to_value((
+            other_prepared.history_base,
+            other_prepared.model_context.as_ref()
+        ))
+        .expect("serialize other store's fork snapshot"),
+        serde_json::to_value((prepared.history_base, prepared.model_context.as_ref()))
+            .expect("serialize live store's fork snapshot"),
+    );
     assert_eq!(
         prepare_paginated_fork(
             &store,
@@ -943,7 +960,7 @@ async fn paginated_fork_persists_empty_source() {
 }
 
 #[tokio::test]
-async fn paginated_fork_materializes_compressed_source_and_ancestor() {
+async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
     let ancestor_thread_id = ThreadId::default();
@@ -975,6 +992,17 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
         .shutdown_thread(ancestor_thread_id)
         .await
         .expect("shutdown ancestor");
+
+    // A standalone source still becomes plain before its first shared reference, so the default
+    // mode does not introduce compressed lineages that older readers cannot follow.
+    compress_rollout(ancestor_path.as_path());
+    assert_eq!(
+        prepare_paginated_fork(&store, ancestor_thread_id, ForkBoundary::Latest)
+            .await
+            .history_base,
+        Some(ancestor_base)
+    );
+    assert!(ancestor_path.exists());
 
     let source_thread_id = ThreadId::default();
     create_paginated_subagent_thread(
@@ -1022,20 +1050,20 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
         prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
         prepare_paginated_fork(&store, source_thread_id, ForkBoundary::Latest),
     );
-    assert!(ancestor_path.exists());
-    assert!(source_path.exists());
-    assert!(!ancestor_compressed_path.exists());
-    assert!(!source_compressed_path.exists());
+    assert!(!ancestor_path.exists());
+    assert!(!source_path.exists());
+    assert!(ancestor_compressed_path.exists());
+    assert!(source_compressed_path.exists());
     assert_eq!(
-        fs::metadata(&ancestor_path)
+        fs::metadata(&ancestor_compressed_path)
             .and_then(|metadata| metadata.modified())
-            .expect("read materialized ancestor timestamp"),
+            .expect("read compressed ancestor timestamp"),
         ancestor_modified
     );
     assert_eq!(
-        fs::metadata(&source_path)
+        fs::metadata(&source_compressed_path)
             .and_then(|metadata| metadata.modified())
-            .expect("read materialized source timestamp"),
+            .expect("read compressed source timestamp"),
         source_modified
     );
     for prepared in [first, second] {
@@ -1050,10 +1078,48 @@ async fn paginated_fork_materializes_compressed_source_and_ancestor() {
             ));
         }
     }
+
+    // Skipping materialization must not allow a reference that cannot be resolved inside this home.
+    let external_home = TempDir::new().expect("external temp dir");
+    let external_path = external_home.path().join(
+        source_compressed_path
+            .file_name()
+            .expect("source rollout filename"),
+    );
+    fs::rename(&source_compressed_path, &external_path).expect("move shared source outside home");
+    store
+        .resume_thread(ResumeThreadParams {
+            thread_id: source_thread_id,
+            rollout_path: Some(external_path),
+            history: None,
+            include_archived: true,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("resume external shared source");
+    let error = store
+        .prepare_fork(PrepareForkParams {
+            thread_id: source_thread_id,
+            boundary: ForkBoundary::Latest,
+        })
+        .await
+        .expect_err("external shared source cannot be referenced by rollout id");
+    assert!(matches!(
+        error,
+        crate::ThreadStoreError::InvalidRequest { message } if message.contains("must be in Codex home")
+    ));
+    store
+        .shutdown_thread(source_thread_id)
+        .await
+        .expect("shutdown external source");
 }
 
 #[tokio::test]
-async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_finishes() {
+async fn cancelled_fork_keeps_source_reserved_until_lineage_resolution_finishes() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
     let ancestor_thread_id = ThreadId::default();
@@ -1096,6 +1162,7 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_fini
     compress_rollout(source_path.as_path());
 
     let ancestor_writer_guard = store.live_writer_locks.lock(ancestor_thread_id).await;
+    let source_coordination = store.live_writer_locks.coordination(source_thread_id).await;
     let preparation_store = store.clone();
     let preparation = tokio::spawn(async move {
         preparation_store
@@ -1106,12 +1173,12 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_fini
             .await
     });
     tokio::time::timeout(Duration::from_secs(10), async {
-        while !source_path.exists() {
+        while source_coordination.lifecycle.try_write().is_ok() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("detached lineage task should materialize the source");
+    .expect("fork preparation should reserve the source");
     preparation.abort();
     assert!(
         preparation
@@ -1126,14 +1193,14 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_materialization_fini
     tokio::select! {
         biased;
         result = &mut delete => {
-            panic!("source deletion completed while lineage materialization was active: {result:?}")
+            panic!("source deletion completed while lineage resolution was active: {result:?}")
         }
         _ = tokio::task::yield_now() => {}
     }
     drop(ancestor_writer_guard);
     delete
         .await
-        .expect("delete source after lineage materialization finishes");
+        .expect("delete source after lineage resolution finishes");
 }
 
 #[tokio::test]
@@ -1662,6 +1729,7 @@ async fn paginated_projection_accepts_float_rate_limits_and_later_final_answers(
             rate_limits: Some(RateLimitSnapshot {
                 limit_id: None,
                 limit_name: None,
+                normal_model_slug: None,
                 primary: primary.map(|used_percent| RateLimitWindow {
                     used_percent,
                     window_minutes: Some(60),
@@ -1954,7 +2022,7 @@ async fn catch_up_preserves_trailing_partial_line_boundaries() {
 }
 
 #[tokio::test]
-async fn catch_up_rejects_invalid_complete_suffixes_without_advancing_state() {
+async fn catch_up_skips_invalid_complete_suffixes_and_projects_later_history() {
     let cases = [
         (
             "missing ordinal",
@@ -1962,28 +2030,28 @@ async fn catch_up_rejects_invalid_complete_suffixes_without_advancing_state() {
                 "{}\n",
                 rollout_line(/*ordinal*/ None, turn_started("turn-1"))
             ),
+            1,
+            Vec::new(),
         ),
         (
             "duplicate ordinal",
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 rollout_line(Some(1), turn_started("turn-1")),
-                rollout_line(Some(1), turn_started("turn-2")),
+                rollout_line(Some(1), turn_started("skipped-turn")),
+                rollout_line(Some(2), turn_started("turn-2")),
             ),
+            3,
+            vec!["turn-1", "turn-2"],
         ),
         (
-            "out of order ordinal",
+            "forward ordinal gap",
             format!("{}\n", rollout_line(Some(2), turn_started("turn-1"))),
-        ),
-        (
-            "gap larger than rejected prefix",
-            format!(
-                "{{not json}}\n{}\n",
-                rollout_line(Some(3), turn_started("turn-1")),
-            ),
+            3,
+            vec!["turn-1"],
         ),
     ];
-    for (name, suffix) in cases {
+    for (name, suffix, expected_next_ordinal, expected_turn_ids) in cases {
         let home = TempDir::new().expect("temp dir");
         let store = projection_store(home.path()).await;
         let thread_id = ThreadId::default();
@@ -2007,26 +2075,22 @@ async fn catch_up_rejects_invalid_complete_suffixes_without_advancing_state() {
 
         super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
             .await
-            .expect_err(name);
+            .expect(name);
 
+        let expected_offset = before.0 + i64::try_from(suffix.len()).expect("suffix byte count");
         assert_eq!(
             projection_state(&pool, thread_id).await,
-            before,
-            "{name} should not advance projection state"
+            (expected_offset, expected_next_ordinal),
+            "{name} should advance projection state"
         );
-        let counts = sqlx::query_as::<_, (i64, i64)>(
-            r#"
-SELECT
-    (SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?),
-    (SELECT COUNT(*) FROM thread_items WHERE thread_id = ?)
-            "#,
+        let turn_ids = sqlx::query_scalar::<_, String>(
+            "SELECT turn_id FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal",
         )
         .bind(thread_id.to_string())
-        .bind(thread_id.to_string())
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
-        .expect("read projected row counts");
-        assert_eq!(counts, (0, 0), "{name} should not project rows");
+        .expect("read projected turns");
+        assert_eq!(turn_ids, expected_turn_ids, "{name}");
     }
 }
 
@@ -2112,7 +2176,7 @@ async fn sqlite_failure_does_not_fail_durable_jsonl_write() {
 }
 
 #[tokio::test]
-async fn blank_and_rejected_rollout_lines_do_not_poison_projection() {
+async fn blank_and_rejected_rollout_lines_advance_projection() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
     let thread_id = ThreadId::default();
@@ -2136,15 +2200,21 @@ async fn blank_and_rejected_rollout_lines_do_not_poison_projection() {
         .append(true)
         .open(rollout_path.as_path())
         .expect("open rollout for rejected line");
-    file.write_all(b"\n \t\r\n{not json}\n\xff\n")
+    file.write_all(b"{not json}\n\n")
         .expect("append blank and rejected lines");
     file.flush().expect("flush rejected line");
+    let rejected_tail_len = i64::try_from(
+        fs::metadata(rollout_path.as_path())
+            .expect("rollout metadata")
+            .len(),
+    )
+    .expect("rollout length");
     super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
         .await
-        .expect("leave rejected tail pending");
+        .expect("skip rejected tail");
     assert_eq!(
         projection_state(&pool, thread_id).await,
-        (before.0 + 5, before.1)
+        (rejected_tail_len, before.1)
     );
 
     let recorder = store
@@ -2182,7 +2252,7 @@ async fn blank_and_rejected_rollout_lines_do_not_poison_projection() {
 }
 
 #[tokio::test]
-async fn unprojectable_rollout_lines_wait_for_later_ordinals() {
+async fn unknown_rollout_lines_leave_ordinals_pending_for_valid_retries() {
     let unknown_line = |ordinal| {
         format!(
             concat!(
@@ -2192,76 +2262,67 @@ async fn unprojectable_rollout_lines_wait_for_later_ordinals() {
             ordinal = ordinal
         )
     };
-    let cases = [
-        ("unknown payload", unknown_line(1), unknown_line(2)),
-        (
-            "structurally invalid JSON",
-            "{}".to_string(),
-            "null".to_string(),
-        ),
-    ];
-    for (name, pending_line, skipped_line) in cases {
-        let home = TempDir::new().expect("temp dir");
-        let store = projection_store(home.path()).await;
-        let thread_id = ThreadId::default();
-        create_paginated_thread(&store, thread_id).await;
-        store
-            .persist_thread(thread_id, PersistContext::Standard)
-            .await
-            .expect("persist session metadata");
-
-        let pool = codex_state::open_thread_history_db(
-            &codex_state::SqliteConfig::new_for_testing(home.path().abs()),
-        )
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
         .await
-        .expect("open thread history db");
-        let before = projection_state(&pool, thread_id).await;
-        let rollout_path = store
-            .live_rollout_path(thread_id)
-            .await
-            .expect("rollout path");
-        append_suffix(rollout_path.as_path(), format!("{pending_line}\n").as_str());
+        .expect("persist session metadata");
 
-        super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-            .await
-            .expect("leave unprojectable tail pending");
-        assert_eq!(projection_state(&pool, thread_id).await, before, "{name}");
-
-        append_suffix(
-            rollout_path.as_path(),
-            format!(
-                "{}\n{skipped_line}\n{}\n",
-                rollout_line(Some(1), turn_started("retry-turn")),
-                rollout_line(Some(3), turn_started("turn-1")),
-            )
-            .as_str(),
-        );
-
-        super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
-            .await
-            .expect(name);
-
-        let rollout_len =
-            i64::try_from(fs::metadata(rollout_path).expect("rollout metadata").len())
-                .expect("rollout length");
-        assert_eq!(
-            projection_state(&pool, thread_id).await,
-            (rollout_len, 4),
-            "{name}"
-        );
-        let turn_ordinals = sqlx::query_as::<_, (String, i64)>(
-            "SELECT turn_id, rollout_ordinal FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal",
-        )
-        .bind(thread_id.to_string())
-        .fetch_all(&pool)
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let before = projection_state(&pool, thread_id).await;
+    let rollout_path = store
+        .live_rollout_path(thread_id)
         .await
-        .expect("read projected turns");
-        assert_eq!(
-            turn_ordinals,
-            vec![("retry-turn".to_string(), 1), ("turn-1".to_string(), 3)],
-            "{name}"
-        );
-    }
+        .expect("rollout path");
+    let pending_line = unknown_line(1);
+    append_suffix(rollout_path.as_path(), format!("{pending_line}\n").as_str());
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("skip unknown tail");
+    let expected_pending_offset =
+        before.0 + i64::try_from(pending_line.len() + 1).expect("pending line byte count");
+    assert_eq!(
+        projection_state(&pool, thread_id).await,
+        (expected_pending_offset, 1)
+    );
+
+    append_suffix(
+        rollout_path.as_path(),
+        format!(
+            "{}\n{}\n{}\n",
+            rollout_line(Some(1), turn_started("retry-turn")),
+            unknown_line(2),
+            rollout_line(Some(3), turn_started("turn-1")),
+        )
+        .as_str(),
+    );
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("project valid retry and later history");
+
+    let rollout_len = i64::try_from(fs::metadata(rollout_path).expect("rollout metadata").len())
+        .expect("rollout length");
+    assert_eq!(projection_state(&pool, thread_id).await, (rollout_len, 4));
+    let turn_ordinals = sqlx::query_as::<_, (String, i64)>(
+        "SELECT turn_id, rollout_ordinal FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("read projected turns");
+    assert_eq!(
+        turn_ordinals,
+        vec![("retry-turn".to_string(), 1), ("turn-1".to_string(), 3)]
+    );
 }
 
 #[tokio::test]
@@ -2526,6 +2587,7 @@ async fn create_paginated_subagent_thread(
             history_base,
             subagent_history_start_ordinal,
             initial_window_id: "window-1".to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(std::env::current_dir().expect("cwd")),
                 model_provider: "test-provider".to_string(),
@@ -2539,6 +2601,7 @@ async fn create_paginated_subagent_thread(
 fn turn_started(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_id.to_string(),
+        root_turn_id: None,
         trace_id: None,
         started_at: Some(10),
         model_context_window: None,
@@ -2606,6 +2669,7 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
         phase: Some(phase),
         memory_citation: None,
         delivery: None,
+        questions: None,
     })
 }
 
@@ -2614,7 +2678,7 @@ fn rollout_line_byte_offsets(path: &std::path::Path, ordinal: u64) -> (i64, i64)
     let mut start_byte_offset = 0;
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
         let end_byte_offset = start_byte_offset + line.len();
-        if serde_json::from_slice::<RolloutLine>(line)
+        if codex_rollout::parse_rollout_line_bytes(line)
             .ok()
             .and_then(|line| line.ordinal)
             == Some(ordinal)

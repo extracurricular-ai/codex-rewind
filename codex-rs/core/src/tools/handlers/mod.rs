@@ -22,8 +22,9 @@ mod request_permissions;
 mod request_plugin_install;
 pub(crate) mod request_plugin_install_spec;
 mod request_user_input;
+mod request_user_input_async;
 pub(crate) mod request_user_input_spec;
-mod send_user_message_async;
+mod send_message_to_user_async;
 pub(crate) mod shell_spec;
 mod sleep;
 mod test_sync;
@@ -35,15 +36,16 @@ mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
 
-use codex_sandboxing::policy_transforms::materialize_additional_permissions;
+use codex_file_system::FileSystemSandboxContext;
+use codex_sandboxing::policy_transforms::materialize_additional_permissions_with_context;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
-use codex_sandboxing::policy_transforms::normalize_additional_permissions;
+use codex_sandboxing::policy_transforms::normalize_additional_permissions_with_context;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
-use std::path::Path;
 
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::function_tool::FunctionCallError;
@@ -68,7 +70,8 @@ pub use plan::PlanHandler;
 pub use request_permissions::RequestPermissionsHandler;
 pub use request_plugin_install::RequestPluginInstallHandler;
 pub use request_user_input::RequestUserInputHandler;
-pub use send_user_message_async::SendUserMessageAsyncHandler;
+pub use request_user_input_async::RequestUserInputAsyncHandler;
+pub use send_message_to_user_async::SendMessageToUserAsyncHandler;
 pub use sleep::SleepHandler;
 pub use test_sync::TestSyncHandler;
 pub(crate) use tool_search::ToolSearchHandlerCache;
@@ -181,7 +184,7 @@ pub(crate) fn normalize_and_validate_additional_permissions(
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
     permissions_preapproved: bool,
-    _cwd: &Path,
+    context: &codex_protocol::permissions::FileSystemSandboxPolicyContext<'_>,
 ) -> Result<Option<AdditionalPermissionProfile>, String> {
     let uses_additional_permissions = matches!(
         sandbox_permissions,
@@ -210,7 +213,8 @@ pub(crate) fn normalize_and_validate_additional_permissions(
                     .to_string(),
             );
         };
-        let normalized = normalize_additional_permissions(additional_permissions)?;
+        let normalized =
+            normalize_additional_permissions_with_context(additional_permissions, context)?;
         if normalized.is_empty() {
             return Err(
                 "`additional_permissions` must include at least one requested permission in `network` or `file_system`"
@@ -236,6 +240,15 @@ pub(super) struct EffectiveAdditionalPermissions {
     pub permissions_preapproved: bool,
 }
 
+pub(super) fn file_system_sandbox_policy_context_for_cwd<'a>(
+    sandbox_context: &'a FileSystemSandboxContext,
+    cwd: &'a PathUri,
+) -> codex_protocol::permissions::FileSystemSandboxPolicyContext<'a> {
+    let mut context = sandbox_context.policy_context();
+    context.cwd = cwd;
+    context
+}
+
 pub(super) fn implicit_granted_permissions(
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<&AdditionalPermissionProfile>,
@@ -255,8 +268,8 @@ pub(super) fn implicit_granted_permissions(
 
 pub(super) async fn apply_granted_turn_permissions(
     session: &Session,
-    environment_id: &str,
-    cwd: &Path,
+    environment: &TurnEnvironment,
+    cwd: &PathUri,
     sandbox_permissions: SandboxPermissions,
     additional_permissions: Option<AdditionalPermissionProfile>,
 ) -> EffectiveAdditionalPermissions {
@@ -268,6 +281,7 @@ pub(super) async fn apply_granted_turn_permissions(
         };
     }
 
+    let environment_id = &environment.selection.environment_id;
     let granted_session_permissions = session.granted_session_permissions(environment_id).await;
     let granted_turn_permissions = session.granted_turn_permissions(environment_id).await;
     let granted_permissions = merge_permission_profiles(
@@ -278,13 +292,15 @@ pub(super) async fn apply_granted_turn_permissions(
         additional_permissions.as_ref(),
         granted_permissions.as_ref(),
     );
+    let sandbox_context = environment.sandbox_context(/*additional_permissions*/ None);
+    let context = file_system_sandbox_policy_context_for_cwd(&sandbox_context, cwd);
     let preapproved_permissions = granted_permissions.as_ref().and_then(|granted| {
         if additional_permissions.is_none() {
             Some(granted.clone())
         } else {
             effective_permissions
                 .as_ref()
-                .and_then(|effective| preapproved_permission_profile(effective, granted, cwd))
+                .and_then(|effective| preapproved_permission_profile(effective, granted, &context))
         }
     });
     let permissions_preapproved = preapproved_permissions.is_some();
@@ -309,11 +325,35 @@ pub(super) async fn apply_granted_turn_permissions(
 fn preapproved_permission_profile(
     effective_permissions: &AdditionalPermissionProfile,
     granted_permissions: &AdditionalPermissionProfile,
-    cwd: &Path,
+    context: &codex_protocol::permissions::FileSystemSandboxPolicyContext<'_>,
 ) -> Option<AdditionalPermissionProfile> {
+    if effective_permissions
+        .file_system
+        .as_ref()
+        .is_some_and(|permissions| {
+            permissions.entries.iter().any(|entry| {
+                (matches!(
+                    &entry.path,
+                    codex_protocol::permissions::FileSystemPath::Special {
+                        value: codex_protocol::permissions::FileSystemSpecialPath::Tmpdir,
+                    }
+                ) && context
+                    .temporary_directories
+                    .is_none_or(<[PathUri]>::is_empty))
+                    || matches!(
+                    &entry.path,
+                    codex_protocol::permissions::FileSystemPath::Special {
+                        value: codex_protocol::permissions::FileSystemSpecialPath::ProjectRoots { .. },
+                    } if context.workspace_roots.is_empty()
+                )
+            })
+        })
+    {
+        return None;
+    }
     let (Ok(effective), Ok(granted)) = (
-        materialize_additional_permissions(effective_permissions.clone(), cwd),
-        materialize_additional_permissions(granted_permissions.clone(), cwd),
+        materialize_additional_permissions_with_context(effective_permissions.clone(), context),
+        materialize_additional_permissions_with_context(granted_permissions.clone(), context),
     ) else {
         return None;
     };
@@ -352,12 +392,14 @@ mod tests {
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicyContext;
     use codex_protocol::permissions::FileSystemSpecialPath;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::GranularApprovalConfig;
-    use codex_sandboxing::policy_transforms::intersect_permission_profiles;
+    use codex_sandboxing::policy_transforms::intersect_permission_profiles_with_context;
     use codex_sandboxing::policy_transforms::merge_permission_profiles;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -382,10 +424,20 @@ mod tests {
         }
     }
 
+    fn local_context(cwd: &PathUri) -> FileSystemSandboxPolicyContext<'_> {
+        FileSystemSandboxPolicyContext {
+            cwd,
+            workspace_roots: std::slice::from_ref(cwd),
+            temporary_directories: None,
+            user_home_dir: None,
+        }
+    }
+
     #[test]
     fn preapproved_permissions_work_when_request_permissions_tool_is_enabled_without_exec_permission_approvals_feature()
      {
         let cwd = tempdir().expect("tempdir");
+        let cwd = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
 
         let normalized = normalize_and_validate_additional_permissions(
             /*additional_permissions_allowed*/ false,
@@ -399,7 +451,7 @@ mod tests {
             SandboxPermissions::WithAdditionalPermissions,
             Some(network_permissions()),
             /*permissions_preapproved*/ true,
-            cwd.path(),
+            &local_context(&cwd),
         )
         .expect("preapproved permissions should be allowed");
 
@@ -409,6 +461,7 @@ mod tests {
     #[test]
     fn fresh_additional_permissions_still_require_exec_permission_approvals_feature() {
         let cwd = tempdir().expect("tempdir");
+        let cwd = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
 
         let err = normalize_and_validate_additional_permissions(
             /*additional_permissions_allowed*/ false,
@@ -416,7 +469,7 @@ mod tests {
             SandboxPermissions::WithAdditionalPermissions,
             Some(network_permissions()),
             /*permissions_preapproved*/ false,
-            cwd.path(),
+            &local_context(&cwd),
         )
         .expect_err("fresh inline permission requests should remain disabled");
 
@@ -485,18 +538,79 @@ mod tests {
             }),
             ..Default::default()
         };
-        let stored_grant = intersect_permission_profiles(
+        let cwd_uri = PathUri::from_host_native_path(cwd.path()).expect("cwd URI");
+        let stored_grant = intersect_permission_profiles_with_context(
             requested_permissions.clone(),
             requested_permissions.clone(),
-            cwd.path(),
+            &local_context(&cwd_uri),
         );
         let effective_permissions =
             merge_permission_profiles(Some(&requested_permissions), Some(&stored_grant))
                 .expect("merged permissions");
 
         assert_eq!(
-            preapproved_permission_profile(&effective_permissions, &stored_grant, cwd.path()),
+            preapproved_permission_profile(
+                &effective_permissions,
+                &stored_grant,
+                &local_context(&cwd_uri),
+            ),
             Some(stored_grant)
+        );
+    }
+
+    #[test]
+    fn symbolic_tmpdir_preapproval_requires_executor_metadata() {
+        let cwd = PathUri::parse("file:///C:/workspace").expect("Windows cwd");
+        let temporary_directory = PathUri::parse("file:///C:/Temp").expect("Windows temp dir");
+        let concrete = FileSystemSandboxEntry::new(
+            temporary_directory.clone().into(),
+            FileSystemAccessMode::Write,
+        );
+        let symbolic = FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Tmpdir,
+            },
+            access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
+        };
+        let effective = AdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                entries: vec![concrete.clone(), symbolic],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+        let granted = AdditionalPermissionProfile {
+            file_system: Some(FileSystemPermissions {
+                entries: vec![concrete],
+                glob_scan_max_depth: None,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            preapproved_permission_profile(&effective, &granted, &local_context(&cwd)),
+            None
+        );
+
+        let empty_temporary_directories = [];
+        let empty_tmpdir_context = FileSystemSandboxPolicyContext {
+            temporary_directories: Some(&empty_temporary_directories),
+            ..local_context(&cwd)
+        };
+        assert_eq!(
+            preapproved_permission_profile(&effective, &granted, &empty_tmpdir_context),
+            None
+        );
+
+        let temporary_directories = [temporary_directory];
+        let tmpdir_context = FileSystemSandboxPolicyContext {
+            temporary_directories: Some(&temporary_directories),
+            ..local_context(&cwd)
+        };
+        assert_eq!(
+            preapproved_permission_profile(&effective, &granted, &tmpdir_context),
+            Some(granted)
         );
     }
 }

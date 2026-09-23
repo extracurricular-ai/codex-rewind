@@ -1,9 +1,10 @@
+use super::ApplicationRequirements;
 use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::BrowserUseConfig;
 use super::ComputerUseConfig;
 use super::SandboxMode;
-use super::WindowsSandboxSetupMode;
+use super::WindowsSandboxImplementation;
 use super::shared::default_enabled;
 use crate::JsonSchema;
 use crate::TS;
@@ -11,6 +12,7 @@ use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ToolExposureSurface;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WebSearchToolConfig;
@@ -209,18 +211,40 @@ pub struct AppToolsConfig {
     pub tools: HashMap<String, AppToolConfig>,
 }
 
+/// Approval settings for a connected account within an app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppLinkConfig {
+    pub approvals_reviewer: Option<ApprovalsReviewer>,
+    pub default_tools_approval_mode: Option<AppToolApproval>,
+}
+
+/// Account settings for a single app.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub struct AppLinksConfig {
+    #[serde(default, flatten)]
+    pub links: HashMap<String, AppLinkConfig>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
 pub struct AppConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Additional model-facing surfaces omitted for this connector's tools.
+    pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub destructive_enabled: Option<bool>,
     pub open_world_enabled: Option<bool>,
     pub default_tools_approval_mode: Option<AppToolApproval>,
     pub default_tools_enabled: Option<bool>,
     pub tools: Option<AppToolsConfig>,
+    /// Per-account approval settings keyed by link ID.
+    pub links: Option<AppLinksConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -387,6 +411,13 @@ pub struct ConfigReadResponse {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ConfigRequirements {
+    /// Exact provider selection required by managed policy.
+    pub model_provider: Option<String>,
+    /// Complete required provider definitions, using config.toml field names.
+    pub model_providers: Option<HashMap<String, JsonValue>>,
+    /// Effective login methods after managed, forced-login, and workspace restrictions.
+    /// An empty list permits no login method. Older servers may omit this field.
+    pub allowed_login_methods: Option<Vec<ForcedLoginMethod>>,
     pub cli_auth_credentials_store: Option<CliAuthCredentialsStoreMode>,
     pub chatgpt_base_url: Option<String>,
     pub additional_developer_instructions: Option<String>,
@@ -395,7 +426,7 @@ pub struct ConfigRequirements {
     #[experimental("configRequirements/read.allowedApprovalsReviewers")]
     pub allowed_approvals_reviewers: Option<Vec<ApprovalsReviewer>>,
     pub allowed_sandbox_modes: Option<Vec<SandboxMode>>,
-    pub allowed_windows_sandbox_implementations: Option<Vec<WindowsSandboxSetupMode>>,
+    pub allowed_windows_sandbox_implementations: Option<Vec<WindowsSandboxImplementation>>,
     pub allowed_permission_profiles: Option<BTreeMap<String, bool>>,
     pub default_permissions: Option<String>,
     pub allowed_web_search_modes: Option<Vec<WebSearchMode>>,
@@ -412,6 +443,8 @@ pub struct ConfigRequirements {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[experimental("configRequirements/read.network")]
     pub network: Option<NetworkRequirements>,
+    #[experimental("configRequirements/read.application")]
+    pub application: Option<ApplicationRequirements>,
     pub auto_review: Option<AutoReviewRequirements>,
     pub models: Option<ModelsRequirements>,
     #[schemars(with = "Option<String>")]
@@ -423,7 +456,6 @@ pub struct ConfigRequirements {
     pub check_for_update_on_startup: Option<bool>,
     pub allow_login_shell: Option<bool>,
     pub feedback: Option<FeedbackRequirements>,
-    pub windows_sandbox_private_desktop: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -482,6 +514,7 @@ pub struct ComputerUseRequirements {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct BrowserUseRequirements {
+    pub allow_webmcp: Option<bool>,
     pub allow_history_access: Option<bool>,
     pub disable_auto_review: Option<bool>,
     pub allow_global_persistent_approval: Option<bool>,
@@ -1058,8 +1091,8 @@ pub struct ConfigBatchWriteParams {
     #[ts(optional = nullable)]
     pub expected_version: Option<String>,
     /// When true, hot-reload updated runtime settings into loaded threads after writing.
-    /// Session-static model, reasoning-effort, Plan-mode reasoning-effort, service-tier, and
-    /// personality defaults are not reloaded.
+    /// Session-static model, reasoning-effort, Plan-mode reasoning-effort, and service-tier
+    /// defaults are not reloaded. The deprecated personality setting is also not reloaded.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reload_user_config: bool,
 }

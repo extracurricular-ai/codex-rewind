@@ -1,6 +1,7 @@
 use super::shared::v2_enum_from_core;
 use crate::JsonSchema;
 use crate::TS;
+use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::approvals::ElicitationRequest as CoreElicitationRequest;
 use codex_protocol::items::McpToolCallError as CoreMcpToolCallError;
 use codex_protocol::mcp::CallToolResult as CoreMcpCallToolResult;
@@ -78,7 +79,12 @@ pub struct McpServerStatus {
     pub runtime_status: Option<McpServerConnectionStatus>,
     pub plugin_id: Option<String>,
     pub server_info: Option<McpServerInfo>,
+    /// Capabilities advertised by the initialized MCP server; null when unavailable.
+    pub server_capabilities: Option<serde_json::Value>,
     pub tools: std::collections::HashMap<String, McpTool>,
+    /// Tool discovery failed and no catalog was returned.
+    /// Null when a catalog is returned, including cached or empty catalogs.
+    pub tools_error: Option<String>,
     pub resources: Vec<McpResource>,
     pub resource_templates: Vec<McpResourceTemplate>,
     pub auth_status: McpAuthStatus,
@@ -376,7 +382,7 @@ impl From<rmcp::model::ElicitationAction> for McpServerElicitationAction {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct McpServerElicitationRequestParams {
@@ -390,6 +396,7 @@ pub struct McpServerElicitationRequestParams {
     pub turn_id: Option<String>,
     pub server_name: String,
     #[serde(flatten)]
+    #[experimental(nested)]
     pub request: McpServerElicitationRequest,
     // TODO: When core can correlate an elicitation with an MCP tool call, expose the associated
     // McpToolCall item id here as an optional field. The current core event does not carry that
@@ -741,11 +748,23 @@ pub struct McpElicitationConstOption {
     pub title: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(tag = "mode", rename_all = "camelCase")]
 #[ts(tag = "mode")]
 #[ts(export_to = "v2/")]
 pub enum McpServerElicitationRequest {
+    /// A device-authenticated approval; accepted responses contain the proof in `content`.
+    #[experimental("mcpServer/elicitation/request.userVerification")]
+    #[serde(rename = "openai/userVerification", rename_all = "camelCase")]
+    #[ts(rename = "openai/userVerification", rename_all = "camelCase")]
+    UserVerification {
+        #[serde(rename = "_meta")]
+        #[ts(rename = "_meta")]
+        meta: Option<JsonValue>,
+        title: String,
+        description: String,
+        challenge: String,
+    },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     Form {
@@ -755,9 +774,19 @@ pub enum McpServerElicitationRequest {
         message: String,
         requested_schema: McpElicitationSchema,
     },
+    // TODO(victor): Deprecate once migrated to `openai/elicitation/create`.
     #[serde(rename = "openai/form", rename_all = "camelCase")]
     #[ts(rename = "openai/form", rename_all = "camelCase")]
     OpenAiForm {
+        #[serde(rename = "_meta")]
+        #[ts(rename = "_meta")]
+        meta: Option<JsonValue>,
+        message: String,
+        requested_schema: JsonValue,
+    },
+    #[serde(rename = "openaiForm", rename_all = "camelCase")]
+    #[ts(rename = "openaiForm", rename_all = "camelCase")]
+    OpenAiElicitationForm {
         #[serde(rename = "_meta")]
         #[ts(rename = "_meta")]
         meta: Option<JsonValue>,
@@ -781,6 +810,17 @@ impl TryFrom<CoreElicitationRequest> for McpServerElicitationRequest {
 
     fn try_from(value: CoreElicitationRequest) -> Result<Self, Self::Error> {
         match value {
+            CoreElicitationRequest::UserVerification {
+                meta,
+                title,
+                description,
+                challenge,
+            } => Ok(Self::UserVerification {
+                meta,
+                title,
+                description,
+                challenge,
+            }),
             CoreElicitationRequest::Form {
                 meta,
                 message,
@@ -795,6 +835,15 @@ impl TryFrom<CoreElicitationRequest> for McpServerElicitationRequest {
                 message,
                 requested_schema,
             } => Ok(Self::OpenAiForm {
+                meta,
+                message,
+                requested_schema,
+            }),
+            CoreElicitationRequest::OpenAiElicitationForm {
+                meta,
+                message,
+                requested_schema,
+            } => Ok(Self::OpenAiElicitationForm {
                 meta,
                 message,
                 requested_schema,

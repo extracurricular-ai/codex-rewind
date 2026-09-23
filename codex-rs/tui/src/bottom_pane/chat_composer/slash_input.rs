@@ -177,7 +177,8 @@ impl<'a> SlashInput<'a> {
                 token_activity_command_enabled: self.command_flags.token_activity_command_enabled,
                 service_tier_commands_enabled: self.command_flags.service_tier_commands_enabled,
                 goal_command_enabled: self.command_flags.goal_command_enabled,
-                personality_command_enabled: self.command_flags.personality_command_enabled,
+                voice_command_enabled: self.command_flags.voice_command_enabled,
+                worktrees_enabled: self.command_flags.worktrees_enabled,
                 windows_degraded_sandbox_active: self.command_flags.allow_elevate_sandbox,
                 side_conversation_active: self.command_flags.side_conversation_active,
             },
@@ -206,12 +207,31 @@ pub(super) fn queued_input_action(
 }
 
 impl ChatComposer {
+    pub(super) fn builtin_command_flags(&self) -> BuiltinCommandFlags {
+        BuiltinCommandFlags {
+            collaboration_modes_enabled: self.collaboration_modes_enabled,
+            connectors_enabled: self.connectors_enabled,
+            plugins_command_enabled: self.plugins_command_enabled,
+            token_activity_command_enabled: self.token_activity_command_enabled,
+            service_tier_commands_enabled: self.service_tier_commands_enabled,
+            goal_command_enabled: self.goal_command_enabled,
+            voice_command_enabled: self.voice_command_enabled,
+            worktrees_enabled: self.worktrees_enabled,
+            allow_elevate_sandbox: self.windows_degraded_sandbox_active,
+            side_conversation_active: self.side_conversation_active,
+        }
+    }
+
+    pub fn set_worktrees_enabled(&mut self, enabled: bool) {
+        self.worktrees_enabled = enabled;
+    }
+
     /// Handle key event when the slash-command popup is visible.
     pub(super) fn handle_key_event_with_slash_popup(
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
+        if self.handle_empty_prompt_shortcut(&key_event) {
             return (InputResult::None, true);
         }
         if key_event.code == KeyCode::Esc {
@@ -366,8 +386,11 @@ impl ChatComposer {
                     }
 
                     self.stage_selected_slash_command_history(&sel);
-                    self.draft.textarea.set_text_clearing_elements("");
-                    self.draft.is_bash_mode = false;
+                    if !matches!(sel, CommandItem::Builtin(cmd) if cmd.requires_dispatch_validation())
+                    {
+                        self.draft.textarea.set_text_clearing_elements("");
+                        self.draft.is_bash_mode = false;
+                    }
                     return (
                         match sel {
                             CommandItem::Builtin(cmd) => InputResult::Command(cmd),
@@ -662,6 +685,6 @@ mod tests {
             press(&mut composer, KeyCode::Enter),
             InputResult::Command(SlashCommand::Review)
         );
-        assert!(composer.draft.textarea.is_empty());
+        assert_eq!(composer.draft.textarea.text(), "/review ");
     }
 }

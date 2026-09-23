@@ -1,0 +1,132 @@
+//! Calls the decision extension for each approval and enforces host constraints.
+//! The synchronous service captures one action; no outcome is stored by tool-call ID.
+
+use codex_async_utils::THREAD_STACK_SIZE_BYTES;
+use codex_protocol::protocol::ReviewDecision;
+use std::sync::Arc;
+use tokio::sync::oneshot;
+
+use super::ApprovalRequestReasons;
+use super::GuardianApprovalRequest;
+use super::GuardianReviewContext;
+use super::GuardianReviewOptions;
+use super::runtime::ReviewAction;
+use super::runtime::ReviewRuntime;
+use crate::session::session::Session;
+
+pub(crate) fn spawn_approval_decision(
+    session: Arc<Session>,
+    context: impl Into<GuardianReviewContext>,
+    review_id: String,
+    request: impl Into<super::ReviewAction>,
+    reasons: ApprovalRequestReasons,
+    options: GuardianReviewOptions,
+) -> oneshot::Receiver<Option<ReviewDecision>> {
+    let context: GuardianReviewContext = context.into();
+    let request: ReviewAction = request.into();
+    let (tx, rx) = oneshot::channel();
+    let runtime = session.services.runtime_handle.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("codex-approval-review".to_string())
+        .stack_size(THREAD_STACK_SIZE_BYTES)
+        .spawn(move || {
+            let decision = runtime.block_on(decide_approval(
+                session, context, review_id, request, reasons, options,
+            ));
+            let _ = tx.send(decision);
+        });
+    if let Err(err) = spawn_result {
+        tracing::error!(%err, "failed to spawn automatic approval review worker");
+    }
+    rx
+}
+
+/// `None` requests the existing user flow. No contributor is never an implicit allow.
+pub(crate) async fn decide_approval(
+    session: Arc<Session>,
+    context: impl Into<GuardianReviewContext>,
+    review_id: String,
+    request: impl Into<ReviewAction>,
+    reasons: ApprovalRequestReasons,
+    mut options: GuardianReviewOptions,
+) -> Option<ReviewDecision> {
+    let context = context.into();
+    let request = request.into();
+    let (_, history_reset) = session.history_reset().await;
+    let cancellation = match options.external_cancel.take() {
+        Some(external) => crate::exec::cancel_when_either(external, history_reset.clone()),
+        None => history_reset.child_token(),
+    };
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let turn = context.turn();
+    let live_config = session.get_config().await;
+    let requirements = live_config.config_layer_stack.requirements();
+    let model_requires_review =
+        requirements.auto_review_required_for_model(&context.model_info.slug);
+    let require_guardian = options.require_guardian
+        || model_requires_review
+        || requirements
+            .approvals_reviewer
+            .can_set(&codex_protocol::config_types::ApprovalsReviewer::User)
+            .is_err();
+    let full_access = context.environments().has_full_access(
+        context.approval_policy,
+        &turn.config.permissions.effective_permission_profile(),
+    );
+    let require_synchronous_review = options.require_synchronous_review;
+    let retried = reasons.retry.is_some();
+    let decision = codex_guardian_reviewer::ReviewRequest {
+        host: ReviewRuntime {
+            session: Arc::clone(&session),
+            history_reset: history_reset.clone(),
+            context: context.clone(),
+            request: request.clone(),
+            reasons,
+            options,
+        },
+        approval_id: &review_id,
+        tool_call_id: request
+            .request
+            .as_ref()
+            .ok()
+            .and_then(|request| match request {
+                // Stdin's target is the terminal launch; freshness belongs to this write.
+                GuardianApprovalRequest::WriteStdin { approval_id, .. } => {
+                    Some(approval_id.as_str())
+                }
+                // Intercepts retain the launch ID, not the current triggering call.
+                #[cfg(unix)]
+                GuardianApprovalRequest::Execve { .. } => None,
+                _ => super::approval_request::guardian_request_target_item_id(request),
+            }),
+        action: request.action.as_ref().ok(),
+        thread_id: session.thread_id,
+        thread_store: &session.services.thread_extension_data,
+        category: request.category,
+        approval_policy: context.approval_policy,
+        approvals_reviewer: context.approvals_reviewer,
+        require_guardian,
+        require_synchronous_review,
+        model_requires_review,
+        async_enabled: turn.config.features.enabled(codex_features::Feature::GuardianV2),
+        retried,
+        escalated_exec: matches!(&request.request, Ok(GuardianApprovalRequest::ExecCommand { sandbox_permissions, .. }) if sandbox_permissions.requires_escalated_permissions()),
+        full_access,
+        cancellation: cancellation.clone(),
+        // Keep the existing turn-level reporting policy during this ownership move.
+        model: turn.model_info(),
+        telemetry: &session.services.session_telemetry,
+        analytics: &session.services.analytics_events_client,
+        metrics: Some(crate::session::extension_metrics::from_session_telemetry(
+            turn.session_telemetry.clone(),
+        )),
+    }
+    .decide(&session.services.extensions)
+    .await;
+    // Enforce cancellation after extension callbacks too, including cached decisions.
+    if history_reset.is_cancelled() || cancellation.is_cancelled() {
+        Some(ReviewDecision::Abort)
+    } else {
+        decision
+    }
+}

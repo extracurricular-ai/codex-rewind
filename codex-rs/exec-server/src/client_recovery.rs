@@ -9,6 +9,8 @@ use codex_network_proxy::NetworkDecision;
 use codex_network_proxy::NetworkPolicyDecision;
 use codex_network_proxy::NetworkPolicyRequest;
 use codex_network_proxy::NetworkProtocol;
+use codex_network_proxy::NetworkRequestCancellation;
+use codex_network_proxy::NetworkRequestCancellationReason;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -392,8 +394,8 @@ impl Inner {
         let mut registry_retry_attempt = 0;
         let last_error = loop {
             match timeout_at(deadline, self.resume_once(&session_id)).await {
-                Ok(Ok((rpc_client, _attempt))) => {
-                    if !rpc_client.is_disconnected() && self.install_recovered_client(rpc_client) {
+                Ok(Ok((rpc_client, _attempt, executor_registration_id))) => {
+                    if self.install_recovered_client(rpc_client, executor_registration_id) {
                         return;
                     }
                 }
@@ -442,17 +444,23 @@ impl Inner {
         }
     }
 
-    fn install_recovered_client(&self, rpc_client: Arc<RpcClient>) -> bool {
+    fn install_recovered_client(
+        &self,
+        rpc_client: Arc<RpcClient>,
+        executor_registration_id: Option<String>,
+    ) -> bool {
         let installed = {
             let mut connection = self
                 .connection
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !matches!(connection.status, ConnectionStatus::Recovering)
+            if self.retired.is_cancelled()
+                || !matches!(connection.status, ConnectionStatus::Recovering)
                 || rpc_client.is_disconnected()
             {
                 false
             } else {
+                connection.executor_registration_id = executor_registration_id;
                 connection.set_status(ConnectionStatus::Connected(rpc_client));
                 true
             }
@@ -470,13 +478,23 @@ impl Inner {
     async fn resume_once(
         self: &Arc<Self>,
         session_id: &str,
-    ) -> Result<(Arc<RpcClient>, Option<tokio::sync::OwnedSemaphorePermit>), ExecServerError> {
+    ) -> Result<
+        (
+            Arc<RpcClient>,
+            Option<tokio::sync::OwnedSemaphorePermit>,
+            Option<String>,
+        ),
+        ExecServerError,
+    > {
         let reconnect_strategy = self
             .reconnect_strategy
             .as_ref()
             .ok_or_else(|| ExecServerError::Protocol("missing reconnect strategy".to_string()))?;
         let attempt = reconnect_strategy.resume(session_id).await?;
-        let (connection, options, attempt_permit) = attempt.into_parts();
+        let (connection, options, attempt_permit, noise_context) = attempt.into_parts();
+        let executor_registration_id = noise_context
+            .as_ref()
+            .map(|context| context.executor_registration_id.clone());
         let (rpc_client, events_rx) = RpcClient::new(connection);
         let rpc_client = Arc::new(rpc_client);
         let client = ExecServerClient {
@@ -488,10 +506,12 @@ impl Inner {
         // burst cannot fill the bounded event channel and block the initialize
         // response behind it.
         client.spawn_rpc_reader(&rpc_client, events_rx);
-        client.initialize_rpc(&rpc_client, options).await?;
+        client
+            .initialize_rpc(&rpc_client, options, noise_context)
+            .await?;
 
         self.recover_processes(&rpc_client).await?;
-        Ok((rpc_client, attempt_permit))
+        Ok((rpc_client, attempt_permit, executor_registration_id))
     }
 
     async fn recover_processes(
@@ -524,6 +544,10 @@ impl Inner {
                 Ok(true) => self.remove_session_if(process_id, session),
                 Ok(false) => {}
                 Err(error) => {
+                    session
+                        .network_policy
+                        .cancellation
+                        .record(NetworkRequestCancellationReason::ProcessCancelled);
                     let terminated: Result<TerminateResponse, ExecServerError> = rpc_client
                         .call_for_cleanup(
                             EXEC_TERMINATE_METHOD,
@@ -686,6 +710,10 @@ impl ExecServerClient {
                         let process_cancelled = session
                             .as_ref()
                             .map(|session| session.network_policy.cancelled.clone());
+                        let process_cancellation = session
+                            .as_ref()
+                            .map(|session| session.network_policy.cancellation.clone());
+                        let cancellation = NetworkRequestCancellation::default();
                         let expected_session = session.as_ref().map(Arc::downgrade);
                         let policy_request =
                             (process_id_valid && host_valid).then_some(NetworkPolicyRequest {
@@ -710,6 +738,7 @@ impl ExecServerClient {
                                 exec_policy_hint: None,
                                 execution_id: None,
                                 disconnect: None,
+                                cancellation: Some(cancellation.clone()),
                             });
                         let inner = Arc::downgrade(&inner);
                         let rpc_client = Arc::downgrade(&rpc_client);
@@ -719,18 +748,26 @@ impl ExecServerClient {
                             let _request_guard = request_guard;
                             let decision = match (controller, policy_request, process_cancelled) {
                                 (Some(controller), Some(request), Some(process_cancelled)) => {
-                                    // Core's pending-approval guard makes dropping this
-                                    // future on process removal or deadline fail closed.
+                                    // Keep the decision future outside select/timeout so its
+                                    // guard sees the cancellation cause before it is dropped.
+                                    let mut decision = controller.decider.decide(request);
                                     tokio::select! {
                                         biased;
-                                        _ = connection_cancelled.cancelled() => return,
+                                        _ = connection_cancelled.cancelled() => {
+                                            cancellation.record(NetworkRequestCancellationReason::ConnectionClosed);
+                                            return;
+                                        },
                                         _ = process_cancelled.cancelled() => {
+                                            cancellation.record(process_cancellation.as_ref()
+                                                .and_then(NetworkRequestCancellation::reason)
+                                                .unwrap_or(NetworkRequestCancellationReason::ProcessCancelled));
                                             NetworkDecision::deny(NETWORK_POLICY_DENIAL_REASON)
                                         }
-                                        decision = timeout(
+                                        result = timeout(
                                             controller.timeout,
-                                            controller.decider.decide(request),
-                                        ) => decision.unwrap_or_else(|_| {
+                                            &mut decision,
+                                        ) => result.unwrap_or_else(|_| {
+                                            cancellation.record(NetworkRequestCancellationReason::TimedOut);
                                             NetworkDecision::deny(NETWORK_POLICY_DENIAL_REASON)
                                         }),
                                     }
@@ -818,7 +855,8 @@ pub(crate) fn is_retryable_recovery_error(error: &ExecServerError) -> bool {
     is_transport_closed_error(error)
         || matches!(
             error,
-            ExecServerError::WebSocketConnectTimeout { .. }
+            ExecServerError::ProvisioningFailed(_)
+                | ExecServerError::WebSocketConnectTimeout { .. }
                 | ExecServerError::WebSocketConnect { .. }
                 | ExecServerError::InitializeTimedOut { .. }
         )

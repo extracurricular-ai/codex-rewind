@@ -98,6 +98,7 @@ async fn check_for_update(
     )
     .with_legacy_custom_ca_fallback();
     let latest_version = match action {
+        Some(UpdateAction::Daemon(_)) => return Ok(()),
         Some(UpdateAction::BrewUpgrade) => {
             let HomebrewCaskInfo { version } = client_pool
                 .get(HOMEBREW_CASK_API_URL)
@@ -111,6 +112,7 @@ async fn check_for_update(
         }
         Some(UpdateAction::NpmGlobalLatest)
         | Some(UpdateAction::BunGlobalLatest)
+        | Some(UpdateAction::VitePlusGlobalLatest)
         | Some(UpdateAction::PnpmGlobalLatest) => {
             let latest_version = fetch_latest_github_release_version(&client_pool).await?;
             let package_info = client_pool

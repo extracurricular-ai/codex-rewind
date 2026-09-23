@@ -145,8 +145,8 @@ Seven versions of **one** package, `codex-rewind`:
 
 | version | dist-tag |
 | --- | --- |
-| `0.151.0-rewind.0-linux-x64`, and five more like it | `linux-x64`, … |
-| `0.151.0-rewind.0` — the launcher | `next` |
+| `0.156.1-rewind.0-linux-x64`, and five more like it | `linux-x64`, … |
+| `0.156.1-rewind.0` — the launcher | `next` |
 
 The platform builds are deliberately kept off `latest`. That tag is what a bare
 `npm install` follows, so pointing it at a platform build would hand every
@@ -175,7 +175,7 @@ Promote it once you are satisfied:
 
 ```shell
 npm login                                              # once
-npm dist-tag add codex-rewind@0.151.0-rewind.0 latest
+npm dist-tag add codex-rewind@0.156.1-rewind.0 latest
 npm dist-tag ls codex-rewind                           # confirm
 ```
 

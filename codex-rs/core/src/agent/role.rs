@@ -94,7 +94,6 @@ async fn apply_role_to_config_inner(
                 && let Some(
                     feature @ (Feature::ShellTool
                     | Feature::Apps
-                    | Feature::Personality
                     | Feature::Plugins
                     | Feature::MemoryTool
                     | Feature::RequestPermissionsTool),
@@ -222,10 +221,9 @@ mod role_overrides {
         {
             next_config.include_skill_instructions = false;
         }
-        let personality_changed = config.personality != next_config.personality
-            || config.features.enabled(Feature::Personality)
-                != next_config.features.enabled(Feature::Personality);
-        if personality_changed
+        let strips_baked_personality =
+            |config: &Config| config.personality == Some(Personality::None);
+        if strips_baked_personality(config) != strips_baked_personality(&next_config)
             && matches!(
                 config.base_instructions_provenance,
                 Some(BaseInstructionsProvenance::Model { .. })
@@ -311,11 +309,7 @@ pub(crate) mod spawn_tool_spec {
                     let reasoning_effort = role_toml
                         .get("model_reasoning_effort")
                         .and_then(TomlValue::as_str);
-                    let service_tier = role_toml
-                        .get("service_tier")
-                        .and_then(TomlValue::as_str);
-
-                    let model_and_reasoning_note = match (model, reasoning_effort) {
+                    match (model, reasoning_effort) {
                         (Some(model), Some(reasoning_effort)) => format!(
                             "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
                         ),
@@ -330,15 +324,7 @@ pub(crate) mod spawn_tool_spec {
                             )
                         }
                         (None, None) => String::new(),
-                    };
-                    let service_tier_note = service_tier
-                        .map(|service_tier| {
-                            format!(
-                                "\n- This role's service tier is set to `{service_tier}`. If it is supported by the resolved model, it takes precedence over a valid spawn request service tier."
-                            )
-                        })
-                        .unwrap_or_default();
-                    format!("{model_and_reasoning_note}{service_tier_note}")
+                    }
                 })
                 .unwrap_or_default();
             format!("{name}: {{\n{description}{locked_settings_note}\n}}")
@@ -417,8 +403,8 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        const EXPLORER: &str = include_str!("builtins/explorer.toml");
-        const AWAITER: &str = include_str!("builtins/awaiter.toml");
+        const EXPLORER: &str = include_str!("../../assets/agent/builtins/explorer.toml");
+        const AWAITER: &str = include_str!("../../assets/agent/builtins/awaiter.toml");
         match path.to_str()? {
             "explorer.toml" => Some(EXPLORER),
             "awaiter.toml" => Some(AWAITER),
