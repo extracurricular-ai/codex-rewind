@@ -4,6 +4,7 @@ use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
 use crate::app_server_session::ForkGoalContinuation;
 use crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT;
+use crate::app_server_session::INITIAL_HISTORY_TURN_LIMIT;
 use crate::app_server_session::turn_permissions_overrides;
 use crate::chatwidget::ThreadInputState;
 use crate::chatwidget::ThreadInputStateRestoreMode;
@@ -41,15 +42,19 @@ impl App {
             return;
         }
         if !self.chat_widget.can_retry_safety_buffered_turn(&turn_id) {
-            self.app_event_tx.send(AppEvent::UpdateModel(model));
-            self.app_event_tx.send(AppEvent::UpdateReasoningEffort(Some(
-                ReasoningEffortConfig::Low,
-            )));
             return;
         }
 
         let retry_config = self.chat_widget.config_ref().clone();
         let input_state = self.chat_widget.capture_thread_input_state();
+        if self.pending_server_profiles.contains_key(&thread_id) {
+            self.fail_safety_buffered_branch(
+                input_state,
+                prompt,
+                color_eyre::eyre::eyre!("Wait for permissions to update before forking."),
+            );
+            return;
+        }
 
         let AppCommand::UserTurn {
             items,
@@ -105,12 +110,13 @@ impl App {
                         /*turn_cursor*/ None,
                         /*item_cursor*/ None,
                         /*config*/ None,
+                        /*local_settings*/ None,
                         crate::app_server_session::HistoryHydrationScope::Initial,
                     )
                     .await?;
             } else {
                 let page = app_server
-                    .thread_turns_page(thread_id, /*cursor*/ None)
+                    .thread_turns_page(thread_id, /*cursor*/ None, INITIAL_HISTORY_TURN_LIMIT)
                     .await?;
                 thread.turns = page.data.into_iter().rev().collect();
                 if let Some(turn_index) = thread.turns.iter().position(|turn| turn.id == turn_id) {
@@ -174,13 +180,16 @@ impl App {
         let retry_display = ChatWidget::user_message_display_from_inputs(items);
 
         self.config = retry_config.clone();
+        let selected_profile = self.confirmed_server_profile(thread_id);
         let started = app_server
             .fork_thread_at(
+                &self.local_settings,
                 retry_config,
                 thread_id,
                 /*last_turn_id*/ None,
                 /*before_turn_id*/ Some(turn_id),
                 ForkGoalContinuation::DeferUntilNextTurn,
+                selected_profile.as_ref(),
                 // Safety re-forks replay the same turn; files must not move.
                 /*restore_files*/
                 false,

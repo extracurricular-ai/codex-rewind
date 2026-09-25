@@ -5,6 +5,7 @@ use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::assert_parent_turn;
@@ -13,8 +14,10 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -215,17 +218,37 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         sse(vec![ev_completed("resp-parent-turn-assistant")]),
     )
     .await;
-    for (text, is_subagent) in [(NESTED_CALL_ID, true), (QUEUE_CALL_ID, false)] {
-        mount_sse_once_match(
-            &server,
-            move |request: &wiremock::Request| {
-                body_contains(request, text)
-                    && request_has_input_type(request, "agent_message") == is_subagent
-            },
-            sse(vec![ev_completed("resp-parent-turn-assistant")]),
-        )
+    // The grandchild's completion can arrive during the worker's completion response,
+    // causing one more sampling request to drain that message before the turn ends.
+    let worker_completion = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(|request: &wiremock::Request| {
+            decoded_body(request)
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .is_some_and(|body| {
+                    body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"] == "function_call_output"
+                                && item["call_id"] == NESTED_CALL_ID
+                        })
+                    })
+                })
+        })
+        .respond_with(sse_response(sse(vec![ev_completed(
+            "resp-worker-complete",
+        )])))
+        .expect(1..=2)
+        .mount_as_scoped(&server)
         .await;
-    }
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, QUEUE_CALL_ID)
+                && !request_has_input_type(request, "agent_message")
+        },
+        sse(vec![ev_completed("resp-parent-turn-assistant")]),
+    )
+    .await;
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
@@ -369,6 +392,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     worker_thread.shutdown_and_wait().await?;
     drop(sibling_thread);
     drop(worker_thread);
+    drop(worker_completion);
 
     let followup_args = serde_json::to_string(&json!({
         "target": "worker",
@@ -442,6 +466,27 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
             .is_err()
     );
 
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| request_has_input_type(request, "compaction_trigger"),
+        sse(vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "DURABLE_AGENT_COMPACTION_SUMMARY",
+                }
+            }),
+            ev_completed("resp-durable-agent-compact"),
+        ]),
+    )
+    .await;
+    resumed.codex.submit(Op::Compact).await?;
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
     let redirected_server = start_mock_server().await;
     let redirected_base_url = format!("{}/v1", redirected_server.uri());
     std::fs::write(
@@ -494,6 +539,33 @@ openai_base_url = "{redirected_base_url}"
             && request.body_contains_text("<permission_profile type=\"disabled\">")
             && !request.body_contains_text(SUBAGENT_DEVELOPER_INSTRUCTIONS)
     }));
+    // The worker is loaded again, while its alphabetically earlier sibling remains unloaded.
+    mount_sse_once(
+        &server,
+        sse(vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": { "type": "compaction", "encrypted_content": "LOADED_FIRST_COMPACTION" },
+            }),
+            ev_completed("resp-loaded-first-compact"),
+        ]),
+    )
+    .await;
+    resumed.codex.submit(Op::Compact).await?;
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let roster_request =
+        mount_sse_once(&server, sse(vec![ev_completed("resp-loaded-first-roster")])).await;
+    resumed.submit_turn("inspect the agent roster").await?;
+    assert!(roster_request.single_request().body_contains_text(
+        r#"<subagents>
+    <agent name="/root/worker" />
+    <agent name="/root/survivor" />
+  </subagents>"#
+    ));
+
     let requests = server
         .received_requests()
         .await
@@ -519,6 +591,18 @@ openai_base_url = "{redirected_base_url}"
     let followup_root = body_for(FOLLOWUP_PROMPT, root_thread_id);
     let initial_child = body_for(INITIAL_TASK, worker_thread_id);
     let followup_child = body_for(FOLLOWUP_TASK, worker_thread_id);
+    let roster = queue_root["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .filter_map(|item| item["text"].as_str())
+        .rfind(|text| text.contains("<subagents>"))
+        .expect("post-compaction context should include cold agents");
+    assert!(roster.contains(r#"<agent name="/root/worker" />"#));
+    assert!(roster.contains(r#"<agent name="/root/survivor" />"#));
+    assert!(!roster.contains("grandchild"));
     let initial_parent = initial_root["client_metadata"]["turn_id"]
         .as_str()
         .expect("initial parent turn");

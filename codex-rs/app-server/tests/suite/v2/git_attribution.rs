@@ -17,8 +17,6 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
-use codex_app_server_protocol::ThreadRollbackParams;
-use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -27,7 +25,6 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_rollout::RolloutItem;
-use codex_rollout::RolloutLine;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
@@ -80,7 +77,7 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
             "Recovered",
             "Cached",
             "After switch",
-            "After rollback",
+            "After switching back",
         ]
         .into_iter()
         .map(create_final_assistant_message_sse_response)
@@ -168,14 +165,6 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
     run_turn(&mut app_server, &thread.id, "Turn after workspace switch").await?;
 
     let request_id = app_server
-        .send_thread_rollback_request(ThreadRollbackParams {
-            thread_id: thread.id.clone(),
-            num_turns: 1,
-        })
-        .await?;
-    let _: ThreadRollbackResponse = read_response(&mut app_server, request_id).await?;
-
-    let request_id = app_server
         .send_chatgpt_auth_tokens_login_request(
             "e30.e30.c2ln".to_string(),
             "workspace-enabled".to_string(),
@@ -183,13 +172,13 @@ async fn git_attribution_follows_authenticated_workspace_policy() -> Result<()> 
         )
         .await?;
     let _: LoginAccountResponse = read_response(&mut app_server, request_id).await?;
-    run_turn(&mut app_server, &thread.id, "Turn after rollback").await?;
+    run_turn(&mut app_server, &thread.id, "Turn after switching back").await?;
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 5);
     for (request, expected) in requests
         .into_iter()
-        .zip([(0, 0), (1, 0), (1, 0), (1, 1), (1, 0)])
+        .zip([(0, 0), (1, 0), (1, 0), (1, 1), (2, 1)])
     {
         let developer_text = request.message_input_texts("developer").join("\n");
         assert_eq!(
@@ -334,7 +323,7 @@ fn replace_attribution_fragment_with_legacy(
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let mut line = serde_json::from_str::<RolloutLine>(line)?;
+            let mut line = codex_rollout::parse_rollout_line(line)?;
             if let RolloutItem::ResponseItem(response_item) = &mut line.item
                 && let ResponseItem::Message { role, content, .. } = &mut response_item.item
                 && role == "developer"

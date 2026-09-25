@@ -14,8 +14,10 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+codex-mxc-sandbox = { workspace = true }
 codex-network-proxy = { workspace = true }
 codex-protocol = { workspace = true }
+codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 codex-utils-pty = { workspace = true }
@@ -24,15 +26,17 @@ dunce = { workspace = true }
 libc = { workspace = true }
 serde_json = { workspace = true }
 regex-lite = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true, features = ["log"] }
 url = { workspace = true }
 which = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+codex-otel = { workspace = true }
 codex-utils-home-dir = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

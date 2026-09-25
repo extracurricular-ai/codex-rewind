@@ -44,14 +44,34 @@ pub struct RateLimitResetCreditDetails {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RateLimitsWithResetCredits {
     pub rate_limits: Vec<RateLimitSnapshot>,
+    /// Backend decision for ordinary included usage; absence is not permission to recover.
+    pub ordinary_usage_allowed: Option<bool>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    pub rate_limit_upsell: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub(crate) struct RateLimitStatusWithResetCredits {
     #[serde(flatten)]
     pub rate_limits: RateLimitStatusPayload,
+    // Capture the new optional metadata alongside the generated quota fields until the
+    // backend OpenAPI export includes it. This field owns additional_rate_limits on the wire.
+    pub additional_rate_limits: Option<Vec<AdditionalRateLimitWithNormalModel>>,
     pub rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
+    pub account_id: Option<String>,
+    pub user_id: Option<String>,
+    // Preserve the backend-owned banner contract without making optional UI data break usage.
+    pub rate_limit_upsell: Option<Value>,
+}
+
+/// Additional quota details plus the normal model whose picker metadata should be used.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(crate) struct AdditionalRateLimitWithNormalModel {
+    #[serde(flatten)]
+    pub details: codex_backend_openapi_models::models::AdditionalRateLimitDetails,
+    pub normal_model_slug: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -116,6 +136,11 @@ pub struct AccountsCheckResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AccountEntry {
     pub id: String,
+    /// Current subscription reported by the accounts endpoint, independent of token claims.
+    #[serde(default)]
+    pub plan_type: Option<codex_protocol::account::PlanType>,
+    pub workspace_backend_origin: Option<String>,
+    pub account_routing_override: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -156,6 +181,8 @@ struct ChatGptAccountEntry {
 struct ChatGptAccountInfo {
     account_id: Option<String>,
     #[serde(default)]
+    plan_type: Option<codex_protocol::account::PlanType>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     profile_picture_url: Option<String>,
@@ -178,6 +205,9 @@ impl<'de> Deserialize<'de> for AccountsCheckResponse {
                     let account = accounts.remove(account_id)?.account;
                     Some(AccountEntry {
                         id: account.account_id?,
+                        plan_type: account.plan_type,
+                        workspace_backend_origin: None,
+                        account_routing_override: None,
                         name: account.name,
                         profile_picture_url: account.profile_picture_url,
                         structure: account.structure,

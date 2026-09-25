@@ -67,6 +67,7 @@ impl ThreadMetadataSync {
             created_at: Some(created_at),
             updated_at: Some(created_at),
             source: Some(params.source.clone()),
+            originator: (!params.originator.is_empty()).then(|| params.originator.clone()),
             thread_source: Some(params.thread_source.clone()),
             agent_nickname: Some(params.source.get_nickname()),
             agent_role: Some(params.source.get_agent_role()),
@@ -228,6 +229,9 @@ impl ThreadMetadataSync {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
                     update.source = Some(meta_line.meta.source.clone());
+                    if !meta_line.meta.originator.is_empty() {
+                        update.originator = Some(meta_line.meta.originator.clone());
+                    }
                     update.thread_source = Some(meta_line.meta.thread_source.clone());
                     update.agent_nickname = Some(meta_line.meta.agent_nickname.clone());
                     update.agent_role = Some(meta_line.meta.agent_role.clone());
@@ -305,6 +309,8 @@ impl ThreadMetadataSync {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::RealtimeItem(_)
+                | RolloutItem::TokenUsageRecord(_)
+                | RolloutItem::RetainedContext(_)
                 | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::WorldState(_) => {}
             }
@@ -379,6 +385,7 @@ fn update_has_metadata_facts(update: &ThreadMetadataPatch) -> bool {
         || update.created_at.is_some()
         || update.advance_recency_at.is_some()
         || update.source.is_some()
+        || update.originator.is_some()
         || update.thread_source.is_some()
         || update.agent_nickname.is_some()
         || update.agent_role.is_some()
@@ -434,7 +441,7 @@ mod tests {
     use crate::ThreadPersistenceMetadata;
 
     #[tokio::test]
-    async fn create_without_project_omits_project_patch() {
+    async fn create_metadata_records_originator_without_project() {
         let thread_id = ThreadId::new();
         let sync = ThreadMetadataSync::for_create(&CreateThreadParams {
             session_id: thread_id.into(),
@@ -453,6 +460,7 @@ mod tests {
             history_base: None,
             subagent_history_start_ordinal: None,
             initial_window_id: uuid::Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),
@@ -462,7 +470,10 @@ mod tests {
         .await;
 
         let update = sync.take_pending_update().expect("pending metadata update");
-        assert_eq!(update.patch.project_id, None);
+        assert_eq!(
+            (update.patch.project_id, update.patch.originator.as_deref()),
+            (None, Some("test_originator")),
+        );
     }
 
     #[test]
@@ -486,6 +497,7 @@ mod tests {
             "2025-01-03T12:00:00+00:00"
         );
         assert_eq!(update.patch.preview.as_deref(), Some("hello metadata"));
+        assert_eq!(update.patch.originator.as_deref(), Some("test_originator"));
         assert_eq!(update.patch.title.as_deref(), Some("hello metadata"));
         assert_eq!(
             update.patch.first_user_message.as_deref(),
@@ -582,11 +594,15 @@ mod tests {
         let item = RolloutItem::Compacted(CompactedItem {
             message: "compacted".to_string(),
             replacement_history: None,
+            retained_context: None,
+            guardian_history: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         });
 
         let first = sync
@@ -615,6 +631,7 @@ mod tests {
             .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
                     turn_id: "turn-1".to_string(),
+                    root_turn_id: None,
                     trace_id: None,
                     started_at: None,
                     model_context_window: None,
@@ -638,7 +655,9 @@ mod tests {
 
         let mut item = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
             ThreadSettingsAppliedEvent {
+                thread_id: None,
                 thread_settings: ThreadSettingsSnapshot {
+                    disabled_plugin_ids: Vec::new(),
                     model: "gpt-5.2-codex".to_string(),
                     model_provider_id: "updated-provider".to_string(),
                     service_tier: None,
@@ -647,6 +666,7 @@ mod tests {
                     permission_profile: permission_profile.clone(),
                     active_permission_profile: None,
                     cwd: cwd.clone().try_into().expect("absolute settings cwd"),
+                    runtime_workspace_roots: None,
                     reasoning_effort: Some(ReasoningEffort::Ultra),
                     reasoning_summary: Some(ReasoningSummary::Auto),
                     personality: None,
@@ -810,6 +830,7 @@ mod tests {
                 id: thread_id,
                 timestamp: "2025-01-03T12:00:00Z".to_string(),
                 source: SessionSource::Exec,
+                originator: "test_originator".to_string(),
                 ..Default::default()
             },
             git: None,

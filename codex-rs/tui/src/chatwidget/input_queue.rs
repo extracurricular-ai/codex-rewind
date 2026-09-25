@@ -9,6 +9,7 @@ use super::PendingSteer;
 use super::QueuedUserMessage;
 use super::UserMessage;
 use super::UserMessageHistoryRecord;
+use super::UserMessageSource;
 use super::user_message_preview_text;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -20,6 +21,8 @@ pub(super) struct PendingInputPreview {
 
 #[derive(Debug, Default)]
 pub(super) struct InputQueueState {
+    /// The visible draft confirmed during startup, awaiting the protected-input handoff.
+    pub(super) startup_submission: Option<crate::bottom_pane::ComposerDraftSnapshot>,
     /// User inputs queued while a turn is in progress.
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     /// History records for queued user messages. Slash commands such as `/goal`
@@ -31,6 +34,8 @@ pub(super) struct InputQueueState {
     pub(super) user_turn_pending_start: bool,
     /// User messages that tried to steer a non-regular turn and must be retried first.
     pub(super) rejected_steers_queue: VecDeque<UserMessage>,
+    /// The origin of each rejected steer, kept in lockstep with its message.
+    pub(super) rejected_steer_sources: VecDeque<UserMessageSource>,
     /// History records for rejected steers. Slash commands such as `/goal` can
     /// render history that differs from the text submitted to core, so this stays
     /// in lockstep with `rejected_steers_queue`, with missing entries treated as
@@ -42,6 +47,9 @@ pub(super) struct InputQueueState {
     /// fresh user turn instead of restoring them into the composer.
     pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) suppress_queue_autosend: bool,
+    /// Hold submissions while a usage failure or backend-directed model fallback is resolved.
+    pub(super) rate_limit_recovery_pending: bool,
+    pub(super) recovered_queue: bool,
 }
 
 impl InputQueueState {
@@ -50,13 +58,17 @@ impl InputQueueState {
     }
 
     pub(super) fn clear(&mut self) {
+        self.startup_submission = None;
+        self.recovered_queue = false;
         self.queued_user_messages.clear();
         self.queued_user_message_history_records.clear();
         self.user_turn_pending_start = false;
         self.rejected_steers_queue.clear();
+        self.rejected_steer_sources.clear();
         self.rejected_steer_history_records.clear();
         self.pending_steers.clear();
         self.submit_pending_steers_after_interrupt = false;
+        self.rate_limit_recovery_pending = false;
     }
 
     pub(super) fn preview(&self) -> PendingInputPreview {
@@ -111,8 +123,10 @@ mod tests {
             .rejected_steers_queue
             .push_back(UserMessage::from("rejected"));
         state.pending_steers.push_back(PendingSteer {
+            client_id: "test-submission".to_string(),
             user_message: UserMessage::from("pending"),
             history_record: UserMessageHistoryRecord::UserMessageText,
+            source: UserMessageSource::Prompt,
             compare_key: crate::chatwidget::user_messages::PendingSteerCompareKey {
                 message: "pending".to_string(),
                 image_count: 0,

@@ -2,19 +2,18 @@ use super::super::TextArea;
 use super::VimAction;
 use crate::keymap::KeyChordMatch;
 use crate::keymap::KeyChordMatcher;
-use crate::keymap::KeymapContextSet;
 use crate::keymap::RuntimeKeymap;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
-use tokio::time::Instant;
 
 fn vim_textarea(text: &str, cursor: usize) -> TextArea {
     let mut textarea = TextArea::new();
     textarea.insert_str(text);
     textarea.set_cursor(cursor);
     textarea.set_vim_enabled(/*enabled*/ true);
+    textarea.enable_vim_search();
     textarea
 }
 
@@ -22,18 +21,13 @@ fn keys(textarea: &mut TextArea, keys: &str) {
     let keymap = RuntimeKeymap::defaults();
     let mut matcher = KeyChordMatcher::default();
     for key in keys.chars() {
-        let code = if key == '\n' {
-            KeyCode::Enter
-        } else {
-            KeyCode::Char(key)
+        let code = match key {
+            '\n' => KeyCode::Enter,
+            '\x1b' => KeyCode::Esc,
+            ch => KeyCode::Char(ch),
         };
         let event = KeyEvent::new(code, KeyModifiers::NONE);
-        match matcher.advance(
-            event,
-            &keymap.chords,
-            KeymapContextSet::new(textarea.keymap_context()),
-            Instant::now(),
-        ) {
+        match matcher.advance(event, &keymap.chords, textarea.keymap_contexts()) {
             KeyChordMatch::PassThrough => textarea.input(event),
             KeyChordMatch::Completed(event) => textarea.input(event),
             KeyChordMatch::Pending(_) | KeyChordMatch::Cancelled | KeyChordMatch::Ignored => {}
@@ -74,6 +68,157 @@ fn replace_character_preserves_normal_mode_and_grapheme_boundaries() {
         ));
         assert_eq!(textarea.text(), "a\n@");
     }
+}
+
+#[test]
+fn replace_mode_overwrites_graphemes_and_appends_at_line_end() {
+    let mut textarea = vim_textarea("a👩‍💻c\nnext", /*cursor*/ 1);
+    keys(&mut textarea, "RXY!");
+    assert_eq!(textarea.text(), "aXY!\nnext");
+    assert_eq!(textarea.vim_mode_label(), Some("Replace"));
+    assert_eq!(
+        textarea.keymap_context(),
+        crate::keymap::KeymapContext::Editor
+    );
+
+    escape(&mut textarea);
+    assert_eq!(
+        (textarea.vim_mode_label(), textarea.cursor()),
+        (Some("Normal"), 3)
+    );
+
+    let mut textarea = vim_textarea("abc", /*cursor*/ 0);
+    keys(&mut textarea, "R\nX");
+    assert_eq!(textarea.text(), "\nXbc");
+
+    let mut textarea = vim_textarea("abc def", /*cursor*/ 0);
+    keys(&mut textarea, "R/?nN");
+    assert_eq!(textarea.text(), "/?nNdef");
+    escape(&mut textarea);
+    keys(&mut textarea, "/def\n");
+    assert_eq!(textarea.cursor(), 4);
+}
+
+#[test]
+fn replace_mode_uses_configured_binding_and_respects_unbinding() {
+    let mut textarea = vim_textarea("abc", /*cursor*/ 0);
+    let mut keymap = crate::keymap::RuntimeKeymap::defaults();
+    keymap.vim_normal.enter_replace_mode = vec![crate::key_hint::plain(KeyCode::F(2))];
+    textarea.set_keymap_bindings(&keymap);
+
+    keys(&mut textarea, "R");
+    assert_eq!(textarea.vim_mode_label(), Some("Normal"));
+
+    textarea.input(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+    keys(&mut textarea, "X");
+    assert_eq!(textarea.text(), "Xbc");
+
+    escape(&mut textarea);
+    keymap.vim_normal.enter_replace_mode.clear();
+    textarea.set_keymap_bindings(&keymap);
+    textarea.input(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+    assert_eq!(textarea.vim_mode_label(), Some("Normal"));
+}
+
+#[test]
+fn replace_mode_backspace_restores_original_text() {
+    let mut textarea = vim_textarea("a👩‍💻", /*cursor*/ 0);
+    keys(&mut textarea, "RXYZ");
+    assert_eq!(textarea.text(), "XYZ");
+
+    let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+    for expected in ["XY", "X👩‍💻", "a👩‍💻", "a👩‍💻"] {
+        textarea.input(backspace);
+        assert_eq!(textarea.text(), expected);
+    }
+    assert_eq!(textarea.cursor(), 0);
+
+    let mut textarea = vim_textarea("abcd", /*cursor*/ 0);
+    keys(&mut textarea, "RXY");
+    textarea.input(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    textarea.input(backspace);
+    assert_eq!(textarea.text(), "Ycd");
+
+    let mut textarea = vim_textarea("abé", /*cursor*/ 0);
+    keys(&mut textarea, "RXY");
+    textarea.input(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    textarea.input(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    textarea.input(backspace);
+    assert_eq!(textarea.text(), "");
+    assert_eq!(textarea.vim_mode_label(), Some("Replace"));
+}
+
+#[test]
+fn replace_mode_preserves_atomic_attachments() {
+    for (cursor, command, edited) in [
+        (0, "RXY", "X<image><paste>Y"),
+        (1, "RX", "a<image><paste>X"),
+    ] {
+        let mut textarea = vim_textarea("ab", /*cursor*/ 1);
+        textarea.insert_element("<image>");
+        textarea.insert_element("<paste>");
+        textarea.set_cursor(cursor);
+        let elements = textarea.text_element_snapshots();
+        keys(&mut textarea, command);
+        assert_eq!(textarea.text(), edited);
+        assert_eq!(textarea.text_element_snapshots(), elements);
+        assert!(!textarea.retract_paste_burst(/*start*/ 0));
+        for _ in command.chars().skip(/*n*/ 1) {
+            textarea.input(KeyEvent::from(KeyCode::Backspace));
+        }
+        assert_eq!(
+            (
+                textarea.text(),
+                textarea.cursor(),
+                textarea.text_element_snapshots(),
+            ),
+            ("a<image><paste>b", cursor, elements)
+        );
+        textarea.input(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(
+            textarea.text(),
+            if cursor == 0 {
+                "a<image><paste>b"
+            } else {
+                "<image><paste>b"
+            }
+        );
+        assert_eq!(textarea.element_payloads(), vec!["<image>", "<paste>"]);
+    }
+}
+
+#[test]
+fn replace_mode_replays_with_dot() {
+    let mut textarea = vim_textarea("abc def", /*cursor*/ 0);
+    keys(&mut textarea, "Rx\u{301}");
+    escape(&mut textarea);
+    assert_eq!(textarea.text(), "x\u{301}c def");
+
+    keys(&mut textarea, "w.");
+    assert_eq!(textarea.text(), "x\u{301}c x\u{301}f");
+    assert_eq!(textarea.vim_mode_label(), Some("Normal"));
+
+    let mut textarea = vim_textarea("abc def", /*cursor*/ 0);
+    keys(&mut textarea, "RXY");
+    textarea.input(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    escape(&mut textarea);
+    assert_eq!(textarea.text(), "Xbc def");
+
+    keys(&mut textarea, "w.");
+    assert_eq!(textarea.text(), "Xbc Xef");
+    assert_eq!(textarea.vim_mode_label(), Some("Normal"));
+}
+
+#[test]
+fn replace_mode_overwrites_explicit_paste() {
+    let mut textarea = vim_textarea("abcdef", /*cursor*/ 1);
+    keys(&mut textarea, "R");
+    textarea.insert_str("XYZ");
+    assert_eq!(textarea.text(), "aXYZef");
+    escape(&mut textarea);
+
+    keys(&mut textarea, "0.");
+    assert_eq!(textarea.text(), "XYZZef");
 }
 
 #[test]
@@ -167,7 +312,7 @@ fn repeat_omits_ineffective_deletions_before_inserted_text() {
     ] {
         let mut textarea = vim_textarea("one two\n", cursor);
         keys(&mut textarea, "i");
-        textarea.apply_vim_insert_action(action);
+        textarea.apply_vim_insert_action(action.clone());
         keys(&mut textarea, "X");
         escape(&mut textarea);
         textarea.set_cursor(repeat_cursor);
@@ -619,4 +764,58 @@ fn find_and_navigation_have_visual_snapshot_coverage() {
     gg: alpha beta\ngamma delta
     ^
     "###);
+}
+
+#[test]
+fn search_motions_compose_with_operators_and_repeat() {
+    for (commands, text, cursor, mode) in [
+        ("/b\n", "a b c b d b", 2, "Normal"),
+        ("/b\nn", "a b c b d b", 6, "Normal"),
+        ("/b\nnN", "a b c b d b", 2, "Normal"),
+        ("/b\nnnn", "a b c b d b", 2, "Normal"),
+        ("?b\n", "a b c b d b", 10, "Normal"),
+        ("?b\nn", "a b c b d b", 6, "Normal"),
+        ("?b\nN", "a b c b d b", 2, "Normal"),
+        ("d/b\n", "b c b d b", 0, "Normal"),
+        ("c/b\n", "b c b d b", 0, "Insert"),
+        ("y/b\np", "aa  b c b d b", 3, "Normal"),
+        ("/b\ndn", "a b d b", 2, "Normal"),
+        ("?b\ndN", "a b", 2, "Normal"),
+        ("?b\nd?b\n", "a b c b", 6, "Normal"),
+        ("?b\ny?b\n", "a b c b d b", 6, "Normal"),
+        ("d/missing\n", "a b c b d b", 0, "Normal"),
+        ("/b\nc?missing\x1bn", "a b c b d b", 6, "Normal"),
+        ("c/b\nX\x1bl.", "XXb d b", 1, "Normal"),
+    ] {
+        let mut area = vim_textarea("a b c b d b", /*cursor*/ 0);
+        keys(&mut area, commands);
+        assert_eq!(
+            (area.text(), area.cursor(), area.vim_mode_label()),
+            (text, cursor, Some(mode)),
+            "{commands:?}"
+        );
+    }
+    for (cursor, commands, expected) in [
+        (1, "d/xyz\n", "a\nxyz"),
+        (0, "d/xyz\n", "xyz"),
+        (0, "c/xyz\nQ\x1b", "Q\nxyz"),
+        (1, "c/xyz\nQ\x1b", "aQ\nxyz"),
+        (0, "y/xyz\np", "abc\nabc\nxyz"),
+    ] {
+        let mut area = vim_textarea("abc\nxyz", cursor);
+        keys(&mut area, commands);
+        assert_eq!(area.text(), expected, "{commands:?}");
+    }
+}
+
+#[test]
+fn search_skips_atomic_elements_and_partial_graphemes() {
+    let mut area = vim_textarea("é e\u{301}\n", /*cursor*/ 0);
+    area.insert_element("[photo.png]");
+    keys(&mut area, "/photo\n");
+    assert_eq!(area.cursor(), "[photo.png]".len());
+    keys(&mut area, "/\u{301}\n");
+    assert_eq!(area.cursor(), "[photo.png]".len());
+    keys(&mut area, "/e\u{301}\n");
+    assert_eq!(area.cursor(), "[photo.png]é ".len());
 }

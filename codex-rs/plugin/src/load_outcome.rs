@@ -95,7 +95,7 @@ pub fn prompt_safe_plugin_description(description: Option<&str>) -> Option<Strin
 
 /// Runtime view of loaded plugins and their derived capability summaries.
 ///
-/// Callers must apply any runtime capability policies before constructing this outcome.
+/// Runtime exclusions retain loaded metadata while removing derived capabilities.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginLoadOutcome<M> {
     plugins: Vec<LoadedPlugin<M>>,
@@ -118,6 +118,19 @@ impl<M: Clone> PluginLoadOutcome<M> {
             plugins,
             capability_summaries,
         }
+    }
+
+    /// Marks matching canonical plugin IDs inactive while retaining their loaded metadata.
+    pub fn without_plugins(mut self, disabled_plugin_ids: &[String]) -> Self {
+        if disabled_plugin_ids.is_empty() {
+            return self;
+        }
+        for plugin in &mut self.plugins {
+            if disabled_plugin_ids.contains(&plugin.config_name) {
+                plugin.enabled = false;
+            }
+        }
+        Self::from_plugins(self.plugins)
     }
 
     pub fn effective_plugin_skill_roots(&self) -> Vec<PluginSkillRoot> {
@@ -169,19 +182,27 @@ impl<M: Clone> PluginLoadOutcome<M> {
     }
 
     pub fn effective_plugin_hook_sources(&self) -> Vec<PluginHookSource> {
+        self.iter_effective_plugin_hook_sources().cloned().collect()
+    }
+
+    pub fn iter_effective_plugin_hook_sources(&self) -> impl Iterator<Item = &PluginHookSource> {
         self.plugins
             .iter()
             .filter(|plugin| plugin.is_active())
-            .flat_map(|plugin| plugin.hook_sources.iter().cloned())
-            .collect()
+            .flat_map(|plugin| plugin.hook_sources.iter())
     }
 
     pub fn effective_plugin_hook_warnings(&self) -> Vec<String> {
+        self.iter_effective_plugin_hook_warnings()
+            .cloned()
+            .collect()
+    }
+
+    pub fn iter_effective_plugin_hook_warnings(&self) -> impl Iterator<Item = &String> {
         self.plugins
             .iter()
             .filter(|plugin| plugin.is_active())
-            .flat_map(|plugin| plugin.hook_load_warnings.iter().cloned())
-            .collect()
+            .flat_map(|plugin| plugin.hook_load_warnings.iter())
     }
 
     pub fn capability_summaries(&self) -> &[PluginCapabilitySummary] {

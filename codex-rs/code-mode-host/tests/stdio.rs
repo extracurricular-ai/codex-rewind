@@ -174,9 +174,13 @@ fn execute_request(source: &str) -> ExecuteRequest {
     }
 }
 
-async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) -> RuntimeResponse {
+async fn execute(
+    session: &Arc<dyn CodeModeSession>,
+    request: ExecuteRequest,
+    delegate: Arc<dyn CodeModeSessionDelegate>,
+) -> RuntimeResponse {
     session
-        .execute(request)
+        .execute(request, delegate.clone())
         .await
         .expect("start execution")
         .initial_response()
@@ -187,8 +191,12 @@ async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) ->
 async fn execute_to_terminal(
     session: &Arc<dyn CodeModeSession>,
     request: ExecuteRequest,
+    delegate: Arc<dyn CodeModeSessionDelegate>,
 ) -> RuntimeResponse {
-    let started = session.execute(request).await.expect("start execution");
+    let started = session
+        .execute(request, delegate.clone())
+        .await
+        .expect("start execution");
     let mut response = started.initial_response().await.expect("initial response");
     loop {
         match response {
@@ -227,51 +235,52 @@ async fn session_execution_limits_are_isolated_on_a_shared_process_host() {
             codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
         ));
     let limited = provider
-        .create_session_with_limits(
-            Arc::new(RecordingDelegate::default()),
-            CodeModeSessionCellExecutionLimits {
-                max_yield_time_ms: Some(1),
-                max_heap_size_bytes: None,
-            },
-        )
+        .create_session_with_limits(CodeModeSessionCellExecutionLimits {
+            max_yield_time_ms: Some(1),
+            max_heap_size_bytes: None,
+        })
         .await
         .expect("create limited session");
     let other = provider
-        .create_session_with_limits(
-            Arc::new(RecordingDelegate::default()),
-            CodeModeSessionCellExecutionLimits {
-                max_yield_time_ms: Some(1_000),
-                max_heap_size_bytes: None,
-            },
-        )
+        .create_session_with_limits(CodeModeSessionCellExecutionLimits {
+            max_yield_time_ms: Some(1_000),
+            max_heap_size_bytes: None,
+        })
         .await
         .expect("create independently limited session");
 
     let response = tokio::time::timeout(
         Duration::from_secs(5),
-        execute(&limited, execute_request("await new Promise(() => {});")),
+        execute(
+            &limited,
+            execute_request("await new Promise(() => {});"),
+            Arc::new(RecordingDelegate::default()),
+        ),
     )
     .await
     .expect("session limit should bound the default execution wait");
     assert_eq!(
         response,
         RuntimeResponse::Yielded {
+            code_mode_host_duration: response.code_mode_host_duration(),
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         }
     );
+    let actual = tokio::time::timeout(
+        Duration::from_secs(5),
+        limited.wait(WaitRequest {
+            cell_id: cell_id("1"),
+            yield_time_ms: 60_000,
+        }),
+    )
+    .await
+    .expect("session limit should bound explicit waits")
+    .expect("wait for yielded cell");
     assert_eq!(
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            limited.wait(WaitRequest {
-                cell_id: cell_id("1"),
-                yield_time_ms: 60_000,
-            }),
-        )
-        .await
-        .expect("session limit should bound explicit waits")
-        .expect("wait for yielded cell"),
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
@@ -294,14 +303,22 @@ async fn remote_session_persists_values_forwards_delegates_and_controls_cells() 
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
     let delegate = Arc::new(RecordingDelegate::default());
+    let first_delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .expect("create remote session");
 
+    let actual = execute(
+        &session,
+        execute_request(r#"store("key", "persisted");"#),
+        first_delegate.clone(),
+    )
+    .await;
     assert_eq!(
-        execute(&session, execute_request(r#"store("key", "persisted");"#),).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: None,
@@ -324,9 +341,11 @@ text(result.value);
         input_schema: None,
         output_schema: None,
     }];
+    let actual = execute(&session, callback_request, delegate.clone()).await;
     assert_eq!(
-        execute(&session, callback_request).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "output".to_string(),
@@ -352,32 +371,38 @@ text(result.value);
     let mut pending_request = execute_request("await new Promise(() => {});");
     pending_request.tool_call_id = "call-3".to_string();
     pending_request.yield_time_ms = Some(1);
+    let actual = execute(&session, pending_request, delegate.clone()).await;
     assert_eq!(
-        execute(&session, pending_request).await,
+        actual,
         RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("3"),
             content_items: Vec::new(),
         }
     );
+    let actual = session
+        .wait(WaitRequest {
+            cell_id: cell_id("3"),
+            yield_time_ms: 1,
+        })
+        .await
+        .expect("wait for cell");
     assert_eq!(
-        session
-            .wait(WaitRequest {
-                cell_id: cell_id("3"),
-                yield_time_ms: 1,
-            })
-            .await
-            .expect("wait for cell"),
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("3"),
             content_items: Vec::new(),
         })
     );
+    let actual = session
+        .terminate(cell_id("3"))
+        .await
+        .expect("terminate cell");
     assert_eq!(
-        session
-            .terminate(cell_id("3"))
-            .await
-            .expect("terminate cell"),
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("3"),
             content_items: Vec::new(),
         })
@@ -386,7 +411,14 @@ text(result.value);
     session.shutdown().await.expect("shutdown remote session");
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),
-        vec![cell_id("1"), cell_id("2"), cell_id("3")]
+        vec![cell_id("2"), cell_id("3")]
+    );
+    assert_eq!(
+        *first_delegate
+            .closed_cells
+            .lock()
+            .expect("closed cells lock"),
+        vec![cell_id("1")]
     );
 }
 
@@ -396,16 +428,21 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
     let session = provider
-        .create_session(Arc::new(RecordingDelegate::default()))
+        .create_session()
         .await
         .expect("create remote session");
     let mut request = execute_request("await new Promise(() => {});");
     request.yield_time_ms = Some(1);
-    let started = session.execute(request).await.expect("start execution");
+    let started = session
+        .execute(request, Arc::new(RecordingDelegate::default()))
+        .await
+        .expect("start execution");
     let running_cell_id = started.cell_id.clone();
+    let actual = started.initial_response().await.expect("initial response");
     assert_eq!(
-        started.initial_response().await.expect("initial response"),
+        actual,
         RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: running_cell_id.clone(),
             content_items: Vec::new(),
         }
@@ -425,18 +462,20 @@ async fn dropping_long_wait_releases_observer_before_next_wait() {
     first_wait.abort();
     let _ = first_wait.await;
 
+    let actual = tokio::time::timeout(
+        Duration::from_secs(2),
+        session.wait(WaitRequest {
+            cell_id: running_cell_id.clone(),
+            yield_time_ms: 1,
+        }),
+    )
+    .await
+    .expect("second wait timeout")
+    .expect("second wait");
     assert_eq!(
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            session.wait(WaitRequest {
-                cell_id: running_cell_id.clone(),
-                yield_time_ms: 1,
-            })
-        )
-        .await
-        .expect("second wait timeout")
-        .expect("second wait"),
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: running_cell_id.clone(),
             content_items: Vec::new(),
         })
@@ -455,7 +494,7 @@ async fn unawaited_slow_tool_is_cancelled_after_parallel_tools_complete() {
     );
     let (delegate, mut events_rx) = CancellationDelegate::new();
     let session = provider
-        .create_session(delegate.clone())
+        .create_session()
         .await
         .expect("create remote session");
     let mut request = execute_request(
@@ -491,11 +530,16 @@ return;
     })
     .collect();
 
-    let started = session.execute(request).await.expect("start execution");
+    let started = session
+        .execute(request, delegate.clone())
+        .await
+        .expect("start execution");
     let running_cell_id = started.cell_id.clone();
+    let actual = started.initial_response().await.expect("initial response");
     assert_eq!(
-        started.initial_response().await.expect("initial response"),
+        actual,
         RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: running_cell_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "hello world".to_string(),
@@ -544,12 +588,14 @@ return;
             CallbackEvent::CellClosed(running_cell_id.clone()),
         ]
     );
+    let actual = wait_task
+        .await
+        .expect("wait task")
+        .expect("wait for terminal response");
     assert_eq!(
-        wait_task
-            .await
-            .expect("wait task")
-            .expect("wait for terminal response"),
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: running_cell_id,
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "hello".to_string(),
@@ -566,11 +612,14 @@ async fn oversized_execute_request_does_not_close_the_shared_host() {
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
     let session = provider
-        .create_session(Arc::new(RecordingDelegate::default()))
+        .create_session()
         .await
         .expect("create remote session");
     let error = session
-        .execute(execute_request(&"x".repeat(MAX_FRAME_BYTES)))
+        .execute(
+            execute_request(&"x".repeat(MAX_FRAME_BYTES)),
+            Arc::new(RecordingDelegate::default()),
+        )
         .await
         .err()
         .expect("oversized execute should fail");
@@ -579,9 +628,16 @@ async fn oversized_execute_request_does_not_close_the_shared_host() {
         "unexpected error: {error}"
     );
 
+    let actual = execute(
+        &session,
+        execute_request(r#"text("still alive");"#),
+        Arc::new(RecordingDelegate::default()),
+    )
+    .await;
     assert_eq!(
-        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
@@ -598,7 +654,7 @@ async fn oversized_delegate_payloads_fail_only_the_tool_call() {
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
     let session = provider
-        .create_session(Arc::new(OversizedResultDelegate))
+        .create_session()
         .await
         .expect("create remote session");
     let tool = |name: &str| ToolDefinition {
@@ -621,9 +677,16 @@ try {{
     ));
     oversized_argument.enabled_tools = vec![tool("big_argument")];
     oversized_argument.yield_time_ms = Some(60_000);
+    let actual = execute_to_terminal(
+        &session,
+        oversized_argument,
+        Arc::new(OversizedResultDelegate),
+    )
+    .await;
     assert_eq!(
-        execute_to_terminal(&session, oversized_argument).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "argument rejected".to_string(),
@@ -643,9 +706,16 @@ try {
     );
     oversized_result.enabled_tools = vec![tool("big_result")];
     oversized_result.yield_time_ms = Some(60_000);
+    let actual = execute_to_terminal(
+        &session,
+        oversized_result,
+        Arc::new(OversizedResultDelegate),
+    )
+    .await;
     assert_eq!(
-        execute_to_terminal(&session, oversized_result).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "result rejected".to_string(),
@@ -654,9 +724,16 @@ try {
         }
     );
 
+    let actual = execute(
+        &session,
+        execute_request(r#"text("still alive");"#),
+        Arc::new(OversizedResultDelegate),
+    )
+    .await;
     assert_eq!(
-        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("3"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
@@ -673,13 +750,14 @@ async fn oversized_initial_response_does_not_close_the_shared_host() {
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
     let session = provider
-        .create_session(Arc::new(RecordingDelegate::default()))
+        .create_session()
         .await
         .expect("create remote session");
     let started = session
-        .execute(execute_request(&format!(
-            r#"text("x".repeat({MAX_FRAME_BYTES}));"#
-        )))
+        .execute(
+            execute_request(&format!(r#"text("x".repeat({MAX_FRAME_BYTES}));"#)),
+            Arc::new(RecordingDelegate::default()),
+        )
         .await
         .expect("start oversized response");
     let error = started
@@ -691,9 +769,16 @@ async fn oversized_initial_response_does_not_close_the_shared_host() {
         "unexpected error: {error}"
     );
 
+    let actual = execute(
+        &session,
+        execute_request(r#"text("still alive");"#),
+        Arc::new(RecordingDelegate::default()),
+    )
+    .await;
     assert_eq!(
-        execute(&session, execute_request(r#"text("still alive");"#)).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "still alive".to_string(),
@@ -732,11 +817,11 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
     delegate_a.hold_slow_cleanup();
     let delegate_b = Arc::new(RecordingDelegate::default());
     let session_a = provider
-        .create_session(delegate_a.clone())
+        .create_session()
         .await
         .expect("create first remote session");
     let session_b = provider
-        .create_session(delegate_b.clone())
+        .create_session()
         .await
         .expect("create second remote session");
 
@@ -751,16 +836,18 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
         output_schema: None,
     }];
     let started_a = session_a
-        .execute(request_a)
+        .execute(request_a, delegate_a.clone())
         .await
         .expect("start first cell");
     let cell_a = started_a.cell_id.clone();
+    let actual = started_a
+        .initial_response()
+        .await
+        .expect("first initial response");
     assert_eq!(
-        started_a
-            .initial_response()
-            .await
-            .expect("first initial response"),
+        actual,
         RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_a.clone(),
             content_items: Vec::new(),
         }
@@ -773,16 +860,18 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
     let mut request_b = execute_request("await new Promise(() => {});");
     request_b.yield_time_ms = Some(1);
     let started_b = session_b
-        .execute(request_b)
+        .execute(request_b, delegate_b.clone())
         .await
         .expect("start second cell");
     let cell_b = started_b.cell_id.clone();
+    let actual = started_b
+        .initial_response()
+        .await
+        .expect("second initial response");
     assert_eq!(
-        started_b
-            .initial_response()
-            .await
-            .expect("second initial response"),
+        actual,
         RuntimeResponse::Yielded {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_b.clone(),
             content_items: Vec::new(),
         }
@@ -864,9 +953,16 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
     .await
     .expect("unrelated session cleanup timeout");
 
+    let actual = execute(
+        &session_b,
+        execute_request(r#"text("replacement");"#),
+        delegate_b.clone(),
+    )
+    .await;
     assert_eq!(
-        execute(&session_b, execute_request(r#"text("replacement");"#)).await,
+        actual,
         RuntimeResponse::Result {
+            code_mode_host_duration: actual.code_mode_host_duration(),
             cell_id: cell_id("g2:1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "replacement".to_string(),

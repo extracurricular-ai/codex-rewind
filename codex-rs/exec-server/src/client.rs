@@ -13,6 +13,8 @@ use arc_swap::ArcSwapOption;
 use codex_exec_server_protocol::JSONRPCNotification;
 use codex_network_proxy::NetworkPolicyDecider;
 use codex_network_proxy::NetworkProxyAuditMetadata;
+use codex_network_proxy::NetworkRequestCancellation;
+use codex_network_proxy::NetworkRequestCancellationReason;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -118,6 +120,16 @@ use crate::protocol::SignalParams;
 use crate::protocol::SignalResponse;
 use crate::protocol::TerminateParams;
 use crate::protocol::TerminateResponse;
+use crate::protocol::WireFsCanonicalizeParams;
+use crate::protocol::WireFsCopyParams;
+use crate::protocol::WireFsCreateDirectoryParams;
+use crate::protocol::WireFsGetMetadataParams;
+use crate::protocol::WireFsOpenParams;
+use crate::protocol::WireFsReadDirectoryParams;
+use crate::protocol::WireFsReadFileParams;
+use crate::protocol::WireFsRemoveParams;
+use crate::protocol::WireFsWalkParams;
+use crate::protocol::WireFsWriteFileParams;
 use crate::protocol::WriteParams;
 use crate::protocol::WriteResponse;
 use crate::rpc::RpcCallError;
@@ -129,6 +141,9 @@ use codex_http_client::HttpClientFactory;
 pub(crate) mod accepted;
 pub(crate) mod http_client;
 mod network_policy_audit;
+#[cfg(test)]
+#[path = "../tests/unit/client_provisioning_tests.rs"]
+mod provisioning_tests;
 #[path = "client_recovery.rs"]
 mod recovery;
 #[path = "client_refresh.rs"]
@@ -208,6 +223,7 @@ pub(crate) struct SessionState {
 struct NetworkPolicyState {
     controller: ArcSwapOption<NetworkPolicyDecisionController>,
     cancelled: CancellationToken,
+    cancellation: NetworkRequestCancellation,
     audit: Option<NetworkPolicyAuditContext>,
 }
 
@@ -275,6 +291,8 @@ struct Inner {
 
 struct ConnectionState {
     status: ConnectionStatus,
+    // Publish registration renewal together with the recovered transport.
+    executor_registration_id: Option<String>,
     active_process_starts: usize,
     environment_connection_state_tx: watch::Sender<EnvironmentConnectionState>,
 }
@@ -323,6 +341,17 @@ enum RecoveryPolicy {
 pub struct ExecServerClient {
     inner: Arc<Inner>,
     recovery_policy: RecoveryPolicy,
+}
+
+/// State carried from a Noise readiness wait into the initialize RPC.
+///
+/// The span preserves the existing logical initialize operation while
+/// `timeout_for_error` keeps diagnostics tied to the caller's configured
+/// budget after readiness has consumed part of that budget.
+pub(crate) struct NoiseInitializeContext {
+    pub(crate) executor_registration_id: String,
+    pub(crate) span: tracing::Span,
+    pub(crate) timeout_for_error: Duration,
 }
 
 struct ActiveProcessStart {
@@ -426,6 +455,13 @@ impl LazyRemoteExecServerClient {
     }
 
     pub(crate) async fn status(&self) -> crate::EnvironmentObservedStatus {
+        if let Some(ExecServerTransportParams::Deferred(deferred)) = &self.transport_params
+            && let Some(Err(error)) = deferred.readiness.borrow().as_ref()
+        {
+            return crate::EnvironmentObservedStatus::Disconnected {
+                error: ExecServerError::ProvisioningFailed(error.clone()).to_string(),
+            };
+        }
         // Fail-fast lookup preserves the non-mutating contract: never start or recover a client.
         let client = match self.fail_fast().get().await {
             Ok(client) => client,
@@ -498,23 +534,34 @@ impl LazyRemoteExecServerClient {
     }
 
     async fn initial_client(&self) -> Result<ExecServerClient, ExecServerError> {
-        if self.can_reconnect()
+        let result = if self.can_reconnect()
             && (self.startup.cancelled.is_cancelled()
                 || self.startup.result.get().is_some_and(|result| {
                     result
                         .as_ref()
                         .is_err_and(|error| recovery::is_retryable_recovery_error(error))
-                }))
+                })) {
+            Box::pin(self.reconnect()).await
+        } else {
+            self.startup
+                .result
+                .get_or_init(|| self.connect_once(&self.startup))
+                .await
+                .clone()
+                .map_err(ExecServerError::ConnectionAttempt)
+        };
+        // Ready may arrive before an older attempt publishes its provisioning failure.
+        if let Err(ExecServerError::ConnectionAttempt(error)) = &result
+            && matches!(error.as_ref(), ExecServerError::ProvisioningFailed(_))
+            && matches!(
+                &self.transport_params,
+                Some(ExecServerTransportParams::Deferred(deferred))
+                    if matches!(*deferred.readiness.borrow(), Some(Ok(())))
+            )
         {
             return Box::pin(self.reconnect()).await;
         }
-
-        self.startup
-            .result
-            .get_or_init(|| self.connect_once(&self.startup))
-            .await
-            .clone()
-            .map_err(ExecServerError::ConnectionAttempt)
+        result
     }
 
     async fn reconnect(&self) -> Result<ExecServerClient, ExecServerError> {
@@ -552,6 +599,11 @@ impl LazyRemoteExecServerClient {
     fn connected_client(&self) -> Option<ExecServerClient> {
         self.cached_client()
             .filter(|client| !client.is_disconnected())
+    }
+
+    pub(crate) fn cached_executor_registration_id(&self) -> Option<String> {
+        self.cached_client()
+            .and_then(|client| client.executor_registration_id())
     }
 
     fn cached_client(&self) -> Option<ExecServerClient> {
@@ -618,6 +670,8 @@ pub enum ExecServerError {
     Closed,
     #[error("{0}")]
     Disconnected(String),
+    #[error("environment unavailable: {0}")]
+    ProvisioningFailed(String),
     #[error("failed to serialize or deserialize exec-server JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("HTTP request failed: {0}")]
@@ -647,6 +701,15 @@ pub enum ExecServerError {
 }
 
 impl ExecServerClient {
+    fn executor_registration_id(&self) -> Option<String> {
+        self.inner
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .executor_registration_id
+            .clone()
+    }
+
     fn attach_environment_connection_state(
         &self,
         state_tx: watch::Sender<EnvironmentConnectionState>,
@@ -698,23 +761,41 @@ impl ExecServerClient {
         &self,
         rpc_client: &RpcClient,
         options: ExecServerClientConnectOptions,
+        noise_context: Option<NoiseInitializeContext>,
     ) -> Result<InitializeResponse, ExecServerError> {
         let ExecServerClientConnectOptions {
             client_name,
             initialize_timeout,
             resume_session_id,
         } = options;
+        let timeout_for_error = noise_context
+            .as_ref()
+            .map_or(initialize_timeout, |context| context.timeout_for_error);
 
         timeout(initialize_timeout, async {
-            let response: InitializeResponse = rpc_client
-                .call(
-                    INITIALIZE_METHOD,
-                    &InitializeParams {
-                        client_name,
-                        resume_session_id,
-                    },
-                )
-                .await?;
+            let params = InitializeParams {
+                client_name,
+                resume_session_id,
+            };
+            let response: InitializeResponse = if let Some(noise_context) = noise_context {
+                // This is the one RPC whose wire method and trace operation
+                // intentionally differ: preserve the compatibility initialize
+                // parent while measuring only the actual RPC as initialize_rpc.
+                let initialize_rpc_span = tracing::info_span!(
+                    parent: &noise_context.span,
+                    "codex.exec_server.remote.initialize_rpc",
+                    otel.kind = "client",
+                    otel.name = "codex.exec_server.remote.initialize_rpc",
+                );
+                let response = rpc_client
+                    .call_untraced(INITIALIZE_METHOD, &params)
+                    .instrument(initialize_rpc_span)
+                    .await;
+                drop(noise_context);
+                response?
+            } else {
+                rpc_client.call(INITIALIZE_METHOD, &params).await?
+            };
             let session_id = self
                 .inner
                 .session_id
@@ -732,7 +813,7 @@ impl ExecServerClient {
         })
         .await
         .map_err(|_| ExecServerError::InitializeTimedOut {
-            timeout: initialize_timeout,
+            timeout: timeout_for_error,
         })?
     }
 
@@ -826,6 +907,13 @@ impl ExecServerClient {
         &self,
         process_id: &ProcessId,
     ) -> Result<TerminateResponse, ExecServerError> {
+        // A close notification may arrive before the termination response.
+        if let Some(session) = self.inner.get_session(process_id) {
+            session
+                .network_policy
+                .cancellation
+                .record(NetworkRequestCancellationReason::ProcessCancelled);
+        }
         self.call_for_cleanup(
             EXEC_TERMINATE_METHOD,
             &TerminateParams {
@@ -839,11 +927,13 @@ impl ExecServerClient {
         &self,
         params: FsReadFileParams,
     ) -> Result<FsReadFileResponse, ExecServerError> {
-        self.call(FS_READ_FILE_METHOD, &params).await
+        self.call(FS_READ_FILE_METHOD, &WireFsReadFileParams::from(params))
+            .await
     }
 
     pub async fn fs_open(&self, params: FsOpenParams) -> Result<FsOpenResponse, ExecServerError> {
-        self.call(FS_OPEN_METHOD, &params).await
+        self.call(FS_OPEN_METHOD, &WireFsOpenParams::from(params))
+            .await
     }
 
     pub async fn fs_read_block(
@@ -864,50 +954,70 @@ impl ExecServerClient {
         &self,
         params: FsWriteFileParams,
     ) -> Result<FsWriteFileResponse, ExecServerError> {
-        self.call(FS_WRITE_FILE_METHOD, &params).await
+        self.call(FS_WRITE_FILE_METHOD, &WireFsWriteFileParams::from(params))
+            .await
     }
 
     pub async fn fs_create_directory(
         &self,
         params: FsCreateDirectoryParams,
     ) -> Result<FsCreateDirectoryResponse, ExecServerError> {
-        self.call(FS_CREATE_DIRECTORY_METHOD, &params).await
+        self.call(
+            FS_CREATE_DIRECTORY_METHOD,
+            &WireFsCreateDirectoryParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_get_metadata(
         &self,
         params: FsGetMetadataParams,
     ) -> Result<FsGetMetadataResponse, ExecServerError> {
-        self.call(FS_GET_METADATA_METHOD, &params).await
+        self.call(
+            FS_GET_METADATA_METHOD,
+            &WireFsGetMetadataParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_canonicalize(
         &self,
         params: FsCanonicalizeParams,
     ) -> Result<FsCanonicalizeResponse, ExecServerError> {
-        self.call(FS_CANONICALIZE_METHOD, &params).await
+        self.call(
+            FS_CANONICALIZE_METHOD,
+            &WireFsCanonicalizeParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_read_directory(
         &self,
         params: FsReadDirectoryParams,
     ) -> Result<FsReadDirectoryResponse, ExecServerError> {
-        self.call(FS_READ_DIRECTORY_METHOD, &params).await
+        self.call(
+            FS_READ_DIRECTORY_METHOD,
+            &WireFsReadDirectoryParams::from(params),
+        )
+        .await
     }
 
     pub async fn fs_walk(&self, params: FsWalkParams) -> Result<FsWalkResponse, ExecServerError> {
-        self.call(FS_WALK_METHOD, &params).await
+        self.call(FS_WALK_METHOD, &WireFsWalkParams::from(params))
+            .await
     }
 
     pub async fn fs_remove(
         &self,
         params: FsRemoveParams,
     ) -> Result<FsRemoveResponse, ExecServerError> {
-        self.call(FS_REMOVE_METHOD, &params).await
+        self.call(FS_REMOVE_METHOD, &WireFsRemoveParams::from(params))
+            .await
     }
 
     pub async fn fs_copy(&self, params: FsCopyParams) -> Result<FsCopyResponse, ExecServerError> {
-        self.call(FS_COPY_METHOD, &params).await
+        self.call(FS_COPY_METHOD, &WireFsCopyParams::from(params))
+            .await
     }
 
     pub(crate) async fn start_process(
@@ -1086,6 +1196,36 @@ impl ExecServerClient {
         options: ExecServerClientConnectOptions,
         reconnect_strategy: Option<ExecServerReconnectStrategy>,
     ) -> Result<Self, ExecServerError> {
+        Self::connect_with_recovery_inner(
+            connection,
+            options,
+            reconnect_strategy,
+            /*noise_context*/ None,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_recovery_and_noise_context(
+        connection: JsonRpcConnection,
+        options: ExecServerClientConnectOptions,
+        reconnect_strategy: Option<ExecServerReconnectStrategy>,
+        noise_context: NoiseInitializeContext,
+    ) -> Result<Self, ExecServerError> {
+        Self::connect_with_recovery_inner(
+            connection,
+            options,
+            reconnect_strategy,
+            Some(noise_context),
+        )
+        .await
+    }
+
+    async fn connect_with_recovery_inner(
+        connection: JsonRpcConnection,
+        options: ExecServerClientConnectOptions,
+        reconnect_strategy: Option<ExecServerReconnectStrategy>,
+        noise_context: Option<NoiseInitializeContext>,
+    ) -> Result<Self, ExecServerError> {
         let (rpc_client, events_rx) = RpcClient::new(connection);
         let rpc_client = Arc::new(rpc_client);
         let session_id = OnceLock::new();
@@ -1093,6 +1233,9 @@ impl ExecServerClient {
         let inner = Arc::new(Inner {
             connection: StdMutex::new(ConnectionState {
                 status: ConnectionStatus::Connected(Arc::clone(&rpc_client)),
+                executor_registration_id: noise_context
+                    .as_ref()
+                    .map(|context| context.executor_registration_id.clone()),
                 active_process_starts: 0,
                 environment_connection_state_tx: watch::channel(
                     EnvironmentConnectionState::Connected,
@@ -1121,7 +1264,9 @@ impl ExecServerClient {
         // before initialize returns. Drain them immediately so a burst cannot
         // fill the bounded event channel and block the initialize response.
         client.spawn_rpc_reader(&rpc_client, events_rx);
-        let initialize_response = client.initialize_rpc(&rpc_client, options).await?;
+        let initialize_response = client
+            .initialize_rpc(&rpc_client, options, noise_context)
+            .await?;
         if let Some(info) = initialize_response.environment_info {
             assert!(
                 client.inner.environment_info.set(info).is_ok(),
@@ -1235,6 +1380,7 @@ impl SessionState {
             network_policy: NetworkPolicyState {
                 controller: ArcSwapOption::empty(),
                 cancelled: CancellationToken::new(),
+                cancellation: NetworkRequestCancellation::default(),
                 audit: None,
             },
         }
@@ -1298,6 +1444,11 @@ impl SessionState {
             let is_closed = matches!(&event, ExecProcessEvent::Closed { .. });
             ordered_events.closed_published |= is_closed;
             published_closed |= is_closed;
+            if is_closed && ordered_events.exit_published {
+                self.network_policy
+                    .cancellation
+                    .record(NetworkRequestCancellationReason::ProcessFinished);
+            }
             self.events.publish(event);
         }
         published_closed
@@ -1498,6 +1649,10 @@ impl Session {
     }
 
     pub(crate) fn cancel_network_policy_decisions(&self) {
+        self.state
+            .network_policy
+            .cancellation
+            .record(NetworkRequestCancellationReason::ProcessCancelled);
         self.state.network_policy.cancelled.cancel();
     }
 
@@ -1555,6 +1710,10 @@ impl Inner {
         let mut next_sessions = sessions.as_ref().clone();
         next_sessions.remove(process_id);
         self.sessions.store(Arc::new(next_sessions));
+        expected
+            .network_policy
+            .cancellation
+            .record(NetworkRequestCancellationReason::ProcessCancelled);
         expected.network_policy.cancelled.cancel();
         expected.network_policy.controller.store(None);
     }
@@ -1595,6 +1754,10 @@ fn fail_all_sessions(inner: &Arc<Inner>, message: String) {
     let sessions = inner.take_all_sessions();
 
     for (_, session) in sessions {
+        session
+            .network_policy
+            .cancellation
+            .record(NetworkRequestCancellationReason::ConnectionClosed);
         session.network_policy.cancelled.cancel();
         session.network_policy.controller.store(None);
         // Sessions synthesize a closed read response and emit a pushed Failed
@@ -1701,6 +1864,7 @@ mod tests {
     use codex_utils_path_uri::PathUri;
     use futures::SinkExt;
     use futures::StreamExt;
+    use http::HeaderMap;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use pretty_assertions::assert_eq;
@@ -1871,6 +2035,7 @@ mod tests {
         let session = client
             .start_process(
                 ExecParams {
+                    metadata: Default::default(),
                     process_id: process_id.clone(),
                     argv: vec!["true".to_string()],
                     cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
@@ -2428,6 +2593,11 @@ mod tests {
     }
 
     #[test_case::test_case(Some(EnvironmentInfo::local()); "from_initialize")]
+    #[test_case::test_case(Some(EnvironmentInfo {
+        executor_version: "1.2.3-alpha.4".to_string(),
+        provider_id: Some("sha256:fb4f62da3e84f6864dcec8ede7bc66f1c96ecaeaf55f8a786b85df994057c8ac".to_string()),
+        ..EnvironmentInfo::local()
+    }); "with_executor_metadata")]
     #[test_case::test_case(None; "legacy_server")]
     #[tokio::test]
     async fn environment_info_is_cached(
@@ -2519,6 +2689,7 @@ mod tests {
                 websocket_url,
                 connect_timeout: Duration::from_secs(1),
                 initialize_timeout: Duration::from_secs(1),
+                http_headers: HeaderMap::new(),
             },
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );
@@ -2629,6 +2800,7 @@ mod tests {
                 websocket_url,
                 connect_timeout: Duration::from_secs(1),
                 initialize_timeout: Duration::from_secs(1),
+                http_headers: HeaderMap::new(),
             },
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );
@@ -2771,6 +2943,7 @@ mod tests {
                 websocket_url,
                 connect_timeout: Duration::from_secs(1),
                 initialize_timeout: Duration::from_secs(1),
+                http_headers: HeaderMap::new(),
             },
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );
@@ -2870,6 +3043,7 @@ mod tests {
                 websocket_url,
                 connect_timeout: Duration::from_secs(1),
                 initialize_timeout: Duration::from_secs(1),
+                http_headers: HeaderMap::new(),
             },
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );
@@ -2961,6 +3135,7 @@ mod tests {
                 websocket_url,
                 connect_timeout: Duration::from_secs(1),
                 initialize_timeout: Duration::from_secs(1),
+                http_headers: HeaderMap::new(),
             },
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         );

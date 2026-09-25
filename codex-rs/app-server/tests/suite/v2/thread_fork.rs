@@ -23,6 +23,12 @@ use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource;
+use codex_app_server_protocol::ThreadAttachmentAddParams;
+use codex_app_server_protocol::ThreadAttachmentAddResponse;
+use codex_app_server_protocol::ThreadAttachmentListParams;
+use codex_app_server_protocol::ThreadAttachmentListResponse;
+use codex_app_server_protocol::ThreadAttachmentRemoveParams;
+use codex_app_server_protocol::ThreadAttachmentRemoveResponse;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
@@ -94,6 +100,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
     let list_id = mcp
         .send_thread_list_request(ThreadListParams {
+            originators: None,
             cursor: None,
             limit: Some(50),
             sort_key: None,
@@ -707,6 +714,75 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     }
 
     let original_contents = std::fs::read_to_string(source_path.as_path())?;
+    // Membership added after the requested history cutoff must still be inherited.
+    let attachment: ThreadAttachmentAddResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentAdd {
+            request_id,
+            params: ThreadAttachmentAddParams {
+                thread_id: source_thread_id.clone(),
+                attachment_type: "pull_request".to_string(),
+                identity_key: "openai/codex#123".to_string(),
+                payload: json!({"url": "https://github.com/openai/codex/pull/123"}),
+            },
+        })
+        .await?;
+    let sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    let pool = sqlite.open_read_write_pool(&sqlite.state_db_path()).await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_fork_attachment_copy BEFORE INSERT ON thread_attachments \
+         BEGIN SELECT RAISE(FAIL, 'attachment copy failure'); END",
+    )
+    .execute(&pool)
+    .await?;
+    let fork_without_attachments: ThreadForkResponse = mcp
+        .request(|request_id| ClientRequest::ThreadFork {
+            request_id,
+            params: ThreadForkParams {
+                thread_id: source_thread_id.clone(),
+                last_turn_id: Some(turn_ids[1].clone()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(
+        fork_without_attachments
+            .thread
+            .turns
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect::<Vec<_>>(),
+        turn_ids[..2]
+    );
+    assert!(
+        fork_without_attachments
+            .thread
+            .path
+            .as_ref()
+            .expect("durable fork path")
+            .exists()
+    );
+    let without_attachments: ThreadAttachmentListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: fork_without_attachments.thread.id.clone(),
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert!(without_attachments.data.is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT id FROM threads WHERE id = ?")
+            .bind(&fork_without_attachments.thread.id)
+            .fetch_one(&pool)
+            .await?,
+        fork_without_attachments.thread.id
+    );
+    sqlx::query("DROP TRIGGER fail_fork_attachment_copy")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
             thread_id: source_thread_id.clone(),
@@ -718,6 +794,66 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
         thread: forked_thread,
         ..
     } = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    let started = loop {
+        let notification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("thread/started"),
+        )
+        .await??;
+        let started: ThreadStartedNotification =
+            serde_json::from_value(notification.params.expect("params must be present"))?;
+        if started.thread.id == forked_thread.id {
+            break started;
+        }
+    };
+    assert!(started.thread.turns.is_empty());
+    assert_eq!(
+        started.thread.forked_from_id,
+        Some(source_thread_id.clone())
+    );
+
+    let copied: ThreadAttachmentListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: started.thread.id,
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert_eq!(copied.data.len(), 1);
+    assert_ne!(copied.data[0].id, attachment.attachment.id);
+    assert_eq!(
+        copied.data[0],
+        codex_app_server_protocol::ThreadAttachment {
+            id: copied.data[0].id.clone(),
+            created_at: copied.data[0].created_at,
+            ..attachment.attachment.clone()
+        }
+    );
+    let _: ThreadAttachmentRemoveResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentRemove {
+            request_id,
+            params: ThreadAttachmentRemoveParams {
+                thread_id: forked_thread.id.clone(),
+                attachment_type: attachment.attachment.attachment_type.clone(),
+                identity_key: attachment.attachment.identity_key.clone(),
+            },
+        })
+        .await?;
+    let parent_attachments: ThreadAttachmentListResponse = mcp
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: source_thread_id.clone(),
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert_eq!(parent_attachments.data, vec![attachment.attachment]);
 
     assert_eq!(
         forked_thread
@@ -759,20 +895,6 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
     }
     assert!(!forked_contents.contains(turn_ids[2].as_str()));
 
-    let started = loop {
-        let notification = timeout(
-            DEFAULT_READ_TIMEOUT,
-            mcp.read_stream_until_notification_message("thread/started"),
-        )
-        .await??;
-        let started: ThreadStartedNotification =
-            serde_json::from_value(notification.params.expect("params must be present"))?;
-        if started.thread.id == forked_thread.id {
-            break started;
-        }
-    };
-    assert!(started.thread.turns.is_empty());
-
     if history_mode == ThreadHistoryMode::Paginated {
         let before_fork_id = mcp
             .send_thread_fork_request(ThreadForkParams {
@@ -813,7 +935,7 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
             .request(|request_id| ClientRequest::ThreadFork {
                 request_id,
                 params: ThreadForkParams {
-                    thread_id: forked_thread.id,
+                    thread_id: forked_thread.id.clone(),
                     before_turn_id: Some(completed.turn.id),
                     ephemeral: true,
                     exclude_turns: true,
@@ -823,6 +945,33 @@ async fn assert_thread_fork_at_named_boundary_keeps_only_terminal_prefix(
             .await?;
         assert_eq!(ephemeral_fork.preview, "first");
     }
+
+    // Resuming a fork must not copy its parent's attachments again after an explicit removal.
+    mcp.shutdown_gracefully().await?;
+    let mut resumed = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let _: ThreadResumeResponse = resumed
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: forked_thread.id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let after_resume: ThreadAttachmentListResponse = resumed
+        .request(|request_id| ClientRequest::ThreadAttachmentList {
+            request_id,
+            params: ThreadAttachmentListParams {
+                thread_id: forked_thread.id,
+                cursor: None,
+                limit: None,
+            },
+        })
+        .await?;
+    assert!(after_resume.data.is_empty());
 
     Ok(())
 }
@@ -1186,6 +1335,7 @@ async fn thread_fork_can_cut_before_unfinished_stored_turn() -> Result<()> {
         &source_path,
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: unfinished_turn_id.to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -1460,6 +1610,7 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
     for item in [
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: Some(10),
             model_context_window: None,
@@ -1590,6 +1741,62 @@ async fn thread_fork_creates_reference_backed_paginated_thread() -> Result<()> {
             .thread_id,
         ThreadId::from_string(forked_thread_id.as_str())?
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn thread_fork_accepts_resumed_rollout_under_symlinked_sessions_root() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let external = TempDir::new()?;
+    let external_sessions = external.path().join("sessions");
+    std::fs::create_dir_all(external_sessions.as_path())?;
+    std::os::unix::fs::symlink(
+        external_sessions.as_path(),
+        codex_home.path().join("sessions"),
+    )?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let conversation_id = create_fake_paginated_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let source_path = rollout_path(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        conversation_id.as_str(),
+    );
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id.clone(),
+            path: Some(source_path),
+            ..Default::default()
+        })
+        .await?;
+    let _: ThreadResumeResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(resume_id)).await??;
+
+    let fork_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: conversation_id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let ThreadForkResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(fork_id)).await??;
+
+    assert_eq!(thread.forked_from_id, Some(conversation_id));
     Ok(())
 }
 
@@ -1733,6 +1940,7 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         source_path.as_path(),
         &RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "active-turn".to_string(),
+            root_turn_id: None,
             trace_id: None,
             started_at: Some(10),
             model_context_window: None,
@@ -1807,7 +2015,7 @@ async fn assert_thread_fork_freezes_active_paginated_turn_as_interrupted(
         .expect("fork history base");
     let child_rollout = std::fs::read_to_string(forked_path.as_path())?
         .lines()
-        .map(serde_json::from_str::<RolloutLine>)
+        .map(codex_rollout::parse_rollout_line)
         .collect::<Result<Vec<_>, _>>()?;
     assert!(matches!(
         child_rollout.as_slice(),

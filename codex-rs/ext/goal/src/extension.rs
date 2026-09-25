@@ -3,6 +3,7 @@ use std::sync::Weak;
 
 use codex_analytics::AnalyticsEventsClient;
 use codex_core::ThreadManager;
+use codex_core::TurnStartOptions;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
@@ -14,8 +15,10 @@ use codex_extension_api::ThreadResumeInput;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ThreadStopInput;
 use codex_extension_api::TokenUsageContributor;
+use codex_extension_api::ToolCall;
 use codex_extension_api::ToolCallOutcome;
 use codex_extension_api::ToolContributor;
+use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
@@ -26,6 +29,7 @@ use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
 use codex_otel::MetricsClient;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -41,6 +45,7 @@ use crate::metrics::GoalMetrics;
 use crate::runtime::ActiveGoalStopReason;
 use crate::runtime::GoalRuntimeConfig;
 use crate::runtime::GoalRuntimeHandle;
+use crate::spec::CREATE_GOAL_TOOL_NAME;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
 use crate::steering::budget_limit_steering_item;
 use crate::tool::GoalToolExecutor;
@@ -98,11 +103,12 @@ where
         Box::pin(async move {
             let config = (self.goal_config)(input.config);
             let enabled = config.enabled;
-            let tools_available_for_thread = input.persistent_thread_state_available
-                && !matches!(
-                    input.session_source,
-                    SessionSource::SubAgent(SubAgentSource::Review)
-                );
+            let tools_visible_for_thread = !matches!(
+                input.session_source,
+                SessionSource::SubAgent(SubAgentSource::Review)
+            );
+            let tools_available_for_thread =
+                input.persistent_thread_state_available && tools_visible_for_thread;
             input.thread_store.insert(config);
             let accounting_state = input
                 .thread_store
@@ -146,6 +152,7 @@ where
                         analytics: self.analytics.clone(),
                         enabled,
                         tools_available_for_thread,
+                        tools_visible_for_thread,
                         root_accounting_state,
                     },
                 )
@@ -227,6 +234,11 @@ where
                 return;
             }
 
+            let Some(token_usage_at_turn_start) = input.token_usage_at_turn_start else {
+                tracing::warn!("skipping goal turn accounting: token baseline unavailable");
+                return;
+            };
+
             if let Err(err) = self
                 .state_dbs
                 .thread_goals()
@@ -240,7 +252,7 @@ where
             accounting.start_turn(
                 input.turn_id,
                 input.collaboration_mode.mode,
-                input.token_usage_at_turn_start,
+                token_usage_at_turn_start,
             );
             if matches!(
                 input.collaboration_mode.mode,
@@ -269,6 +281,23 @@ where
         })
     }
 
+    fn on_item_completed<'a>(
+        &'a self,
+        thread_store: &'a ExtensionData,
+        turn_store: &'a ExtensionData,
+        item: &'a TurnItem,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(runtime) = goal_runtime_handle(thread_store)
+                && runtime.is_enabled()
+            {
+                runtime
+                    .accounting_state()
+                    .record_item(turn_store.level_id(), item);
+            }
+        })
+    }
+
     fn on_turn_stop<'a>(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
@@ -279,6 +308,29 @@ where
             }
 
             let turn_id = input.turn_store.level_id();
+            if let Some(expected_goal_id) =
+                runtime.accounting_state().execution_failure_goal(turn_id)
+                && let Err(err) = runtime
+                    .stop_active_goal_for_turn(
+                        turn_id,
+                        ActiveGoalStopReason::ExecutionUnavailable { expected_goal_id },
+                    )
+                    .await
+            {
+                input.thread_store.remove::<TurnStartOptions>();
+                tracing::warn!(
+                    "failed to stop active goal after repeated execution failures for {turn_id}: {err}"
+                );
+                return;
+            }
+            if let Err(err) = runtime
+                .stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::EmptyResponse)
+                .await
+            {
+                input.thread_store.remove::<TurnStartOptions>();
+                tracing::warn!("failed to stop goal after empty responses for {turn_id}: {err}");
+                return;
+            }
             if let Err(err) = runtime
                 .account_active_goal_progress(
                     turn_id,
@@ -288,12 +340,27 @@ where
                 )
                 .await
             {
+                input.thread_store.remove::<TurnStartOptions>();
                 tracing::warn!(
                     "failed to account active goal progress at turn stop for {turn_id}: {err}"
                 );
                 return;
             }
-            runtime.accounting_state().finish_turn(turn_id);
+            let accounting = runtime.accounting_state();
+            if accounting
+                .current_active_goal_id_for_turn(turn_id)
+                .is_some()
+                && let Some(options) = input.thread_store.get::<TurnStartOptions>()
+            {
+                input.thread_store.insert_if(
+                    TurnStartOptions {
+                        parent_turn_id: Some(turn_id.to_string()),
+                        ..options.as_ref().clone()
+                    },
+                    |current| current.is_some(),
+                );
+            }
+            accounting.finish_turn(turn_id);
         })
     }
 
@@ -302,11 +369,13 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
+            runtime.accounting_state().reset_empty_responses();
             if !runtime.is_enabled() {
                 return;
             }
 
             let turn_id = input.turn_store.level_id();
+            input.thread_store.remove::<TurnStartOptions>();
             if let Err(err) = runtime
                 .account_active_goal_progress(
                     turn_id,
@@ -390,10 +459,35 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
-            let should_count_for_goal_progress = runtime.is_enabled()
-                && tool_attempt_counts_for_goal_progress(input.outcome)
-                && !(input.tool_name.is_default_namespace()
-                    && input.tool_name.name == UPDATE_GOAL_TOOL_NAME);
+            if !runtime.is_enabled() {
+                return;
+            }
+            runtime.accounting_state().record_tool_outcome(
+                input.turn_id,
+                input.tool_name,
+                input.outcome,
+            );
+            if input.tool_name.is_default_namespace()
+                && input.tool_name.name == CREATE_GOAL_TOOL_NAME
+                && matches!(input.outcome, ToolCallOutcome::Completed { success: true })
+            {
+                input.thread_store.remove::<TurnStartOptions>();
+                if let Ok(_goal_state_permit) = runtime.goal_state_permit().await
+                    && let Some(thread_manager) = self.thread_manager.upgrade()
+                    && let Ok(thread) = thread_manager.get_thread(runtime.thread_id()).await
+                    && let Some(root_turn_id) = thread.active_turn_root(input.turn_id).await
+                {
+                    input.thread_store.insert(TurnStartOptions {
+                        root_turn_id: Some(root_turn_id),
+                        parent_turn_id: Some(input.turn_id.to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+            let should_count_for_goal_progress =
+                tool_attempt_counts_for_goal_progress(input.outcome)
+                    && !(input.tool_name.is_default_namespace()
+                        && input.tool_name.name == UPDATE_GOAL_TOOL_NAME);
             if !should_count_for_goal_progress {
                 return;
             }
@@ -453,16 +547,16 @@ where
             .get::<GoalExtensionConfig>()
             .and_then(|config| config.max_goal_token_budget);
 
-        vec![
-            Arc::new(GoalToolExecutor::get(
+        let tools = [
+            GoalToolExecutor::get(
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
                 runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),
-            )),
-            Arc::new(GoalToolExecutor::create(
+            ),
+            GoalToolExecutor::create(
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
                 runtime.accounting_state(),
@@ -470,16 +564,23 @@ where
                 self.event_emitter.clone(),
                 self.metrics.clone(),
                 max_goal_token_budget,
-            )),
-            Arc::new(GoalToolExecutor::update(
+            ),
+            GoalToolExecutor::update(
                 runtime.thread_id(),
                 Arc::clone(&self.state_dbs),
                 runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),
-            )),
-        ]
+            ),
+        ];
+        tools
+            .into_iter()
+            .map(|mut tool| {
+                tool.execution_allowed = runtime.tools_available();
+                Arc::new(tool) as Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>
+            })
+            .collect()
     }
 }
 

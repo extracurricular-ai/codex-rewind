@@ -14,6 +14,7 @@ use codex_app_server_protocol::AppsListParams;
 use codex_app_server_protocol::AppsListResponse;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
+use codex_app_server_protocol::GetAccountRateLimitsParams;
 use codex_app_server_protocol::GetAccountTokenUsageParams;
 use codex_app_server_protocol::GetAccountTokenUsageResponse;
 use codex_app_server_protocol::MarketplaceAddParams;
@@ -29,9 +30,7 @@ use crate::hooks_rpc::write_hook_trust;
 use crate::hooks_rpc::write_hook_trusts;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
-const TOKEN_ACTIVITY_FETCH_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(/*secs*/ 15);
-const THREAD_USAGE_FETCH_TIMEOUT: std::time::Duration =
+pub(super) const THREAD_USAGE_FETCH_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(/*secs*/ 65);
 const RATE_LIMIT_RESET_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(/*secs*/ 15);
@@ -73,22 +72,36 @@ impl App {
     /// Spawns a background task to fetch account rate limits and deliver the
     /// result as a `RateLimitsLoaded` event.
     ///
-    /// The `origin` is forwarded to the completion handler so it can distinguish
-    /// a startup prefetch (which updates cached snapshots and may surface a
-    /// reset-credit notice) from a `/status`-triggered refresh (which must
-    /// finalize the corresponding status card).
-    pub(super) fn refresh_rate_limits(
+    /// Recovery requests are coalesced and bounded by the reset-request timeout. The origin
+    /// also identifies command-specific completion work, such as finalizing a `/status` card,
+    /// without confusing sparse inference notifications with authoritative usage responses.
+    pub(crate) fn refresh_rate_limits(
         &mut self,
         app_server: &AppServerSession,
         origin: RateLimitRefreshOrigin,
     ) {
+        if matches!(
+            origin,
+            RateLimitRefreshOrigin::Recovery | RateLimitRefreshOrigin::ResetConsume { .. }
+        ) {
+            self.chat_widget.invalidate_ordinary_usage_recovery();
+            self.chat_widget.hold_rate_limit_recovery();
+        }
+        let Some((request_id, hard_stop_generation)) = self
+            .rate_limit_refresh_state
+            .start(origin, &mut self.rate_limit_hard_stop_generation)
+        else {
+            return;
+        };
+        self.chat_widget.start_usage_notice_read(request_id);
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
-        let hard_stop_generation = self.rate_limit_hard_stop_generation;
         tokio::spawn(async move {
-            let request = fetch_account_rate_limits(request_handle);
+            let request = fetch_account_rate_limits(request_handle, origin);
             let result = match origin {
-                RateLimitRefreshOrigin::ResetConsume { .. }
+                RateLimitRefreshOrigin::Recovery
+                | RateLimitRefreshOrigin::Periodic
+                | RateLimitRefreshOrigin::ResetConsume { .. }
                 | RateLimitRefreshOrigin::ResetPicker { .. } => {
                     tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
                         .await
@@ -102,29 +115,11 @@ impl App {
                 }
             };
             app_event_tx.send(AppEvent::RateLimitsLoaded {
+                request_id,
                 origin,
                 hard_stop_generation,
                 result,
             });
-        });
-    }
-
-    pub(super) fn refresh_token_activity(
-        &mut self,
-        app_server: &AppServerSession,
-        request_id: u64,
-    ) {
-        let request_handle = app_server.request_handle();
-        let app_event_tx = self.app_event_tx.clone();
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                TOKEN_ACTIVITY_FETCH_TIMEOUT,
-                fetch_account_token_activity(request_handle),
-            )
-            .await
-            .map_err(|_| "account/usage/read timed out in TUI".to_string())
-            .and_then(|result| result.map_err(|err| err.to_string()));
-            app_event_tx.send(AppEvent::TokenActivityLoaded { request_id, result });
         });
     }
 
@@ -208,6 +203,7 @@ impl App {
     pub(super) fn send_add_credits_nudge_email(
         &mut self,
         app_server: &AppServerSession,
+        request_id: Uuid,
         credit_type: AddCreditsNudgeCreditType,
     ) {
         let request_handle = app_server.request_handle();
@@ -216,7 +212,7 @@ impl App {
             let result = send_add_credits_nudge_email(request_handle, credit_type)
                 .await
                 .map_err(|err| err.to_string());
-            app_event_tx.send(AppEvent::AddCreditsNudgeEmailFinished { result });
+            app_event_tx.send(AppEvent::AddCreditsNudgeEmailFinished { request_id, result });
         });
     }
 
@@ -743,6 +739,7 @@ impl App {
         };
 
         self.transcript_cells.remove(index);
+        self.native_history.retain(&self.transcript_cells);
         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
             overlay.replace_cells(self.transcript_cells.clone());
         }
@@ -785,31 +782,37 @@ pub(super) async fn fetch_all_mcp_server_statuses(
 
 pub(super) async fn fetch_account_rate_limits(
     request_handle: AppServerRequestHandle,
+    origin: RateLimitRefreshOrigin,
 ) -> Result<GetAccountRateLimitsResponse> {
     let request_id = RequestId::String(format!("account-rate-limits-{}", Uuid::new_v4()));
-    request_handle
+    let result = request_handle
         .request_typed(ClientRequest::GetAccountRateLimits {
-            request_id,
-            params: None,
+            request_id: request_id.clone(),
+            params: Some(GetAccountRateLimitsParams {
+                supports_luna_reserve: true,
+                exclude_reset_credit_details: origin == RateLimitRefreshOrigin::Periodic,
+            }),
         })
-        .await
-        .wrap_err("account/rateLimits/read failed in TUI")
+        .await;
+    // Older remote app servers accept only null params. Keep their usage reads working
+    // without opting them into exposure or pretending that they support the new capability.
+    if matches!(
+        &result,
+        Err(codex_app_server_client::TypedRequestError::Server { source, .. })
+            if matches!(source.code, -32600 | -32602)
+    ) {
+        return request_handle
+            .request_typed(ClientRequest::GetAccountRateLimits {
+                request_id,
+                params: None,
+            })
+            .await
+            .wrap_err("account/rateLimits/read failed in TUI");
+    }
+    result.wrap_err("account/rateLimits/read failed in TUI")
 }
 
-pub(super) async fn fetch_account_token_activity(
-    request_handle: AppServerRequestHandle,
-) -> Result<codex_app_server_protocol::GetAccountTokenUsageResponse> {
-    let request_id = RequestId::String(format!("account-token-usage-{}", Uuid::new_v4()));
-    request_handle
-        .request_typed(ClientRequest::GetAccountTokenUsage {
-            request_id,
-            params: None,
-        })
-        .await
-        .wrap_err("account/usage/read failed in TUI")
-}
-
-async fn fetch_thread_usage(
+pub(super) async fn fetch_thread_usage(
     request_handle: AppServerRequestHandle,
     thread_id: ThreadId,
 ) -> Result<ThreadUsageOutcome> {
@@ -1556,6 +1559,8 @@ mod tests {
     fn mcp_inventory_maps_prefix_tool_names_by_server() {
         let statuses = vec![
             McpServerStatus {
+                server_capabilities: None,
+                tools_error: None,
                 name: "docs".to_string(),
                 runtime_status: None,
                 plugin_id: None,
@@ -1578,6 +1583,8 @@ mod tests {
                 auth_status: codex_app_server_protocol::McpAuthStatus::Unsupported,
             },
             McpServerStatus {
+                server_capabilities: None,
+                tools_error: None,
                 name: "disabled".to_string(),
                 runtime_status: None,
                 plugin_id: None,

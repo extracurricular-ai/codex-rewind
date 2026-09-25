@@ -3,6 +3,9 @@ use codex_core::exec::ExecCapturePolicy;
 use codex_core::exec::ExecParams;
 use codex_core::exec::process_exec_tool_call;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_core::windows_sandbox::WindowsSandboxSetupMode;
+use codex_core::windows_sandbox::WindowsSandboxSetupRequest;
+use codex_core::windows_sandbox::run_windows_sandbox_setup;
 use codex_core::windows_sandbox::sandbox_setup_is_complete;
 use codex_features::Feature;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -30,6 +33,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use tempfile::TempDir;
 
 struct EnvVarGuard {
@@ -124,6 +128,179 @@ fn stage_windows_sandbox_helpers() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn escape_toml_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
+}
+
+fn stage_windows_sandbox_cli(fixture_bin: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(fixture_bin)?;
+    let resources_dir = fixture_bin.join("codex-resources");
+    std::fs::create_dir_all(&resources_dir)?;
+
+    let codex_source = codex_utils_cargo_bin::cargo_bin("codexr")?;
+    let codex = fixture_bin.join("codex.exe");
+    std::fs::copy(&codex_source, &codex)
+        .with_context(|| format!("copy {} to {}", codex_source.display(), codex.display()))?;
+    for helper_name in ["codex-windows-sandbox-setup", "codex-command-runner"] {
+        let helper = codex_utils_cargo_bin::cargo_bin(helper_name)?;
+        let destination = resources_dir.join(Path::new(helper_name).with_extension("exe"));
+        std::fs::copy(&helper, &destination)
+            .with_context(|| format!("copy {} to {}", helper.display(), destination.display()))?;
+    }
+
+    let probe_source = codex_utils_cargo_bin::cargo_bin("codex-windows-managed-deny-probe")?;
+    let probe = fixture_bin.join("managed-deny-probe.exe");
+    std::fs::copy(&probe_source, &probe)
+        .with_context(|| format!("copy {} to {}", probe_source.display(), probe.display()))?;
+    Ok((codex, probe))
+}
+
+fn assert_managed_deny_probe(output: &std::process::Output, launch: usize) -> anyhow::Result<()> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "managed deny probe launch {launch} failed: status={:?}; stdout={stdout}; stderr={stderr}",
+        output.status.code()
+    );
+    assert!(
+        stdout.contains("allowed-read:OK") && stdout.contains("allowed-import:OK"),
+        "managed deny probe launch {launch} lost allowed access: {stdout}"
+    );
+    assert!(
+        stdout.contains("denied-read:DENIED") && stdout.contains("denied-import:DENIED"),
+        "managed deny probe launch {launch} did not enforce denied access: {stdout}"
+    );
+    assert!(
+        !stdout.contains("UNEXPECTED_SUCCESS"),
+        "managed deny probe launch {launch} leaked denied content: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+#[serial(codex_home)]
+fn windows_sandbox_cli_preserves_managed_deny_reads_across_launches() -> anyhow::Result<()> {
+    let codex_home =
+        codex_home_for_windows_sandbox_test("windows-cli-managed-deny-read-codex-home")?;
+
+    let fixture = TempDir::new()?;
+    let fixture_root = dunce::canonicalize(fixture.path())?;
+    let work = fixture_root.join("work");
+    let runtime = fixture_root.join("runtime");
+    let denied = runtime.join("denied");
+    let bin = fixture_root.join("bin");
+    std::fs::create_dir_all(&work)?;
+    std::fs::create_dir_all(&denied)?;
+    let (codex, probe) = stage_windows_sandbox_cli(&bin)?;
+
+    let allowed_text = runtime.join("allowed.txt");
+    let denied_text = denied.join("secret.txt");
+    let allowed_module = runtime.join("allowed.dll");
+    let denied_module = denied.join("secret.dll");
+    std::fs::write(&allowed_text, "ALLOW-CONTROL\n")?;
+    std::fs::write(&denied_text, "DENIED-CONTENT\n")?;
+    let system_root = std::env::var_os("SystemRoot").context("resolve SystemRoot")?;
+    let system_module = PathBuf::from(system_root)
+        .join("System32")
+        .join("version.dll");
+    std::fs::copy(&system_module, &allowed_module).with_context(|| {
+        format!(
+            "copy {} to {}",
+            system_module.display(),
+            allowed_module.display()
+        )
+    })?;
+    std::fs::copy(&system_module, &denied_module).with_context(|| {
+        format!(
+            "copy {} to {}",
+            system_module.display(),
+            denied_module.display()
+        )
+    })?;
+
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "default_permissions = \"managed-deny-test\"\n\
+             \n\
+             [windows]\n\
+             sandbox = \"elevated\"\n\
+             \n\
+             [shell_environment_policy]\n\
+             inherit = \"all\"\n\
+             \n\
+             [permissions.managed-deny-test.filesystem]\n\
+             \":minimal\" = \"read\"\n\
+             \":root\" = \"read\"\n\
+             \"{}\" = \"write\"\n\
+             \"{}\" = \"deny\"\n\
+             \n\
+             [permissions.managed-deny-test.network]\n\
+             enabled = false\n",
+            escape_toml_path(&work),
+            escape_toml_path(&denied),
+        ),
+    )?;
+
+    for launch in 1..=2 {
+        let output = Command::new(&codex)
+            .current_dir(&work)
+            .env("CODEX_HOME", codex_home.path())
+            .env("CODEX_WINDOWS_ALLOWED_TEXT", &allowed_text)
+            .env("CODEX_WINDOWS_DENIED_TEXT", &denied_text)
+            .env("CODEX_WINDOWS_ALLOWED_MODULE", &allowed_module)
+            .env("CODEX_WINDOWS_DENIED_MODULE", &denied_module)
+            .args(["sandbox", "--permission-profile"])
+            .arg("managed-deny-test")
+            .arg("--cd")
+            .arg(&work)
+            .arg("--")
+            .arg(&probe)
+            .output()?;
+        assert_managed_deny_probe(&output, launch)?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_home)]
+async fn windows_elevated_setup_rejects_default_root_deny() -> anyhow::Result<()> {
+    let codex_home = codex_home_for_windows_sandbox_test("windows-elevated-root-deny-codex-home")?;
+    let workspace = TempDir::new()?;
+    let cwd = dunce::canonicalize(workspace.path())?.abs();
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
+        }]);
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    let err = run_windows_sandbox_setup(WindowsSandboxSetupRequest {
+        mode: WindowsSandboxSetupMode::Elevated,
+        permission_profile,
+        workspace_roots: vec![cwd.clone()],
+        command_cwd: cwd.to_path_buf(),
+        env_map: HashMap::new(),
+        codex_home: codex_home.path().to_path_buf(),
+    })
+    .await
+    .expect_err("elevated setup should reject default root deny");
+
+    assert_eq!(
+        err.to_string(),
+        "elevated Windows sandbox requires effective `:root` read access"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[serial(codex_home)]
 async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> anyhow::Result<()> {
@@ -190,7 +367,6 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -198,6 +374,7 @@ async fn windows_restricted_token_rejects_exact_and_glob_deny_read_policy() -> a
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
+        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )
@@ -239,7 +416,6 @@ async fn windows_elevated_does_not_create_missing_workspace_metadata() -> anyhow
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Elevated,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -247,6 +423,7 @@ async fn windows_elevated_does_not_create_missing_workspace_metadata() -> anyhow
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
+        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )
@@ -261,6 +438,78 @@ async fn windows_elevated_does_not_create_missing_workspace_metadata() -> anyhow
             path.display()
         );
     }
+
+    let firewall_output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            r#"
+$ErrorActionPreference = 'Stop'
+$sid = (Get-LocalUser -Name 'CodexSandboxOffline').SID.Value
+$rules = foreach ($name in @('codex_sandbox_offline_block_inbound', 'codex_sandbox_offline_block_outbound')) {
+    $rule = @(Get-NetFirewallRule -PolicyStore ActiveStore -DisplayName $name)
+    if ($rule.Count -ne 1) { throw "Expected exactly one effective rule for $name" }
+    $address = $rule | Get-NetFirewallAddressFilter
+    $security = $rule | Get-NetFirewallSecurityFilter
+    $port = $rule | Get-NetFirewallPortFilter
+    [pscustomobject]@{
+        name = $name
+        direction = [string]$rule[0].Direction
+        action = [string]$rule[0].Action
+        enabled = [string]$rule[0].Enabled
+        profile = [string]$rule[0].Profile
+        protocol = [string]$port.Protocol
+        localAddresses = @($address.LocalAddress)
+        remoteAddresses = @($address.RemoteAddress | Sort-Object)
+        localPorts = @($port.LocalPort)
+        remotePorts = @($port.RemotePort)
+        localUser = [string]$security.LocalUser
+    }
+}
+[pscustomobject]@{ offlineSid = $sid; rules = @($rules) } | ConvertTo-Json -Depth 4 -Compress
+"#,
+        ])
+        .output()
+        .context("read offline sandbox firewall rules")?;
+    assert!(
+        firewall_output.status.success(),
+        "read offline sandbox firewall rules: {}",
+        String::from_utf8_lossy(&firewall_output.stderr)
+    );
+    let firewall_rules: serde_json::Value = serde_json::from_slice(&firewall_output.stdout)
+        .context("parse offline sandbox firewall rules")?;
+    let offline_sid = firewall_rules["offlineSid"]
+        .as_str()
+        .context("offline sandbox firewall rules should include their user SID")?;
+    let local_user = format!("O:LSD:(A;;CC;;;{offline_sid})");
+    let expected_rules: Vec<_> = [
+        ("codex_sandbox_offline_block_inbound", "Inbound"),
+        ("codex_sandbox_offline_block_outbound", "Outbound"),
+    ]
+    .into_iter()
+    .map(|(name, direction)| {
+        serde_json::json!({
+            "name": name,
+            "direction": direction,
+            "action": "Block",
+            "enabled": "True",
+            "profile": "Any",
+            "protocol": "Any",
+            "localAddresses": ["Any"],
+            "remoteAddresses": [
+                "::",
+                "::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                "0.0.0.0-126.255.255.255",
+                "128.0.0.0-255.255.255.255",
+            ],
+            "localPorts": ["Any"],
+            "remotePorts": ["Any"],
+            "localUser": local_user,
+        })
+    })
+    .collect();
+    assert_eq!(firewall_rules["rules"], serde_json::json!(expected_rules));
     Ok(())
 }
 
@@ -346,7 +595,6 @@ async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyh
             network_environment_id: None,
             sandbox_permissions: SandboxPermissions::UseDefault,
             windows_sandbox_level: WindowsSandboxLevel::Elevated,
-            windows_sandbox_private_desktop: false,
             justification: None,
             arg0: None,
         },
@@ -354,6 +602,7 @@ async fn windows_elevated_enforces_deny_read_and_protects_setup_marker() -> anyh
         &cwd,
         std::slice::from_ref(&cwd),
         &None,
+        /*codex_self_exe*/ &None,
         /*use_legacy_landlock*/ false,
         /*stdout_stream*/ None,
     )

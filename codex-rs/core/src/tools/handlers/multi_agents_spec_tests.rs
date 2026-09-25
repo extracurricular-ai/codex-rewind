@@ -28,6 +28,7 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
             description: "1.5x speed, increased usage".to_string(),
         }],
         default_service_tier: None,
+        available_access_programs: None,
         is_default: false,
         upgrade: None,
         show_in_picker,
@@ -44,20 +45,23 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     legacy.multi_agent_version = Some(MultiAgentVersion::V1);
     let mut disabled = model_preset("disabled", /*show_in_picker*/ true);
     disabled.multi_agent_version = Some(MultiAgentVersion::Disabled);
-    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: vec![
-            model_preset("visible", /*show_in_picker*/ true),
-            model_preset("hidden", /*show_in_picker*/ false),
-            legacy,
-            disabled,
-        ],
-        agent_type_description: "role help".to_string(),
-        expose_agent_type: true,
-        hide_agent_type_model_reasoning: false,
-        expose_spawn_agent_model_overrides: true,
-        multi_agent_version: MultiAgentVersion::V2,
-        usage_hint_text: None,
-    });
+    let tool = create_spawn_agent_tool_v2(
+        SpawnAgentToolOptions {
+            available_models: vec![
+                model_preset("visible", /*show_in_picker*/ true),
+                model_preset("hidden", /*show_in_picker*/ false),
+                legacy,
+                disabled,
+            ],
+            agent_type_description: "role help".to_string(),
+            expose_agent_type: true,
+            hide_agent_type_model_reasoning: false,
+            expose_spawn_agent_model_overrides: true,
+            multi_agent_version: MultiAgentVersion::V2,
+            usage_hint_text: None,
+        },
+        /*description_override*/ None,
+    );
 
     let ToolSpec::Function(ResponsesApiTool {
         description,
@@ -115,20 +119,56 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
             .and_then(|schema| schema.description.as_deref()),
         Some("Reasoning effort override for the new agent. Omit to inherit the parent effort.")
     );
-    assert_eq!(
-        properties
-            .get("service_tier")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
-    );
+    assert!(!properties.contains_key("service_tier"));
     assert_eq!(
         parameters.required.as_ref(),
         Some(&vec!["task_name".to_string(), "message".to_string()])
     );
     assert_eq!(
-        output_schema.expect("spawn_agent output schema")["required"],
+        output_schema.expect("spawn_agent output schema").to_value()["required"],
         json!(["task_name", "nickname"])
     );
+}
+
+#[test]
+fn spawn_agent_catalog_description_preserves_generated_context() {
+    let options = SpawnAgentToolOptions {
+        available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
+        agent_type_description: "Available agent roles: explorer".to_string(),
+        expose_spawn_agent_model_overrides: true,
+        multi_agent_version: MultiAgentVersion::V2,
+        usage_hint_text: Some("Local usage hint.".to_string()),
+        ..Default::default()
+    };
+    let ToolSpec::Function(default_tool) =
+        create_spawn_agent_tool_v2(options.clone(), /*description_override*/ None)
+    else {
+        panic!("spawn_agent should be a function tool");
+    };
+    let ToolSpec::Function(mut configured_tool) =
+        create_spawn_agent_tool_v2(options, Some("Catalog spawning guidance."))
+    else {
+        panic!("spawn_agent should be a function tool");
+    };
+    assert!(
+        configured_tool
+            .description
+            .contains("Catalog spawning guidance.")
+    );
+    assert!(configured_tool.description.contains("`visible-model`"));
+    assert!(
+        configured_tool
+            .description
+            .contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE)
+    );
+    assert!(configured_tool.description.ends_with("Local usage hint."));
+    assert!(
+        !configured_tool
+            .description
+            .contains("Spawns an agent to work on the specified task.")
+    );
+    configured_tool.description = default_tool.description.clone();
+    assert_eq!(configured_tool, default_tool);
 }
 
 #[test]
@@ -181,32 +221,30 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
             .and_then(|schema| schema.description.as_deref()),
         Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
     );
-    assert_eq!(
-        properties
-            .get("service_tier")
-            .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION)
-    );
+    assert!(!properties.contains_key("service_tier"));
 }
 
 #[test]
 fn spawn_agent_tool_caps_visible_model_summaries() {
-    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: vec![
-            model_preset("first", /*show_in_picker*/ true),
-            model_preset("second", /*show_in_picker*/ true),
-            model_preset("third", /*show_in_picker*/ true),
-            model_preset("fourth", /*show_in_picker*/ true),
-            model_preset("fifth", /*show_in_picker*/ true),
-            model_preset("sixth", /*show_in_picker*/ true),
-        ],
-        agent_type_description: "role help".to_string(),
-        expose_agent_type: true,
-        hide_agent_type_model_reasoning: false,
-        expose_spawn_agent_model_overrides: true,
-        multi_agent_version: MultiAgentVersion::V2,
-        usage_hint_text: None,
-    });
+    let tool = create_spawn_agent_tool_v2(
+        SpawnAgentToolOptions {
+            available_models: vec![
+                model_preset("first", /*show_in_picker*/ true),
+                model_preset("second", /*show_in_picker*/ true),
+                model_preset("third", /*show_in_picker*/ true),
+                model_preset("fourth", /*show_in_picker*/ true),
+                model_preset("fifth", /*show_in_picker*/ true),
+                model_preset("sixth", /*show_in_picker*/ true),
+            ],
+            agent_type_description: "role help".to_string(),
+            expose_agent_type: true,
+            hide_agent_type_model_reasoning: false,
+            expose_spawn_agent_model_overrides: true,
+            multi_agent_version: MultiAgentVersion::V2,
+            usage_hint_text: None,
+        },
+        /*description_override*/ None,
+    );
 
     let ToolSpec::Function(ResponsesApiTool { description, .. }) = tool else {
         panic!("spawn_agent should be a function tool");
@@ -244,15 +282,18 @@ fn spawn_agent_tool_caps_reasoning_effort_value_length() {
 
 #[test]
 fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden() {
-    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
-        agent_type_description: "role help".to_string(),
-        expose_agent_type: false,
-        hide_agent_type_model_reasoning: true,
-        expose_spawn_agent_model_overrides: true,
-        multi_agent_version: MultiAgentVersion::V2,
-        usage_hint_text: None,
-    });
+    let tool = create_spawn_agent_tool_v2(
+        SpawnAgentToolOptions {
+            available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
+            agent_type_description: "role help".to_string(),
+            expose_agent_type: false,
+            hide_agent_type_model_reasoning: true,
+            expose_spawn_agent_model_overrides: true,
+            multi_agent_version: MultiAgentVersion::V2,
+            usage_hint_text: None,
+        },
+        /*description_override*/ None,
+    );
 
     let ToolSpec::Function(ResponsesApiTool {
         description,
@@ -277,15 +318,18 @@ fn spawn_agent_tool_keeps_model_controls_when_spawn_metadata_is_hidden() {
 
 #[test]
 fn spawn_agent_tool_hides_model_controls_without_override_exposure() {
-    let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
-        available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
-        agent_type_description: "role help".to_string(),
-        expose_agent_type: false,
-        hide_agent_type_model_reasoning: true,
-        expose_spawn_agent_model_overrides: false,
-        multi_agent_version: MultiAgentVersion::V2,
-        usage_hint_text: None,
-    });
+    let tool = create_spawn_agent_tool_v2(
+        SpawnAgentToolOptions {
+            available_models: vec![model_preset("visible", /*show_in_picker*/ true)],
+            agent_type_description: "role help".to_string(),
+            expose_agent_type: false,
+            hide_agent_type_model_reasoning: true,
+            expose_spawn_agent_model_overrides: false,
+            multi_agent_version: MultiAgentVersion::V2,
+            usage_hint_text: None,
+        },
+        Some(""),
+    );
 
     let ToolSpec::Function(ResponsesApiTool {
         description,
@@ -425,7 +469,7 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
     );
     assert_eq!(parameters.required.as_ref(), None);
     assert_eq!(
-        output_schema.expect("wait output schema")["properties"]["message"]["description"],
+        output_schema.expect("wait output schema").to_value()["properties"]["message"]["description"],
         json!(
             "Brief wait summary without the agent's final content, including any timeout adjustment."
         )
@@ -458,7 +502,8 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         Some("Task-path prefix filter without a trailing slash. Omit to list all live agents.")
     );
     assert_eq!(
-        output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["required"],
+        output_schema.expect("list_agents output schema").to_value()["properties"]["agents"]["items"]
+            ["required"],
         json!(["agent_name", "agent_status"])
     );
 }
@@ -471,8 +516,8 @@ fn list_agents_tool_status_schema_includes_interrupted() {
     };
 
     assert_eq!(
-        output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]["properties"]
-            ["agent_status"]["allOf"][0]["oneOf"][0]["enum"],
+        output_schema.expect("list_agents output schema").to_value()["properties"]["agents"]["items"]
+            ["properties"]["agent_status"]["allOf"][0]["oneOf"][0]["enum"],
         json!([
             "pending_init",
             "running",

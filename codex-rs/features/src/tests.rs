@@ -15,12 +15,8 @@ use toml::Table;
 use toml::Value as TomlValue;
 
 #[test]
-fn transcript_v2_resolves_explicit_config_overrides() {
-    let mut features = Features::with_defaults();
-    for enabled in [false, true, false] {
-        features.apply_map(&BTreeMap::from([("transcript_v2".to_string(), enabled)]));
-        assert_eq!(features.enabled(Feature::TranscriptV2), enabled);
-    }
+fn sleep_tool_config_rejects_unknown_mode() {
+    assert!(toml::from_str::<FeaturesToml>("[sleep_tool]\nmode = 'off'").is_err());
 }
 
 #[test]
@@ -86,6 +82,30 @@ fn cwd_relative_turn_diffs_is_an_opt_in_map_feature() {
     )]));
 
     assert!(!features.enabled(Feature::CwdRelativeTurnDiffs));
+}
+
+#[test]
+fn codex_apps_mcp_protocol_can_be_enabled_independently_of_generic_mcp() {
+    let features_toml = FeaturesToml::from(BTreeMap::from([
+        (Feature::CodexAppsMcp20260728.key().to_string(), true),
+        (Feature::Mcp20260728.key().to_string(), false),
+    ]));
+    let features = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&features_toml),
+            ..Default::default()
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+
+    assert_eq!(
+        (
+            features.enabled(Feature::CodexAppsMcp20260728),
+            features.enabled(Feature::Mcp20260728),
+        ),
+        (true, false),
+    );
 }
 
 #[test]
@@ -158,6 +178,43 @@ fn guardian_v2_feature_config_preserves_boolean_toggle() {
 }
 
 #[test]
+fn guardian_thread_context_resolves_nested_config_and_profile_overrides() {
+    let enabled_context = "[guardianv2]\nthread_context = true";
+    let disabled_context = "[guardianv2]\nthread_context = false";
+    for (base, profile, enabled) in [
+        ("", "", false),
+        (disabled_context, "", false),
+        (enabled_context, "", true),
+        (enabled_context, disabled_context, false),
+        (disabled_context, enabled_context, true),
+        (
+            "[guardianv2]\nenabled = false\nthread_context = true",
+            "",
+            true,
+        ),
+    ] {
+        let base = toml::from_str::<FeaturesToml>(base).expect("base features");
+        let profile = toml::from_str::<FeaturesToml>(profile).expect("profile features");
+        let features = Features::from_sources(
+            FeatureConfigSource {
+                features: Some(&base),
+                ..Default::default()
+            },
+            FeatureConfigSource {
+                features: Some(&profile),
+                ..Default::default()
+            },
+            FeatureOverrides::default(),
+        );
+        let mut expected = Features::with_defaults();
+        if enabled {
+            expected.enable(Feature::GuardianThreadContext);
+        }
+        assert_eq!(features.enabled_features(), expected.enabled_features());
+    }
+}
+
+#[test]
 fn guardian_v2_feature_config_deserializes_classifier_and_transcript_settings() {
     let features: FeaturesToml = toml::from_str(
         r#"
@@ -195,6 +252,7 @@ max_recent_non_user_entries = 12
         Some(FeatureToml::Config(crate::GuardianV2ConfigToml {
             enabled: Some(true),
             free_guardian: Some(true),
+            thread_context: None,
             persist_scores: Some(true),
             classifier_instructions: Some("Review this action".to_owned()),
             review_threshold: Some(0.65),
@@ -579,6 +637,35 @@ fn from_sources_ignores_removed_apply_patch_freeform_feature_key() {
 }
 
 #[test]
+fn from_sources_accepts_and_ignores_removed_personality_feature_values() {
+    for enabled in [false, true] {
+        let features_toml: FeaturesToml = toml::from_str(&format!("personality = {enabled}"))
+            .expect("legacy personality feature should deserialize");
+        let source = FeatureConfigSource {
+            features: Some(&features_toml),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            Features::from_sources(
+                source,
+                FeatureConfigSource::default(),
+                FeatureOverrides::default(),
+            ),
+            Features::with_defaults()
+        );
+        assert_eq!(
+            Features::from_sources(
+                FeatureConfigSource::default(),
+                source,
+                FeatureOverrides::default(),
+            ),
+            Features::with_defaults()
+        );
+    }
+}
+
+#[test]
 fn from_sources_ignores_removed_plugin_hooks_feature_key() {
     let features_toml = FeaturesToml::from(BTreeMap::from([("plugin_hooks".to_string(), true)]));
 
@@ -729,7 +816,7 @@ fn unstable_warning_event_only_mentions_enabled_under_development_features() {
         "apply_patch_streaming_events".to_string(),
         TomlValue::Boolean(true),
     );
-    configured_features.insert("personality".to_string(), TomlValue::Boolean(true));
+    configured_features.insert("fast_mode".to_string(), TomlValue::Boolean(true));
     configured_features.insert("unknown".to_string(), TomlValue::Boolean(true));
 
     let mut features = Features::with_defaults();
@@ -747,7 +834,7 @@ fn unstable_warning_event_only_mentions_enabled_under_development_features() {
         panic!("expected warning event");
     };
     assert!(message.contains("apply_patch_streaming_events"));
-    assert!(!message.contains("personality"));
+    assert!(!message.contains("fast_mode"));
     assert!(message.contains("/tmp/config.toml"));
 }
 

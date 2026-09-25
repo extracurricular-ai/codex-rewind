@@ -1,14 +1,13 @@
 //! Low-level markdown event renderer for the TUI transcript.
 //!
 //! This module consumes `pulldown-cmark` events and emits styled `ratatui`
-//! lines, including table layout, width-aware wrapping, and local file-link
+//! lines, including table layout, Mermaid previews, width-aware wrapping, and local file-link
 //! display. It is the final rendering stage used by higher-level helpers in
-//! `markdown.rs`.
+//! `markdown.rs`. Launch-time `tui.rendering` preferences preserve disabled features as source.
 //!
-//! This renderer intentionally treats local file links differently from normal web links. For
-//! local paths, the displayed text comes from the destination, not the markdown label, so
-//! transcripts show the real file target (including normalized location suffixes) and can shorten
-//! absolute paths relative to a known working directory.
+//! Local file-link parsing and display policy live in [`local_links`].
+//! List spacing stays a renderer policy: compact while streaming in an owned viewport, uniform
+//! after source-backed consolidation, and historical spacing for native scrollback.
 //!
 //! ## Table rendering pipeline
 //!
@@ -38,24 +37,25 @@
 //! unusably short chunks, expansive cells form tall narrow strips across enough
 //! body rows, or even 3-char-wide columns cannot fit, body rows render as
 //! key/value records.
+//!
+//! Inline code and local file paths share the active syntax theme's raw-markup foreground.
 
 use crate::markdown_text_merge::DecodedTextMerge;
+use crate::render::highlight::current_syntax_theme;
 use crate::render::highlight::foreground_style_for_scopes;
+use crate::render::highlight::foreground_style_for_scopes_with_theme;
 use crate::render::highlight::highlight_code_to_lines;
 use crate::render::line_utils::line_to_static;
+use crate::style::accent_color;
 use crate::style::table_separator_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
-use crate::terminal_hyperlinks::annotate_web_urls_in_line;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::terminal_hyperlinks::visible_lines;
 use crate::terminal_hyperlinks::web_destination;
 use crate::width::char_width;
 use crate::width::display_width;
 use crate::wrapping::RtOptions;
-use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::word_wrap_line;
-use codex_utils_string::normalize_markdown_hash_location_suffix;
-use dirs::home_dir;
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::CowStr;
@@ -69,20 +69,34 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
-use regex_lite::Regex;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::LazyLock;
-use url::Url;
 
+mod file_citations;
+mod list_spacing;
+mod local_links;
+mod math;
+mod mermaid;
+pub(crate) mod preferences;
+mod source_tables;
 mod streaming;
 mod table_key_value;
 mod web_links;
 
+use file_citations::FileCitations;
+pub(crate) use list_spacing::ListSpacing;
+use list_spacing::UniformList;
+use local_links::is_local_path_like_link;
+use local_links::render_local_link_target;
+use local_links::should_render_local_link_label;
 pub(crate) use streaming::StreamingMarkdownRender;
 pub(crate) use streaming::render_streaming_markdown_lines_with_width_and_cwd;
+#[cfg(test)]
+#[path = "markdown_render/list_spacing_tests.rs"]
+mod list_spacing_tests;
 pub(crate) use web_links::hide_web_link_destination;
+use web_links::style_bare_web_urls;
 
 const TABLE_COLUMN_GAP: usize = 2;
 const TABLE_CELL_PADDING: usize = 1;
@@ -108,6 +122,12 @@ struct MarkdownStyles {
 
 impl Default for MarkdownStyles {
     fn default() -> Self {
+        Self::for_theme(&crate::render::highlight::current_syntax_theme())
+    }
+}
+
+impl MarkdownStyles {
+    fn for_theme(theme: &syntect::highlighting::Theme) -> Self {
         Self {
             h1: Style::new().bold().underlined(),
             h2: Style::new().bold(),
@@ -115,13 +135,20 @@ impl Default for MarkdownStyles {
             h4: Style::new().italic(),
             h5: Style::new().italic(),
             h6: Style::new().italic(),
-            code: Style::new().cyan(),
+            code: foreground_style_for_scopes_with_theme(
+                theme,
+                &[
+                    "markup.inline.raw.string.markdown",
+                    "markup.raw.inline.markdown",
+                ],
+            )
+            .unwrap_or_else(|| Style::new().fg(accent_color())),
             emphasis: Style::new().italic(),
             strong: Style::new().bold(),
             strikethrough: Style::new().crossed_out(),
-            ordered_list_marker: Style::new().light_blue(),
+            ordered_list_marker: Style::new().fg(accent_color()),
             unordered_list_marker: Style::new(),
-            link: Style::new().cyan().underlined(),
+            link: Style::new().fg(accent_color()).underlined(),
             blockquote: Style::new().green(),
         }
     }
@@ -340,7 +367,11 @@ pub(crate) fn render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
-    let parser = DecodedTextMerge::new(Parser::new_ext(input, options).into_offset_iter());
+    let math = math::MathMarkdown::new(input, options, width);
+    let parser = DecodedTextMerge::new(source_tables::preserve(
+        input,
+        math.events(Parser::new_ext(&math.markdown, options).into_offset_iter()),
+    ));
     let mut w = Writer::new(input, parser, width, cwd, is_hidden_link_destination);
     w.run();
     w.text
@@ -354,29 +385,15 @@ struct LinkState {
     has_visible_label: bool,
     /// Pre-rendered display text for local file links.
     ///
-    /// When this is present, the markdown label is intentionally suppressed so the rendered
-    /// transcript always reflects the real target path.
+    /// When this is present, label spans are buffered until the link closes so path-like labels
+    /// can collapse to this canonical target without losing descriptive labels.
     local_target_display: Option<String>,
+    local_label_spans: Vec<Span<'static>>,
 }
 
 fn should_render_link_destination(dest_url: &str) -> bool {
     !is_local_path_like_link(dest_url)
 }
-
-static COLON_LOCATION_SUFFIX_RE: LazyLock<Regex> =
-    LazyLock::new(
-        || match Regex::new(r":\d+(?::\d+)?(?:[-–]\d+(?::\d+)?)?$") {
-            Ok(regex) => regex,
-            Err(error) => panic!("invalid location suffix regex: {error}"),
-        },
-    );
-
-// Covered by load_location_suffix_regexes.
-static HASH_LOCATION_SUFFIX_RE: LazyLock<Regex> =
-    LazyLock::new(|| match Regex::new(r"^L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?$") {
-        Ok(regex) => regex,
-        Err(error) => panic!("invalid hash location regex: {error}"),
-    });
 
 /// Stateful pulldown-cmark event consumer that builds styled `ratatui` output.
 ///
@@ -397,6 +414,8 @@ where
     list_indices: Vec<Option<u64>>,
     list_needs_blank_before_next_item: Vec<bool>,
     list_item_start_line_counts: Vec<usize>,
+    list_spacing: ListSpacing,
+    uniform_lists: Vec<UniformList>,
     link: Option<LinkState>,
     needs_newline: bool,
     pending_marker_line: bool,
@@ -404,6 +423,7 @@ where
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
+    code_block_content_end: usize,
     wrap_width: Option<usize>,
     cwd: Option<PathBuf>,
     is_hidden_link_destination: &'policy dyn Fn(&str) -> bool,
@@ -438,6 +458,8 @@ where
             list_indices: Vec::new(),
             list_needs_blank_before_next_item: Vec::new(),
             list_item_start_line_counts: Vec::new(),
+            list_spacing: ListSpacing::default(),
+            uniform_lists: Vec::new(),
             link: None,
             needs_newline: false,
             pending_marker_line: false,
@@ -445,6 +467,7 @@ where
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
+            code_block_content_end: 0,
             wrap_width,
             cwd: cwd.map(Path::to_path_buf),
             is_hidden_link_destination,
@@ -470,8 +493,13 @@ where
         self.prepare_for_event(&event);
         match event {
             Event::Start(tag) => self.start_tag(tag, range),
-            Event::End(tag) => self.end_tag(tag),
-            Event::Text(text) => self.text(text),
+            Event::End(tag) => self.end_tag(tag, range),
+            Event::Text(text) => {
+                if self.in_code_block {
+                    self.code_block_content_end = range.end;
+                }
+                self.text(text);
+            }
             Event::Code(code) => self.code(code),
             Event::SoftBreak => self.soft_break(),
             Event::HardBreak => self.hard_break(),
@@ -513,6 +541,7 @@ where
             Tag::Heading { level, .. } => self.start_heading(level),
             Tag::BlockQuote => self.start_blockquote(),
             Tag::CodeBlock(kind) => {
+                self.code_block_content_end = range.end;
                 let indent = match kind {
                     CodeBlockKind::Fenced(_) => None,
                     CodeBlockKind::Indented => Some(Span::from(" ".repeat(4))),
@@ -540,16 +569,22 @@ where
         }
     }
 
-    fn end_tag(&mut self, tag: TagEnd) {
+    fn end_tag(&mut self, tag: TagEnd, range: Range<usize>) {
         match tag {
             TagEnd::Paragraph => self.end_paragraph(),
             TagEnd::Heading(_) => self.end_heading(),
             TagEnd::BlockQuote => self.end_blockquote(),
-            TagEnd::CodeBlock => self.end_codeblock(),
+            TagEnd::CodeBlock => self.end_codeblock(range),
             TagEnd::List(_) => self.end_list(),
             TagEnd::Item => {
                 self.flush_current_line();
                 let start_line_count = self.list_item_start_line_counts.pop().unwrap_or_default();
+                if let Some(list) = self.uniform_lists.last_mut() {
+                    let rows = &self.text[start_line_count..];
+                    list.multiline |= rows.len() > 1
+                        || (rows.len() == 1
+                            && self.wrap_width.is_some_and(|width| rows[0].width() > width));
+                }
                 if self.text.len().saturating_sub(start_line_count) > 1
                     && let Some(needs_blank) = self.list_needs_blank_before_next_item.last_mut()
                 {
@@ -646,7 +681,14 @@ where
     }
 
     fn text(&mut self, text: CowStr<'a>) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            let style = self.inline_styles.last().copied().unwrap_or_default();
+            for (index, line) in text.lines().enumerate() {
+                if index > 0 {
+                    self.push_local_link_label_break();
+                }
+                self.push_local_link_label_span(Span::styled(line.to_string(), style));
+            }
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -700,7 +742,8 @@ where
     }
 
     fn code(&mut self, code: CowStr<'a>) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            self.push_local_link_label_span(Span::from(code.into_string()).style(self.styles.code));
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -718,7 +761,17 @@ where
     }
 
     fn html(&mut self, html: CowStr<'a>, inline: bool) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            let style = self.inline_styles.last().copied().unwrap_or_default();
+            for (index, line) in html.lines().enumerate() {
+                if index > 0 {
+                    self.push_local_link_label_break();
+                }
+                self.push_local_link_label_span(Span::styled(line.to_string(), style));
+            }
+            if !inline {
+                self.push_local_link_label_break();
+            }
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -751,7 +804,8 @@ where
     }
 
     fn hard_break(&mut self) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            self.push_local_link_label_break();
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -763,7 +817,8 @@ where
     }
 
     fn soft_break(&mut self) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            self.push_local_link_label_break();
             return;
         }
         if self.in_table_cell() {
@@ -786,24 +841,45 @@ where
         }
         self.list_indices.push(index);
         self.list_needs_blank_before_next_item.push(false);
+        if self.list_spacing == ListSpacing::Uniform {
+            self.uniform_lists.push(UniformList::default());
+        }
     }
 
     fn end_list(&mut self) {
+        self.flush_current_line();
+        if let Some(list) = self.uniform_lists.pop() {
+            list.finish(&mut self.text);
+        }
         self.list_indices.pop();
         self.list_needs_blank_before_next_item.pop();
         self.needs_newline = true;
     }
 
     fn start_item(&mut self) {
-        if self
+        let after_multiline = self
             .list_needs_blank_before_next_item
             .last_mut()
             .map(std::mem::take)
-            .unwrap_or(false)
-        {
-            self.push_blank_line();
-        }
+            .unwrap_or(/*default*/ false);
         self.flush_current_line();
+        let separate = match self.list_spacing {
+            ListSpacing::AfterMultiline => after_multiline,
+            ListSpacing::Compact => false,
+            ListSpacing::Uniform => self.uniform_lists.last().is_some_and(|list| list.has_item),
+        };
+        if separate {
+            let index = self.text.len();
+            self.push_blank_line();
+            if self.text.len() > index
+                && let Some(list) = self.uniform_lists.last_mut()
+            {
+                list.separators.push(index);
+            }
+        }
+        if let Some(list) = self.uniform_lists.last_mut() {
+            list.has_item = true;
+        }
         self.list_item_start_line_counts.push(self.text.len());
         self.pending_marker_line = true;
         let depth = self.list_indices.len();
@@ -846,7 +922,14 @@ where
 
     fn start_codeblock(&mut self, lang: Option<String>, indent: Option<Span<'static>>) {
         self.flush_current_line();
-        if !self.text.is_empty() {
+        let first_item_block = self.pending_marker_line
+            && self
+                .indent_stack
+                .last()
+                .is_some_and(|context| context.is_list);
+        if !self.text.is_empty()
+            && (self.list_spacing == ListSpacing::AfterMultiline || !first_item_block)
+        {
             self.push_blank_line();
         }
         self.in_code_block = true;
@@ -871,12 +954,29 @@ where
         self.needs_newline = true;
     }
 
-    fn end_codeblock(&mut self) {
-        // If we buffered code for a known language, syntax-highlight it now.
+    fn end_codeblock(&mut self, range: Range<usize>) {
+        // Completed Mermaid fences can replace source with a diagram; other blocks keep highlighting.
         if let Some(lang) = self.code_block_lang.take() {
             let code = std::mem::take(&mut self.code_block_buffer);
             if !code.is_empty() {
-                let highlighted = highlight_code_to_lines(&code, &lang);
+                let diagram = if preferences::current().mermaid
+                    && lang == "mermaid"
+                    && mermaid::has_closing_fence(self.input, range, self.code_block_content_end)
+                {
+                    let indent =
+                        Self::spans_display_width(&self.prefix_spans(self.pending_marker_line));
+                    mermaid::render(
+                        &code,
+                        self.wrap_width.map(|width| width.saturating_sub(indent)),
+                        &current_syntax_theme(),
+                    )
+                } else {
+                    None
+                };
+                let highlighted = match diagram {
+                    Some(diagram) => diagram,
+                    None => highlight_code_to_lines(&code, &lang),
+                };
                 for hl_line in highlighted {
                     self.push_line(Line::default());
                     for span in hl_line.spans {
@@ -1065,7 +1165,7 @@ where
         } else if self.link.is_some() || self.in_code_block {
             HyperlinkLine::new(Line::from(span))
         } else {
-            annotate_web_urls_in_line(Line::from(span))
+            style_bare_web_urls(span, self.styles.link)
         };
         if let Some(table_state) = self.table_state.as_mut()
             && let Some(cell) = table_state.current_cell.as_mut()
@@ -1823,6 +1923,7 @@ where
             } else {
                 None
             },
+            local_label_spans: Vec::new(),
             destination: dest_url,
         });
     }
@@ -1862,8 +1963,13 @@ where
                     self.push_span(")".into());
                 }
             } else if let Some(local_target_display) = link.local_target_display {
-                // Local file links are rendered as code-like path text so the transcript shows the
-                // resolved target instead of arbitrary caller-provided label text.
+                let local_label_text = link
+                    .local_label_spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                let show_label =
+                    should_render_local_link_label(&local_label_text, &link.destination);
                 let style = self
                     .inline_styles
                     .last()
@@ -1872,23 +1978,59 @@ where
                     .patch(self.styles.code);
                 let span = Span::styled(local_target_display, style);
                 if self.in_table_cell() {
+                    if show_label {
+                        for label_span in link.local_label_spans {
+                            self.push_span_to_table_cell(label_span);
+                        }
+                        self.push_span_to_table_cell(" (".into());
+                    }
                     self.push_span_to_table_cell(span);
+                    if show_label {
+                        self.push_span_to_table_cell(")".into());
+                    }
                 } else {
                     if self.pending_marker_line {
                         self.push_line(Line::default());
                     }
+                    if show_label {
+                        for label_span in link.local_label_spans {
+                            self.push_span(label_span);
+                        }
+                        self.push_span(" (".into());
+                    }
                     self.push_span(span);
+                    if show_label {
+                        self.push_span(")".into());
+                    }
                     self.line_ends_with_local_link_target = true;
                 }
             }
         }
     }
 
-    fn suppressing_local_link_label(&self) -> bool {
+    fn collecting_local_link_label(&self) -> bool {
         self.link
             .as_ref()
             .and_then(|link| link.local_target_display.as_ref())
             .is_some()
+    }
+
+    fn push_local_link_label_span(&mut self, span: Span<'static>) {
+        if let Some(link) = self.link.as_mut() {
+            link.local_label_spans.push(span);
+        }
+    }
+
+    fn push_local_link_label_break(&mut self) {
+        let needs_space = self
+            .link
+            .as_ref()
+            .and_then(|link| link.local_label_spans.last())
+            .and_then(|span| span.content.chars().last())
+            .is_some_and(|character| !character.is_whitespace());
+        if needs_space {
+            self.push_local_link_label_span(" ".into());
+        }
     }
 
     fn flush_current_line(&mut self) {
@@ -1901,15 +2043,19 @@ where
                 let opts = RtOptions::new(width)
                     .initial_indent(self.current_initial_indent.clone().into())
                     .subsequent_indent(self.current_subsequent_indent.clone().into());
-                let wrapped = adaptive_wrap_line(&line.line, opts)
-                    .into_iter()
-                    .map(|wrapped| line_to_static(&wrapped))
-                    .collect();
-                for wrapped in remap_wrapped_line(&line, wrapped) {
+                for wrapped in crate::terminal_hyperlinks::adaptive_wrap_hyperlink_lines(
+                    std::slice::from_ref(&line),
+                    opts,
+                ) {
                     self.push_output_line(wrapped.style(style));
                 }
             } else {
                 let mut spans = self.current_initial_indent.clone();
+                let mut source =
+                    crate::terminal_hyperlinks::LogicalLineSource::from_line(&line.line);
+                source.prefix_bytes = spans.iter().map(|span| span.content.len()).sum();
+                source.continuation_indent = self.current_subsequent_indent.clone().into();
+                line.source = Some(source);
                 let shift = Self::spans_display_width(&spans);
                 spans.append(&mut line.line.spans);
                 for hyperlink in &mut line.hyperlinks {
@@ -2027,7 +2173,7 @@ where
         } else if self.link.is_some() || self.in_code_block {
             HyperlinkLine::new(Line::from(span))
         } else {
-            annotate_web_urls_in_line(Line::from(span))
+            style_bare_web_urls(span, self.styles.link)
         };
         self.push_annotated(annotated);
     }
@@ -2080,225 +2226,6 @@ where
     }
 }
 
-fn is_local_path_like_link(dest_url: &str) -> bool {
-    dest_url.starts_with("file://")
-        || dest_url.starts_with('/')
-        || dest_url.starts_with("~/")
-        || dest_url.starts_with("./")
-        || dest_url.starts_with("../")
-        || dest_url.starts_with("\\\\")
-        || matches!(
-            dest_url.as_bytes(),
-            [drive, b':', separator, ..]
-                if drive.is_ascii_alphabetic() && matches!(separator, b'/' | b'\\')
-        )
-}
-
-/// Parse a local link target into normalized path text plus an optional location suffix.
-///
-/// This accepts the path shapes Codex emits today: `file://` URLs, absolute and relative paths,
-/// `~/...`, Windows paths, and `#L..C..` or `:line:col` suffixes.
-fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String> {
-    let (path_text, location_suffix) = parse_local_link_target(dest_url)?;
-    let mut rendered = display_local_link_path(&path_text, cwd);
-    if let Some(location_suffix) = location_suffix {
-        rendered.push_str(&location_suffix);
-    }
-    Some(rendered)
-}
-
-/// Split a local-link destination into `(normalized_path_text, location_suffix)`.
-///
-/// The returned path text never includes a trailing `#L..` or `:line[:col]` suffix. Path
-/// normalization expands `~/...` when possible and rewrites path separators into display-stable
-/// forward slashes. The suffix, when present, is returned separately in normalized markdown form.
-///
-/// Returns `None` only when the destination looks like a `file://` URL but cannot be parsed into a
-/// local path. Plain path-like inputs always return `Some(...)` even if they are relative.
-fn parse_local_link_target(dest_url: &str) -> Option<(String, Option<String>)> {
-    if dest_url.starts_with("file://") {
-        let url = Url::parse(dest_url).ok()?;
-        let path_text = file_url_to_local_path_text(&url)?;
-        let location_suffix = url
-            .fragment()
-            .and_then(normalize_hash_location_suffix_fragment);
-        return Some((path_text, location_suffix));
-    }
-
-    let mut path_text = dest_url;
-    let mut location_suffix = None;
-    // Prefer `#L..` style fragments when both forms are present so URLs like `path#L10` do not
-    // get misparsed as a plain path ending in `:10`.
-    if let Some((candidate_path, fragment)) = dest_url.rsplit_once('#')
-        && let Some(normalized) = normalize_hash_location_suffix_fragment(fragment)
-    {
-        path_text = candidate_path;
-        location_suffix = Some(normalized);
-    }
-    if location_suffix.is_none()
-        && let Some(suffix) = extract_colon_location_suffix(path_text)
-    {
-        let path_len = path_text.len().saturating_sub(suffix.len());
-        path_text = &path_text[..path_len];
-        location_suffix = Some(suffix);
-    }
-
-    let decoded_path_text =
-        urlencoding::decode(path_text).unwrap_or(std::borrow::Cow::Borrowed(path_text));
-    Some((expand_local_link_path(&decoded_path_text), location_suffix))
-}
-
-/// Normalize a hash fragment like `L12` or `L12C3-L14C9` into the display suffix we render.
-///
-/// Returns `None` for fragments that are not location references. This deliberately ignores other
-/// `#...` fragments so non-location hashes stay part of the path text.
-fn normalize_hash_location_suffix_fragment(fragment: &str) -> Option<String> {
-    HASH_LOCATION_SUFFIX_RE
-        .is_match(fragment)
-        .then(|| format!("#{fragment}"))
-        .and_then(|suffix| normalize_markdown_hash_location_suffix(&suffix))
-}
-
-/// Extract a trailing `:line`, `:line:col`, or range suffix from a plain path-like string.
-///
-/// The suffix must occur at the end of the input; embedded colons elsewhere in the path are left
-/// alone. This is what keeps Windows drive letters like `C:/...` from being misread as locations.
-fn extract_colon_location_suffix(path_text: &str) -> Option<String> {
-    COLON_LOCATION_SUFFIX_RE
-        .find(path_text)
-        .filter(|matched| matched.end() == path_text.len())
-        .map(|matched| matched.as_str().to_string())
-}
-
-/// Expand home-relative paths and normalize separators for display.
-///
-/// If `~/...` cannot be expanded because the home directory is unavailable, the original text still
-/// goes through separator normalization and is returned as-is otherwise.
-fn expand_local_link_path(path_text: &str) -> String {
-    // Expand `~/...` eagerly so home-relative links can participate in the same normalization and
-    // cwd-relative shortening path as absolute links.
-    if let Some(rest) = path_text.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return normalize_local_link_path_text(&home.join(rest).to_string_lossy());
-    }
-
-    normalize_local_link_path_text(path_text)
-}
-
-/// Convert a `file://` URL into the normalized local-path text used for transcript rendering.
-///
-/// This prefers `Url::to_file_path()` for standard file URLs. When that rejects Windows-oriented
-/// encodings, we reconstruct a display path from the host/path parts so UNC paths and drive-letter
-/// URLs still render sensibly.
-fn file_url_to_local_path_text(url: &Url) -> Option<String> {
-    if let Ok(path) = url.to_file_path() {
-        return Some(normalize_local_link_path_text(&path.to_string_lossy()));
-    }
-
-    // Fall back to string reconstruction for cases `to_file_path()` rejects, especially UNC-style
-    // hosts and Windows drive paths encoded in URL form.
-    let mut path_text = url.path().to_string();
-    if let Some(host) = url.host_str()
-        && !host.is_empty()
-        && host != "localhost"
-    {
-        path_text = format!("//{host}{path_text}");
-    } else if matches!(
-        path_text.as_bytes(),
-        [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
-    ) {
-        path_text.remove(0);
-    }
-
-    Some(normalize_local_link_path_text(&path_text))
-}
-
-/// Normalize local-path text into the transcript display form.
-///
-/// Display normalization is intentionally lexical: it does not touch the filesystem, resolve
-/// symlinks, or collapse `.` / `..`. It only converts separators to forward slashes and rewrites
-/// UNC-style `\\\\server\\share` inputs into `//server/share` so later prefix checks operate on a
-/// stable representation.
-fn normalize_local_link_path_text(path_text: &str) -> String {
-    // Render all local link paths with forward slashes so display and prefix stripping are stable
-    // across mixed Windows and Unix-style inputs.
-    if let Some(rest) = path_text.strip_prefix("\\\\") {
-        format!("//{}", rest.replace('\\', "/").trim_start_matches('/'))
-    } else {
-        path_text.replace('\\', "/")
-    }
-}
-
-fn is_absolute_local_link_path(path_text: &str) -> bool {
-    path_text.starts_with('/')
-        || path_text.starts_with("//")
-        || matches!(
-            path_text.as_bytes(),
-            [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
-        )
-}
-
-/// Remove trailing separators from a local path without destroying root semantics.
-///
-/// Roots like `/`, `//`, and `C:/` stay intact so callers can still distinguish "the root itself"
-/// from "a path under the root".
-fn trim_trailing_local_path_separator(path_text: &str) -> &str {
-    if path_text == "/" || path_text == "//" {
-        return path_text;
-    }
-    if matches!(path_text.as_bytes(), [drive, b':', b'/'] if drive.is_ascii_alphabetic()) {
-        return path_text;
-    }
-    path_text.trim_end_matches('/')
-}
-
-/// Strip `cwd_text` from the start of `path_text` when `path_text` is strictly underneath it.
-///
-/// Returns the relative remainder without a leading slash. If the path equals the cwd exactly, this
-/// returns `None` so callers can keep rendering the full path instead of collapsing it to an empty
-/// string.
-fn strip_local_path_prefix<'a>(path_text: &'a str, cwd_text: &str) -> Option<&'a str> {
-    let path_text = trim_trailing_local_path_separator(path_text);
-    let cwd_text = trim_trailing_local_path_separator(cwd_text);
-    if path_text == cwd_text {
-        return None;
-    }
-
-    // Treat filesystem roots specially so `/tmp/x` under `/` becomes `tmp/x` instead of being
-    // left unchanged by the generic prefix-stripping branch.
-    if cwd_text == "/" || cwd_text == "//" {
-        return path_text.strip_prefix('/');
-    }
-
-    path_text
-        .strip_prefix(cwd_text)
-        .and_then(|rest| rest.strip_prefix('/'))
-}
-
-/// Choose the visible path text for a local link after normalization.
-///
-/// Relative paths stay relative. Absolute paths are shortened against `cwd` only when they are
-/// lexically underneath it; otherwise the absolute path is preserved. This is display logic only,
-/// not filesystem canonicalization.
-fn display_local_link_path(path_text: &str, cwd: Option<&Path>) -> String {
-    let path_text = normalize_local_link_path_text(path_text);
-    if !is_absolute_local_link_path(&path_text) {
-        return path_text;
-    }
-
-    if let Some(cwd) = cwd {
-        // Only shorten absolute paths that are under the provided session cwd; otherwise preserve
-        // the original absolute target for clarity.
-        let cwd_text = normalize_local_link_path_text(&cwd.to_string_lossy());
-        if let Some(stripped) = strip_local_path_prefix(&path_text, &cwd_text) {
-            return stripped.to_string();
-        }
-    }
-
-    path_text
-}
-
 #[cfg(test)]
 mod markdown_render_tests {
     include!("markdown_render_tests.rs");
@@ -2308,6 +2235,7 @@ mod markdown_render_tests {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use ratatui::style::Stylize;
     use ratatui::text::Text;
 
     fn lines_to_strings(text: &Text<'_>) -> Vec<String> {
@@ -2385,9 +2313,19 @@ mod tests {
 
     #[test]
     fn wraps_blockquotes() {
-        let markdown = "> block quote with content that should wrap nicely";
-        let rendered = render_markdown_text_with_width(markdown, Some(22));
-        let lines = lines_to_strings(&rendered);
+        let markdown = "> block quote with **content** that should wrap nicely";
+        let rendered =
+            render_markdown_lines_with_width_and_cwd(markdown, Some(22), /*cwd*/ None);
+        let source = rendered[0].source.as_ref().expect("blockquote source");
+        assert_eq!(
+            source.styled_range(0..source.text.len()),
+            Line::from(vec![
+                "block quote with ".green(),
+                "content".green().bold(),
+                " that should wrap nicely".green(),
+            ])
+        );
+        let lines: Vec<_> = rendered.iter().map(|line| line.line.to_string()).collect();
         assert_eq!(
             lines,
             vec![
@@ -2460,7 +2398,13 @@ mod tests {
         // extracted (first word / comma-separated token) so highlighting works.
         for info in &["rust,no_run", "rust no_run", "rust title=\"demo\""] {
             let markdown = format!("```{info}\nfn main() {{}}\n```\n");
-            let rendered = render_markdown_text(&markdown);
+            let rendered = crate::terminal_palette::with_test_default_colors(
+                crate::terminal_probe::DefaultColors {
+                    fg: (220, 220, 220),
+                    bg: (20, 20, 20),
+                },
+                || render_markdown_text(&markdown),
+            );
             let has_rgb = rendered.lines.iter().any(|line| {
                 line.spans
                     .iter()

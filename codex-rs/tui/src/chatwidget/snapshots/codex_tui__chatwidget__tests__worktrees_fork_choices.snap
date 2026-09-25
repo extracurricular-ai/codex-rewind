@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/tests/worktree_picker_tests.rs
+expression: popup
+---
+  Where should the forked conversation run?
+
+
+› 1. Current checkout  Keep using the current working directory
+  2. New worktree      Create an isolated managed checkout
+
+  enter select · esc back

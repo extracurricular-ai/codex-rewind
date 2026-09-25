@@ -1,5 +1,4 @@
 use super::App;
-use crate::session_resume::read_session_model;
 use crate::session_state::ThreadSessionState;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::Thread;
@@ -80,7 +79,7 @@ impl App {
         let active_permission_profile = self.current_active_permission_profile();
         let mut session = if let Some(mut session) = self.primary_session_configured.clone() {
             if session.thread_id != thread_id {
-                // `thread/read` does not include thread settings, so do not carry
+                // `thread/read` does not include all thread settings, so do not carry
                 // thread-scoped state from the currently active session.
                 session.collaboration_mode = None;
                 session.personality = None;
@@ -88,6 +87,7 @@ impl App {
             session
         } else {
             ThreadSessionState {
+                windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
                 thread_id,
                 forked_from_id: None,
                 fork_parent_title: None,
@@ -112,6 +112,8 @@ impl App {
                 rollout_path: thread.path.clone(),
             }
         };
+        session.windows_sandbox_host =
+            crate::windows_sandbox::host_from_environments(thread.environments.as_deref());
         session.thread_id = thread_id;
         session.thread_name = thread.name.clone();
         session.model_provider_id = thread.model_provider.clone();
@@ -120,10 +122,8 @@ impl App {
         session.active_permission_profile = active_permission_profile;
         session.instruction_source_paths = Vec::new();
         session.rollout_path = thread.path.clone();
-        if let Some(model) =
-            read_session_model(self.state_db.as_deref(), thread_id, thread.path.as_deref()).await
-        {
-            session.model = model;
+        if let Some(model) = &thread.model {
+            session.model = model.clone();
         } else if thread.path.is_some() {
             session.model.clear();
         }
@@ -172,6 +172,7 @@ mod tests {
 
     fn test_thread_session(thread_id: ThreadId, cwd: PathBuf) -> ThreadSessionState {
         ThreadSessionState {
+            windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
             thread_id,
             forked_from_id: None,
             fork_parent_title: None,
@@ -410,6 +411,8 @@ mod tests {
             ..test_thread_session(primary_thread_id, test_path_buf("/tmp/primary"))
         };
         let read_thread = Thread {
+            originator: None,
+            environments: None,
             id: read_thread_id.to_string(),
             extra: None,
             session_id: read_thread_id.to_string(),
@@ -420,8 +423,11 @@ mod tests {
             section: None,
             section_entered_at: None,
             project_id: None,
+            daybreak_enabled: None,
             history_mode: Default::default(),
             model_provider: "read-provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 1,
             updated_at: 2,
             recency_at: Some(2),

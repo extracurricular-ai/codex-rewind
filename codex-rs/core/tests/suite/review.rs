@@ -7,7 +7,6 @@ use codex_core::find_thread_path_by_id_str;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
@@ -209,7 +208,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .find_map(|line| {
-            let rollout_line: RolloutLine = serde_json::from_str(line).expect("rollout line");
+            let rollout_line = codex_rollout::parse_rollout_line(line).expect("rollout line");
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.id.to_string()),
                 _ => None,
@@ -251,7 +250,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
             continue;
         }
         let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
-        let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
+        let rl = codex_rollout::decode_rollout_line(v).expect("rollout line");
         if let RolloutItem::ResponseItem(envelope) = rl.item
             && let ResponseItem::Message { role, content, .. } = envelope.item
         {
@@ -582,6 +581,8 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
 
     fn model_defaults(guidance_message: &str) -> ModelTokenBudgetConfig {
         ModelTokenBudgetConfig {
+            enabled: false,
+            use_history_notes_extension: false,
             reminder_threshold_tokens: 6_144,
             reminder_message_template: "Reminder: {n_remaining} tokens remain.".to_string(),
             guidance_message: guidance_message.to_string(),
@@ -761,8 +762,8 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
     let review_session_cwd = review_rollout
         .lines()
         .find_map(|line| {
-            let rollout_line: RolloutLine =
-                serde_json::from_str(line).expect("review rollout line should be valid");
+            let rollout_line = codex_rollout::parse_rollout_line(line)
+                .expect("review rollout line should be valid");
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.cwd),
                 _ => None,
@@ -773,8 +774,8 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
     let review_context = review_rollout
         .lines()
         .filter_map(|line| {
-            let rollout_line: RolloutLine =
-                serde_json::from_str(line).expect("review rollout line should be valid");
+            let rollout_line = codex_rollout::parse_rollout_line(line)
+                .expect("review rollout line should be valid");
             match rollout_line.item {
                 RolloutItem::TurnContext(turn_context) => Some(turn_context),
                 _ => None,
@@ -805,7 +806,7 @@ async fn review_uses_updated_turn_permissions_and_approval_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_omits_retained_tier_when_fast_mode_disabled() -> anyhow::Result<()> {
+async fn review_preserves_flex_tier_when_fast_mode_disabled() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let (server, request_log) =
         start_responses_server_with_sse(completed_sse(), /*expected_requests*/ 1).await;
@@ -858,7 +859,7 @@ async fn review_omits_retained_tier_when_fast_mode_disabled() -> anyhow::Result<
     );
     assert_eq!(
         request_log.single_request().body_json().get("service_tier"),
-        None
+        Some(&serde_json::json!("flex"))
     );
     Ok(())
 }
@@ -1227,7 +1228,7 @@ async fn review_input_isolated_from_parent_history() {
             continue;
         }
         let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line");
-        let rl: RolloutLine = serde_json::from_value(v).expect("rollout line");
+        let rl = codex_rollout::decode_rollout_line(v).expect("rollout line");
         if let RolloutItem::ResponseItem(envelope) = rl.item
             && let ResponseItem::Message { role, content, .. } = envelope.item
             && role == "user"

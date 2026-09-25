@@ -410,6 +410,19 @@
     - 这次的实际损失是零(build 失败 ⇒ publish 不会运行 ⇒ 版本号没被占用),但那是**运气好在失败点靠前**。若失败发生在第七个 publish,六个平台包已公开、版本号即作废。
     - 附带发现:`.github/workflows/zstd`(上游的 DotSlash manifest)被 fork 裁剪 workflow 时一起删了。**目前无害** —— `build.yml` 不传 `--archive-output`,`write_archive` 不被调用;且 `resolve_zstd_command` 会先用 PATH 上的 `zstd`,runner 自带,DotSlash 只是兜底。记在这里是免得下次有人查到这条路又重新推导一遍。
 
+### 上游同步 rust-v0.151.0 → rust-v0.156.1(2026-09-23)
+
+70. **上游的 prompt edit 已改成原线程 `thread/revert`,不是文件回退。** 上游明确提示文件保持不变。直接接管这条路径会丢掉本 fork 的文件恢复和 `/redo` 所需的原会话。
+    - `/rewind` 继续分叉、恢复文件并归档原会话;开启 `file_snapshots` 的历史编辑也走这条路径。未开启时,普通历史编辑采用上游的新行为。
+    - 分叉适配放在 `tui/src/app/rewind.rs`,不把整段旧 handler 塞回上游的事件分发器。
+    - 选择通过 `Arc<dyn HistoryCell>` 保留身份,并用上游的分页历史加载、可见消息投影和最新 turn 校验定位实际边界。不能再把当前屏幕上的第 N 条直接当成完整历史的第 N 条。
+    - 权限选择、工作区根和当前模型随分叉保留。普通 fork、切换目录和 safety retry 不恢复文件。
+    - 本地后台服务的兼容性检查包含 `file_snapshots`,开启快照时不能复用缺少此能力的官方服务。
+
+71. **包名适配不止安装命令。** 新版启动器读取 pnpm/Vite+ 的安装归属元数据;这些路径和元数据中的包名也必须是 `codex-rewind`。启动器测试覆盖实际目录布局,不能只检查更新命令的字符串。新增的 Rust 测试也继续使用 `cargo_bin("codexr")`。
+
+72. **协议生成入口已由上游修复。** 本版本使用 `just write-app-server-schema` 和 `--experimental`,普通生成还会更新 Python SDK。继续重生成本 fork 的恢复接口,不要只接受上游的压缩预生成文件。决策 64 的手工调用只适用于旧基线。
+
 ## 四、已知但暂不处理
 
 41. **resume 之后,会话 UI 不显示 apply_patch 的 diff**(你报的,2026-08-13)。

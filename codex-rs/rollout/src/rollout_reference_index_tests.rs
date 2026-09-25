@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
-use std::time::Instant;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HistoryPosition;
@@ -109,6 +107,147 @@ async fn indexes_multiple_rollouts_for_the_same_thread() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn unarchived_scan_finds_all_active_rollouts_owned_by_a_thread() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let owner_id = thread_id(Uuid::from_u128(30))?;
+    let original_uuid = Uuid::from_u128(31);
+    let replacement_uuid = Uuid::from_u128(32);
+    let original_path = active_rollout_path(home.path(), original_uuid);
+    let replacement_path = active_rollout_path(home.path(), replacement_uuid);
+    write_rollout(original_path.clone(), owner_id, /*history_base*/ None)?;
+    compress_now(&original_path)?;
+    write_rollout(
+        replacement_path.clone(),
+        owner_id,
+        /*history_base*/ None,
+    )?;
+    write_rollout(
+        archived_rollout_path(home.path(), Uuid::from_u128(33)),
+        owner_id,
+        /*history_base*/ None,
+    )?;
+    write_rollout(
+        active_rollout_path(home.path(), Uuid::from_u128(34)),
+        thread_id(Uuid::from_u128(34))?,
+        /*history_base*/ None,
+    )?;
+
+    let index = RolloutReferenceIndex::scan_unarchived(home.path()).await?;
+    let mut owned: Vec<_> = index
+        .rollouts_for_thread(owner_id)
+        .map(|(id, path)| (id, path.to_path_buf()))
+        .collect();
+    owned.sort_by_key(|(_, path)| path.clone());
+    assert_eq!(
+        owned,
+        vec![
+            (
+                thread_id(original_uuid)?,
+                original_path.with_extension("jsonl.zst")
+            ),
+            (thread_id(replacement_uuid)?, replacement_path),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn filtered_unarchived_scan_includes_reverts_and_requested_descendants() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let owner_uuid = Uuid::from_u128(40);
+    let owner_id = thread_id(owner_uuid)?;
+    let replacement_id = thread_id(Uuid::from_u128(41))?;
+    let descendant_uuid = Uuid::from_u128(42);
+    let descendant_id = thread_id(descendant_uuid)?;
+    let unrelated_uuid = Uuid::from_u128(43);
+    let unrelated_id = thread_id(unrelated_uuid)?;
+    let original_path = active_rollout_path(home.path(), owner_uuid);
+    let replacement_path = original_path.with_file_name(format!(
+        "rollout-2025-01-03T12-00-00-{owner_id}_{replacement_id}.jsonl"
+    ));
+    let descendant_path = active_rollout_path(home.path(), descendant_uuid);
+
+    write_rollout(original_path.clone(), owner_id, /*history_base*/ None)?;
+    compress_now(&original_path)?;
+    write_rollout(
+        replacement_path.clone(),
+        owner_id,
+        /*history_base*/ None,
+    )?;
+    // A leftover compressed sibling must not supersede the plain rollout.
+    compress_now(&replacement_path)?;
+    write_rollout(
+        replacement_path.clone(),
+        owner_id,
+        /*history_base*/ None,
+    )?;
+    write_rollout(
+        descendant_path.clone(),
+        descendant_id,
+        Some(history_position(owner_id)),
+    )?;
+    write_rollout(
+        archived_rollout_path(home.path(), owner_uuid),
+        owner_id,
+        /*history_base*/ None,
+    )?;
+    let unrelated_path = active_rollout_path(home.path(), unrelated_uuid);
+    write_rollout(
+        unrelated_path.clone(),
+        unrelated_id,
+        /*history_base*/ None,
+    )?;
+    compress_now(&unrelated_path)?;
+
+    let index =
+        RolloutReferenceIndex::scan_unarchived_threads(home.path(), &[owner_id, descendant_id])
+            .await?;
+    let mut owned: Vec<_> = index
+        .rollouts_for_thread(owner_id)
+        .map(|(id, path)| (id, path.to_path_buf()))
+        .collect();
+    owned.sort_by_key(|(id, _)| id.to_string());
+    assert_eq!(
+        owned,
+        vec![
+            (owner_id, original_path.with_extension("jsonl.zst")),
+            (replacement_id, replacement_path),
+        ]
+    );
+    assert_eq!(
+        index.rollouts_for_thread(descendant_id).collect::<Vec<_>>(),
+        vec![(descendant_id, descendant_path.as_path())]
+    );
+    assert_eq!(
+        index.rollouts_for_thread(unrelated_id).collect::<Vec<_>>(),
+        Vec::new()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn filtered_unarchived_scan_validates_candidate_ownership() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let requested_uuid = Uuid::from_u128(50);
+    let requested_id = thread_id(requested_uuid)?;
+    let actual_owner = thread_id(Uuid::from_u128(51))?;
+    write_rollout(
+        active_rollout_path(home.path(), requested_uuid),
+        actual_owner,
+        /*history_base*/ None,
+    )?;
+
+    let index =
+        RolloutReferenceIndex::scan_unarchived_threads(home.path(), &[requested_id]).await?;
+    assert_eq!(
+        index.rollouts_for_thread(requested_id).collect::<Vec<_>>(),
+        Vec::new()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn self_history_base_does_not_count_as_reference() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let thread_id = thread_id(Uuid::from_u128(11))?;
@@ -123,17 +262,6 @@ async fn self_history_base_does_not_count_as_reference() -> anyhow::Result<()> {
 
     assert_eq!(index.history_base(thread_id), Some(&history_base));
     assert_eq!(index.reference_count(thread_id), 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn expired_deadline_returns_none() -> anyhow::Result<()> {
-    let home = TempDir::new()?;
-
-    let index =
-        RolloutReferenceIndex::scan_until(home.path(), Instant::now(), Duration::ZERO).await?;
-
-    assert!(index.is_none());
     Ok(())
 }
 

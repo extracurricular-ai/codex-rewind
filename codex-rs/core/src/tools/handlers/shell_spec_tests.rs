@@ -93,7 +93,7 @@ fn exec_command_tool_matches_expected_spec() {
                 Some(vec!["cmd".to_string()]),
                 Some(false.into())
             ),
-            output_schema: Some(unified_exec_output_schema()),
+            output_schema: Some(unified_exec_output_schema().into()),
         })
     );
 }
@@ -107,6 +107,7 @@ fn exec_command_tool_can_hide_shell_parameter() {
         },
         /*include_environment_id*/ false,
         /*include_shell_parameter*/ false,
+        /*include_windows_shell_guidance*/ cfg!(windows),
     );
 
     assert!(!has_parameter(&tool, "shell"));
@@ -158,7 +159,7 @@ fn write_stdin_tool_matches_expected_spec() {
                 Some(vec!["session_id".to_string()]),
                 Some(false.into())
             ),
-            output_schema: Some(unified_exec_output_schema()),
+            output_schema: Some(unified_exec_output_schema().into()),
         })
     );
 }

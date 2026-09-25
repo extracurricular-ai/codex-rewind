@@ -12,9 +12,10 @@ use codex_utils_pty::TerminalSize;
 use crate::SandboxType;
 use crate::WindowsSandboxFilesystemOverrides;
 use crate::WindowsSandboxProxySettingsMode;
+use crate::terminal_queries::respond_to_terminal_queries;
 
 /// Windows-specific inputs for an executor-native process spawn.
-// TODO(anp): Reconcile Windows backend and desktop copies with the supplied sandbox
+// TODO(anp): Reconcile the Windows backend copy with the supplied sandbox
 // context (TurnEnvironment::sandbox_context for turns), preserving this launch snapshot.
 pub struct WindowsSandboxSpawnRequest<'a> {
     pub permission_profile: &'a PermissionProfile,
@@ -24,7 +25,6 @@ pub struct WindowsSandboxSpawnRequest<'a> {
     pub network_proxy_restricting_sid: Option<&'a str>,
     pub proxy_settings_mode: WindowsSandboxProxySettingsMode,
     pub filesystem_overrides: Option<&'a WindowsSandboxFilesystemOverrides>,
-    pub use_private_desktop: bool,
 }
 
 /// Executor-native process launch request shared by local and exec-server execution.
@@ -42,6 +42,15 @@ pub struct SpawnRequest<'a> {
 
 /// Spawn a process using the backend selected by the prepared sandbox request.
 pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> {
+    let tty = request.tty;
+    let finish_spawn = |spawned| {
+        if tty {
+            respond_to_terminal_queries(spawned)
+        } else {
+            spawned
+        }
+    };
+
     if request.sandbox == SandboxType::WindowsRestrictedToken {
         #[cfg(target_os = "windows")]
         {
@@ -82,10 +91,10 @@ pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> 
                     }),
                     tty: request.tty,
                     stdin_open: request.stdin_open,
-                    use_private_desktop: windows.use_private_desktop,
                 },
             )
-            .await;
+            .await
+            .map(finish_spawn);
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -96,7 +105,7 @@ pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> 
         .command
         .split_first()
         .context("missing program for process spawn")?;
-    if request.tty {
+    let spawned = if tty {
         codex_utils_pty::pty::spawn_process(
             program,
             args,
@@ -127,5 +136,6 @@ pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> 
             request.inherited_fds,
         )
         .await
-    }
+    };
+    spawned.map(finish_spawn)
 }

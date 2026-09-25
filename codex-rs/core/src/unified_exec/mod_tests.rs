@@ -68,7 +68,6 @@ fn test_exec_request(
     cwd: AbsolutePathBuf,
     env: HashMap<String, String>,
 ) -> ExecRequest {
-    let windows_sandbox_private_desktop = false;
     let permission_profile = turn.permission_profile();
     let network = None;
     let arg0 = None;
@@ -81,9 +80,13 @@ fn test_exec_request(
         ExecExpiration::DefaultTimeout,
         ExecCapturePolicy::ShellTool,
         SandboxType::None,
-        turn.config.effective_workspace_roots(),
+        turn.config
+            .effective_workspace_roots()
+            .iter()
+            .map(PathUri::to_abs_path)
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("test workspace roots are host-native"),
         turn.windows_sandbox_level,
-        windows_sandbox_private_desktop,
         permission_profile,
         arg0,
     )
@@ -111,11 +114,12 @@ async fn exec_command_with_tty(
             .open_session_with_prepared_exec_env(
                 process_id,
                 &request,
+                /*tool_ctx*/ None,
                 codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
                 /*network_policy_decider*/ None,
                 tty,
                 Box::new(NoopSpawnLifecycle),
-                turn.environments
+                turn.initial_environments
                     .primary()
                     .expect("turn environment")
                     .environment
@@ -142,7 +146,16 @@ async fn exec_command_with_tty(
             hook_command: cmd.to_string(),
             tty,
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-            escalated: false,
+            permissions: TerminalPermissions::for_launch(
+                turn.initial_environments
+                    .primary()
+                    .expect("turn environment"),
+                turn,
+                TerminalSandboxSource::Native,
+                SandboxPermissions::UseDefault,
+                /*additional_permissions*/ None,
+                /*internal_permissions*/ None,
+            ),
             network_approval: None,
             session: Arc::downgrade(session),
             last_used: started_at,
@@ -609,7 +622,16 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             hook_command: "sleep 60".to_string(),
             tty: true,
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-            escalated: false,
+            permissions: TerminalPermissions::for_launch(
+                turn.initial_environments
+                    .primary()
+                    .expect("turn environment"),
+                &turn,
+                TerminalSandboxSource::Native,
+                SandboxPermissions::UseDefault,
+                /*additional_permissions*/ None,
+                /*internal_permissions*/ None,
+            ),
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
@@ -685,7 +707,16 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             hook_command: "sleep 60".to_string(),
             tty: true,
             environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
-            escalated: false,
+            permissions: TerminalPermissions::for_launch(
+                turn.initial_environments
+                    .primary()
+                    .expect("turn environment"),
+                &turn,
+                TerminalSandboxSource::Native,
+                SandboxPermissions::UseDefault,
+                /*additional_permissions*/ None,
+                /*internal_permissions*/ None,
+            ),
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used,
@@ -751,6 +782,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
         .open_session_with_prepared_exec_env(
             /*process_id*/ 1234,
             &request,
+            /*tool_ctx*/ None,
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ false,
@@ -793,6 +825,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         .open_session_with_prepared_exec_env(
             /*process_id*/ 1234,
             &request,
+            /*tool_ctx*/ None,
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ true,
@@ -823,7 +856,8 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
 
     let remote_test_env = remote_test_env().await?;
     let (_, mut turn) = make_session_and_context().await;
-    let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0] else {
+    let TurnEnvironmentState::Ready(environment) = &mut turn.initial_environments.environments[0]
+    else {
         panic!("expected ready primary environment");
     };
     environment.environment = Arc::new(remote_test_env.environment().clone());
@@ -842,13 +876,14 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
         .open_session_with_prepared_exec_env(
             /*process_id*/ 1234,
             &request,
+            /*tool_ctx*/ None,
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
             /*network_policy_decider*/ None,
             /*tty*/ true,
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],
             }),
-            turn.environments
+            turn.initial_environments
                 .primary()
                 .expect("turn environment")
                 .environment
@@ -899,14 +934,38 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
     let original = {
         let mut store = manager.process_store.lock().await;
         let entry = store.processes.get_mut(&process_id).unwrap();
-        entry.escalated = true;
+        entry.permissions = TerminalPermissions::for_launch(
+            turn.initial_environments
+                .primary()
+                .expect("turn environment"),
+            &turn,
+            TerminalSandboxSource::Native,
+            SandboxPermissions::RequireEscalated,
+            /*additional_permissions*/ None,
+            /*internal_permissions*/ None,
+        );
         entry.environment_id = "unselected-executor".to_string();
         entry.cwd = cwd.clone();
         Arc::clone(&entry.process)
     };
+    // A queued write must acquire the terminal lock before reading active strict
+    // mode: code-mode calls can enable it while another interaction is draining.
+    {
+        let interaction = original.interaction_lock().lock_owned().await;
+        let _active_turn = session.active_turn.lock().await;
+        let mut queued = Box::pin(write_stdin(
+            &session, &turn, process_id, "queued\n", /*yield_time_ms*/ 250,
+        ));
+        let mut task_context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(queued.as_mut().poll(&mut task_context).is_pending());
+        drop(interaction);
+        assert!(queued.as_mut().poll(&mut task_context).is_pending());
+        assert!(original.interaction_lock().try_lock_owned().is_err());
+    }
     // Empty polling must complete without an approval response.
+    // The test deadline must allow the minimum empty-poll wait.
     tokio::time::timeout(
-        Duration::from_secs(/*secs*/ 5),
+        Duration::from_millis(MIN_EMPTY_YIELD_TIME_MS) + Duration::from_secs(/*secs*/ 5),
         write_stdin(&session, &turn, process_id, "", /*yield_time_ms*/ 250),
     )
     .await??;
@@ -921,6 +980,25 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
     );
     Arc::make_mut(&mut Arc::get_mut(&mut turn).unwrap().config).approvals_reviewer =
         ApprovalsReviewer::User;
+    assert!(matches!(
+        write_stdin(&session, &turn, process_id, input, /*yield_time_ms*/ 250).await,
+        Err(UnifiedExecError::StdinApproval(ToolError::Rejected(reason)))
+            if reason.contains("select it before retrying")
+    ));
+    manager
+        .process_store
+        .lock()
+        .await
+        .processes
+        .get_mut(&process_id)
+        .unwrap()
+        .environment_id = turn
+        .initial_environments
+        .primary()
+        .unwrap()
+        .selection
+        .environment_id
+        .clone();
     for (input, decision) in [
         ("rejected\n", ReviewDecision::denied("test denial")),
         ("accepted\n", ReviewDecision::Approved),

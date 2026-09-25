@@ -1,3 +1,4 @@
+use codex_code_mode_protocol::NoopCodeModeSessionDelegate;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -43,13 +44,10 @@ fn resolve_yield_timeout_applies_grace_before_session_limits() {
         (Some(10_500), 5_000, Duration::from_secs(5)),
         (Some(u64::MAX), u64::MAX, Duration::from_millis(u64::MAX)),
     ] {
-        let session = InProcessCodeModeSession::with_delegate_and_limits(
-            Arc::new(ReleasableToolDelegate::default()),
-            CodeModeSessionCellExecutionLimits {
-                max_yield_time_ms,
-                max_heap_size_bytes: None,
-            },
-        );
+        let session = InProcessCodeModeSession::with_limits(CodeModeSessionCellExecutionLimits {
+            max_yield_time_ms,
+            max_heap_size_bytes: None,
+        });
 
         assert_eq!(
             session.resolve_yield_timeout(requested_yield_time_ms),
@@ -62,14 +60,14 @@ fn resolve_yield_timeout_applies_grace_before_session_limits() {
 #[tokio::test(start_paused = true)]
 async fn execute_waits_for_nested_tool_during_yield_grace() {
     let delegate = Arc::new(ReleasableToolDelegate::default());
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let service = InProcessCodeModeSession::new();
     let request = ExecuteRequest {
         enabled_tools: vec![echo_tool()],
         source: r#"await tools.echo({}); text("done");"#.to_string(),
         yield_time_ms: Some(10_000),
         ..execute_request("")
     };
-    let started = service.execute(request).await.unwrap();
+    let started = service.execute(request, delegate.clone()).await.unwrap();
     let response = tokio::spawn(started.initial_response());
     wait_until_tool_started(&delegate).await;
     tokio::time::advance(Duration::from_millis(10_500)).await;
@@ -80,6 +78,7 @@ async fn execute_waits_for_nested_tool_during_yield_grace() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
@@ -92,20 +91,20 @@ async fn execute_waits_for_nested_tool_during_yield_grace() {
 #[tokio::test(start_paused = true)]
 async fn execute_and_wait_clamp_yield_grace_without_stopping_the_cell() {
     let delegate = Arc::new(ReleasableToolDelegate::default());
-    let service = InProcessCodeModeSession::with_delegate_and_limits(
-        delegate.clone(),
-        CodeModeSessionCellExecutionLimits {
-            max_yield_time_ms: Some(/*value*/ 10_000),
-            max_heap_size_bytes: None,
-        },
-    );
+    let service = InProcessCodeModeSession::with_limits(CodeModeSessionCellExecutionLimits {
+        max_yield_time_ms: Some(/*value*/ 10_000),
+        max_heap_size_bytes: None,
+    });
     let started = service
-        .execute(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"await tools.echo({}); text("done");"#.to_string(),
-            yield_time_ms: None,
-            ..execute_request("")
-        })
+        .execute(
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                source: r#"await tools.echo({}); text("done");"#.to_string(),
+                yield_time_ms: None,
+                ..execute_request("")
+            },
+            delegate.clone(),
+        )
         .await
         .unwrap();
     let initial_response = tokio::spawn(started.initial_response());
@@ -118,6 +117,7 @@ async fn execute_and_wait_clamp_yield_grace_without_stopping_the_cell() {
     assert_eq!(
         initial_response.await.unwrap().unwrap(),
         RuntimeResponse::Yielded {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         }
@@ -136,6 +136,7 @@ async fn execute_and_wait_clamp_yield_grace_without_stopping_the_cell() {
     assert_eq!(
         wait_response.await.unwrap().unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
@@ -153,6 +154,7 @@ async fn execute_and_wait_clamp_yield_grace_without_stopping_the_cell() {
     assert_eq!(
         completion.await.unwrap().unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
@@ -165,13 +167,16 @@ async fn execute_and_wait_clamp_yield_grace_without_stopping_the_cell() {
 #[tokio::test(start_paused = true)]
 async fn wait_waits_for_nested_tool_during_yield_grace() {
     let delegate = Arc::new(ReleasableToolDelegate::default());
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let service = InProcessCodeModeSession::new();
     let initial_response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"await tools.echo({}); text("done");"#.to_string(),
-            ..execute_request("")
-        })
+        .execute_to_pending(
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                source: r#"await tools.echo({}); text("done");"#.to_string(),
+                ..execute_request("")
+            },
+            delegate.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -198,6 +203,7 @@ async fn wait_waits_for_nested_tool_during_yield_grace() {
     assert_eq!(
         response.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
@@ -210,29 +216,30 @@ async fn wait_waits_for_nested_tool_during_yield_grace() {
 #[tokio::test(start_paused = true)]
 async fn zero_yield_limit_is_immediate_and_scoped_to_its_session() {
     let zero_delegate = Arc::new(ReleasableToolDelegate::default());
-    let zero_session = InProcessCodeModeSession::with_delegate_and_limits(
-        zero_delegate.clone(),
-        CodeModeSessionCellExecutionLimits {
-            max_yield_time_ms: Some(/*value*/ 0),
-            max_heap_size_bytes: None,
-        },
-    );
+    let zero_session = InProcessCodeModeSession::with_limits(CodeModeSessionCellExecutionLimits {
+        max_yield_time_ms: Some(/*value*/ 0),
+        max_heap_size_bytes: None,
+    });
     let limited_delegate = Arc::new(ReleasableToolDelegate::default());
-    let limited_session = InProcessCodeModeSession::with_delegate_and_limits(
-        limited_delegate.clone(),
-        CodeModeSessionCellExecutionLimits {
+    let limited_session =
+        InProcessCodeModeSession::with_limits(CodeModeSessionCellExecutionLimits {
             max_yield_time_ms: Some(/*value*/ 10),
             max_heap_size_bytes: None,
-        },
-    );
+        });
     let request = ExecuteRequest {
         enabled_tools: vec![echo_tool()],
         source: "await tools.echo({});".to_string(),
         yield_time_ms: Some(/*value*/ 60_000),
         ..execute_request("")
     };
-    let zero_started = zero_session.execute(request.clone()).await.unwrap();
-    let limited_started = limited_session.execute(request).await.unwrap();
+    let zero_started = zero_session
+        .execute(request.clone(), zero_delegate.clone())
+        .await
+        .unwrap();
+    let limited_started = limited_session
+        .execute(request, limited_delegate.clone())
+        .await
+        .unwrap();
     let zero_response = tokio::spawn(zero_started.initial_response());
     let limited_response = tokio::spawn(limited_started.initial_response());
     wait_until_tool_started(&zero_delegate).await;
@@ -242,6 +249,7 @@ async fn zero_yield_limit_is_immediate_and_scoped_to_its_session() {
     assert_eq!(
         zero_response.await.unwrap().unwrap(),
         RuntimeResponse::Yielded {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         }
@@ -258,6 +266,7 @@ async fn zero_yield_limit_is_immediate_and_scoped_to_its_session() {
     assert_eq!(
         zero_wait.await.unwrap().unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
@@ -268,6 +277,7 @@ async fn zero_yield_limit_is_immediate_and_scoped_to_its_session() {
     assert_eq!(
         limited_response.await.unwrap().unwrap(),
         RuntimeResponse::Yielded {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         }
@@ -364,7 +374,7 @@ fn echo_tool() -> ToolDefinition {
 
 async fn execute(service: &InProcessCodeModeSession, request: ExecuteRequest) -> RuntimeResponse {
     service
-        .execute(request)
+        .execute(request, Arc::new(NoopCodeModeSessionDelegate))
         .await
         .unwrap()
         .initial_response()
@@ -389,6 +399,7 @@ async fn synchronous_exit_returns_successfully() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "before".to_string(),
@@ -435,6 +446,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
     assert_eq!(
         write_response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: None,
@@ -443,6 +455,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
     assert_eq!(
         same_session,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("2"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "visible".to_string(),
@@ -453,6 +466,7 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
     assert_eq!(
         other_session,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "undefined".to_string(),
@@ -463,19 +477,65 @@ async fn stored_values_are_shared_between_cells_but_not_sessions() {
 }
 
 #[tokio::test]
+async fn storing_undefined_preserves_the_previous_value() {
+    let service = InProcessCodeModeSession::new();
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: r#"
+store("key", null);
+try {
+  store("key", undefined);
+} catch (error) {
+  text(String(error));
+}
+text(load("key"));
+"#
+            .to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            code_mode_host_duration: None,
+            cell_id: cell_id("1"),
+            content_items: vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "Unable to store \"key\". Only plain serializable objects can be stored."
+                        .to_string(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "null".to_string(),
+                },
+            ],
+            error_text: None,
+        }
+    );
+}
+
+#[tokio::test]
 async fn shutdown_interrupts_cpu_bound_cells() {
     let service = InProcessCodeModeSession::new();
 
     let cell = service
-        .execute(ExecuteRequest {
-            source: "while (true) {}".to_string(),
-            ..execute_request("")
-        })
+        .execute(
+            ExecuteRequest {
+                source: "while (true) {}".to_string(),
+                ..execute_request("")
+            },
+            Arc::new(NoopCodeModeSessionDelegate),
+        )
         .await
         .unwrap();
     assert_eq!(
         cell.initial_response().await.unwrap(),
         RuntimeResponse::Yielded {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         }
@@ -493,7 +553,10 @@ async fn start_cell_rejects_new_cell_after_shutdown_begins() {
     service.shutdown().await.unwrap();
 
     let error = service
-        .execute(execute_request("text('late');"))
+        .execute(
+            execute_request("text('late');"),
+            Arc::new(NoopCodeModeSessionDelegate),
+        )
         .await
         .err()
         .unwrap();
@@ -506,17 +569,21 @@ async fn execute_to_pending_returns_completed_for_synchronous_results() {
     let service = InProcessCodeModeSession::new();
 
     let response = service
-        .execute_to_pending(ExecuteRequest {
-            source: r#"text("done");"#.to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
+        .execute_to_pending(
+            ExecuteRequest {
+                source: r#"text("done");"#.to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            },
+            Arc::new(NoopCodeModeSessionDelegate),
+        )
         .await
         .unwrap();
 
     assert_eq!(
         response,
         ExecuteToPendingOutcome::Completed(RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
@@ -532,11 +599,14 @@ async fn execute_to_pending_returns_once_the_runtime_is_quiescent() {
 
     let response = tokio::time::timeout(
         Duration::from_secs(1),
-        service.execute_to_pending(ExecuteRequest {
-            source: r#"text("before"); await new Promise(() => {});"#.to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        }),
+        service.execute_to_pending(
+            ExecuteRequest {
+                source: r#"text("before"); await new Promise(() => {});"#.to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            },
+            Arc::new(NoopCodeModeSessionDelegate),
+        ),
     )
     .await
     .unwrap()
@@ -558,6 +628,7 @@ async fn execute_to_pending_returns_once_the_runtime_is_quiescent() {
     assert_eq!(
         termination,
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
@@ -569,18 +640,21 @@ async fn execute_to_pending_identifies_tool_calls_in_paused_frontier() {
     let service = InProcessCodeModeSession::new();
 
     let response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
+        .execute_to_pending(
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                source: r#"
 await Promise.all([
   tools.echo({ value: "first" }),
   tools.echo({ value: "second" }),
 ]);
 "#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
+                .to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            },
+            Arc::new(NoopCodeModeSessionDelegate),
+        )
         .await
         .unwrap();
 
@@ -598,6 +672,7 @@ await Promise.all([
     assert_eq!(
         termination,
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
@@ -609,9 +684,10 @@ async fn execute_to_pending_excludes_delayed_timeout_tool_calls_until_wait() {
     let service = InProcessCodeModeSession::new();
 
     let initial_response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
+        .execute_to_pending(
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                source: r#"
 setTimeout(() => {
   tools.echo({ value: "delayed" });
 }, 1000);
@@ -620,10 +696,12 @@ await Promise.all([
   tools.echo({ value: "third" }),
 ]);
 "#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
+                .to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            },
+            Arc::new(NoopCodeModeSessionDelegate),
+        )
         .await
         .unwrap();
 
@@ -662,6 +740,7 @@ await Promise.all([
     assert_eq!(
         termination,
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
@@ -671,20 +750,23 @@ await Promise.all([
 #[tokio::test]
 async fn wait_to_pending_returns_after_resumed_runtime_becomes_quiescent_again() {
     let delegate = Arc::new(ReleasableToolDelegate::default());
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let service = InProcessCodeModeSession::new();
 
     let initial_response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
+        .execute_to_pending(
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                source: r#"
 await tools.echo({});
 text("after");
 await new Promise(() => {});
 "#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
+                .to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            },
+            delegate.clone(),
+        )
         .await
         .unwrap();
 
@@ -725,6 +807,7 @@ await new Promise(() => {});
     assert_eq!(
         termination,
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
         })
@@ -734,19 +817,22 @@ await new Promise(() => {});
 #[tokio::test]
 async fn wait_to_pending_returns_completed_after_resumed_runtime_finishes() {
     let delegate = Arc::new(ReleasableToolDelegate::default());
-    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let service = InProcessCodeModeSession::new();
 
     let initial_response = service
-        .execute_to_pending(ExecuteRequest {
-            enabled_tools: vec![echo_tool()],
-            source: r#"
+        .execute_to_pending(
+            ExecuteRequest {
+                enabled_tools: vec![echo_tool()],
+                source: r#"
 await tools.echo({});
 text("done");
 "#
-            .to_string(),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        })
+                .to_string(),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            },
+            delegate.clone(),
+        )
         .await
         .unwrap();
 
@@ -775,6 +861,7 @@ text("done");
         resumed_response,
         WaitToPendingOutcome::LiveCell(ExecuteToPendingOutcome::Completed(
             RuntimeResponse::Result {
+                code_mode_host_duration: None,
                 cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "done".to_string(),
@@ -920,6 +1007,7 @@ async fn v8_console_is_not_exposed_on_global_this() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "false".to_string(),
@@ -960,6 +1048,7 @@ text(value);
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
@@ -999,6 +1088,7 @@ text(formatter.format(new Date("2025-01-02T03:04:05Z")));
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
@@ -1034,6 +1124,7 @@ text(JSON.stringify(returnsUndefined));
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputText {
@@ -1072,6 +1163,7 @@ async fn text_helper_serializes_objects() {
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: r#"{"json":true}"#.to_string(),
@@ -1115,6 +1207,7 @@ text(circular);
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: Some(error_text),
@@ -1149,6 +1242,7 @@ audio({
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputAudio {
@@ -1162,6 +1256,9 @@ audio({
         }
     );
 }
+
+#[path = "service_audio_tests.rs"]
+mod audio_tests;
 
 #[tokio::test]
 async fn audio_helper_rejects_non_data_urls() {
@@ -1184,6 +1281,7 @@ async fn audio_helper_rejects_non_data_urls() {
         assert_eq!(
             response,
             RuntimeResponse::Result {
+                code_mode_host_duration: None,
                 cell_id: cell_id("1"),
                 content_items: Vec::new(),
                 error_text: Some(
@@ -1199,9 +1297,7 @@ async fn audio_helper_rejects_non_data_urls() {
 async fn image_helper_accepts_raw_mcp_image_block_with_original_detail() {
     let service = InProcessCodeModeSession::new();
 
-    let response = execute(
-            &service,
-            ExecuteRequest {
+    let response = execute(&service, ExecuteRequest {
                 source: r#"
 image({
   type: "image",
@@ -1213,13 +1309,13 @@ image({
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            },
-        )
+            })
         .await;
 
     assert_eq!(
             response,
             RuntimeResponse::Result {
+                code_mode_host_duration: None,
                 cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
@@ -1253,6 +1349,7 @@ generatedImage({
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![
                 FunctionCallOutputContentItem::InputImage {
@@ -1294,6 +1391,7 @@ image(
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAA".to_string(),
@@ -1308,9 +1406,7 @@ image(
 async fn image_helper_second_arg_overrides_raw_mcp_image_detail() {
     let service = InProcessCodeModeSession::new();
 
-    let response = execute(
-            &service,
-            ExecuteRequest {
+    let response = execute(&service, ExecuteRequest {
                 source: r#"
 image(
   {
@@ -1325,13 +1421,13 @@ image(
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            },
-        )
+            })
         .await;
 
     assert_eq!(
             response,
             RuntimeResponse::Result {
+                code_mode_host_duration: None,
                 cell_id: cell_id("1"),
                 content_items: vec![FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
@@ -1365,6 +1461,7 @@ image({
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAA".to_string(),
@@ -1400,6 +1497,7 @@ async fn image_helpers_reject_remote_urls() {
             assert_eq!(
                     response,
                     RuntimeResponse::Result {
+                        code_mode_host_duration: None,
                         cell_id: cell_id("1"),
                         content_items: Vec::new(),
                         error_text: Some(
@@ -1434,6 +1532,7 @@ async fn image_helpers_reject_invalid_image_outputs() {
         assert_eq!(
             response,
             RuntimeResponse::Result {
+                code_mode_host_duration: None,
                 cell_id: cell_id("1"),
                 content_items: Vec::new(),
                 error_text: Some(
@@ -1468,6 +1567,7 @@ image({
     assert_eq!(
         response,
         RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
             error_text: Some("image detail must be one of: auto, low, high, original".to_string()),
@@ -1479,9 +1579,7 @@ image({
 async fn image_helper_rejects_raw_mcp_result_container() {
     let service = InProcessCodeModeSession::new();
 
-    let response = execute(
-            &service,
-            ExecuteRequest {
+    let response = execute(&service, ExecuteRequest {
                 source: r#"
 image({
   content: [
@@ -1498,13 +1596,13 @@ image({
                 .to_string(),
                 yield_time_ms: None,
                 ..execute_request("")
-            },
-        )
+            })
         .await;
 
     assert_eq!(
             response,
             RuntimeResponse::Result {
+                code_mode_host_duration: None,
                 cell_id: cell_id("1"),
                 content_items: Vec::new(),
                 error_text: Some(
@@ -1529,6 +1627,7 @@ async fn wait_reports_missing_cell_separately_from_runtime_results() {
     assert_eq!(
         response,
         WaitOutcome::MissingCell(RuntimeResponse::Result {
+            code_mode_host_duration: None,
             cell_id: cell_id("missing"),
             content_items: Vec::new(),
             error_text: Some("exec cell missing not found".to_string()),

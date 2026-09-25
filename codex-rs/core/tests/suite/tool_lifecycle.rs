@@ -36,6 +36,7 @@ use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::test_env;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
@@ -49,6 +50,9 @@ use wiremock::Mock;
 use wiremock::Request;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::body_partial_json;
+
+#[path = "command_lifecycle_tests.rs"]
+mod command_lifecycle;
 
 struct RecordedHistory {
     call_id: String,
@@ -160,6 +164,7 @@ async fn tool_start_receives_conversation_history() -> Result<()> {
     extensions.tool_lifecycle_contributor(recorder.clone());
     let test = test_codex()
         .with_extensions(Arc::new(extensions.build()))
+        .with_config(|config| config.update_plan_enabled = true)
         .build_with_auto_env(&server)
         .await?;
 
@@ -497,9 +502,11 @@ async fn tool_start_receives_frozen_host_plugin_root() -> Result<()> {
     let server = responses::start_mock_server().await;
     let codex_home = Arc::new(tempfile::tempdir()?);
     let plugin_root = super::plugins::write_sample_plugin_manifest_and_config(codex_home.as_ref());
+    let test_env = test_env().await?;
     let server_config = json!({
         "command": super::rmcp_client::remote_aware_stdio_server_bin()?,
         "environment_id": super::rmcp_client::remote_aware_environment_id(),
+        "cwd": test_env.cwd(),
     });
     fs::write(
         plugin_root.join(".mcp.json"),
@@ -513,7 +520,7 @@ async fn tool_start_receives_frozen_host_plugin_root() -> Result<()> {
         .with_home(codex_home)
         .with_extensions(Arc::new(extensions.build()))
         .with_model_info_override("gpt-5.4", |model| model.supports_search_tool = false)
-        .build_with_auto_env(&server)
+        .build_with_environment(&server, test_env)
         .await?;
     wait_for_mcp_server(&test.codex, "sample").await?;
     responses::mount_sse_sequence(
@@ -600,6 +607,7 @@ async fn tool_start_receives_rewritten_payload_and_post_hook_history() -> Result
                 .expect("write pre-tool hook fixture");
         })
         .with_config(trust_discovered_hooks)
+        .with_config(|config| config.update_plan_enabled = true)
         .build_with_auto_env(&server)
         .await?;
 
@@ -690,6 +698,7 @@ async fn tool_start_is_not_called_when_pre_tool_hook_prevents_execution() -> Res
                     .expect("write pre-tool hook fixture");
             })
             .with_config(trust_discovered_hooks)
+            .with_config(|config| config.update_plan_enabled = true)
             .build_with_auto_env(&server)
             .await?;
 

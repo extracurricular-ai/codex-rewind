@@ -5,6 +5,16 @@
 slow-timeout = { period = "30s", terminate-after = 2 }
 retries = 1
 
+[[profile.default.overrides]]
+# This case validates and copies both the initial and replacement debug package.
+filter = 'package(codex-cli) & binary(app_server_daemon) & test(=packaged_daemon_start_and_explicit_replacement)'
+slow-timeout = { period = "1m", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# These cases copy a full debug CLI package and launch its new executable.
+filter = 'package(codex-cli) & binary(app_server_daemon) & test(packaged_daemon_)'
+slow-timeout = { period = "1m", terminate-after = 2 }
+
 [profile.default.junit]
 path = "junit.xml"
 
@@ -35,6 +45,11 @@ max-threads = 2
 # Do not add new tests here
 filter = 'test(rmcp_client) | test(humanlike_typing_1000_chars_appears_live_no_placeholder)'
 slow-timeout = { period = "1m", terminate-after = 4 }
+
+[[profile.default.overrides]]
+# This end-to-end case launches several CLI subprocesses and checks cloud policy.
+filter = 'package(codex-exec) & test(worktree_start_and_fork_use_host_pool_and_preserve_legacy_resume)'
+slow-timeout = { period = "30s", terminate-after = 4 }
 
 [[profile.default.overrides]]
 filter = 'test(approval_matrix_covers_all_modes)'

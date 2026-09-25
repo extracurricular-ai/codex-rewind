@@ -1,0 +1,28 @@
+---
+source: tui/src/app/tests/navigation_reconnect_tests.rs
+expression: "render_bottom_popup(&app.chat_widget, 100)"
+---
+  Agent command center  Group: Project  g
+   All 2   Needs you 0   Working 1   Ready 1   Inactive 0
+  ────────────────────────────────────────────────────────────────────────────────────────────────
+  Rename › Keep this task draft!                          │ Task details
+      Tasks                                               │
+  /tmp/project  2                                         │ Selected task
+  › ● Selected task                                       │ ● Working
+    ○ Vanished task                                       │
+                                                          │ Project
+                                                          │ /tmp/project
+                                                          │ Model: Unknown
+                                                          │
+                                                          │ Prompt
+                                                          │ Selected task
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+  Reconnecting — agent list is stale

@@ -5,7 +5,13 @@ mod accounting;
 
 use accounting::BudgetLimitedGoalDisposition;
 use accounting::GoalAccountingState;
+use codex_extension_api::ToolCallOutcome;
+use codex_extension_api::ToolName;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::TurnItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::TokenUsage;
 use codex_state::ThreadGoalStatus;
 use pretty_assertions::assert_eq;
@@ -51,6 +57,156 @@ fn goal_accounting_ignores_plan_mode_turns() {
     );
 
     assert_eq!(None, recorded);
+}
+
+#[test]
+fn empty_continuations_require_three_turns_without_activity_or_goal_changes() {
+    let empty_final = TurnItem::AgentMessage(AgentMessageItem {
+        id: "empty".into(),
+        content: vec![AgentMessageContent::Text { text: " \n".into() }],
+        phase: Some(MessagePhase::FinalAnswer),
+        memory_citation: None,
+        delivery: None,
+        questions: None,
+    });
+    for (interruption, blocking_turn) in [
+        ("none", 3),
+        ("user", 6),
+        ("tool", 6),
+        ("goal", 5),
+        ("reset", 6),
+        ("missing final", 6),
+    ] {
+        let state = GoalAccountingState::default();
+        for turn in 1..=blocking_turn {
+            let id = turn.to_string();
+            let goal_id = if interruption == "goal" && turn >= 3 {
+                "new"
+            } else {
+                "goal"
+            };
+            state.start_turn(&id, ModeKind::Default, &TokenUsage::default());
+            state.mark_turn_goal_active(&id, goal_id);
+            if !(turn == 3 && interruption == "missing final") {
+                state.record_item(&id, &empty_final);
+            }
+            // Admission can finish after output arrives, but before turn-stop evaluation.
+            if !(turn == 3 && interruption == "user") {
+                state.mark_goal_continuation(id.clone());
+            }
+            if turn == 3 && interruption == "tool" {
+                state.record_tool_outcome(
+                    &id,
+                    &ToolName::plain("shell"),
+                    ToolCallOutcome::Completed { success: false },
+                );
+            }
+            if turn == 3 && interruption == "reset" {
+                state.reset_empty_responses();
+            }
+            assert_eq!(
+                (turn == blocking_turn).then(|| goal_id.to_string()),
+                state.empty_response_goal(&id),
+                "interruption: {interruption}, turn: {turn}",
+            );
+            state.finish_turn(&id);
+        }
+    }
+}
+
+#[test]
+fn execution_failures_do_not_transfer_to_a_replacement_goal() {
+    let state = GoalAccountingState::default();
+
+    for (turn, goal_id, replacement_goal_id) in [
+        (1, "first-goal", Some("second-goal")),
+        (2, "second-goal", None),
+        (3, "second-goal", None),
+        (4, "second-goal", None),
+    ] {
+        let turn_id = format!("turn-{turn}");
+        state.start_turn(&turn_id, ModeKind::Default, &TokenUsage::default());
+        state.mark_turn_goal_active(&turn_id, goal_id);
+        state.record_tool_outcome(
+            &turn_id,
+            &ToolName::plain("exec"),
+            ToolCallOutcome::Failed {
+                handler_executed: true,
+            },
+        );
+        if let Some(replacement_goal_id) = replacement_goal_id {
+            state.mark_current_turn_goal_active(replacement_goal_id);
+        }
+
+        assert_eq!(
+            (turn == 4).then(|| "second-goal".to_string()),
+            state.execution_failure_goal(&turn_id)
+        );
+        state.finish_turn(&turn_id);
+        if turn == 3 {
+            state.reset_idle_progress_baseline_and_clear_active_goal();
+        }
+    }
+}
+
+#[test]
+fn script_errors_and_failures_before_execution_do_not_block_goals() {
+    for outcome in [
+        ToolCallOutcome::Completed { success: false },
+        ToolCallOutcome::Failed {
+            handler_executed: false,
+        },
+    ] {
+        let state = GoalAccountingState::default();
+        for turn in 1..=3 {
+            let turn_id = format!("turn-{turn}");
+            state.start_turn(&turn_id, ModeKind::Default, &TokenUsage::default());
+            state.mark_turn_goal_active(&turn_id, "goal");
+            state.record_tool_outcome(&turn_id, &ToolName::plain("exec"), outcome);
+
+            assert_eq!(None, state.execution_failure_goal(&turn_id));
+            state.finish_turn(&turn_id);
+        }
+    }
+}
+
+#[test]
+fn successful_tool_resets_failures_before_an_interrupted_turn_ends() {
+    let state = GoalAccountingState::default();
+
+    for (turn, tool_name, outcome) in [
+        (
+            1,
+            "exec",
+            ToolCallOutcome::Failed {
+                handler_executed: true,
+            },
+        ),
+        (
+            2,
+            "exec",
+            ToolCallOutcome::Failed {
+                handler_executed: true,
+            },
+        ),
+        (3, "shell", ToolCallOutcome::Completed { success: true }),
+        (
+            4,
+            "exec",
+            ToolCallOutcome::Failed {
+                handler_executed: true,
+            },
+        ),
+    ] {
+        let turn_id = format!("turn-{turn}");
+        state.start_turn(&turn_id, ModeKind::Default, &TokenUsage::default());
+        state.mark_turn_goal_active(&turn_id, "goal");
+        state.record_tool_outcome(&turn_id, &ToolName::plain(tool_name), outcome);
+        if turn != 3 {
+            assert_eq!(None, state.execution_failure_goal(&turn_id));
+        }
+        state.finish_turn(&turn_id);
+    }
 }
 
 #[test]

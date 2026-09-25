@@ -5,6 +5,7 @@ use crate::history_cell::plain_lines;
 use crate::history_cell::with_border_with_inner_width;
 use crate::legacy_core::config::Config;
 use crate::line_truncation::line_width;
+use crate::style::accent_color;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
@@ -23,13 +24,12 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use codex_utils_sandbox_summary::summarize_permission_profile;
 use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use url::Url;
 
 use super::account::StatusAccountDisplay;
 use super::format::FieldFormatter;
@@ -80,13 +80,23 @@ struct StatusRateLimitState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StatusHistoryHandle {
-    rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
-    thread_usage: StatusThreadUsage,
+    card: Arc<StatusHistoryCell>,
 }
 
 impl StatusHistoryHandle {
+    pub(crate) fn copy_text(&self) -> String {
+        self.card
+            .content_lines(u16::MAX)
+            .iter()
+            .map(|line| line.to_string().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
     pub(crate) fn reserve_thread_usage_label_width(&self) {
-        self.thread_usage.reserve_label_width();
+        self.card.thread_usage.reserve_label_width();
     }
 
     pub(crate) fn finish_rate_limit_refresh(
@@ -101,6 +111,7 @@ impl StatusHistoryHandle {
         };
         #[expect(clippy::expect_used)]
         let mut state = self
+            .card
             .rate_limit_state
             .write()
             .expect("status history rate-limit state poisoned");
@@ -112,7 +123,7 @@ impl StatusHistoryHandle {
         &self,
         estimate: Option<codex_app_server_protocol::ThreadUsage>,
     ) {
-        self.thread_usage.set_estimate(estimate);
+        self.card.thread_usage.set_estimate(estimate);
     }
 }
 
@@ -194,7 +205,8 @@ pub(crate) fn new_status_output_with_rate_limits(
 ) -> CompositeHistoryCell {
     new_status_output_with_rate_limits_handle(
         config,
-        /*runtime_model_provider_base_url*/ None,
+        config.model_provider.requires_openai_auth,
+        /*model_provider_id*/ None,
         /*remote_connection*/ None,
         account_display,
         token_info,
@@ -217,7 +229,8 @@ pub(crate) fn new_status_output_with_rate_limits(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_status_output_with_rate_limits_handle(
     config: &Config,
-    runtime_model_provider_base_url: Option<&str>,
+    requires_openai_auth: bool,
+    model_provider_id: Option<&str>,
     remote_connection: Option<&RemoteConnectionStatus>,
     account_display: Option<&StatusAccountDisplay>,
     token_info: Option<&TokenUsageInfo>,
@@ -235,9 +248,10 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     refreshing_rate_limits: bool,
 ) -> (CompositeHistoryCell, StatusHistoryHandle) {
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
-    let (card, handle) = StatusHistoryCell::new(
+    let card = Arc::new(StatusHistoryCell::new(
         config,
-        runtime_model_provider_base_url,
+        requires_openai_auth,
+        model_provider_id,
         remote_connection,
         account_display,
         token_info,
@@ -253,7 +267,10 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
         reasoning_effort_override,
         agents_summary,
         refreshing_rate_limits,
-    );
+    ));
+    let handle = StatusHistoryHandle {
+        card: Arc::clone(&card),
+    };
 
     (
         CompositeHistoryCell::new(vec![Box::new(command), Box::new(card)]),
@@ -293,7 +310,8 @@ impl StatusHistoryCell {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: &Config,
-        runtime_model_provider_base_url: Option<&str>,
+        requires_openai_auth: bool,
+        model_provider_id: Option<&str>,
         remote_connection: Option<&RemoteConnectionStatus>,
         account_display: Option<&StatusAccountDisplay>,
         token_info: Option<&TokenUsageInfo>,
@@ -309,27 +327,29 @@ impl StatusHistoryCell {
         reasoning_effort_override: Option<Option<ReasoningEffort>>,
         agents_summary: String,
         refreshing_rate_limits: bool,
-    ) -> (Self, StatusHistoryHandle) {
+    ) -> Self {
         let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
         let permission_profile = config.permissions.effective_permission_profile();
         let workspace_roots = config.effective_workspace_roots();
+        let cwd = PathUri::from_abs_path(&config.cwd);
+        let model_provider = model_provider_id
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string);
         let mut config_entries = vec![
             ("workdir", config.cwd.display().to_string()),
             ("model", model_name.to_string()),
-            ("provider", config.model_provider_id.clone()),
             (
                 "approval",
                 config.permissions.approval_policy.value().to_string(),
             ),
             (
                 "sandbox",
-                summarize_permission_profile(
-                    &permission_profile,
-                    &config.cwd,
-                    workspace_roots.as_slice(),
-                ),
+                summarize_permission_profile(&permission_profile, &cwd, &workspace_roots),
             ),
         ];
+        if let Some(provider_id) = &model_provider {
+            config_entries.insert(2, ("provider", provider_id.clone()));
+        }
         if config.model_provider.wire_api == WireApi::Responses {
             let effort_value = reasoning_effort_override
                 .unwrap_or_else(|| config.model_reasoning_effort.clone())
@@ -351,9 +371,8 @@ impl StatusHistoryCell {
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| "<unknown>".to_string());
         let active_permission_profile = config.permissions.active_permission_profile();
-        let sandbox =
-            status_permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
-        let workspace_root_suffix = workspace_root_suffix(workspace_roots.as_slice(), &config.cwd);
+        let sandbox = status_permission_summary(&permission_profile, &cwd, &workspace_roots);
+        let workspace_root_suffix = workspace_root_suffix(&workspace_roots, &cwd);
         let approval = status_approval_label(approval_policy, config.approvals_reviewer, &approval);
         let permissions = status_permissions_label(
             active_permission_profile.as_ref(),
@@ -363,8 +382,7 @@ impl StatusHistoryCell {
             &approval,
             workspace_root_suffix.as_deref(),
         );
-        let model_provider = format_model_provider(config, runtime_model_provider_base_url);
-        let show_chatgpt_usage_link = config.model_provider.requires_openai_auth;
+        let show_chatgpt_usage_link = requires_openai_auth;
         let account = compose_account_display(account_display);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
@@ -397,31 +415,25 @@ impl StatusHistoryCell {
         let agents_summary = Arc::new(RwLock::new(agents_summary));
         let thread_usage = StatusThreadUsage::default();
 
-        (
-            Self {
-                model_name,
-                model_details,
-                directory: config.cwd.to_path_buf(),
-                permissions,
-                collaboration_mode: collaboration_mode.map(ToString::to_string),
-                model_provider,
-                remote_connection: remote_connection.cloned(),
-                show_chatgpt_usage_link,
-                account,
-                thread_name,
-                session_id,
-                forked_from,
-                file_snapshots: file_snapshots_summary(config),
-                token_usage,
-                agents_summary,
-                rate_limit_state: rate_limit_state.clone(),
-                thread_usage: thread_usage.clone(),
-            },
-            StatusHistoryHandle {
-                rate_limit_state,
-                thread_usage,
-            },
-        )
+        Self {
+            model_name,
+            model_details,
+            directory: config.cwd.to_path_buf(),
+            permissions,
+            collaboration_mode: collaboration_mode.map(ToString::to_string),
+            model_provider,
+            remote_connection: remote_connection.cloned(),
+            show_chatgpt_usage_link,
+            account,
+            thread_name,
+            session_id,
+            forked_from,
+            file_snapshots: file_snapshots_summary(config),
+            token_usage,
+            agents_summary,
+            rate_limit_state,
+            thread_usage,
+        }
     }
 
     fn token_usage_spans(&self) -> Vec<Span<'static>> {
@@ -627,8 +639,8 @@ impl StatusHistoryCell {
 
 fn status_permission_summary(
     permission_profile: &PermissionProfile,
-    cwd: &AbsolutePathBuf,
-    workspace_roots: &[AbsolutePathBuf],
+    cwd: &PathUri,
+    workspace_roots: &[PathUri],
 ) -> String {
     let summary = summarize_permission_profile(permission_profile, cwd, workspace_roots);
     if let Some(details) = summary.strip_prefix("read-only") {
@@ -649,14 +661,11 @@ fn status_permission_summary(
     summary
 }
 
-fn workspace_root_suffix(
-    workspace_roots: &[AbsolutePathBuf],
-    cwd: &AbsolutePathBuf,
-) -> Option<String> {
+fn workspace_root_suffix(workspace_roots: &[PathUri], cwd: &PathUri) -> Option<String> {
     let extra_roots = workspace_roots
         .iter()
-        .filter(|root| *root != cwd)
-        .map(|root| root.to_string_lossy().to_string())
+        .filter(|root| root.to_string() != cwd.to_string())
+        .map(PathUri::inferred_native_path_string)
         .collect::<Vec<_>>();
     if extra_roots.is_empty() {
         None
@@ -754,8 +763,8 @@ fn status_approval_label(
     approval.to_string()
 }
 
-impl HistoryCell for StatusHistoryCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+impl StatusHistoryCell {
+    fn content_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(vec![
             Span::from(format!("{}>_ ", FieldFormatter::INDENT)).dim(),
@@ -831,12 +840,12 @@ impl HistoryCell for StatusHistoryCell {
         let value_width = formatter.value_width(available_inner_width);
 
         let note_first_line = Line::from(vec![
-            Span::from("Visit ").cyan(),
-            CHATGPT_USAGE_URL.cyan().underlined(),
-            Span::from(" for up-to-date").cyan(),
+            Span::from("Visit ").fg(accent_color()),
+            CHATGPT_USAGE_URL.fg(accent_color()).underlined(),
+            Span::from(" for up-to-date").fg(accent_color()),
         ]);
         let note_second_line = Line::from(vec![
-            Span::from("information on rate limits and credits").cyan(),
+            Span::from("information on rate limits and credits").fg(accent_color()),
         ]);
         let note_lines = adaptive_wrap_lines(
             [note_first_line, note_second_line],
@@ -850,18 +859,20 @@ impl HistoryCell for StatusHistoryCell {
             lines.push(Line::from(Vec::<Span<'static>>::new()));
         }
         if let Some(remote_connection) = self.remote_connection.as_ref() {
-            let wrapped_remote = word_wrap_lines(
-                [Line::from(vec![
+            let value = if remote_connection.is_local_daemon {
+                Line::from("Local background server")
+            } else {
+                Line::from(vec![
                     Span::from(remote_connection.address.clone()),
                     Span::from(" (").dim(),
                     Span::from(remote_connection.version.clone()).dim(),
                     Span::from(")").dim(),
-                ])],
-                RtOptions::new(value_width.max(1)),
-            );
+                ])
+            };
+            let wrapped_remote = word_wrap_lines([value], RtOptions::new(value_width.max(1)));
             let mut wrapped_remote = wrapped_remote.into_iter();
             if let Some(first) = wrapped_remote.next() {
-                lines.push(formatter.line("Remote", first.spans));
+                lines.push(formatter.line("Server", first.spans));
                 lines.extend(wrapped_remote.map(|line| formatter.continuation(line.spans)));
             }
             lines.push(Line::from(Vec::<Span<'static>>::new()));
@@ -923,6 +934,17 @@ impl HistoryCell for StatusHistoryCell {
             lines.extend(thread_usage_lines);
         }
 
+        lines
+    }
+}
+
+impl HistoryCell for Arc<StatusHistoryCell> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let available_inner_width = usize::from(width.saturating_sub(4));
+        if available_inner_width == 0 {
+            return Vec::new();
+        }
+        let lines = self.content_lines(width);
         let content_width = lines.iter().map(line_width).max().unwrap_or(0);
         let inner_width = content_width.min(available_inner_width);
         let truncated_lines: Vec<Line<'static>> = lines
@@ -968,40 +990,4 @@ impl HistoryCell for StatusHistoryCell {
     ) -> Vec<crate::terminal_hyperlinks::HyperlinkLine> {
         self.display_hyperlink_lines(width)
     }
-}
-
-fn format_model_provider(config: &Config, runtime_base_url: Option<&str>) -> Option<String> {
-    let provider = &config.model_provider;
-    let name = provider.name.trim();
-    let provider_name = if name.is_empty() {
-        config.model_provider_id.as_str()
-    } else {
-        name
-    };
-    let base_url = runtime_base_url.and_then(sanitize_base_url);
-    let is_default_openai = provider.is_openai() && base_url.is_none();
-    if is_default_openai {
-        return None;
-    }
-
-    Some(match base_url {
-        Some(base_url) => format!("{provider_name} - {base_url}"),
-        None => provider_name.to_string(),
-    })
-}
-
-fn sanitize_base_url(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let Ok(mut url) = Url::parse(trimmed) else {
-        return None;
-    };
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_query(None);
-    url.set_fragment(None);
-    Some(url.to_string().trim_end_matches('/').to_string()).filter(|value| !value.is_empty())
 }

@@ -1,0 +1,5 @@
+---
+source: tui/src/app/rewind_tests.rs
+expression: "history[notice_index]"
+---
+• You’re continuing from this point in a new conversation

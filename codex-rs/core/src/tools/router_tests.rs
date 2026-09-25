@@ -26,7 +26,6 @@ use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
-use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -191,14 +190,7 @@ async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow
 
     assert_eq!(
         router
-            .tool_runtime(&ToolCall {
-                tool_name: ToolName::plain(parallel_tool_name),
-                call_id: "call-local-tool".to_string(),
-                payload: ToolPayload::Function {
-                    arguments: "{}".to_string(),
-                },
-                encrypted_function_args: None,
-            })
+            .tool_runtime(&ToolName::plain(parallel_tool_name))
             .map(|runtime| runtime.tool_name()),
         Some(ToolName::plain(parallel_tool_name))
     );
@@ -370,7 +362,7 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     assert!(router.tool_supports_parallel(&call));
     assert_eq!(
         router
-            .tool_runtime(&call)
+            .tool_runtime(&call.tool_name)
             .map(|runtime| runtime.tool_name()),
         Some(call.tool_name.clone())
     );
@@ -386,7 +378,7 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     assert!(!router.tool_supports_parallel(&different_server_call));
     assert_eq!(
         router
-            .tool_runtime(&different_server_call)
+            .tool_runtime(&different_server_call.tool_name)
             .map(|runtime| runtime.tool_name()),
         Some(different_server_call.tool_name.clone())
     );
@@ -400,7 +392,7 @@ async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
         encrypted_function_args: None,
     };
     assert!(!router.tool_supports_parallel(&hidden_call));
-    assert!(router.tool_runtime(&hidden_call).is_some());
+    assert!(router.tool_runtime(&hidden_call.tool_name).is_some());
 
     let nested_only_call = ToolCall {
         tool_name: ToolName::namespaced("mcp__nested_echo__", "query_with_delay"),
@@ -551,7 +543,11 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         internal_chat_message_metadata_passthrough: None,
     };
     session
-        .record_conversation_items(&turn, std::slice::from_ref(&history_item))
+        .record_conversation_items(
+            &turn,
+            turn.model_info(),
+            std::slice::from_ref(&history_item),
+        )
         .await;
     let expected_history_item = session
         .clone_history()
@@ -604,10 +600,12 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         )
         .await?;
 
-    let response = result.into_response();
+    let response = result.into_response().item;
     match response {
-        ResponseInputItem::FunctionCallOutput { call_id, output } => {
-            assert_eq!(call_id, "call-extension");
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } => {
+            assert_eq!(call_id.as_deref(), Some("call-extension"));
             let FunctionCallOutputBody::Text(text) = output.body else {
                 panic!("expected text function call output")
             };

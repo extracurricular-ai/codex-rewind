@@ -288,7 +288,7 @@ impl RequestUserInputOverlay {
             let question_line = if answered {
                 Line::from(line.clone())
             } else {
-                Line::from(line.clone()).cyan()
+                Line::from(line.clone()).fg(crate::style::accent_color())
             };
             Paragraph::new(question_line).render(
                 Rect {
@@ -347,7 +347,7 @@ impl RequestUserInputOverlay {
         let option_tip = if options_hidden {
             let selected = self.selected_option_index().unwrap_or(0).saturating_add(1);
             let total = self.options_len();
-            Some(super::FooterTip::new(format!("option {selected}/{total}")))
+            Some(Line::from(format!("option {selected}/{total}").dim()))
         } else {
             None
         };
@@ -362,11 +362,7 @@ impl RequestUserInputOverlay {
                 if tip_idx > 0 {
                     spans.push(TIP_SEPARATOR.into());
                 }
-                if tip.highlight {
-                    spans.push(tip.text.cyan().bold().not_dim());
-                } else {
-                    spans.push(tip.text.into());
-                }
+                spans.extend(tip.spans);
             }
             let line = Line::from(spans).dim();
             let line = truncate_line_word_boundary_with_ellipsis(line, footer_area.width as usize);
@@ -427,7 +423,7 @@ impl RequestUserInputOverlay {
 ///
 /// This keeps footer spacing stable by anchoring the options block to the
 /// bottom of its allocated region.
-fn render_rows_bottom_aligned(
+pub(in crate::bottom_pane) fn render_rows_bottom_aligned(
     area: Rect,
     buf: &mut Buffer,
     rows: &[crate::bottom_pane::selection_popup_common::GenericDisplayRow],
@@ -471,7 +467,7 @@ fn render_rows_bottom_aligned(
 /// overflows, it truncates at the last word boundary when possible (falling back to the last
 /// fitting character), trims trailing whitespace, then appends an ellipsis styled to match the
 /// last visible span (or the line style if nothing was kept).
-fn truncate_line_word_boundary_with_ellipsis(
+pub(in crate::bottom_pane) fn truncate_line_word_boundary_with_ellipsis(
     line: Line<'static>,
     max_width: usize,
 ) -> Line<'static> {

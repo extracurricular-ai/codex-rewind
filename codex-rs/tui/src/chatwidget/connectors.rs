@@ -116,6 +116,12 @@ impl ChatWidget {
 
     fn queue_connectors_refresh(&mut self, force_refetch: bool) {
         if self.begin_connectors_refresh(force_refetch) {
+            if matches!(self.connectors.cache, ConnectorsCacheState::Loading) {
+                let _ = self.bottom_pane.replace_selection_view_if_active(
+                    CONNECTORS_SELECTION_VIEW_ID,
+                    self.connectors_loading_popup_params(),
+                );
+            }
             self.app_event_tx.send(AppEvent::FetchConnectorsList {
                 force_refetch,
                 generation: self.connectors.generation,
@@ -207,20 +213,47 @@ impl ChatWidget {
     }
 
     fn connectors_loading_popup_params(&self) -> SelectionViewParams {
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Apps".bold()));
-        header.push(Line::from("Loading installed and available apps...".dim()));
-
         SelectionViewParams {
             view_id: Some(CONNECTORS_SELECTION_VIEW_ID),
-            header: Box::new(header),
+            title: Some("Apps".to_string()),
+            subtitle: Some("Loading installed and available apps...".to_string()),
             items: vec![SelectionItem {
                 name: "Loading apps...".to_string(),
                 description: Some("This updates when the full list is ready.".to_string()),
                 is_disabled: true,
                 ..Default::default()
             }],
-            ..Default::default()
+            ..SelectionViewParams::picker()
+        }
+    }
+
+    fn connectors_error_popup_params(&self) -> SelectionViewParams {
+        SelectionViewParams {
+            view_id: Some(CONNECTORS_SELECTION_VIEW_ID),
+            title: Some("Apps".to_string()),
+            subtitle: Some("Failed to load apps.".to_string()),
+            items: vec![
+                SelectionItem {
+                    name: "App directory unavailable".to_string(),
+                    description: Some(
+                        "The app directory request failed. Retry, or press Esc to continue."
+                            .to_string(),
+                    ),
+                    is_disabled: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Retry".to_string(),
+                    description: Some("Reload installed and available apps.".to_string()),
+                    actions: vec![Box::new(|tx| {
+                        tx.send(AppEvent::RefreshConnectors {
+                            force_refetch: true,
+                        });
+                    })],
+                    ..Default::default()
+                },
+            ],
+            ..SelectionViewParams::picker()
         }
     }
 
@@ -234,14 +267,12 @@ impl ChatWidget {
             .iter()
             .filter(|connector| connector.is_accessible)
             .count();
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Apps".bold()));
-        header.push(Line::from(
-            "Use $ to insert an installed app into your prompt.".dim(),
-        ));
-        header.push(Line::from(
-            format!("Installed {installed} of {total} available apps.").dim(),
-        ));
+        let header = Paragraph::new(vec![
+            Line::from("Apps".bold()),
+            Line::from("Use $ to insert an installed app into your prompt.".dim()),
+            Line::from(format!("Installed {installed} of {total} available apps.").dim()),
+        ])
+        .wrap(Wrap { trim: false });
         let initial_selected_idx = selected_connector_id.and_then(|selected_connector_id| {
             connectors
                 .iter()
@@ -313,13 +344,12 @@ impl ChatWidget {
         SelectionViewParams {
             view_id: Some(CONNECTORS_SELECTION_VIEW_ID),
             header: Box::new(header),
-            footer_hint: Some(self.bottom_pane.standard_popup_hint_line()),
             items,
             is_searchable: true,
             search_placeholder: Some("Type to search apps".to_string()),
             col_width_mode: ColumnWidthMode::AutoAllRows,
             initial_selected_idx,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         }
     }
 
@@ -435,6 +465,10 @@ impl ChatWidget {
                     self.refresh_connectors_popup_if_open(&snapshot.connectors);
                     self.connectors.cache = ConnectorsCacheState::Ready(snapshot);
                 } else {
+                    let _ = self.bottom_pane.replace_selection_view_if_active(
+                        CONNECTORS_SELECTION_VIEW_ID,
+                        self.connectors_error_popup_params(),
+                    );
                     self.connectors.cache = ConnectorsCacheState::Failed(err);
                 }
             }

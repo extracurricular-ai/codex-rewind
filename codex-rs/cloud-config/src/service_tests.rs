@@ -554,6 +554,55 @@ async fn get_bundle_rejects_invalid_remote_bundle_before_cache_write() {
 }
 
 #[tokio::test]
+async fn invalid_cloud_provider_does_not_replace_cached_bundle() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache = create_test_cache(codex_home.path());
+    let previous = test_bundle();
+    cache
+        .save(
+            Some("user-12345".to_string()),
+            Some("account-12345".to_string()),
+            previous.clone(),
+        )
+        .await
+        .expect("cache valid bundle");
+
+    for contents in [
+        "[model_providers.openai]\nname = 'Reserved'",
+        "[model_providers.gateway]\nname = '   '",
+        "[model_providers.gateway]\nbase_url = 'https://gateway.example/v1'",
+        "[model_providers.amazon-bedrock]\nname = 'Managed Bedrock'",
+        "[model_providers.amazon-bedrock-runtime]\nname = 'Managed Bedrock Runtime'",
+        "[model_providers.amazon-bedrock]\nrequest_max_retries = 3",
+        "[model_providers.gateway]\nname = 'Gateway'\n[model_providers.gateway.auth]\ntimeout_ms = 10000",
+    ] {
+        let mut invalid = test_bundle();
+        invalid.requirements_toml.enterprise_managed[0].contents = contents.to_string();
+        let auth_manager = auth_manager_with_plan("business").await;
+        let auth = auth_manager.auth().await.expect("business auth");
+        let service = CloudConfigBundleService::new(
+            auth_manager,
+            Arc::new(StaticBundleClient::new(invalid.clone())),
+            codex_home.path().to_path_buf(),
+            CLOUD_CONFIG_BUNDLE_TIMEOUT,
+        );
+        let error = service
+            .validate_and_cache_remote_bundle(&auth, "refresh", /*attempt*/ 1, invalid)
+            .await
+            .expect_err("invalid provider must fail before cache write");
+        assert_eq!(error.code(), CloudConfigBundleLoadErrorCode::InvalidBundle);
+        assert_eq!(
+            cache
+                .load(Some("user-12345"), Some("account-12345"))
+                .await
+                .expect("retain previous cache")
+                .bundle,
+            previous
+        );
+    }
+}
+
+#[tokio::test]
 async fn get_bundle_ignores_invalid_cache_and_refetches() {
     let codex_home = tempdir().expect("tempdir");
     let cache = create_test_cache(codex_home.path());
@@ -632,6 +681,74 @@ async fn get_bundle_uses_cache_when_valid() {
 
     assert_eq!(service.load_startup_bundle().await, Ok(Some(bundle)));
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn get_bundle_without_cache_ignores_and_preserves_valid_cache() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache = create_test_cache(codex_home.path());
+    cache
+        .save(
+            Some("user-12345".to_string()),
+            Some("account-12345".to_string()),
+            CloudConfigBundle::default(),
+        )
+        .await
+        .expect("write empty cache");
+    let cached_bytes = std::fs::read(cache.path()).expect("read cache");
+    let bundle = test_bundle();
+    let fetcher = Arc::new(StaticBundleClient::new(bundle.clone()));
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        fetcher.clone(),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    )
+    .without_cache();
+
+    assert_eq!(
+        service.load_startup_bundle_with_timeout().await,
+        Ok(Some(bundle))
+    );
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read(cache.path()).expect("read unchanged cache"),
+        cached_bytes
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn get_bundle_without_cache_fails_closed_on_request_failure() {
+    let codex_home = tempdir().expect("tempdir");
+    create_test_cache(codex_home.path())
+        .save(
+            Some("user-12345".to_string()),
+            Some("account-12345".to_string()),
+            test_bundle(),
+        )
+        .await
+        .expect("write valid cache");
+    let fetcher = Arc::new(SequenceBundleClient::new(vec![
+        Err(request_error());
+        CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS
+    ]));
+    let service = CloudConfigBundleService::new(
+        auth_manager_with_plan("business").await,
+        fetcher.clone(),
+        codex_home.path().to_path_buf(),
+        CLOUD_CONFIG_BUNDLE_TIMEOUT,
+    )
+    .without_cache();
+
+    let err = service
+        .load_startup_bundle_with_timeout()
+        .await
+        .expect_err("request failure must not fall back to the cache");
+    assert_eq!(err.code(), CloudConfigBundleLoadErrorCode::RequestFailed);
+    assert_eq!(
+        fetcher.request_count.load(Ordering::SeqCst),
+        CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS
+    );
 }
 
 #[tokio::test]

@@ -22,16 +22,12 @@ const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("seatbelt_base_policy.sbpl
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("seatbelt_network_policy.sbpl");
 const MACOS_SEATBELT_PREFERENCES_POLICY: &str = include_str!("seatbelt_preferences_policy.sbpl");
 const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
-    include_str!("restricted_read_only_platform_defaults.sbpl");
-// Ordinary processes need system scratch directories for compatibility, but filesystem helpers
-// must not inherit scratch access beyond the paths their permission profile explicitly grants.
-const MACOS_PROCESS_PLATFORM_DEFAULTS: &str = r#"
-(allow file-read* (subpath "/Applications"))
-(allow file-read* file-test-existence file-write* (subpath "/tmp"))
-(allow file-read* file-write* (subpath "/private/tmp"))
-(allow file-read* file-write* (subpath "/var/tmp"))
-(allow file-read* file-write* (subpath "/private/var/tmp"))
-"#;
+    include_str!("seatbelt_read_only_platform_defaults.sbpl");
+#[path = "seatbelt_daemon.rs"]
+mod daemon;
+
+#[path = "seatbelt_scratch.rs"]
+mod scratch;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum MacosSeatbeltProfile {
@@ -130,6 +126,27 @@ impl Default for UnixDomainSocketPolicy {
     }
 }
 
+impl UnixDomainSocketPolicy {
+    fn from_allowlist(paths: &[String], extra_allowed: Vec<AbsolutePathBuf>) -> Self {
+        let mut allowed = paths
+            .iter()
+            .filter_map(|socket_path| {
+                match normalize_path_for_sandbox(Path::new(socket_path)) {
+                    Some(path) => Some(path),
+                    None => {
+                        warn!(
+                            "ignoring network.allow_unix_sockets entry because it could not be normalized: {socket_path}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        allowed.extend(extra_allowed);
+        Self::Restricted { allowed }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UnixSocketPathParam {
     index: usize,
@@ -147,30 +164,22 @@ fn proxy_policy_inputs(
         .filter_map(|socket_path| normalize_path_for_sandbox(socket_path.as_path()))
         .collect::<Vec<_>>();
 
-    let unix_domain_socket_policy = match network {
-        Some(network) if network.dangerously_allow_all_unix_sockets() => {
+    // Prefer this command's prepared Unix-socket policy.
+    // Fall back to the live proxy only when no prepared context exists.
+    let unix_domain_socket_policy = match (managed_network, network) {
+        (Some(context), _) if context.dangerously_allow_all_unix_sockets => {
             UnixDomainSocketPolicy::AllowAll
         }
-        Some(network) => {
-            let mut allowed = network
-                .allow_unix_sockets()
-                .iter()
-                .filter_map(|socket_path| {
-                    match normalize_path_for_sandbox(Path::new(socket_path)) {
-                        Some(path) => Some(path),
-                        None => {
-                            warn!(
-                                "ignoring network.allow_unix_sockets entry because it could not be normalized: {socket_path}"
-                            );
-                            None
-                        }
-                    }
-                })
-                .collect::<Vec<_>>();
-            allowed.extend(extra_allowed);
-            UnixDomainSocketPolicy::Restricted { allowed }
+        (Some(context), _) => {
+            UnixDomainSocketPolicy::from_allowlist(&context.allow_unix_sockets, extra_allowed)
         }
-        None => UnixDomainSocketPolicy::Restricted {
+        (None, Some(network)) if network.dangerously_allow_all_unix_sockets() => {
+            UnixDomainSocketPolicy::AllowAll
+        }
+        (None, Some(network)) => {
+            UnixDomainSocketPolicy::from_allowlist(&network.allow_unix_sockets(), extra_allowed)
+        }
+        (None, None) => UnixDomainSocketPolicy::Restricted {
             allowed: extra_allowed,
         },
     };
@@ -447,19 +456,34 @@ fn normalize_top_level_alias_for_sandbox(
 
 fn normalize_writable_root_for_sandbox(
     root: AbsolutePathBuf,
+    allowed_symlinked_codex_home: Option<&AbsolutePathBuf>,
 ) -> Result<NormalizedWritableRoot, SeatbeltPreparationError> {
-    if let Some(symlink) = nested_symlink_component(root.as_path()) {
+    let allow_symlinks = allowed_symlinked_codex_home.is_some_and(|home| {
+        root.as_path().starts_with(home.as_path())
+            || normalize_path_for_sandbox(home.as_path())
+                .is_some_and(|target| root.as_path().starts_with(target.as_path()))
+    });
+    if !allow_symlinks && let Some(symlink) = nested_symlink_component(root.as_path()) {
         return Err(SeatbeltPreparationError::FileSystem(format!(
-            "writable root {} contains symlink component {}; symlinked writable roots are not supported",
+            "writable root {} contains symlink component {}; symlinked writable roots are not supported.\n\
+             If this writable root is at or beneath CODEX_HOME and you trust its symlink targets, \
+             set `allow_symlinked_codex_home = true` at the top level of `$CODEX_HOME/config.toml` \
+             (normally `~/.codex/config.toml`) on the execution host, then restart Codex or its executor. \
+             This opt-out trusts targets outside CODEX_HOME and targets changed between commands. \
+             It does not apply to other writable roots.",
             root.display(),
             symlink.display()
         )));
     }
 
-    // Resolve only top-level system aliases such as `/tmp -> /private/tmp`.
-    // Deeper components can be mutated by an already-running sandboxed process,
-    // so following them here would turn a path check into a new authority grant.
-    let normalized = normalize_top_level_alias_for_sandbox(root)?;
+    let normalized = if allow_symlinks {
+        // This explicit opt-out trusts the current target, including targets
+        // outside CODEX_HOME and links changed by an earlier command.
+        normalize_path_for_sandbox(root.as_path()).unwrap_or(root)
+    } else {
+        // Otherwise preserve mutable components instead of granting their targets.
+        normalize_top_level_alias_for_sandbox(root)?
+    };
 
     let metadata = match std::fs::symlink_metadata(normalized.as_path()) {
         Ok(metadata) => metadata,
@@ -483,6 +507,7 @@ fn normalize_writable_root_for_sandbox(
 fn build_seatbelt_access_policy(
     access_kind: SeatbeltAccessKind,
     roots: Vec<SeatbeltAccessRoot>,
+    allowed_symlinked_codex_home: Option<&AbsolutePathBuf>,
 ) -> Result<(String, Vec<(String, PathBuf)>), SeatbeltPreparationError> {
     let mut policy_components = Vec::new();
     let mut root_anchor_denies = Vec::new();
@@ -500,7 +525,10 @@ fn build_seatbelt_access_policy(
                 (root, SeatbeltPathMatch::Subpath)
             }
             SeatbeltAccessKind::Write => {
-                match normalize_writable_root_for_sandbox(access_root.root)? {
+                match normalize_writable_root_for_sandbox(
+                    access_root.root,
+                    allowed_symlinked_codex_home,
+                )? {
                     NormalizedWritableRoot::Subpath(root) => (root, SeatbeltPathMatch::Subpath),
                     NormalizedWritableRoot::Literal(root) => (root, SeatbeltPathMatch::Literal),
                 }
@@ -607,7 +635,7 @@ fn protected_metadata_names_for_writable_root(
             continue;
         }
         let path = writable_root.root.join(*name);
-        if !file_system_sandbox_policy.can_write_path_with_cwd(path.as_path(), cwd) {
+        if !file_system_sandbox_policy.can_write_local_path_with_cwd(path.as_path(), cwd) {
             names.push((*name).to_string());
         }
     }
@@ -844,13 +872,18 @@ pub struct CreateSeatbeltCommandArgsParams<'a> {
 pub fn create_seatbelt_command_args(
     args: CreateSeatbeltCommandArgsParams<'_>,
 ) -> Result<Vec<String>, String> {
-    create_seatbelt_command_args_with_profile(args, MacosSeatbeltProfile::Process)
-        .map_err(|err| err.to_string())
+    create_seatbelt_command_args_with_profile(
+        args,
+        MacosSeatbeltProfile::Process,
+        /*allowed_symlinked_codex_home*/ None,
+    )
+    .map_err(|err| err.to_string())
 }
 
 pub(crate) fn create_seatbelt_command_args_with_profile(
     args: CreateSeatbeltCommandArgsParams<'_>,
     profile: MacosSeatbeltProfile,
+    allowed_symlinked_codex_home: Option<&AbsolutePathBuf>,
 ) -> Result<Vec<String>, SeatbeltPreparationError> {
     let CreateSeatbeltCommandArgsParams {
         command,
@@ -866,24 +899,43 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
 
     let unreadable_roots =
         file_system_sandbox_policy.get_unreadable_roots_with_cwd(sandbox_policy_cwd);
-    let writable_roots = file_system_sandbox_policy
+    let mut writable_roots = file_system_sandbox_policy
         .get_writable_roots_with_cwd_preserving_mutable_paths(sandbox_policy_cwd);
+    let include_platform_defaults = file_system_sandbox_policy.include_platform_defaults();
+    let scratch_reads = if include_platform_defaults && profile == MacosSeatbeltProfile::Process {
+        let (reads, writes) = scratch::scratch_access_roots(
+            file_system_sandbox_policy,
+            sandbox_policy_cwd,
+            &writable_roots,
+        )?;
+        writable_roots.extend(writes);
+        reads
+    } else {
+        Vec::new()
+    };
+    let allowed_symlinked_codex_home = allowed_symlinked_codex_home
+        .cloned()
+        .map(normalize_top_level_alias_for_sandbox)
+        .transpose()?;
     // Protect ancestors of read-only paths so renaming a writable directory
     // cannot move its descendants outside their policy carveouts.
     let mut protected_ancestors = BTreeSet::new();
     for writable_root in &writable_roots {
         let root = normalize_path_for_sandbox(writable_root.root.as_path())
             .unwrap_or_else(|| writable_root.root.clone());
-        for protected_directory in writable_root.read_only_subpaths.iter().filter_map(|path| {
-            normalize_path_for_sandbox(path.as_path())
-                .unwrap_or_else(|| path.clone())
-                .parent()
-        }) {
-            for ancestor in protected_directory.ancestors() {
-                if !ancestor.as_path().starts_with(root.as_path()) {
-                    break;
+        for path in &writable_root.read_only_subpaths {
+            // Protect the logical entry's parents as well as its target's:
+            // moving a symlink's parent would otherwise bypass its exclusion.
+            let logical = normalize_top_level_alias_for_sandbox(path.clone())?;
+            let resolved = normalize_path_for_sandbox(logical.as_path())
+                .filter(|resolved| resolved != &logical);
+            for protected_path in std::iter::once(logical).chain(resolved) {
+                for ancestor in protected_path.ancestors().skip(/*n*/ 1) {
+                    if !ancestor.as_path().starts_with(root.as_path()) {
+                        break;
+                    }
+                    protected_ancestors.insert(ancestor);
                 }
-                protected_ancestors.insert(ancestor);
             }
         }
     }
@@ -908,6 +960,7 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
                         excluded_subpaths: unreadable_roots.clone(),
                         protected_metadata_names: Vec::new(),
                     }],
+                    /*allowed_symlinked_codex_home*/ None,
                 )?
             }
         } else {
@@ -925,6 +978,7 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
                         excluded_subpaths: root.read_only_subpaths,
                     })
                     .collect(),
+                allowed_symlinked_codex_home.as_ref(),
             )?
         };
 
@@ -943,6 +997,7 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
                         excluded_subpaths: unreadable_roots,
                         protected_metadata_names: Vec::new(),
                     }],
+                    /*allowed_symlinked_codex_home*/ None,
                 )?;
                 (
                     format!("; allow read-only file operations\n{policy}"),
@@ -964,7 +1019,9 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
                         protected_metadata_names: Vec::new(),
                         root,
                     })
+                    .chain(scratch_reads)
                     .collect(),
+                /*allowed_symlinked_codex_home*/ None,
             )?;
             if policy.is_empty() {
                 (String::new(), params)
@@ -986,7 +1043,6 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
     let network_policy =
         dynamic_network_policy_for_network(network_sandbox_policy, enforce_managed_network, &proxy);
 
-    let include_platform_defaults = file_system_sandbox_policy.include_platform_defaults();
     let deny_read_policy =
         build_seatbelt_unreadable_glob_policy(file_system_sandbox_policy, sandbox_policy_cwd);
     let mut policy_sections = vec![
@@ -1001,9 +1057,17 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
     if include_platform_defaults {
         policy_sections.push(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS.to_string());
         if profile == MacosSeatbeltProfile::Process {
-            policy_sections.push(MACOS_PROCESS_PLATFORM_DEFAULTS.to_string());
+            policy_sections.push("(allow file-read* (subpath \"/Applications\"))".to_string());
         }
     }
+    // Network grants and Unix-socket allowlists must never reopen the
+    // privileged app-server RPC transport to filesystem-restricted commands.
+    if !file_system_sandbox_policy.has_full_disk_write_access() {
+        let directory = codex_uds::shared_daemon_socket_directory()
+            .map_err(|error| SeatbeltPreparationError::FileSystem(error.to_string()))?;
+        policy_sections.push(daemon::protection_policy(&directory)?);
+    }
+    policy_sections.push("(deny mach-lookup (xpc-service-name-prefix \"\"))".to_string());
     policy_sections.push(deny_read_policy);
     // Renaming an allowed ancestor relocates its protected descendants past
     // their pathname carveouts. Keep these denies last so no broader allowance
@@ -1015,6 +1079,13 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
             )
         }),
     );
+
+    // These fcntls mutate files through read-only descriptors, bypassing
+    // file-write* and file-ioctl. Even deny-default needs this explicit deny.
+    // F_MAKECOMPRESSED = 80, F_TRANSFEREXTENTS = 110.
+    if !file_system_sandbox_policy.has_full_disk_write_access() {
+        policy_sections.push("(deny system-fcntl (fcntl-command 80 110))".to_string());
+    }
 
     let full_policy = policy_sections.join("\n");
 
@@ -1041,3 +1112,11 @@ pub(crate) fn create_seatbelt_command_args_with_profile(
 #[cfg(test)]
 #[path = "seatbelt_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "seatbelt_daemon_socket_tests.rs"]
+mod daemon_socket_tests;
+
+#[cfg(test)]
+#[path = "seatbelt_fcntl_tests.rs"]
+mod fcntl_tests;

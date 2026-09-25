@@ -4,7 +4,8 @@
 //! configuration, authentication, terminal, state paths, and bounded reachability
 //! probes without attempting repair or starting long-lived services. Each check
 //! returns a redacted, serializable row so the same data can back the human
-//! summary and `--json` support report.
+//! summary and `--json` support report. PATH entries are untrusted data: checks
+//! may inspect them, but must not execute the programs they select.
 //!
 //! A failing check should describe the problem and remediation, but it should not
 //! mutate user state. That keeps the command safe to run before filing a support
@@ -21,7 +22,6 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -32,11 +32,12 @@ use codex_api::ApiError;
 use codex_api::ResponsesWebsocketClient;
 use codex_api::is_azure_responses_provider;
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::ConfigLoadError;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
-use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::LoaderOverrides;
 use codex_core::config::find_codex_home;
 use codex_features::FEATURES;
 use codex_http_client::ClientRouteClass;
@@ -74,6 +75,7 @@ use supports_color::Stream;
 mod background;
 mod desktop;
 mod disk;
+mod filesystem_paths;
 mod git;
 mod network;
 mod output;
@@ -133,10 +135,6 @@ const COLOR_ENV_VARS: &[&str] = &[
 const TERMINAL_DIMENSION_ENV_VARS: &[&str] = &["COLUMNS", "LINES"];
 const TERMINFO_ENV_VARS: &[&str] = &["TERMINFO", "TERMINFO_DIRS"];
 const LOCALE_ENV_VARS: &[&str] = &["LC_ALL", "LC_CTYPE", "LANG"];
-#[cfg(windows)]
-const NPM_COMMAND: &str = "npm.cmd";
-#[cfg(not(windows))]
-const NPM_COMMAND: &str = "npm";
 const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "SSH_TTY",
     "SSH_CONNECTION",
@@ -150,13 +148,6 @@ const REMOTE_TERMINAL_ENV_VARS: &[&str] = &[
     "DISPLAY",
     "WT_SESSION",
 ];
-const TMUX_OPTION_NAMES: &[&str] = &[
-    "extended-keys",
-    "xterm-keys",
-    "allow-passthrough",
-    "set-clipboard",
-    "focus-events",
-];
 const NARROW_TERMINAL_COLUMNS: u16 = 80;
 const NARROW_TERMINAL_ROWS: u16 = 24;
 
@@ -166,6 +157,10 @@ const NARROW_TERMINAL_ROWS: u16 = 24;
 /// detailed diagnostics by default; --summary keeps the terminal output compact.
 #[derive(Debug, Parser)]
 pub struct DoctorCommand {
+    /// Internal isolated filesystem probe; exits before loading configuration.
+    #[arg(long, hide = true)]
+    probe_filesystem_path: Option<PathBuf>,
+
     /// Emit a redacted machine-readable report.
     #[arg(long, default_value_t = false)]
     json: bool,
@@ -331,6 +326,9 @@ pub async fn run_doctor(
     interactive: &TuiCli,
     arg0_paths: &Arg0DispatchPaths,
 ) -> anyhow::Result<()> {
+    if let Some(path) = &command.probe_filesystem_path {
+        std::process::exit(filesystem_paths::probe_exit_code(path));
+    }
     let report = build_report(&command, root_config_overrides, interactive, arg0_paths).await;
 
     if command.json {
@@ -369,7 +367,9 @@ async fn build_report(
     checks.push(run_sync_check("search", progress.clone(), search_check));
 
     progress.begin("config");
+    let config_started = Instant::now();
     let config_result = load_config(root_config_overrides, interactive, arg0_paths).await;
+    let config_duration = config_started.elapsed();
     let cwd = config_result
         .as_ref()
         .map(|config| config.cwd.as_path().to_path_buf())
@@ -389,6 +389,14 @@ async fn build_report(
     }));
     match &config_result {
         Ok(config) => {
+            // Other checks below do synchronous work inside join!. Keep the
+            // probe deadlines independent of those checks' scheduler delays.
+            let filesystem_paths_check = run_async_check(
+                "filesystem paths",
+                progress.clone(),
+                filesystem_paths::check(config),
+            )
+            .await;
             let auth_manager_result =
                 AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
             let auth_manager = auth_manager_result.as_ref().ok().cloned();
@@ -414,7 +422,14 @@ async fn build_report(
                 background_server_check,
                 reachability_check,
             ) = tokio::join!(
-                async { run_sync_check("config", progress.clone(), || config_check(config)) },
+                async {
+                    run_sync_check("config", progress.clone(), || {
+                        config_check(config).detail(format!(
+                            "configuration load ms: {}",
+                            config_duration.as_millis()
+                        ))
+                    })
+                },
                 async {
                     run_sync_check("auth", progress.clone(), || match &auth_manager_result {
                         Ok(_) => auth_check(config),
@@ -430,7 +445,7 @@ async fn build_report(
                         ),
                     })
                 },
-                async { run_sync_check("updates", progress.clone(), || updates_check(config)) },
+                run_async_check("updates", progress.clone(), updates_check(config)),
                 async {
                     run_sync_check("network", progress.clone(), || network::check(Some(config)))
                 },
@@ -450,7 +465,9 @@ async fn build_report(
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(config.cwd.as_path())),
+                async {
+                    run_sync_check("git", progress.clone(), || git_check(config.cwd.as_path()))
+                },
                 async {
                     run_sync_check("terminal title", progress.clone(), || {
                         terminal_title_check(config)
@@ -487,6 +504,7 @@ async fn build_report(
                 websocket_check,
                 mcp_check,
                 sandbox_check,
+                filesystem_paths_check,
                 terminal_check,
                 git_check,
                 terminal_title_check,
@@ -508,14 +526,38 @@ async fn build_report(
             ) = tokio::join!(
                 async {
                     run_sync_check("config", progress.clone(), || {
-                        DoctorCheck::new(
+                        let check = DoctorCheck::new(
                             "config.load",
                             "config",
                             CheckStatus::Fail,
                             "config could not be loaded",
                         )
-                        .detail(err.to_string())
-                        .remediation("Fix the reported config error, then rerun codex doctor.")
+                        .remediation("Fix the reported config error, then rerun codex doctor.");
+                        // Error messages can echo config values. Report only typed metadata,
+                        // including errors wrapped by io::Error, whose source skips the wrapper.
+                        let config_error = err.chain().find_map(|cause| {
+                            cause.downcast_ref::<ConfigLoadError>().or_else(|| {
+                                cause
+                                    .downcast_ref::<std::io::Error>()?
+                                    .get_ref()?
+                                    .downcast_ref::<ConfigLoadError>()
+                            })
+                        });
+                        if let Some(error) = config_error {
+                            let error = error.config_error();
+                            return check
+                                .detail("error: invalid configuration")
+                                .detail(format!("file: {}", error.path.display()))
+                                .detail(format!("line: {}", error.range.start.line))
+                                .detail(format!("column: {}", error.range.start.column));
+                        }
+                        let io_error = err
+                            .chain()
+                            .find_map(|cause| cause.downcast_ref::<std::io::Error>());
+                        match io_error {
+                            Some(error) => check.detail(format!("error: {}", error.kind())),
+                            None => check.detail("error: configuration load failed"),
+                        }
                     })
                 },
                 async {
@@ -528,7 +570,7 @@ async fn build_report(
                         terminal_check(command.no_color)
                     })
                 },
-                run_async_check("git", progress.clone(), git_check(&cwd)),
+                async { run_sync_check("git", progress.clone(), || git_check(&cwd)) },
                 async { run_sync_check("state", progress.clone(), fallback_state_check) },
                 run_async_check(
                     "provider reachability",
@@ -571,18 +613,14 @@ async fn build_report(
 }
 
 async fn load_config(
-    root_config_overrides: CliConfigOverrides,
+    mut root_config_overrides: CliConfigOverrides,
     interactive: &TuiCli,
     arg0_paths: &Arg0DispatchPaths,
 ) -> anyhow::Result<Config> {
-    let mut cli_kv_overrides = root_config_overrides
-        .parse_overrides()
-        .map_err(anyhow::Error::msg)?;
     if interactive.web_search {
-        cli_kv_overrides.push((
-            "web_search".to_string(),
-            toml::Value::String("live".to_string()),
-        ));
+        root_config_overrides
+            .raw_overrides
+            .push("web_search=\"live\"".to_string());
     }
 
     let overrides = ConfigOverrides {
@@ -590,12 +628,15 @@ async fn load_config(
         ..config_overrides_from_interactive(interactive, arg0_paths)
     };
 
-    ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides)
-        .harness_overrides(overrides)
-        .build()
-        .await
-        .context("failed to load Codex config")
+    crate::cloud_config::config_builder(
+        &root_config_overrides,
+        LoaderOverrides::default(),
+        overrides,
+    )
+    .await?
+    .build()
+    .await
+    .context("failed to load Codex config")
 }
 
 fn config_overrides_from_interactive(
@@ -876,6 +917,10 @@ fn installation_check(show_details: bool) -> DoctorCheck {
         env::var_os("CODEX_MANAGED_BY_BUN").is_some()
     ));
     details.push(format!(
+        "managed by Vite+: {}",
+        env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_some()
+    ));
+    details.push(format!(
         "managed by pnpm: {}",
         env::var_os("CODEX_MANAGED_BY_PNPM").is_some()
     ));
@@ -903,41 +948,15 @@ fn installation_check(show_details: bool) -> DoctorCheck {
     }
 
     if doctor_managed_by_npm(current_exe.as_deref()) {
-        match npm_global_root_check() {
-            NpmRootCheck::Match { package_root } => {
-                details.push(format!("npm update target: {}", package_root.display()));
-            }
-            NpmRootCheck::Mismatch {
-                running_package_root,
-                npm_package_root,
-            } => {
-                status = CheckStatus::Fail;
-                summary =
-                    "npm install -g codex-rewind would update a different install".to_string();
-                remediation = Some(format!(
-                    "Fix PATH or npm prefix so the running package root ({}) matches the npm global package root ({}).",
-                    running_package_root.display(),
-                    npm_package_root.display()
-                ));
-                details.push(format!(
-                    "running package root: {}",
-                    running_package_root.display()
-                ));
-                details.push(format!("npm package root: {}", npm_package_root.display()));
-            }
-            NpmRootCheck::MissingPackageRoot => {
-                status = status.max(CheckStatus::Warning);
-                summary = "npm-managed launch is missing package-root provenance".to_string();
-                remediation = Some(
-                    "Reinstall or update Codex so the JS shim provides CODEX_MANAGED_PACKAGE_ROOT."
-                        .to_string(),
-                );
-            }
-            NpmRootCheck::NpmUnavailable(error) => {
-                status = status.max(CheckStatus::Warning);
-                summary = "npm-managed launch could not inspect npm global root".to_string();
-                details.push(format!("npm root -g failed: {error}"));
-            }
+        details
+            .push("npm update target: not inspected (PATH helpers are not executed)".to_string());
+        if env::var_os("CODEX_MANAGED_PACKAGE_ROOT").is_none() {
+            status = status.max(CheckStatus::Warning);
+            summary = "npm-managed launch is missing package-root provenance".to_string();
+            remediation = Some(
+                "Reinstall or update Codex so the JS shim provides CODEX_MANAGED_PACKAGE_ROOT."
+                    .to_string(),
+            );
         }
     }
 
@@ -967,6 +986,7 @@ fn doctor_managed_by_npm(current_exe: Option<&Path>) -> bool {
 fn inherited_managed_env_for_cargo_binary(current_exe: Option<&Path>) -> bool {
     if env::var_os("CODEX_MANAGED_BY_NPM").is_none()
         && env::var_os("CODEX_MANAGED_BY_BUN").is_none()
+        && env::var_os("CODEX_MANAGED_BY_VITE_PLUS").is_none()
         && env::var_os("CODEX_MANAGED_BY_PNPM").is_none()
     {
         return false;
@@ -1020,6 +1040,9 @@ fn describe_install_context(context: &InstallContext) -> String {
         InstallMethod::Bun => {
             describe_method_with_package_layout("bun", context.package_layout.as_ref())
         }
+        InstallMethod::VitePlus => {
+            describe_method_with_package_layout("vite+", context.package_layout.as_ref())
+        }
         InstallMethod::Pnpm => {
             describe_method_with_package_layout("pnpm", context.package_layout.as_ref())
         }
@@ -1055,62 +1078,6 @@ fn display_optional_path(path: Option<&Path>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum NpmRootCheck {
-    Match {
-        package_root: PathBuf,
-    },
-    Mismatch {
-        running_package_root: PathBuf,
-        npm_package_root: PathBuf,
-    },
-    MissingPackageRoot,
-    NpmUnavailable(String),
-}
-
-fn npm_global_root_check() -> NpmRootCheck {
-    let Some(running_package_root) = env::var_os("CODEX_MANAGED_PACKAGE_ROOT").map(PathBuf::from)
-    else {
-        return NpmRootCheck::MissingPackageRoot;
-    };
-
-    let output = match run_command(NPM_COMMAND, ["root", "-g"]) {
-        Ok(output) => output,
-        Err(err) => return NpmRootCheck::NpmUnavailable(err),
-    };
-    let Some(npm_root) = output.lines().map(str::trim).find(|line| !line.is_empty()) else {
-        return NpmRootCheck::NpmUnavailable("empty output from npm root -g".to_string());
-    };
-
-    compare_npm_package_roots(&running_package_root, &PathBuf::from(npm_root))
-}
-
-fn compare_npm_package_roots(running_package_root: &Path, npm_root: &Path) -> NpmRootCheck {
-    let npm_package_root = npm_root.join("codex-rewind");
-    let running = normalize_path_for_compare(running_package_root);
-    let target = normalize_path_for_compare(&npm_package_root);
-    if running == target {
-        NpmRootCheck::Match {
-            package_root: npm_package_root,
-        }
-    } else {
-        NpmRootCheck::Mismatch {
-            running_package_root: running_package_root.to_path_buf(),
-            npm_package_root,
-        }
-    }
-}
-
-fn normalize_path_for_compare(path: &Path) -> String {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let raw = canonical.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        raw.to_ascii_lowercase()
-    } else {
-        raw
-    }
-}
-
 fn display_list<T: AsRef<str>>(items: &[T]) -> String {
     if items.is_empty() {
         "none".to_string()
@@ -1124,41 +1091,21 @@ fn display_list<T: AsRef<str>>(items: &[T]) -> String {
 }
 
 fn codex_path_entries() -> Vec<String> {
-    #[cfg(windows)]
-    let result = run_command("where", ["codexr"]);
-    #[cfg(not(windows))]
-    let result = run_command("which", ["-a", "codexr"]);
-
-    result
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+    let Ok(candidates) = which::which_all("codexr") else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    candidates
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .map(|path| path.display().to_string())
         .collect()
-}
-
-fn run_command<I, S>(program: &str, args: I) -> Result<String, String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| err.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            return Err(format!("exited with status {}", output.status));
-        }
-        return Err(stderr);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn config_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
+    details
+        .push("configuration scope: invocation config, including cloud-managed policy".to_string());
+    details.push("active thread overrides: not inspected".to_string());
     details.push(format!("CODEX_HOME: {}", config.codex_home.display()));
     details.push(format!("cwd: {}", config.cwd.display()));
     details.push(format!(
@@ -1740,7 +1687,7 @@ impl TerminalCheckInputs {
         let terminal_size = crossterm::terminal::size().map_err(|err| err.to_string());
         let info = terminal_info();
         let tmux_details = if matches!(info.multiplexer, Some(Multiplexer::Tmux { .. })) {
-            tmux_diagnostic_details()
+            vec!["tmux options: not inspected (PATH helpers are not executed)".to_string()]
         } else {
             Vec::new()
         };
@@ -1856,16 +1803,20 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
     let locale_warning = locale.as_deref().is_some_and(is_non_utf8_locale);
     let mut issues = Vec::new();
     if matches!(name, TerminalName::Dumb) {
-        issues.push(
+        let issue = if inputs.stdin_is_terminal || inputs.stdout_is_terminal {
             DoctorIssue::new(
                 CheckStatus::Fail,
                 "TERM=dumb - colors and cursor control are disabled",
             )
-            .measured("TERM=dumb")
             .expected("TERM=xterm-256color or another real terminal type")
             .remedy("set TERM to a real value, for example xterm-256color")
-            .field("TERM"),
-        );
+        } else {
+            DoctorIssue::new(
+                CheckStatus::Warning,
+                "TERM=dumb - colors and cursor control are disabled in this non-interactive run",
+            )
+        };
+        issues.push(issue.measured("TERM=dumb").field("TERM"));
     }
     if locale_warning {
         let measured = locale.unwrap_or_else(|| "unknown".to_string());
@@ -1893,6 +1844,7 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
         );
     }
     issues.extend(terminal_size_issues(&inputs));
+    issues.sort_by_key(|issue| std::cmp::Reverse(issue.severity));
 
     let status = issues
         .iter()
@@ -2137,50 +2089,6 @@ fn terminal_size_issues(inputs: &TerminalCheckInputs) -> Vec<DoctorIssue> {
     }
 
     issues
-}
-
-fn tmux_diagnostic_details() -> Vec<String> {
-    let mut details = Vec::new();
-    push_tmux_display_detail(&mut details, "tmux client termtype", "#{client_termtype}");
-    push_tmux_display_detail(&mut details, "tmux client termname", "#{client_termname}");
-    for option in TMUX_OPTION_NAMES {
-        let value = tmux_option_value(option).unwrap_or_else(|| "unavailable".to_string());
-        details.push(format!("tmux {option}: {value}"));
-    }
-    details
-}
-
-fn push_tmux_display_detail(details: &mut Vec<String>, label: &str, format: &str) {
-    if let Some(value) = tmux_display_message(format) {
-        details.push(format!("{label}: {value}"));
-    }
-}
-
-fn tmux_option_value(option: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["show-options", "-gqv", option])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn tmux_display_message(format: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", format])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    non_empty_trimmed(String::from_utf8(output.stdout).ok()?)
-}
-
-fn non_empty_trimmed(value: String) -> Option<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
 }
 
 async fn state_check(config: &Config, command: &DoctorCommand) -> DoctorCheck {
@@ -2509,6 +2417,7 @@ fn websocket_error_detail(err: &ApiError) -> String {
         | ApiError::RateLimit(_)
         | ApiError::InvalidRequest { .. }
         | ApiError::CyberPolicy { .. }
+        | ApiError::BioPolicy { .. }
         | ApiError::MisalignmentPolicyViolation { .. }
         | ApiError::ServerOverloaded => format!("handshake error: {err}"),
     }
@@ -3239,31 +3148,6 @@ mod tests {
         assert_eq!(
             progress_impl.events(),
             vec!["begin test".to_string(), "finish test Warning".to_string()]
-        );
-    }
-
-    #[test]
-    fn compare_npm_package_roots_detects_match() {
-        let running = PathBuf::from("/prefix/lib/node_modules/codex-rewind");
-        let npm_root = PathBuf::from("/prefix/lib/node_modules");
-        assert_eq!(
-            compare_npm_package_roots(&running, &npm_root),
-            NpmRootCheck::Match {
-                package_root: npm_root.join("codex-rewind")
-            }
-        );
-    }
-
-    #[test]
-    fn compare_npm_package_roots_detects_mismatch() {
-        let running = PathBuf::from("/old/lib/node_modules/@openai/codex");
-        let npm_root = PathBuf::from("/new/lib/node_modules");
-        assert_eq!(
-            compare_npm_package_roots(&running, &npm_root),
-            NpmRootCheck::Mismatch {
-                running_package_root: running,
-                npm_package_root: npm_root.join("codex-rewind"),
-            }
         );
     }
 
@@ -4221,24 +4105,57 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_dumb_terminal() {
-        let mut inputs = terminal_inputs();
-        inputs.info.name = TerminalName::Dumb;
-        inputs.info.term = Some("dumb".to_string());
-        set_terminal_env(&mut inputs, "TERM", "dumb");
+    fn terminal_check_dumb_requires_interactive_stream() {
+        for (stdin, stdout, stderr, expected) in [
+            (false, false, false, CheckStatus::Warning),
+            (false, false, true, CheckStatus::Warning),
+            (false, true, false, CheckStatus::Fail),
+            (true, false, false, CheckStatus::Fail),
+        ] {
+            let mut inputs = terminal_inputs();
+            inputs.info.name = TerminalName::Dumb;
+            inputs.info.term = Some("dumb".to_string());
+            set_terminal_env(&mut inputs, "TERM", "dumb");
+            inputs.stdin_is_terminal = stdin;
+            inputs.stdout_is_terminal = stdout;
+            inputs.stderr_is_terminal = stderr;
 
-        let check = terminal_check_from_inputs(inputs);
+            let check = terminal_check_from_inputs(inputs);
 
-        assert_eq!(check.status, CheckStatus::Fail);
-        assert_eq!(
-            check.summary,
-            "TERM=dumb - colors and cursor control are disabled"
-        );
-        assert_eq!(check.issues.len(), 1);
-        assert_eq!(
-            check.issues[0].remedy.as_deref(),
-            Some("set TERM to a real value, for example xterm-256color")
-        );
+            assert_eq!(check.status, expected);
+            assert_eq!(check.issues.len(), 1);
+            assert_eq!(
+                check.issues[0].remedy.as_deref(),
+                (expected == CheckStatus::Fail)
+                    .then_some("set TERM to a real value, for example xterm-256color")
+            );
+            assert_eq!(
+                check.issues[0].expected.as_deref(),
+                (expected == CheckStatus::Fail)
+                    .then_some("TERM=xterm-256color or another real terminal type")
+            );
+            if !stdin && !stdout && !stderr {
+                let report = DoctorReport {
+                    schema_version: 1,
+                    generated_at: "0s since unix epoch".to_string(),
+                    overall_status: overall_status(std::slice::from_ref(&check)),
+                    codex_version: "0.0.0".to_string(),
+                    checks: vec![check],
+                };
+                insta::assert_snapshot!(
+                    "doctor_dumb_non_interactive_human",
+                    render_human_report(
+                        &report,
+                        HumanOutputOptions {
+                            show_details: true,
+                            show_all: true,
+                            ascii: true,
+                            color_enabled: false,
+                        }
+                    )
+                );
+            }
+        }
     }
 
     #[test]
@@ -4296,10 +4213,15 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_unreadable_terminfo_path() {
+    fn terminal_check_prioritizes_unreadable_terminfo_over_warnings() {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let missing = tempdir.path().join("missing-terminfo");
         let mut inputs = terminal_inputs();
+        inputs.info.name = TerminalName::Dumb;
+        inputs.stdin_is_terminal = false;
+        inputs.stdout_is_terminal = false;
+        set_terminal_env(&mut inputs, "TERM", "dumb");
+        set_terminal_env(&mut inputs, "LANG", "C");
         set_terminal_env(&mut inputs, "TERMINFO", &missing.to_string_lossy());
 
         let check = terminal_check_from_inputs(inputs);
@@ -4319,6 +4241,21 @@ mod tests {
             check.issues[0].remedy.as_deref(),
             Some("check that $TERMINFO points to a readable directory")
         );
+        insta::assert_snapshot!(render_human_report(
+            &DoctorReport {
+                schema_version: 1,
+                generated_at: "0s since unix epoch".to_string(),
+                overall_status: check.status,
+                codex_version: "0.0.0".to_string(),
+                checks: vec![check],
+            },
+            HumanOutputOptions {
+                show_details: false,
+                show_all: false,
+                ascii: true,
+                color_enabled: false,
+            }
+        ));
     }
 
     #[test]
@@ -4358,7 +4295,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_keeps_tmux_probe_failures_non_fatal() {
+    fn terminal_check_allows_missing_tmux_details() {
         let mut inputs = terminal_inputs();
         inputs.info.multiplexer = Some(Multiplexer::Tmux { version: None });
 

@@ -2,18 +2,10 @@ load("//:defs.bzl", "MACOS_WEBRTC_RUSTC_LINK_FLAGS", "codex_rust_crate")
 
 codex_rust_crate(
     name = "tui",
-    compile_data = glob(
-        include = ["**"],
-        allow_empty = True,
-        exclude = [
-            "**/* *",
-            "BUILD.bazel",
-            "Cargo.toml",
-        ],
-    ) + [
-        "//codex-rs/collaboration-mode-templates:templates/default.md",
-        "//codex-rs/collaboration-mode-templates:templates/plan.md",
-    ],
+    binaries_with_build_commit = ["codex-tui"],
+    compile_data = glob([
+        "assets/**",
+    ]),
     crate_name = "codex_tui",
     extra_binaries = [
         "//codex-rs/cli:codex",
@@ -23,8 +15,11 @@ codex_rust_crate(
     test_data_extra = glob([
         "src/**/*.rs",
         "src/**/snapshots/**",
+        "tests/fixtures/**",
     ]),
     test_shard_counts = {
         "tui-unit-tests": 8,
     },
+    # The startup symlink test applies its own Seatbelt policy, which cannot be nested.
+    test_tags = ["no-sandbox"],
 )
