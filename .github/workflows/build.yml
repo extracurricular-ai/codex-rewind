@@ -192,10 +192,17 @@ jobs:
 
           triple="${{ matrix.triple }}"
           triple_env="${triple//-/_}"
+          cflags="-idirafter /usr/include -idirafter /usr/include/$(gcc -print-multiarch)"
+          if [[ "$triple" == "aarch64-unknown-linux-musl" ]]; then
+            # Ubuntu's libgcc atomic helpers depend on glibc's __getauxval.
+            # Inline ARMv8 atomics so jemalloc's configure probes and native
+            # code link against musl without those glibc-only helpers.
+            cflags="$cflags -mno-outline-atomics"
+          fi
           {
             echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig"
             echo "PKG_CONFIG_ALLOW_CROSS=1"
-            echo "CFLAGS_$triple_env=-idirafter /usr/include -idirafter /usr/include/$(gcc -print-multiarch)"
+            echo "CFLAGS_$triple_env=$cflags"
           } >> "$GITHUB_ENV"
 
           PKG_CONFIG_PATH="$prefix/lib/pkgconfig" PKG_CONFIG_ALLOW_CROSS=1 \
@@ -351,4 +358,3 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --draft --title "$TAG" --notes "Built by the build workflow."
           gh release upload "$TAG" "codexr-$TRIPLE.tar.gz" --clobber
-
