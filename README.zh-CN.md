@@ -27,10 +27,13 @@
 这个发行版补上了缺的那一半。`/rewind` 把工作区恢复成你选中那条提示词时的样子,
 `/redo` 在你反悔时把它放回去。
 
-![agent 删掉 notes.txt;/rewind 选中删除之前那一步;ls 显示文件回来了](https://raw.githubusercontent.com/extracurricular-ai/codex-rewind/main/.github/rewind.gif)
+![回退 hello.py 中新增的问候语,再用 /redo 把它恢复回来](.github/rewind.gif)
 
-▶ [完整讲解(21 分钟)](https://www.bilibili.com/video/BV1ZAtv6NEHh/) —— 上面这段演示的完整版,
-附安装教程,以及它背后的设计:为什么 git 是错的地基、三个桶是什么、以及它到哪儿为止。
+下面的[分步指南](#第一次使用-rewind)配有静态截图,可以按自己的节奏阅读。
+
+▶ [早期演示与设计讲解(21 分钟)](https://www.bilibili.com/video/BV1ZAtv6NEHh/)
+—— 删除文件后的恢复演示、安装教程,以及它背后的设计:为什么 git 是错的地基、
+三个桶是什么、以及它到哪儿为止。
 
 ```
 /rewind     选一条提示词,对话和文件一起回到那时
@@ -84,6 +87,51 @@ file_snapshots = true
 
 它是**按会话绑定**的:打开只对**新会话**生效,关闭**不会中断**已经在追踪的会话。所以一个
 会话要么全程有快照、要么全程没有,不存在"追踪了一半"这种需要动脑子的状态。
+
+## 第一次使用 rewind
+
+在练习目录中运行 `codexr --enable file_snapshots`,开始一个**新会话**。
+录像用一个简单的 `hello.py` 演示,你自己的文件修改也可以按同样的步骤操作。
+
+### 1. 做一次修改
+
+先让 Codex `write a hello world py`,等它完成后再输入 `add greetings`。
+此时 `hello.py` 中有两条 print 语句。
+
+![add greetings 这一轮为 hello.py 添加了第二条 print 语句](.github/rewind-before.png)
+
+### 2. 选择要回退的提示词
+
+输入 `/rewind`,用 **↑ / ↓** 选中 **add greetings**,然后按 **Enter**。
+按 **Esc** 可以退出选择器,不执行回退。
+
+**选择你想撤销其修改的那条提示词。** rewind 回到这条提示词执行*之前*的状态,
+撤销这一轮以及之后各轮的修改。列表中最新的提示词排在最前面。
+
+![rewind 选择器选中 add greetings,即第 4 条提示词](.github/rewind-picker.png)
+
+### 3. 检查恢复后的状态
+
+对话从 `add greetings` 之前分支,这条提示词的文字回到输入框。
+`hello.py` 恢复为原来的一条 print 语句。提示词**还没有重新发送**:
+你可以修改它,尝试另一种做法,也可以清空输入框。
+
+![对话停在最初创建 hello.py 的位置,add greetings 回到了输入框](.github/rewind-restored.png)
+
+想直接检查文件,可以在另一个终端进入同一目录,运行 `cat hello.py`,
+或用编辑器打开文件。此时应当只有 `print("Hello, world!")`。
+
+### 4. 撤销这次回退
+
+清空输入框中的提示词,输入 `/redo`,按 **Enter**。
+对话和文件都会回到 rewind 之前的状态,例子中的问候语也会回来。
+下面的终端先显示 rewind 后的一行内容,再显示 redo 后恢复的两行内容。
+
+![两次 cat hello.py 检查显示:rewind 后只有一条 print,redo 后两条都回来了](.github/rewind-redo.png)
+
+如果回退后又修改了文件或继续了对话,请在继续前阅读确认提示。
+**回退到第一条提示词会开始一个新对话,无法用 `/redo` 撤销**;
+执行前选择器会明确提醒。
 
 ## ⚠️ 与官方版共用 `~/.codex`
 

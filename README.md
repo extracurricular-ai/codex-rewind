@@ -28,11 +28,14 @@ that predates the code sitting on disk.
 This distribution adds the missing half. `/rewind` restores the workspace to how it
 looked at the prompt you pick, and `/redo` puts it back if you change your mind.
 
-![The agent deletes notes.txt; /rewind picks the prompt before that; ls shows the file back.](https://raw.githubusercontent.com/extracurricular-ai/codex-rewind/main/.github/rewind.gif)
+![Rewind the greeting added to hello.py, then use /redo to bring it back.](.github/rewind.gif)
 
-▶ [Full walkthrough (22 min)](https://youtu.be/OpJI8NQ-mvY) — the demo above in full,
-then the design behind it: why git is the wrong foundation, what the three buckets are,
-and where it stops.
+Follow the [step-by-step guide](#try-your-first-rewind) below, with still screenshots
+you can read at your own pace.
+
+▶ [Earlier walkthrough and design discussion (22 min)](https://youtu.be/OpJI8NQ-mvY)
+— a deletion-recovery demo, why git is the wrong foundation, what the three buckets
+are, and where it stops.
 
 ```
 /rewind     pick a prompt; the conversation and the files both return to it
@@ -91,6 +94,55 @@ file_snapshots = true
 It binds **per session**: enabling affects new sessions only, and disabling never
 stops a session that is already tracking. So a session either has snapshots for its
 whole life or has none — there is no half-tracked state to reason about.
+
+## Try your first rewind
+
+Start a **new session** in a scratch directory with
+`codexr --enable file_snapshots`. The recording uses a small `hello.py` example;
+the same steps apply to your own edits.
+
+### 1. Make a change
+
+Ask Codex to `write a hello world py`, wait for it to finish, then ask it to
+`add greetings`. Now `hello.py` has two print statements.
+
+![The add greetings turn adds a second print statement to hello.py.](.github/rewind-before.png)
+
+### 2. Pick the prompt to rewind
+
+Enter `/rewind`. Use **↑ / ↓** to select **add greetings**, then press **Enter**.
+Press **Esc** to leave the picker without rewinding.
+
+**Pick the prompt whose changes you want to undo.** Rewind returns to *before*
+that prompt, undoing it and the turns after it. The newest prompt appears first.
+
+![The rewind picker highlights add greetings, prompt 4 of 4.](.github/rewind-picker.png)
+
+### 3. Check the restored state
+
+The conversation branches before `add greetings`, and its text returns to the
+composer. `hello.py` is back to its original single print statement. The prompt
+has **not** been sent again: edit it to try a different approach, or clear it.
+
+![The conversation ends at the original hello.py, with add greetings back in the composer.](.github/rewind-restored.png)
+
+To verify the file yourself, run `cat hello.py` in another terminal in the same
+directory (or open the file in your editor). It should contain only
+`print("Hello, world!")`.
+
+### 4. Undo the rewind
+
+Clear the draft prompt, enter `/redo`, and press **Enter**. This returns to the
+conversation and files from before the rewind. In this example, the greeting
+line comes back too; the terminal below shows the one-line file after rewind
+and the two-line file after redo.
+
+![Two cat hello.py checks show one print statement after rewind and both statements after redo.](.github/rewind-redo.png)
+
+If you have changed files or continued the conversation since rewinding, review
+the confirmation before proceeding. **Rewinding to the very first prompt starts
+a new conversation and cannot be undone with `/redo`**; the picker warns you
+before doing that.
 
 ## ⚠️ Sharing `~/.codex` with the official build
 
