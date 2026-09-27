@@ -9,6 +9,8 @@
     />
     <meta name="theme-color" content="#ffffff" />
     <title>Codex Rewind — Documentation</title>
+    <link rel="alternate" hreflang="en" href="./" />
+    <link rel="alternate" hreflang="zh-CN" href="./zh/" />
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
     <script src="./site.js" defer></script>
@@ -21,7 +23,7 @@
       >
       <span class="header-label">Documentation</span>
       <div class="header-links">
-        <a href="https://github.com/extracurricular-ai/codex-rewind/blob/main/README.zh-CN.md" lang="zh-CN">中文</a>
+        <a href="./zh/" lang="zh-CN" hreflang="zh-CN" data-language-switch>中文</a>
         <a href="https://github.com/extracurricular-ai/codex-rewind">GitHub <span aria-hidden="true">↗</span></a>
       </div>
       <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="sidebar" hidden>Menu</button>
@@ -131,6 +133,33 @@
             <strong>Start a new session.</strong> Snapshots are off by default. Enabling them affects new sessions only;
             disabling them does not stop a session that is already tracking.
           </div>
+          <h3>3. See rewind in action</h3>
+          <p>
+            Watch a greeting disappear with <code>/rewind</code> and return with <code>/redo</code>, then follow the
+            <a href="#first-rewind">screenshot guide below</a> to try it yourself.
+          </p>
+          <details class="walkthrough-recording">
+            <summary>
+              <span class="recording-icon" aria-hidden="true">▶</span>
+              <span
+                ><strong>Watch rewind and redo</strong
+                ><span class="recording-hint">Expand to play · Collapse to hide animation</span></span
+              >
+            </summary>
+            <figure class="walkthrough-media">
+              <img
+                src="./assets/rewind.gif"
+                alt="Terminal recording: add a greeting to hello.py, rewind the prompt to remove it, then redo to restore it."
+                width="1100"
+                height="684"
+                loading="lazy"
+                decoding="async"
+              />
+              <figcaption>
+                Add a greeting → rewind → check the file → redo. The conversation and files move together.
+              </figcaption>
+            </figure>
+          </details>
           <p>
             New to Codex itself? The <a href="https://github.com/openai/codex#readme">upstream guide</a> covers
             authentication and the standard CLI workflow.
@@ -140,7 +169,10 @@
         <section id="first-rewind" aria-labelledby="first-rewind-title">
           <div class="section-label">WALKTHROUGH</div>
           <h2 id="first-rewind-title">Your first rewind</h2>
-          <p>Try this in a scratch directory with snapshots enabled in a new session.</p>
+          <p>
+            Try this in a scratch directory with snapshots enabled in a new session. Select any screenshot to open it at
+            full size.
+          </p>
           <ol class="steps">
             <li>
               <h3>Make two changes</h3>
@@ -148,6 +180,19 @@
                 Ask <code>write a hello world py</code>. When it finishes, ask <code>add greetings</code>. Your
                 <code>hello.py</code> now has two print statements.
               </p>
+              <figure class="walkthrough-media">
+                <a href="./assets/rewind-before.png" aria-label="Open full-size screenshot of the added greeting">
+                  <img
+                    src="./assets/rewind-before.png"
+                    alt="Codex adds a second print statement to hello.py for the add greetings prompt."
+                    width="1100"
+                    height="340"
+                    loading="lazy"
+                    decoding="async"
+                  />
+                </a>
+                <figcaption>Before rewind: the greeting is the second line in <code>hello.py</code>.</figcaption>
+              </figure>
             </li>
             <li>
               <h3>Pick the prompt to undo</h3>
@@ -155,6 +200,21 @@
                 Enter <code>/rewind</code>, use <kbd>↑</kbd> / <kbd>↓</kbd> to select <strong>add greetings</strong>,
                 and press <kbd>Enter</kbd>. The newest prompt is first. <kbd>Esc</kbd> closes the picker.
               </p>
+              <figure class="walkthrough-media">
+                <a href="./assets/rewind-picker.png" aria-label="Open full-size screenshot of the rewind picker">
+                  <img
+                    src="./assets/rewind-picker.png"
+                    alt="The rewind picker highlights add greetings, the newest prompt, with Enter to select and Esc to go back."
+                    width="1100"
+                    height="204"
+                    loading="lazy"
+                    decoding="async"
+                  />
+                </a>
+                <figcaption>
+                  Choose the prompt whose changes you want to undo: <strong>add greetings</strong>.
+                </figcaption>
+              </figure>
             </li>
             <li>
               <h3>Check your files</h3>
@@ -166,6 +226,24 @@
                 The selected prompt returns to the composer without being sent. Edit it to try another approach, or
                 clear it.
               </p>
+              <figure class="walkthrough-media">
+                <a
+                  href="./assets/rewind-restored.png"
+                  aria-label="Open full-size screenshot of the restored conversation"
+                >
+                  <img
+                    src="./assets/rewind-restored.png"
+                    alt="The conversation branches from the original hello-world file, and add greetings is back in the composer as an unsent draft."
+                    width="1100"
+                    height="282"
+                    loading="lazy"
+                    decoding="async"
+                  />
+                </a>
+                <figcaption>
+                  After rewind: the original hello-world line remains, and the prompt is ready to edit.
+                </figcaption>
+              </figure>
             </li>
             <li>
               <h3>Bring the change back</h3>
@@ -173,6 +251,24 @@
                 Clear the draft prompt, enter <code>/redo</code>, and press <kbd>Enter</kbd>. The conversation and files
                 return to their state before the rewind.
               </p>
+              <figure class="walkthrough-media">
+                <a
+                  href="./assets/rewind-redo.png"
+                  aria-label="Open full-size screenshot comparing the file after rewind and redo"
+                >
+                  <img
+                    src="./assets/rewind-redo.png"
+                    alt="Two terminal checks of hello.py show one print statement after rewind and both print statements after redo."
+                    width="1100"
+                    height="154"
+                    loading="lazy"
+                    decoding="async"
+                  />
+                </a>
+                <figcaption>
+                  Verify with <code>cat hello.py</code>: one line after rewind, two lines again after redo.
+                </figcaption>
+              </figure>
             </li>
           </ol>
           <div class="callout warning">
@@ -180,9 +276,6 @@
             with <code>/redo</code>. The picker warns you before proceeding. If you edit files or continue after a
             rewind, review the redo confirmation carefully.
           </div>
-          <a class="text-link" href="https://github.com/extracurricular-ai/codex-rewind#try-your-first-rewind"
-            >See the walkthrough with screenshots <span aria-hidden="true">↗</span></a
-          >
         </section>
 
         <section id="commands" aria-labelledby="commands-title">
