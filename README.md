@@ -2,6 +2,8 @@
 
 **English** · [简体中文](https://github.com/extracurricular-ai/codex-rewind/blob/main/README.zh-CN.md)
 
+[Documentation](https://extracurricular-ai.github.io/codex-rewind/) - Installation, rewind walkthrough, and command reference.
+
 [![npm](https://img.shields.io/npm/v/codex-rewind?label=npm&color=cb3837)](https://www.npmjs.com/package/codex-rewind)
 [![downloads](https://img.shields.io/npm/dm/codex-rewind?label=downloads&color=2f855a)](https://www.npmjs.com/package/codex-rewind)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](LICENSE)

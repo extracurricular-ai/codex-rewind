@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Codex Rewind documentation. Restore your conversation and workspace together with automatic file snapshots, /rewind, and /redo."
+    />
+    <meta name="theme-color" content="#ffffff" />
+    <title>Codex Rewind — Documentation</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./site.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="header">
+      <a class="brand" href="#overview" aria-label="Codex Rewind home"
+        ><span class="brand-mark" aria-hidden="true">↶</span> Codex <span class="brand-light">Rewind</span></a
+      >
+      <span class="header-label">Documentation</span>
+      <div class="header-links">
+        <a href="https://github.com/extracurricular-ai/codex-rewind/blob/main/README.zh-CN.md" lang="zh-CN">中文</a>
+        <a href="https://github.com/extracurricular-ai/codex-rewind">GitHub <span aria-hidden="true">↗</span></a>
+      </div>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="sidebar" hidden>Menu</button>
+    </header>
+    <div class="layout">
+      <aside class="sidebar" id="sidebar">
+        <nav aria-label="Documentation">
+          <p class="nav-label">Get started</p>
+          <a class="nav-link" href="#overview" aria-current="location">Overview</a>
+          <a class="nav-link" href="#quickstart">Quickstart <span class="nav-tag">2 min</span></a>
+          <a class="nav-link" href="#first-rewind">Your first rewind</a>
+          <p class="nav-label">Using Rewind</p>
+          <a class="nav-link" href="#commands">Commands</a>
+          <a class="nav-link" href="#tracking">What gets tracked</a>
+          <a class="nav-link" href="#configuration">Configuration</a>
+          <a class="nav-link" href="#limitations">Limits &amp; compatibility</a>
+          <p class="nav-label">Resources</p>
+          <a class="nav-link" href="#uninstall">Uninstall</a>
+          <a class="nav-link" href="#contributing">Contributing &amp; support</a>
+        </nav>
+        <div class="sidebar-note">
+          <span class="status-dot" aria-hidden="true"></span> Open source · Apache-2.0
+          <p>An independent Codex CLI distribution.</p>
+        </div>
+      </aside>
+      <main id="main">
+        <section id="overview" aria-labelledby="overview-title">
+          <div class="eyebrow">CODEX REWIND / DOCUMENTATION</div>
+          <h1 id="overview-title">A step back.<br />A new way forward.</h1>
+          <p class="lead">
+            Rewind the conversation <em>and</em> your files.<br class="desktop-break" />
+            Pick an earlier prompt. Try a different approach.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#quickstart">Get started <span aria-hidden="true">→</span></a
+            ><a class="button" href="https://github.com/extracurricular-ai/codex-rewind"
+              >View on GitHub <span aria-hidden="true">↗</span></a
+            >
+          </div>
+          <p class="hero-meta">Local snapshots. No git required. Your workflow, with an undo.</p>
+          <div class="demo" aria-label="Interactive rewind illustration">
+            <div class="demo-toolbar">
+              <span><span class="status-dot" aria-hidden="true"></span> Workspace preview</span
+              ><span class="demo-badge">Interactive example</span>
+            </div>
+            <div class="demo-body">
+              <div class="timeline">
+                <span class="code-label">CONVERSATION</span>
+                <p class="timeline-step">Write a hello world py</p>
+                <p class="timeline-step" id="greeting-turn">Add greetings <span id="turn-state">completed</span></p>
+              </div>
+              <div class="file-preview">
+                <span class="code-label">hello.py</span>
+                <pre tabindex="0"><code><span class="line-number">1</span> print("Hello, world!")
+<span id="greeting-line"><span class="line-number">2</span> print("Nice to meet you!")</span></code></pre>
+              </div>
+            </div>
+            <div class="demo-footer">
+              <p id="demo-status" role="status">Two prompts. Two lines. Try rewinding the second prompt.</p>
+              <div class="demo-controls" hidden>
+                <button id="rewind-demo" type="button">↶ /rewind</button
+                ><button id="redo-demo" type="button" disabled>↷ /redo</button>
+              </div>
+            </div>
+          </div>
+          <div class="feature-grid">
+            <div>
+              <h3>Files follow the conversation</h3>
+              <p>Restore tracked workspace files to before the prompt you select.</p>
+            </div>
+            <div>
+              <h3>Room to change your mind</h3>
+              <p>Use <code>/redo</code> to return to the state before a rewind.</p>
+            </div>
+            <div>
+              <h3>Your git state stays yours</h3>
+              <p>No commits, stashes, or index writes. Works outside repositories, too.</p>
+            </div>
+          </div>
+          <p class="muted small">
+            An unofficial distribution of OpenAI Codex CLI. Not affiliated with, endorsed by, or supported by OpenAI.
+          </p>
+        </section>
+
+        <section id="quickstart" aria-labelledby="quickstart-title">
+          <div class="section-label">GET STARTED</div>
+          <h2 id="quickstart-title">Up and running</h2>
+          <p>
+            Install the distribution, enable snapshots, and start a new session. Prebuilt binaries are available for
+            macOS, Linux, and Windows on x64 and arm64. Requires Node.js 16 or newer.
+          </p>
+          <h3>1. Install Codex Rewind</h3>
+          <div class="code-block">
+            <div class="code-header"><span>Terminal</span></div>
+            <pre tabindex="0"><code>npm install -g codex-rewind</code></pre>
+          </div>
+          <p>
+            The command is <code>codexr</code>. It installs alongside the official <code>codex</code> command and uses
+            your existing login and configuration by default.
+          </p>
+          <h3>2. Start with snapshots enabled</h3>
+          <div class="code-block">
+            <div class="code-header"><span>Terminal</span></div>
+            <pre tabindex="0"><code>codexr --enable file_snapshots</code></pre>
+          </div>
+          <div class="callout">
+            <strong>Start a new session.</strong> Snapshots are off by default. Enabling them affects new sessions only;
+            disabling them does not stop a session that is already tracking.
+          </div>
+          <p>
+            New to Codex itself? The <a href="https://github.com/openai/codex#readme">upstream guide</a> covers
+            authentication and the standard CLI workflow.
+          </p>
+        </section>
+
+        <section id="first-rewind" aria-labelledby="first-rewind-title">
+          <div class="section-label">WALKTHROUGH</div>
+          <h2 id="first-rewind-title">Your first rewind</h2>
+          <p>Try this in a scratch directory with snapshots enabled in a new session.</p>
+          <ol class="steps">
+            <li>
+              <h3>Make two changes</h3>
+              <p>
+                Ask <code>write a hello world py</code>. When it finishes, ask <code>add greetings</code>. Your
+                <code>hello.py</code> now has two print statements.
+              </p>
+            </li>
+            <li>
+              <h3>Pick the prompt to undo</h3>
+              <p>
+                Enter <code>/rewind</code>, use <kbd>↑</kbd> / <kbd>↓</kbd> to select <strong>add greetings</strong>,
+                and press <kbd>Enter</kbd>. The newest prompt is first. <kbd>Esc</kbd> closes the picker.
+              </p>
+            </li>
+            <li>
+              <h3>Check your files</h3>
+              <p>
+                Rewind returns to <strong>before the selected prompt</strong>, undoing that turn and the turns after it.
+                Open <code>hello.py</code>: only the original hello-world line remains.
+              </p>
+              <p>
+                The selected prompt returns to the composer without being sent. Edit it to try another approach, or
+                clear it.
+              </p>
+            </li>
+            <li>
+              <h3>Bring the change back</h3>
+              <p>
+                Clear the draft prompt, enter <code>/redo</code>, and press <kbd>Enter</kbd>. The conversation and files
+                return to their state before the rewind.
+              </p>
+            </li>
+          </ol>
+          <div class="callout warning">
+            <strong>The first prompt is special.</strong> Rewinding to it starts a new conversation and cannot be undone
+            with <code>/redo</code>. The picker warns you before proceeding. If you edit files or continue after a
+            rewind, review the redo confirmation carefully.
+          </div>
+          <a class="text-link" href="https://github.com/extracurricular-ai/codex-rewind#try-your-first-rewind"
+            >See the walkthrough with screenshots <span aria-hidden="true">↗</span></a
+          >
+        </section>
+
+        <section id="commands" aria-labelledby="commands-title">
+          <div class="section-label">REFERENCE</div>
+          <h2 id="commands-title">Three commands to know</h2>
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only">
+                Rewind slash commands
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Command</th>
+                  <th scope="col">What it does</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row"><code>/rewind</code></th>
+                  <td>Choose a prompt and restore the conversation and tracked files to before it.</td>
+                </tr>
+                <tr>
+                  <th scope="row"><code>/redo</code></th>
+                  <td>Undo a rewind. Review any confirmation about files that have changed since.</td>
+                </tr>
+                <tr>
+                  <th scope="row"><code>/status</code></th>
+                  <td>Check snapshot status and disk usage when the feature is enabled.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="tracking" aria-labelledby="tracking-title">
+          <div class="section-label">UNDER THE HOOD</div>
+          <h2 id="tracking-title">What gets tracked</h2>
+          <p>
+            Snapshots combine three sources of files. Shell changes are covered within these bounds; this is not a
+            backup of everything on your machine.
+          </p>
+          <div class="table-wrap">
+            <table>
+              <caption class="sr-only">
+                Snapshot sources and limits
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Source</th>
+                  <th scope="col">Coverage</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row">Git-tracked files</th>
+                  <td>Read from the index, with no file-count cap.</td>
+                </tr>
+                <tr>
+                  <th scope="row">Agent-edited files</th>
+                  <td>Captured by the edit tool, including files outside the working directory. No file-count cap.</td>
+                </tr>
+                <tr>
+                  <th scope="row">Recently modified files</th>
+                  <td>
+                    Up to 100 files, 16 MB each. Skips dependency and build directories such as
+                    <code>node_modules</code>, <code>target</code>, and <code>Pods</code>.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            Hidden files are excluded by default, except when explicitly edited by the agent. Rewind never modifies git
+            metadata.
+          </p>
+          <h3>Exclude files from snapshots</h3>
+          <p>
+            Create a <code>.codexsnapignore</code> in your project using gitignore syntax. It is separate from
+            <code>.gitignore</code>. Excluded paths are never snapshotted, restored, or deleted by a restore.
+          </p>
+          <div class="code-block">
+            <div class="code-header"><span>.codexsnapignore · example</span></div>
+            <pre tabindex="0"><code>private-notes/
+*.local.csv</code></pre>
+          </div>
+          <h3>Storage</h3>
+          <p>
+            Snapshots live in <code>~/.codex/file_snapshots/</code>. Identical file contents are stored once across
+            turns and sessions. Check usage with <code>/status</code>. Deleting a conversation also deletes its
+            snapshots; checkpoints are not discarded just to limit the number of turns.
+          </p>
+        </section>
+
+        <section id="configuration" aria-labelledby="configuration-title">
+          <div class="section-label">CONFIGURATION</div>
+          <h2 id="configuration-title">Make it part of your workflow</h2>
+          <p>
+            To enable snapshots for future sessions, turn the feature on in <code>/experimental</code>, or add the key
+            to your existing configuration. If a <code>[features]</code> table exists, add the key there.
+          </p>
+          <div class="code-block">
+            <div class="code-header"><span>~/.codex/config.toml</span></div>
+            <pre tabindex="0"><code>[features]
+file_snapshots = true</code></pre>
+          </div>
+          <h3>Keep your Codex installations separate</h3>
+          <p>
+            By default, both distributions share <code>~/.codex</code>, including login, config, and history. To isolate
+            Rewind, set <code>CODEX_HOME</code> to another directory. You will need to sign in again.
+          </p>
+          <div class="code-block">
+            <div class="code-header"><span>macOS / Linux · shell</span></div>
+            <pre
+              tabindex="0"
+              aria-label="Run Rewind with a separate Codex home"
+            ><code>CODEX_HOME=~/.codex-rewind codexr --enable file_snapshots</code></pre>
+          </div>
+          <div class="code-block">
+            <div class="code-header"><span>Windows · PowerShell</span></div>
+            <pre tabindex="0"><code>$env:CODEX_HOME = "$HOME\.codex-rewind"
+codexr --enable file_snapshots</code></pre>
+          </div>
+        </section>
+
+        <section id="limitations" aria-labelledby="limitations-title">
+          <div class="section-label">GOOD TO KNOW</div>
+          <h2 id="limitations-title">Limits &amp; compatibility</h2>
+          <div class="callout warning">
+            <strong>Finish a session in the build that started it.</strong> Continuing a tracked session in official
+            <code>codex</code> creates a silent gap: those turns have no snapshots. Sessions started in the official
+            build have no file snapshots to restore.
+          </div>
+          <ul class="prose-list">
+            <li><strong>Local environments only.</strong> Remote environments are not supported.</li>
+            <li>
+              <strong>No merging between sessions.</strong> Concurrent sessions in one directory can overwrite each
+              other’s files. Use separate worktrees or checkouts.
+            </li>
+            <li>
+              <strong>Recovery needs a snapshot.</strong> Rewind cannot restore content from before it knew a file
+              existed. It only deletes a file when a capture provides evidence that the file was absent.
+            </li>
+            <li>
+              <strong>Shared config has a caveat.</strong> Official Codex warns about the unknown
+              <code>file_snapshots</code> feature key. With <code>--strict-config</code>, leftover unknown fields can
+              cause an error.
+            </li>
+          </ul>
+          <p>
+            Rewind archives the conversation it replaces. History keeps the upstream format, and archived conversations
+            can be retrieved with <code>codex unarchive &lt;id&gt;</code>.
+          </p>
+        </section>
+
+        <section id="uninstall" aria-labelledby="uninstall-title">
+          <div class="section-label">MANAGE YOUR INSTALLATION</div>
+          <h2 id="uninstall-title">Clean uninstall</h2>
+          <div class="code-block">
+            <div class="code-header"><span>Terminal</span></div>
+            <pre tabindex="0"><code>npm uninstall -g codex-rewind</code></pre>
+          </div>
+          <p>
+            To remove snapshot data, delete only the <code>file_snapshots</code> directory inside your Codex home
+            (normally <code>~/.codex/file_snapshots/</code>). This permanently removes the ability to restore those file
+            snapshots.
+          </p>
+          <p>
+            Optionally remove <code>file_snapshots</code> from <code>[features]</code> and any
+            <code>[file_snapshots]</code> table in <code>config.toml</code>.
+          </p>
+          <div class="callout">
+            <strong>Keep your Codex home directory.</strong> Do not delete <code>~/.codex</code> itself: it contains
+            your login, configuration, and conversations, shared with official Codex. Uninstalling does not unarchive
+            conversations that rewind archived.
+          </div>
+          <a class="text-link" href="https://github.com/extracurricular-ai/codex-rewind#clean-uninstall"
+            >Full inventory of files on disk <span aria-hidden="true">↗</span></a
+          >
+        </section>
+
+        <section id="contributing" aria-labelledby="contributing-title">
+          <div class="section-label">BUILD WITH US</div>
+          <h2 id="contributing-title">Contributing &amp; support</h2>
+          <p>
+            Report issues in this project’s repository. Include both versions below: npm identifies the Rewind release,
+            while <code>codexr --version</code> reports its upstream baseline.
+          </p>
+          <div class="code-block">
+            <div class="code-header"><span>Terminal</span></div>
+            <pre tabindex="0"><code>npm ls -g codex-rewind
+codexr --version</code></pre>
+          </div>
+          <p>
+            Contributions should include a sign-off with <code>git commit -s</code>. If a change is later proposed
+            upstream, its original author must personally sign OpenAI’s CLA.
+          </p>
+          <div class="resource-grid">
+            <a class="resource" href="https://github.com/extracurricular-ai/codex-rewind/issues"
+              ><h3>Report an issue <span aria-hidden="true">↗</span></h3>
+              <p>Bug reports and feature requests.</p></a
+            >
+            <a
+              class="resource"
+              href="https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/rfc-file-snapshot-rewind.md"
+              ><h3>Read the design <span aria-hidden="true">↗</span></h3>
+              <p>Snapshot boundaries and correctness rules.</p></a
+            >
+            <a
+              class="resource"
+              href="https://github.com/extracurricular-ai/codex-rewind/blob/main/docs/file-snapshots-decision-log.zh.md"
+              ><h3>Decision log <span aria-hidden="true">↗</span></h3>
+              <p>Tradeoffs and lessons learned. In Chinese.</p></a
+            >
+            <a class="resource" href="https://github.com/extracurricular-ai/filesnap"
+              ><h3>The snapshot engine <span aria-hidden="true">↗</span></h3>
+              <p>Use filesnap in your own tools.</p></a
+            >
+          </div>
+        </section>
+        <footer class="footer">
+          <span>Codex Rewind</span
+          ><span
+            >Independent, open source,
+            <a href="https://github.com/extracurricular-ai/codex-rewind/blob/main/LICENSE">Apache-2.0</a>.</span
+          ><a href="#overview">Back to top ↑</a>
+        </footer>
+      </main>
+      <aside class="page-aside" aria-label="Quick links">
+        <p class="nav-label">IN THIS GUIDE</p>
+        <a href="#quickstart">Install &amp; enable</a><a href="#first-rewind">Try a rewind</a
+        ><a href="#tracking">Understand snapshots</a>
+        <hr />
+        <p>Built on Codex.<br />With room to go back.</p>
+        <a href="https://www.npmjs.com/package/codex-rewind">View on npm ↗</a>
+      </aside>
+    </div>
+  </body>
+</html>

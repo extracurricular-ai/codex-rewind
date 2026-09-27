@@ -1,5 +1,7 @@
 # codex-rewind
 
+[在线文档（英文）](https://extracurricular-ai.github.io/codex-rewind/) · 安装、回退教程与命令参考。
+
 [English](https://github.com/extracurricular-ai/codex-rewind/blob/main/README.md) · **简体中文**
 
 [![npm](https://img.shields.io/npm/v/codex-rewind?label=npm&color=cb3837)](https://www.npmjs.com/package/codex-rewind)
