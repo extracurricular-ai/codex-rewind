@@ -101,6 +101,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # Cargo resolves the workspace's V8 Git patch even for this small crate.
+      # Its Chromium submodules exceed Windows' default checkout path limit.
+      - name: Enable Git long paths (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.longpaths true
+
       # `rustup toolchain install` with no argument installs whatever
       # `rust-toolchain.toml` pins. Spelled out because rustup 1.28 stopped
       # auto-installing behind `rustup show`, and a job that depends on that

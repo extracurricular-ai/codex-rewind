@@ -433,6 +433,8 @@
 
 本次在 Linux 上完成 447 项定向 Rust 回归(424 项单测及 TUI 回归、23 项文件快照与服务端集成)、5 项启动器测试、27 项打包测试,以及格式检查、schema 生成和 npm 启动器包校验。`codexr` 构建成功,版本为 0.166.0。未运行全工作区测试或跨平台发布 dry run。
 
+76. **Windows CI 必须显式启用 Git 长路径。** 发布演练中,Windows 快照测试和 x64/ARM64 发布构建都在 Cargo 检出 V8 的 `third_party/rust` 子模块时失败(`path too long`),尚未进入编译或测试。上游 `setup-ci` 已执行 `git config --global core.longpaths true`,但 fork 的 `tests.yml` 和 `build.yml` 不调用该 action。两个工作流各自补上同样的 Windows 初始化步骤,放在缓存恢复与 Cargo 操作之前。仅修改本地配置不能影响 GitHub runner;旧运行的重新执行也不会取得新的工作流提交。
+
 ## 四、已知但暂不处理
 
 41. **resume 之后,会话 UI 不显示 apply_patch 的 diff**(你报的,2026-08-13)。
