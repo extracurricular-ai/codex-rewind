@@ -3,8 +3,10 @@
 
 use std::cell::RefCell;
 use std::io;
-use std::os::windows::io::BorrowedHandle;
-use std::os::windows::io::IntoRawHandle;
+use std::os::windows::io::AsHandle;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::OwnedHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -35,7 +37,6 @@ use windows_sys::Win32::System::RemoteDesktop::WTSFreeMemory;
 use windows_sys::Win32::System::RemoteDesktop::WTSQueryUserToken;
 
 use crate::installation_record::InstallationRecord;
-use crate::ipc::OwnedHandle;
 
 mod cleanup;
 mod registered;
@@ -55,6 +56,7 @@ struct UserInstallation {
 
 pub(crate) struct PackageLifecycle {
     package_name: HSTRING,
+    preinstalled: bool,
     uninstalling: Arc<AtomicBool>,
     installation: RefCell<Option<UserInstallation>>,
 }
@@ -63,8 +65,20 @@ impl PackageLifecycle {
     pub(crate) fn new(uninstalling: Arc<AtomicBool>) -> Result<Self> {
         unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
             .context("initialize the sandbox service Windows Runtime apartment")?;
+        let package = Package::Current()?;
+        // Windows removes OEM metadata on uninstall; capture it while the package is installed.
+        let preinstalled = package
+            .InstalledLocation()
+            .and_then(|location| location.Path())
+            .is_ok_and(|path| {
+                PathBuf::from(path.to_os_string())
+                    .join("microsoft.system.package.metadata")
+                    .join("Custom.data")
+                    .is_file()
+            });
         Ok(Self {
-            package_name: Package::Current()?.Id()?.FullName()?,
+            package_name: package.Id()?.FullName()?,
+            preinstalled,
             uninstalling,
             installation: RefCell::default(),
         })
@@ -102,7 +116,7 @@ impl PackageLifecycle {
         }
 
         let saved_record = record.clone();
-        with_owner_impersonation(user_token.0, || {
+        with_owner_impersonation(user_token.as_raw_handle(), || {
             let mut directory_handles = Vec::new();
             let mut directory_guard = None;
             let codex_home = match crate::ipc::pin_existing_ancestors(
@@ -113,15 +127,14 @@ impl PackageLifecycle {
                 let home = directory_handles
                     .last()
                     .context("pin the registered home")?;
-                let guard =
-                    create_directory_guard(unsafe { BorrowedHandle::borrow_raw(home.0 as _) })?;
+                let guard = create_directory_guard(home.as_handle())?;
                 // Reject a conversion that happened before the handle-relative guard was created.
                 drop(crate::ipc::pin_directory(
                     &record.codex_home,
                     filesystem::FILE_READ_ATTRIBUTES,
                     DirectoryOpenDisposition::OpenExisting,
                 )?);
-                directory_guard = Some(OwnedHandle(guard.into_raw_handle() as HANDLE));
+                directory_guard = Some(guard);
                 Ok(())
             }) {
                 Ok(()) => Some(record.codex_home.clone()),
@@ -219,12 +232,13 @@ impl PackageLifecycle {
         {
             return Ok(());
         }
-        let mut raw_token = 0;
+        let mut raw_token = std::ptr::null_mut();
         if unsafe { WTSQueryUserToken(session_id, &mut raw_token) } == 0 {
             return Err(io::Error::last_os_error()).context("open the logged-in user's token");
         }
-        let token = crate::ipc::OwnedHandle(raw_token);
-        let user = unsafe { codex_windows_sandbox::get_user_sid_bytes(token.0) }?;
+        // SAFETY: WTSQueryUserToken transferred this handle on success.
+        let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+        let user = unsafe { codex_windows_sandbox::get_user_sid_bytes(token.as_raw_handle()) }?;
         let user_sid = string_from_sid_bytes(&user).map_err(anyhow::Error::msg)?;
         ensure!(
             user_sid == record.user_sid,
@@ -264,7 +278,13 @@ impl PackageLifecycle {
         let installation = installation
             .as_mut()
             .context("the authenticated package installation was not recorded")?;
-        cleanup::clean_up(installation, prepared, runtime, &self.uninstalling)
+        cleanup::clean_up(
+            installation,
+            prepared,
+            runtime,
+            &self.uninstalling,
+            /*preinstalled*/ self.preinstalled,
+        )
     }
 }
 

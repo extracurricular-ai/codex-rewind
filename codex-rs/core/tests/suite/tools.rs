@@ -126,7 +126,9 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
             defer_loading: false,
         })]
     };
-    let codex_core::NewThread { thread, .. } = test
+    let codex_core::NewThread {
+        thread_id, thread, ..
+    } = test
         .thread_manager
         .start_thread(StartThreadOptions {
             dynamic_tools,
@@ -166,7 +168,13 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
     };
     assert_eq!(completed.error, Some(error));
     thread.flush_rollout().await?;
-    let history = thread.load_history(/*include_archived*/ false).await?;
+    let history = test
+        .thread_store
+        .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await?;
     let attribution = history.items.iter().find_map(|item| match item {
         codex_history::RolloutItem::EventMsg(EventMsg::TurnStarted(event))
             if event.turn_id == completed.turn_id =>
@@ -237,7 +245,7 @@ async fn strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> {
+async fn empty_turn_environments_keeps_environment_backed_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -270,8 +278,8 @@ async fn empty_turn_environments_omits_environment_backed_tools() -> Result<()> 
     );
     for environment_tool in ["exec_command", "write_stdin", "apply_patch", "view_image"] {
         assert!(
-            !tools.contains(&environment_tool.to_string()),
-            "{environment_tool} should be omitted for explicit empty turn environments; got {tools:?}"
+            tools.contains(&environment_tool.to_string()),
+            "{environment_tool} should remain available for explicit empty turn environments; got {tools:?}"
         );
     }
 
@@ -498,16 +506,11 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
     );
     let expected_escaped_calls = json!([{
         "name": format!("{namespace}__{tool_name}"),
-        "arguments": {
-            "_codex_executed_tool_call_truncated": {
-                "original_bytes": serde_json::to_vec(&escaped_input)?.len(),
-                "max_bytes": 8 * 1024,
-            },
-        },
+        "arguments": escaped_input,
     }]);
     assert_eq!(
         tool_call_metadata(escaped_request.custom_tool_call_output(escaped_call_id)),
-        json!({"executed_tool_calls": expected_escaped_calls}),
+        json!({"executed_tool_calls": expected_escaped_calls, "tool_calls_complete": true}),
     );
 
     let direct_exec_call_id = "custom-direct-exec";

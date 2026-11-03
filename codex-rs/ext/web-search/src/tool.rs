@@ -1,4 +1,3 @@
-use codex_api::ReqwestTransport;
 use codex_api::SearchClient;
 use codex_api::SearchCommands;
 use codex_api::SearchQuery;
@@ -18,8 +17,10 @@ use codex_extension_api::parse_tool_input_schema_without_compaction;
 use codex_extension_items::ExtensionItem;
 use codex_extension_items::web_search::WebSearchAction;
 use codex_extension_items::web_search::WebSearchItem;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
 use codex_login::default_client::add_originator_header;
-use codex_login::default_client::create_client;
+use codex_login::default_client::create_transport_for_routes_async;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::models::WebSearchAction as CoreWebSearchAction;
 use codex_protocol::protocol::EventMsg;
@@ -44,8 +45,10 @@ const RESULTS_PAYLOAD_BYTES_METRIC: &str = "codex.web_search.results.payload_byt
 
 pub(crate) struct WebSearchTool {
     pub(crate) session_id: String,
+    pub(crate) http_client_factory: HttpClientFactory,
     pub(crate) provider: SharedModelProvider,
     pub(crate) settings: SearchSettings,
+    pub(crate) supports_literature_search: bool,
     pub(crate) originator: Option<String>,
 }
 
@@ -56,7 +59,8 @@ impl<'call> ToolExecutor<ToolCall<'call>> for WebSearchTool {
 
     fn spec(&self) -> ToolSpec {
         // parse schema without compaction that removes field metadata/descriptions to match hosted tool definition
-        let parameters = match parse_tool_input_schema_without_compaction(&commands_schema()) {
+        let schema = commands_schema(self.supports_literature_search);
+        let parameters = match parse_tool_input_schema_without_compaction(&schema) {
             Ok(parameters) => parameters,
             Err(err) => panic!("search command schema should parse: {err}"),
         };
@@ -96,23 +100,20 @@ impl WebSearchTool {
         &self,
         call: ToolCall<'_>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
-        let commands = parse_commands(&call)?;
+        let commands = parse_commands(call.function_arguments()?, self.supports_literature_search)?;
         let command_action = command_action(&commands);
-        let provider = self
+        let (provider, auth) = self
             .provider
-            .api_provider()
+            .api_provider_and_auth()
             .await
             .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
-        let auth = self
-            .provider
-            .api_auth()
-            .await
-            .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
-        let client = SearchClient::new(
-            ReqwestTransport::from_http_client(create_client()),
-            provider,
-            auth,
-        );
+        let transport = create_transport_for_routes_async(
+            self.http_client_factory.clone(),
+            ClientRouteClass::Api,
+        )
+        .await
+        .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+        let client = SearchClient::new(transport, provider, auth);
         let request = SearchRequest {
             id: self.session_id.clone(),
             model: call.model.clone(),
@@ -202,14 +203,22 @@ fn search_request_headers(originator: Option<&str>, turn_metadata: Option<&str>)
     headers
 }
 
-fn parse_commands(call: &ToolCall<'_>) -> Result<SearchCommands, FunctionCallError> {
-    let arguments = call.function_arguments()?;
+fn parse_commands(
+    arguments: &str,
+    supports_literature_search: bool,
+) -> Result<SearchCommands, FunctionCallError> {
     if arguments.trim().is_empty() {
         return Ok(SearchCommands::default());
     }
 
-    serde_json::from_str(arguments)
-        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))
+    let commands: SearchCommands = serde_json::from_str(arguments)
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+    if !supports_literature_search && commands.literature_search_query.is_some() {
+        return Err(FunctionCallError::RespondToModel(
+            "literature_search_query is unavailable for this model".to_string(),
+        ));
+    }
+    Ok(commands)
 }
 
 fn command_action(commands: &SearchCommands) -> WebSearchAction {
@@ -217,6 +226,12 @@ fn command_action(commands: &SearchCommands) -> WebSearchAction {
         .search_query
         .as_deref()
         .and_then(query_action)
+        .or_else(|| {
+            commands
+                .literature_search_query
+                .as_deref()
+                .and_then(query_action)
+        })
         .or_else(|| commands.image_query.as_deref().and_then(query_action))
         .or_else(|| {
             commands
@@ -273,8 +288,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::command_action;
+    use super::parse_commands;
     use super::search_request_headers;
     use codex_core::X_CODEX_TURN_METADATA_HEADER;
+    use codex_extension_api::FunctionCallError;
 
     #[test]
     fn search_request_headers_forward_thread_originator_and_turn_metadata() {
@@ -291,6 +308,17 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("turn-metadata")
         );
+    }
+
+    #[test]
+    fn rejects_literature_search_without_the_model_capability() {
+        let arguments =
+            r#"{"search_query":[{"q":"regular"}],"literature_search_query":[{"q":"papers"}]}"#;
+        assert!(matches!(
+            parse_commands(arguments, /*supports_literature_search*/ false),
+            Err(FunctionCallError::RespondToModel(message))
+                if message == "literature_search_query is unavailable for this model"
+        ));
     }
 
     #[test]

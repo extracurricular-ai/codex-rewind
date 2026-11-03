@@ -5,6 +5,7 @@ use super::AppServerStartedThread;
 use super::HistoryHydrationScope;
 use super::ResumeModelSettings;
 use super::ThreadHistorySupport;
+use super::ThreadSettingsOwner;
 use super::bootstrap_request_error;
 use super::is_history_pagination_unsupported;
 use super::started_thread_from_resume_response;
@@ -92,7 +93,6 @@ impl AppServerSession {
             config.workspace_roots.clone(),
             Vec::new(),
             thread.reasoning_effort,
-            config.personality,
             local_settings,
         )
         .await
@@ -138,6 +138,27 @@ impl AppServerSession {
         thread_id: ThreadId,
         model_settings: ResumeModelSettings,
     ) -> Result<AppServerStartedThread> {
+        Box::pin(self.resume_thread_with_permission_overrides(
+            local_settings,
+            config,
+            thread_id,
+            model_settings,
+            crate::resume_permissions::ResumePermissions::default(),
+        ))
+        .await
+    }
+
+    pub(crate) async fn resume_thread_with_permission_overrides(
+        &mut self,
+        local_settings: &crate::local_settings::LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        model_settings: ResumeModelSettings,
+        permission_overrides: crate::resume_permissions::ResumePermissions,
+    ) -> Result<AppServerStartedThread> {
+        if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client {
+            self.thread_tool_transport().validate_config(&config)?;
+        }
         let session_config = if matches!(
             model_settings,
             ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread
@@ -152,9 +173,17 @@ impl AppServerSession {
             self.thread_params_mode(),
             self.remote_cwd_override.as_deref(),
             model_settings,
+            permission_overrides,
         );
-        self.thread_tool_transport()
-            .configure_mcp(&mut params.config);
+        if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client
+            && model_settings == ResumeModelSettings::OverrideFromCurrentConfig
+        {
+            params.model_provider = self.explicit_model_provider(&config);
+        }
+        if self.thread_params_mode().settings_owner() == ThreadSettingsOwner::Client {
+            self.thread_tool_transport()
+                .configure_mcp(&mut params.config);
+        }
         let mut rollout_maintenance_guard = None;
         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
             let known_legacy_history = self
@@ -229,7 +258,6 @@ impl AppServerSession {
         let mut started = started_thread_from_resume_response(
             response,
             local_settings,
-            &config,
             self.thread_params_mode(),
         )
         .await?;

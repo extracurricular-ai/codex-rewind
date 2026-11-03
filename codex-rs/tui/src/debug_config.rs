@@ -359,7 +359,7 @@ fn render_debug_config_lines(
 
     if let Some(network) = requirements.network.as_ref() {
         requirement_lines.push(requirement_line(
-            "experimental_network",
+            "network_proxy",
             format_network_constraints(&network.value),
             Some(&network.source),
         ));
@@ -557,6 +557,7 @@ fn format_network_constraints(network: &NetworkConstraints) -> String {
         dangerously_allow_non_loopback_proxy,
         dangerously_allow_all_unix_sockets,
         domains,
+        review_domains,
         managed_allowed_domains_only,
         unix_sockets,
         allow_local_binding,
@@ -590,6 +591,9 @@ fn format_network_constraints(network: &NetworkConstraints) -> String {
             "domains={}",
             format_network_permission_entries(&domains.entries, format_network_domain_permission)
         ));
+    }
+    if let Some(review_domains) = review_domains {
+        parts.push(format!("review_domains={{{}}}", review_domains.join(", ")));
     }
     if let Some(managed_allowed_domains_only) = managed_allowed_domains_only {
         parts.push(format!(
@@ -917,6 +921,7 @@ interrupt_message = false
                             NetworkDomainPermissionToml::Allow,
                         )]),
                     }),
+                    review_domains: Some(vec!["api.example.com".to_string()]),
                     header_injections: Some(vec![NetworkHeaderInjectionToml {
                         host: "api.example.com".to_string(),
                         methods: vec!["POST".to_string()],
@@ -943,12 +948,14 @@ interrupt_message = false
         };
 
         let requirements_toml = ConfigRequirementsToml {
+            config_server: None,
             application: None,
             allowed_login_methods: None,
             allowed_chatgpt_workspaces: None,
             cli_auth_credentials_store: None,
             chatgpt_base_url: None,
             sqlite_home: Some(sqlite_home),
+            unsafe_enforce_sqlite_journal_mode: None,
             log_dir: Some(log_dir),
             model_catalog_json: Some(model_catalog_json),
             model_provider: None,
@@ -974,9 +981,12 @@ interrupt_message = false
             in_app_browser: None,
             windows: Some(WindowsRequirementsToml {
                 allowed_sandbox_implementations: None,
+                allow_mxc: None,
+                require_mxc: None,
             }),
             additional_developer_instructions: None,
             guardian_policy_config: Some("Use the managed guardian policy.".to_string()),
+            guardian_extra_policy: None,
             feature_requirements: Some(FeatureRequirementsToml {
                 entries: BTreeMap::from([("guardian_approval".to_string(), true)]),
             }),
@@ -991,6 +1001,7 @@ interrupt_message = false
             )])),
             plugins: None,
             marketplaces: None,
+            otel: None,
             apps: None,
             rules: None,
             enforce_residency: Some(ResidencyRequirement::Us),
@@ -1061,7 +1072,7 @@ interrupt_message = false
             "enforce_residency: us (source: {requirements_source})"
         )));
         assert!(rendered.contains(&format!(
-            "experimental_network: enabled=true, domains={{example.com=allow}}, header_injections=1 hosts={{api.example.com}} (source: {requirements_source})"
+            "network_proxy: enabled=true, domains={{example.com=allow}}, review_domains={{api.example.com}}, header_injections=1 hosts={{api.example.com}} (source: {requirements_source})"
         )));
         assert!(!rendered.contains("secret-looking-value"));
         assert!(
@@ -1217,7 +1228,7 @@ interrupt_message = false
         let rendered = render_stack_to_text(&stack);
         let requirements_source = (RequirementSource::LegacyManagedConfigTomlFromMdm).to_string();
         assert!(rendered.contains(&format!(
-            "experimental_network: unix_sockets={{/tmp/blocked.sock=deny, /tmp/codex.sock=allow}} (source: {requirements_source})"
+            "network_proxy: unix_sockets={{/tmp/blocked.sock=deny, /tmp/codex.sock=allow}} (source: {requirements_source})"
         )));
     }
 
@@ -1347,6 +1358,7 @@ approval_policy = "never"
             computer_use: None,
             windows: None,
             guardian_policy_config: None,
+            guardian_extra_policy: None,
             feature_requirements: None,
             hooks: None,
             mcp_servers: None,
@@ -1382,7 +1394,7 @@ approval_policy = "never"
                         std::path::PathBuf::from("/enterprise/hooks")
                     }),
                     windows_managed_dir: Some(std::path::PathBuf::from(r"C:\enterprise\hooks")),
-                    hooks: HookEventsToml {
+                    hooks: Box::new(HookEventsToml {
                         pre_tool_use: vec![MatcherGroup {
                             matcher: Some("^Bash$".to_string()),
                             hooks: vec![HookHandlerConfig::Command {
@@ -1395,7 +1407,7 @@ approval_policy = "never"
                             }],
                         }],
                         ..Default::default()
-                    },
+                    }),
                 }),
                 Some(RequirementSource::LegacyManagedConfigTomlFromMdm),
             )),

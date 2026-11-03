@@ -1,5 +1,6 @@
-//! Restricted editing retains drafts and allows the local warnings viewer.
+//! Restricted editing retains drafts and allows local warnings, configuration, and quit commands.
 //! Unavailable threads also allow recovery and other local commands.
+//! Connected unavailable threads retain the empty-prompt agents shortcut.
 //! Paste Enter handling is shared with normal submission so buffered newlines survive both paths.
 //! Recovery commands must occupy one line and be visible before the submit key expands pastes.
 //! Offline draft edits also consume the Astra sparkle opportunity before rendering.
@@ -56,6 +57,9 @@ impl ChatComposer {
         key: KeyEvent,
         mode: RestrictedInputMode,
     ) -> InputResult {
+        if mode == RestrictedInputMode::UnavailableThread && self.handle_agents_navigation(key) {
+            return InputResult::None;
+        }
         self.cancel_history_search();
         self.attachments.clear_remote_image_selection();
         self.popups.active = ActivePopup::None;
@@ -85,7 +89,7 @@ impl ChatComposer {
                 .or_else(|| input.inline_command(text).map(|command| command.command))
                 .filter(|_| text.trim().lines().count() == 1);
             if matches!(command, Some(SlashCommandItem::Builtin(command))
-                if command == SlashCommand::Warnings
+                if matches!(command, SlashCommand::Warnings | SlashCommand::Config | SlashCommand::Quit | SlashCommand::Exit)
                     || mode == RestrictedInputMode::UnavailableThread && command.available_when_thread_unavailable())
             {
                 return self
@@ -104,6 +108,7 @@ impl ChatComposer {
             let before = if key.code == KeyCode::Null {
                 None
             } else {
+                self.draft.textarea_state.get_mut().follow_cursor();
                 self.before_sparkle_editor_key(key)
             };
             let (result, _) = self.handle_input_basic(key);

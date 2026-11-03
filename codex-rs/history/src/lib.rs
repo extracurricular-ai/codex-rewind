@@ -1,7 +1,22 @@
 //! Model-history and persisted-rollout domain types.
 
+mod heartbeat;
+pub use heartbeat::HEARTBEAT_CONTENT_KIND;
+pub use heartbeat::Heartbeat;
+pub use heartbeat::UserInputOrigin;
+
+mod compaction_resume_metadata;
+pub use codex_protocol::turn_input::TurnAttribution;
+pub use compaction_resume_metadata::CompactionResumeMetadata;
+pub use compaction_resume_metadata::DynamicToolsSnapshot;
+pub use compaction_resume_metadata::PreviousTurnSettings;
+pub use compaction_resume_metadata::resume_multi_agent_version;
+
 mod compaction_checkpoint;
 pub use compaction_checkpoint::CompactionCheckpoint;
+
+mod initialization;
+pub use initialization::HistoryInitialization;
 
 use std::borrow::Borrow;
 use std::ops::Deref;
@@ -12,6 +27,8 @@ use std::sync::Arc;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::mcp::McpAttribution;
+use codex_protocol::mcp::McpAttributionStatus;
 use codex_protocol::mcp::McpResourceOriginCheckpoint;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -49,7 +66,27 @@ pub struct ResponseItemEnvelope {
 ///
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 pub struct CodexHarnessMetadata {
-    /// Whether a developer message was supplied by an app-server client.
+    /// Complete retained records actually delivered by this Guardian message. Host-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardian_sources: Vec<RetainedSource>,
+
+    /// Completed sync reviews delivered by this complete Guardian message. Host-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardian_review_ids: Vec<codex_protocol::ResponseItemId>,
+
+    /// This complete message delivered the meaning of retained source-order labels.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guardian_source_order_guidance: bool,
+
+    /// Section-scoped omission delivery proof; None means unknown, not complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardian_retained_omissions: Option<GuardianRetainedOmissions>,
+
+    /// Original retained evidence represented by this exact history item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_source: Option<RetainedSource>,
+
+    /// Whether a developer message was supplied by a client or a client requested tool-output retention.
     #[serde(default)]
     pub client_authored: bool,
 
@@ -75,17 +112,62 @@ pub struct CodexHarnessMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model_hash: Option<String>,
 
-    /// Thread acceptance order, independent of when queued user input reaches model history.
+    /// User acceptance or assistant delivery order, independent of queued input recording.
+    /// The serialized name is retained for compatibility with saved history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_input_order: Option<u64>,
 
-    /// Copied parent context stays model-visible but must not become child-local authorization.
+    /// Output generated for compaction is not an original user-visible assistant message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compaction_output: bool,
+
+    /// Copied parent user/assistant context must not become child-local authorization.
+    /// The serialized field name is retained for compatibility with saved history.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherited_user_message: bool,
+
+    /// Cumulative MCP tools/call attribution checkpoint, never model-visible.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_mcp_attribution_checkpoint"
+    )]
+    pub mcp_attribution: Option<McpAttribution>,
 
     /// Sender context captured by the host when this task message was accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_user_messages: Option<Box<SenderUserMessages>>,
+}
+
+fn deserialize_mcp_attribution_checkpoint<'de, D>(
+    deserializer: D,
+) -> Result<Option<McpAttribution>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(Some(serde_json::from_value(value).unwrap_or_else(|_| {
+        McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            error_reason: None,
+            sources: Vec::new(),
+        }
+    })))
+}
+
+impl CodexHarnessMetadata {
+    /// Shortened messages no longer prove complete instruction or review delivery.
+    pub fn mark_retained_sources_incomplete(&mut self) {
+        self.guardian_review_ids.clear();
+        self.guardian_source_order_guidance = false;
+        self.guardian_retained_omissions = None;
+        if let Some(source) = &mut self.retained_source {
+            source.complete = false;
+        }
+        for source in &mut self.guardian_sources {
+            source.complete = false;
+        }
+    }
 }
 
 impl ResponseItemEnvelope {
@@ -132,13 +214,18 @@ impl Borrow<ResponseItem> for ResponseItemEnvelope {
 /// Persisted rollout item used by core history and rollout storage.
 #[derive(Debug, Clone)]
 pub enum RolloutItem {
-    SessionMeta(SessionMetaLine),
+    SessionMeta(Box<SessionMetaLine>),
+    /// Complete dynamic-tool catalog for subsequent model steps, including an empty catalog.
+    DynamicToolsUpdated {
+        thread_id: ThreadId,
+        tools: Vec<DynamicToolSpec>,
+    },
     ResponseItem(ResponseItemEnvelope),
     InterAgentCommunication(InterAgentCommunication),
     InterAgentCommunicationMetadata {
         trigger_turn: bool,
     },
-    Compacted(CompactedItem),
+    Compacted(Box<CompactedItem>),
     TurnContext(TurnContextItem),
     TokenUsageRecord(TokenUsageRecord),
     WorldState(WorldStateItem),
@@ -194,12 +281,16 @@ pub use retained_context::RetainedContextEntry;
 pub use retained_context::RetainedContextEvent;
 pub use retained_context::RetainedContextOrder;
 pub use retained_context::RetainedInputSource;
+pub use retained_context::RetainedSource;
+pub use retained_context::RetainedSourceId;
+pub use retained_context::RetainedSourceRole;
 pub use retained_context::RetainedUserMessage;
 pub use retained_context::VerifiedAnswer;
 pub use retained_context::VerifiedQuestionAnswer;
 mod rollout_payload;
 
 pub use guardian_history::GuardianHistoryCheckpoint;
+pub use guardian_history::GuardianRetainedOmissions;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactedItem {
@@ -219,6 +310,9 @@ pub struct CompactedItem {
     /// `thread/resume` can restore token usage totals from this field without scanning arbitrarily
     /// far past the compaction.
     pub latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Resume metadata for values not represented by the companion rollout records.
+    /// Presence distinguishes explicitly persisted values from legacy fallback reconstruction.
+    pub resume_metadata: Option<CompactionResumeMetadata>,
 }
 
 impl Serialize for CompactedItem {
@@ -258,9 +352,13 @@ impl JsonSchema for CompactedItem {
 impl From<CompactedItem> for ResponseItem {
     fn from(value: CompactedItem) -> Self {
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: value.message,
             }],
             phase: None,
@@ -286,6 +384,9 @@ pub struct RolloutLine {
 pub struct ResumedHistory {
     pub conversation_id: ThreadId,
     pub history: Arc<Vec<RolloutItem>>,
+    /// Store-issued revision for this exact snapshot; clear it when modifying the history.
+    #[serde(skip)]
+    pub history_revision: Option<String>,
     pub rollout_path: Option<PathBuf>,
 }
 
@@ -336,31 +437,6 @@ impl InitialHistory {
         }
     }
 
-    pub fn get_event_msgs(&self) -> Option<Vec<EventMsg>> {
-        match self {
-            Self::New | Self::Cleared => None,
-            Self::Resumed(resumed) => Some(
-                resumed
-                    .history
-                    .iter()
-                    .filter_map(|item| match item {
-                        RolloutItem::EventMsg(event) => Some(event.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            Self::Forked(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|item| match item {
-                        RolloutItem::EventMsg(event) => Some(event.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-        }
-    }
-
     pub fn get_base_instructions(&self) -> Option<BaseInstructions> {
         match self {
             Self::New | Self::Cleared => None,
@@ -376,17 +452,7 @@ impl InitialHistory {
     }
 
     pub fn get_dynamic_tools(&self) -> Option<Vec<DynamicToolSpec>> {
-        match self {
-            Self::New | Self::Cleared => None,
-            Self::Resumed(resumed) => resumed.history.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
-                _ => None,
-            }),
-            Self::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => meta_line.meta.dynamic_tools.clone(),
-                _ => None,
-            }),
-        }
+        latest_dynamic_tools(self.get_rollout_items()).map(<[_]>::to_vec)
     }
 
     pub fn get_selected_capability_roots(&self) -> Vec<SelectedCapabilityRoot> {
@@ -468,6 +534,31 @@ fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
     })
 }
 
+/// Returns the latest catalog, preserving explicit clears and falling back to creation metadata.
+pub fn latest_dynamic_tools(items: &[RolloutItem]) -> Option<&[DynamicToolSpec]> {
+    let metadata = items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta) => Some(&meta.meta),
+        _ => None,
+    });
+    items
+        .iter()
+        .rev()
+        .find_map(|item| {
+            let (thread_id, tools) = match item {
+                RolloutItem::DynamicToolsUpdated { thread_id, tools } => (thread_id, tools),
+                RolloutItem::Compacted(compacted) => {
+                    let snapshot = compacted.resume_metadata.as_ref()?.dynamic_tools.as_ref()?;
+                    (&snapshot.thread_id, &snapshot.tools)
+                }
+                _ => return None,
+            };
+            metadata
+                .is_none_or(|meta| meta.id == *thread_id)
+                .then_some(tools.as_slice())
+        })
+        .or_else(|| metadata.and_then(|meta| meta.dynamic_tools.as_deref()))
+}
+
 /// Returns a thread's latest plugin selection, with a turn-context fallback.
 ///
 /// Forked history may contain ancestor snapshots, and compaction may append a
@@ -509,22 +600,7 @@ fn multi_agent_version_from_items(
         _ => None,
     });
 
-    session_meta_version.or_else(|| {
-        items.iter().rev().find_map(|item| match item {
-            RolloutItem::TurnContext(turn_context) => turn_context.multi_agent_version,
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::TokenUsageRecord(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::RetainedContext(_)
-            | RolloutItem::SecurityRiskScore(_)
-            | RolloutItem::RealtimeItem(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
-    })
+    session_meta_version.or_else(|| items.iter().rev().find_map(resume_multi_agent_version))
 }
 
 #[cfg(test)]

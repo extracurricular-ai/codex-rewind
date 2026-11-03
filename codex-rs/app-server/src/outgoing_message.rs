@@ -66,6 +66,7 @@ pub(crate) struct RequestContext {
     request_id: ConnectionRequestId,
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
     cancellation_scope: RequestCancellationScope,
+    is_process_request: bool,
     span: Span,
     parent_trace: Option<W3cTraceContext>,
     _diagnostics_guard: Arc<GaugeGuard>,
@@ -75,6 +76,7 @@ pub(crate) struct RequestContext {
 enum RequestCancellationScope {
     Unavailable,
     UserVerification,
+    ThreadSample,
 }
 
 impl RequestContext {
@@ -87,11 +89,16 @@ impl RequestContext {
         Self {
             request_id,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            is_process_request: matches!(
+                method,
+                "process/spawn" | "process/writeStdin" | "process/resizePty" | "process/kill"
+            ),
             cancellation_scope: match method {
                 "userVerification/status"
                 | "userVerification/enroll"
                 | "userVerification/delete"
                 | "userVerification/verify" => RequestCancellationScope::UserVerification,
+                "thread/sample" => RequestCancellationScope::ThreadSample,
                 _ => RequestCancellationScope::Unavailable,
             },
             span,
@@ -131,6 +138,7 @@ pub(crate) struct OutgoingMessageSender {
     verification_connections: Mutex<HashSet<ConnectionId>>,
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
+    process_reply_sender: mpsc::Sender<OutgoingEnvelope>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
@@ -196,6 +204,12 @@ impl ThreadScopedOutgoingMessageSender {
             );
     }
 
+    pub(crate) fn track_realtime_session_updated(&self, realtime_session_id: String) {
+        self.outgoing
+            .analytics_events_client
+            .track_realtime_session_updated(self.thread_id.to_string(), realtime_session_id);
+    }
+
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         self.outgoing
             .analytics_events_client
@@ -246,11 +260,20 @@ impl OutgoingMessageSender {
             verification_auth: OnceLock::new(),
             verification_connections: Mutex::new(HashSet::new()),
             next_server_request_id: AtomicI64::new(0),
+            process_reply_sender: sender.clone(),
             sender,
             request_id_to_callback: Mutex::new(HashMap::new()),
             request_contexts: Mutex::new(HashMap::new()),
             analytics_events_client,
         }
+    }
+
+    pub(crate) fn with_process_reply_sender(
+        mut self,
+        sender: mpsc::Sender<OutgoingEnvelope>,
+    ) -> Self {
+        self.process_reply_sender = sender;
+        self
     }
 
     pub(crate) async fn register_request_context(&self, request_context: RequestContext) {
@@ -267,6 +290,15 @@ impl OutgoingMessageSender {
         let contexts = self.request_contexts.lock().await;
         if let Some(context) = contexts.get(request_id)
             && context.cancellation_scope == RequestCancellationScope::UserVerification
+        {
+            context.cancellation.cancel();
+        }
+    }
+
+    pub(crate) async fn cancel_thread_sample_request(&self, request_id: &ConnectionRequestId) {
+        let contexts = self.request_contexts.lock().await;
+        if let Some(context) = contexts.get(request_id)
+            && context.cancellation_scope == RequestCancellationScope::ThreadSample
         {
             context.cancellation.cancel();
         }
@@ -741,13 +773,23 @@ impl OutgoingMessageSender {
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         if matches!(
             notification,
-            ServerNotification::ThreadArchived(_) | ServerNotification::ThreadUnarchived(_)
+            ServerNotification::ThreadArchived(_)
+                | ServerNotification::ThreadClosed(_)
+                | ServerNotification::ThreadUnarchived(_)
         ) {
             self.analytics_events_client
                 .track_notification(&notification);
         }
         self.send_server_notification_to_connections(&[], notification)
             .await;
+    }
+
+    pub(crate) fn try_send_server_notification(&self, notification: ServerNotification) {
+        if let Err(error) = self.sender.try_send(OutgoingEnvelope::Broadcast {
+            message: timestamped_server_notification(notification),
+        }) {
+            warn!("failed to queue server notification to clients: {error}");
+        }
     }
 
     pub(crate) async fn send_server_notification_to_connections(
@@ -772,12 +814,13 @@ impl OutgoingMessageSender {
             }
             return;
         }
-        for connection_id in connection_ids {
+        let messages = std::iter::repeat_n(outgoing_message, connection_ids.len());
+        for (connection_id, message) in connection_ids.iter().zip(messages) {
             if let Err(err) = self
                 .sender
                 .send(OutgoingEnvelope::ToConnection {
                     connection_id: *connection_id,
-                    message: outgoing_message.clone(),
+                    message,
                     write_complete_tx: None,
                 })
                 .await
@@ -861,10 +904,23 @@ impl OutgoingMessageSender {
         message: OutgoingMessage,
         message_kind: &'static str,
     ) {
-        let send_fut = self.sender.send(OutgoingEnvelope::ToConnection {
+        // Process requests serialize by handle. A blocked resize reply would also block the next kill.
+        let sender = if request_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.is_process_request)
+        {
+            &self.process_reply_sender
+        } else {
+            &self.sender
+        };
+        // The spawn reply must reach the embedder before the collectors can publish output.
+        let (written_tx, written_rx) = (!sender.same_channel(&self.sender))
+            .then(oneshot::channel)
+            .unzip();
+        let send_fut = sender.send(OutgoingEnvelope::ToConnection {
             connection_id,
             message,
-            write_complete_tx: None,
+            write_complete_tx: written_tx,
         });
         let send_result = if let Some(request_context) = request_context {
             send_fut.instrument(request_context.span()).await
@@ -874,6 +930,8 @@ impl OutgoingMessageSender {
 
         if let Err(err) = send_result {
             warn!("failed to send {message_kind} to client: {err:?}");
+        } else if let Some(written_rx) = written_rx {
+            let _ = written_rx.await;
         }
     }
 }
@@ -893,6 +951,10 @@ fn timestamped_server_notification(notification: ServerNotification) -> Outgoing
         emitted_at_ms: Some(now_unix_timestamp_ms().try_into().unwrap_or_default()),
     })
 }
+
+#[cfg(test)]
+#[path = "thread_sample_cancel_context_tests.rs"]
+mod thread_sample_cancel_context_tests;
 
 #[cfg(test)]
 #[path = "user_verification_ownership_tests.rs"]
@@ -1336,41 +1398,66 @@ mod tests {
         }
     }
 
+    /// Empty target lists broadcast; explicit targets preserve order, payload, and one timestamp.
     #[tokio::test]
     async fn send_server_notification_to_connections_reuses_timestamp() {
-        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(2);
-        let outgoing =
-            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        for connection_ids in [
+            vec![],
+            vec![ConnectionId(1)],
+            vec![ConnectionId(1), ConnectionId(2)],
+        ] {
+            let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(2);
+            let outgoing =
+                OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+            let notification = ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "test".to_string(),
+                details: None,
+                path: None,
+                range: None,
+            });
+            let expected = serde_json::to_value(&notification).expect("serialize notification");
 
-        outgoing
-            .send_server_notification_to_connections(
-                &[ConnectionId(1), ConnectionId(2)],
-                ServerNotification::ConfigWarning(ConfigWarningNotification {
-                    summary: "test".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                }),
-            )
-            .await;
+            outgoing
+                .send_server_notification_to_connections(&connection_ids, notification)
+                .await;
 
-        let timestamps = [
-            rx.recv()
-                .await
-                .expect("first connection should receive notification"),
-            rx.recv()
-                .await
-                .expect("second connection should receive notification"),
-        ]
-        .map(|envelope| match envelope {
-            OutgoingEnvelope::ToConnection {
-                message: OutgoingMessage::AppServerNotification(envelope),
-                ..
-            } => envelope.emitted_at_ms,
-            _ => panic!("expected targeted server notification"),
-        });
-
-        assert_eq!(timestamps[0], timestamps[1]);
+            let mut timestamps = Vec::new();
+            for index in 0..connection_ids.len().max(1) {
+                let message = match rx.try_recv().expect("notification should be queued") {
+                    OutgoingEnvelope::Broadcast { message } => {
+                        assert!(connection_ids.is_empty());
+                        message
+                    }
+                    OutgoingEnvelope::ToConnection {
+                        connection_id,
+                        message,
+                        write_complete_tx,
+                    } => {
+                        assert_eq!(connection_id, connection_ids[index]);
+                        assert!(write_complete_tx.is_none());
+                        message
+                    }
+                };
+                let OutgoingMessage::AppServerNotification(envelope) = message else {
+                    panic!("expected server notification");
+                };
+                assert_eq!(
+                    serde_json::to_value(&envelope.notification).unwrap(),
+                    expected
+                );
+                timestamps.push(
+                    envelope
+                        .emitted_at_ms
+                        .expect("notification has a timestamp"),
+                );
+            }
+            assert!(
+                timestamps
+                    .iter()
+                    .all(|timestamp| *timestamp == timestamps[0])
+            );
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests/model_display_name_tests.rs
-assertion_line: 33
 expression: "render_bottom_popup(&chat, 80)"
 ---
   Select Model

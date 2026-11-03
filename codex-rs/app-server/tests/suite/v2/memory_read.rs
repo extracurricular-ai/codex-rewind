@@ -3,6 +3,7 @@
 use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
+use codex_app_server_protocol::ThreadMemoryReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -22,9 +23,30 @@ use tempfile::TempDir;
 
 #[tokio::test]
 async fn memory_read_version_selects_only_its_own_context() -> Result<()> {
-    for (version, expected, excluded) in [
-        ("v1", "legacy-only-marker", "v2-only-marker"),
-        ("v2", "v2-only-marker", "legacy-only-marker"),
+    for (version, has_v1_workspace, expected, excluded, use_memories) in [
+        (
+            Some("v1"),
+            true,
+            "legacy-only-marker",
+            "v2-only-marker",
+            true,
+        ),
+        (
+            Some("v2"),
+            true,
+            "v2-only-marker",
+            "legacy-only-marker",
+            true,
+        ),
+        (None, true, "legacy-only-marker", "v2-only-marker", true),
+        (None, false, "v2-only-marker", "legacy-only-marker", true),
+        (
+            Some("v2"),
+            true,
+            "v2-only-marker",
+            "legacy-only-marker",
+            false,
+        ),
     ] {
         let server = start_mock_server().await;
         let home = TempDir::new()?;
@@ -35,6 +57,9 @@ async fn memory_read_version_selects_only_its_own_context() -> Result<()> {
             ("memories", "legacy-only-marker"),
             ("memories_v2", "v2-only-marker"),
         ] {
+            if directory == "memories" && !has_v1_workspace {
+                continue;
+            }
             tokio::fs::create_dir_all(home.path().join(directory)).await?;
             tokio::fs::write(
                 home.path().join(directory).join("memory_summary.md"),
@@ -55,23 +80,37 @@ async fn memory_read_version_selects_only_its_own_context() -> Result<()> {
             .with_codex_home(home.path())
             .build_initialized()
             .await?;
+        let mut config = std::collections::HashMap::from([
+            ("memories.generate_memories".to_string(), json!(false)),
+            ("memories.use_memories".to_string(), json!(use_memories)),
+        ]);
+        if let Some(version) = version {
+            config.insert("memories.version".to_string(), json!(version));
+        }
         let start = app
             .send_thread_start_request_with_auto_env(ThreadStartParams {
                 // Skip background consolidation so it cannot consume the read test's response.
                 ephemeral: Some(true),
-                config: Some(
-                    [
-                        ("memories.version".to_string(), json!(version)),
-                        ("memories.generate_memories".to_string(), json!(false)),
-                    ]
-                    .into(),
-                ),
+                config: Some(config),
                 ..Default::default()
             })
             .await?;
         let response: ThreadStartResponse = app.read_response(start).await?;
+        let summary_request = app
+            .send_raw_request(
+                "thread/memory/read",
+                Some(json!({ "threadId": response.thread.id })),
+            )
+            .await?;
+        let summary: ThreadMemoryReadResponse = app.read_response(summary_request).await?;
+        assert_eq!(
+            summary,
+            ThreadMemoryReadResponse {
+                summary: use_memories.then(|| format!("v1\n{expected}\n")),
+            }
+        );
         app.send_turn_start_request(TurnStartParams {
-            thread_id: response.thread.id,
+            thread_id: response.thread.id.clone(),
             input: vec![UserInput::Text {
                 text: "Use my memory preferences".to_string(),
                 text_elements: Vec::new(),
@@ -82,8 +121,23 @@ async fn memory_read_version_selects_only_its_own_context() -> Result<()> {
         let completed: TurnCompletedNotification = app.read_notification("turn/completed").await?;
         assert_eq!(completed.turn.status, TurnStatus::Completed);
         let request = mock.single_request();
-        assert!(request.body_contains_text(expected));
+        assert_eq!(request.body_contains_text(expected), use_memories);
         assert!(!request.body_contains_text(excluded));
+
+        let directory = if version == Some("v1") || (version.is_none() && has_v1_workspace) {
+            "memories"
+        } else {
+            "memories_v2"
+        };
+        tokio::fs::remove_file(home.path().join(directory).join("memory_summary.md")).await?;
+        let summary_request = app
+            .send_raw_request(
+                "thread/memory/read",
+                Some(json!({ "threadId": response.thread.id })),
+            )
+            .await?;
+        let summary: ThreadMemoryReadResponse = app.read_response(summary_request).await?;
+        assert_eq!(summary, ThreadMemoryReadResponse { summary: None });
     }
     Ok(())
 }

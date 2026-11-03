@@ -1,5 +1,5 @@
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::Duration;
 
 use crate::facts::AppInvocation;
 use crate::facts::ArtifactOperation;
@@ -85,6 +85,7 @@ pub(crate) enum TrackEventRequest {
     CommandExecution(CodexCommandExecutionEventRequest),
     PluginMeasurement(CodexPluginMeasurementEventRequest),
     FileChange(CodexFileChangeEventRequest),
+    CuaToolCallStarted(CodexCuaToolCallStartedEventRequest),
     McpToolCall(CodexMcpToolCallEventRequest),
     DynamicToolCall(CodexDynamicToolCallEventRequest),
     ControlToolCall(CodexControlToolCallEventRequest),
@@ -167,6 +168,7 @@ impl TrackEventRequest {
         match self {
             Self::PluginUsed(event) => event.event_params.plugin.plugin_id.is_some(),
             Self::SkillInvocation(event) => event.event_params.plugin_id.is_some(),
+            Self::CuaToolCallStarted(event) => event.event_params.plugin_id.is_some(),
             Self::McpToolCall(event) => event.event_params.plugin_id.is_some(),
             Self::ArtifactOperation(event) => !event.event_params.plugin_id.is_empty(),
             Self::PluginMeasurement(event) => !event.event_params.plugin_id.is_empty(),
@@ -314,6 +316,7 @@ pub enum GuardianReviewTerminalStatus {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardianReviewFailureReason {
+    StaleAuthorization,
     Timeout,
     Cancelled,
     PromptBuildError,
@@ -366,6 +369,7 @@ impl From<&AdditionalPermissionProfile> for GuardianAdditionalPermissions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuardianReviewedAction {
+    NativeToolCall {},
     Shell {
         sandbox_permissions: SandboxPermissions,
         additional_permissions: Option<GuardianAdditionalPermissions>,
@@ -399,6 +403,7 @@ pub enum GuardianReviewedAction {
 
 #[derive(Clone, Serialize)]
 pub struct GuardianReviewEventParams {
+    pub guardian_context_mode: Option<&'static str>,
     pub thread_id: String,
     pub turn_id: String,
     pub review_id: String,
@@ -423,6 +428,7 @@ pub struct GuardianReviewEventParams {
     pub guardian_review_model_override: Option<String>,
     pub guardian_model_provider_id: Option<String>,
     pub had_prior_review_context: Option<bool>,
+    /// Configured overall review budget in milliseconds; zero means unlimited.
     pub review_timeout_ms: u64,
     pub tool_call_count: Option<u64>,
     pub time_to_first_token_ms: Option<u64>,
@@ -446,7 +452,6 @@ pub struct GuardianReviewTrackContext {
     reviewed_action: GuardianReviewedAction,
     review_timeout_ms: u64,
     pub started_at_ms: u64,
-    started_instant: Instant,
 }
 
 impl GuardianReviewTrackContext {
@@ -468,7 +473,6 @@ impl GuardianReviewTrackContext {
             reviewed_action,
             review_timeout_ms,
             started_at_ms: now_unix_millis(),
-            started_instant: Instant::now(),
         }
     }
 
@@ -476,8 +480,11 @@ impl GuardianReviewTrackContext {
         &self,
         result: GuardianReviewAnalyticsResult,
         completed_at_ms: u64,
+        elapsed: Duration,
     ) -> GuardianReviewEventParams {
+        let completion_latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         GuardianReviewEventParams {
+            guardian_context_mode: result.guardian_context_mode,
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
             review_id: self.review_id.clone(),
@@ -506,7 +513,7 @@ impl GuardianReviewTrackContext {
             // TODO(rhan-oai): plumb nested Guardian review session tool-call counts.
             tool_call_count: None,
             time_to_first_token_ms: result.time_to_first_token_ms,
-            completion_latency_ms: Some(self.started_instant.elapsed().as_millis() as u64),
+            completion_latency_ms: Some(completion_latency_ms),
             started_at: self.started_at_ms / 1_000,
             completed_at: Some(completed_at_ms / 1_000),
             input_tokens: result.token_usage.as_ref().map(|usage| usage.input_tokens),
@@ -530,10 +537,14 @@ impl GuardianReviewTrackContext {
 
 #[derive(Debug)]
 pub struct GuardianReviewAnalyticsResult {
+    pub guardian_context_mode: Option<&'static str>,
     pub decision: GuardianReviewDecision,
     pub terminal_status: GuardianReviewTerminalStatus,
     pub failure_reason: Option<GuardianReviewFailureReason>,
     pub attempt_count: i64,
+    /// An allow was validated against changed parent/root authorization or review context.
+    /// Retained across attempts; this does not identify the cause of a later cancellation.
+    pub context_changed: bool,
     pub risk_level: Option<GuardianRiskLevel>,
     pub user_authorization: Option<GuardianUserAuthorization>,
     pub outcome: Option<GuardianAssessmentOutcome>,
@@ -555,10 +566,12 @@ pub struct GuardianReviewAnalyticsResult {
 impl GuardianReviewAnalyticsResult {
     pub fn without_session() -> Self {
         Self {
+            guardian_context_mode: None,
             decision: GuardianReviewDecision::Denied,
             terminal_status: GuardianReviewTerminalStatus::FailedClosed,
             failure_reason: None,
             attempt_count: 1,
+            context_changed: false,
             risk_level: None,
             user_authorization: None,
             outcome: None,
@@ -704,6 +717,35 @@ pub(crate) struct CodexToolItemEventBase {
     pub(crate) requested_network_access: bool,
 }
 
+#[derive(Serialize)]
+pub(crate) struct CodexCuaToolCallStartedEventParams {
+    pub(crate) thread_id: String,
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) root_turn_id: Option<String>,
+    pub(crate) item_id: String,
+    pub(crate) cell_id: Option<String>,
+    pub(crate) parent_call_id: Option<String>,
+    pub(crate) originating_response_id: Option<String>,
+    pub(crate) app_server_client: CodexAppServerClientMetadata,
+    pub(crate) runtime: CodexRuntimeMetadata,
+    pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) subagent_source: Option<String>,
+    pub(crate) parent_thread_id: Option<String>,
+    pub(crate) tool_event_type: Option<ToolEventType>,
+    pub(crate) started_at_ms: u64,
+    pub(crate) mcp_server_name: String,
+    pub(crate) mcp_tool_name: String,
+    pub(crate) plugin_id: Option<String>,
+    pub(crate) connector_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexCuaToolCallStartedEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexCuaToolCallStartedEventParams,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -793,6 +835,7 @@ pub(crate) enum WebSearchActionKind {
 
 #[derive(Serialize)]
 pub(crate) struct CodexCommandExecutionEventParams {
+    pub(crate) sandbox_backend: Option<String>,
     pub(crate) model_slug: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     #[serde(flatten)]
@@ -1021,8 +1064,10 @@ pub(crate) struct CodexCompactionEventParams {
     pub(crate) phase: CompactionPhase,
     pub(crate) strategy: CompactionStrategy,
     pub(crate) status: CompactionStatus,
+    pub(crate) voice_session_id: Option<String>,
     pub(crate) codex_error_kind: Option<CodexErrKind>,
     pub(crate) codex_error_http_status_code: Option<u16>,
+    pub(crate) usage_limit_window_minutes: Option<u16>,
     pub(crate) active_context_tokens_before: i64,
     pub(crate) active_context_tokens_after: i64,
     pub(crate) retained_image_count: Option<usize>,
@@ -1066,6 +1111,8 @@ pub(crate) struct CodexGoalEventRequest {
 
 #[derive(Serialize)]
 pub(crate) struct CodexTurnEventParams {
+    #[serde(flatten)]
+    pub(crate) critical_path: crate::turn_critical_path::CriticalPathEventParams,
     pub(crate) thread_id: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
@@ -1094,6 +1141,7 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) approval_policy: String,
     pub(crate) approvals_reviewer: String,
     pub(crate) guardian_v2_enabled: bool,
+    pub(crate) multi_agent_version: codex_protocol::protocol::MultiAgentVersion,
     pub(crate) sandbox_network_access: bool,
     pub(crate) collaboration_mode: Option<&'static str>,
     pub(crate) personality: Option<String>,
@@ -1108,6 +1156,8 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) turn_error: Option<CodexErrorInfo>,
     pub(crate) codex_error_kind: Option<CodexErrKind>,
     pub(crate) codex_error_http_status_code: Option<u16>,
+    /// The server-selected window responsible for a usage limit, when known.
+    pub(crate) usage_limit_window_minutes: Option<u16>,
     pub(crate) steer_count: Option<usize>,
     pub(crate) total_tool_call_count: Option<usize>,
     pub(crate) shell_command_count: Option<usize>,
@@ -1131,6 +1181,7 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) after_last_sampling_ms: u64,
     pub(crate) sampling_request_count: u32,
     pub(crate) sampling_retry_count: u32,
+    pub(crate) tools_change_count: u32,
     pub(crate) duration_ms: Option<u64>,
     pub(crate) started_at: Option<u64>,
     pub(crate) completed_at: Option<u64>,
@@ -1385,8 +1436,10 @@ pub(crate) fn codex_compaction_event_params(
         phase: input.phase,
         strategy: input.strategy,
         status: input.status,
+        voice_session_id: None,
         codex_error_kind: input.codex_error_kind,
         codex_error_http_status_code: input.codex_error_http_status_code,
+        usage_limit_window_minutes: input.usage_limit_window_minutes,
         active_context_tokens_before: input.active_context_tokens_before,
         active_context_tokens_after: input.active_context_tokens_after,
         retained_image_count: input.retained_image_count,
@@ -1470,6 +1523,8 @@ fn analytics_hook_event_name(event_name: HookEventName) -> &'static str {
         HookEventName::PostToolUse => "PostToolUse",
         HookEventName::PreCompact => "PreCompact",
         HookEventName::PostCompact => "PostCompact",
+        HookEventName::PreModelRequest => "PreModelRequest",
+        HookEventName::PostModelRequest => "PostModelRequest",
         HookEventName::SessionStart => "SessionStart",
         HookEventName::SessionEnd => "SessionEnd",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
@@ -1526,7 +1581,7 @@ pub(crate) fn subagent_thread_started_event_request(
         ephemeral: input.ephemeral,
         is_worktree: None,
         thread_source: input.thread_source,
-        initialization_mode: ThreadInitializationMode::New,
+        initialization_mode: input.initialization_mode,
         subagent_source: Some(subagent_source_name(&input.subagent_source)),
         parent_thread_id: input.parent_thread_id,
         forked_from_thread_id: input.forked_from_thread_id,

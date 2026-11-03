@@ -242,13 +242,13 @@ jobs:
         run: cargo build --release --bin codexr --target ${{ matrix.triple }}
 
       # A Codex package is more than the entrypoint. `codex-code-mode-host` sits
-      # beside it in `bin/`, and `codex-resources/` and `codex-path/` hold the
-      # bundled bwrap, the patched zsh, and ripgrep. Shipping only `bin/codexr`
+      # beside it and `codex-exec-server` in `bin/`, and `codex-resources/`
+      # and `codex-path/` hold bundled bwrap and ripgrep. Shipping only `bin/codexr`
       # is what 0.147.0-rewind.1 did, and it left code mode unavailable and
       # `codexr doctor` reporting that ripgrep could not be found.
       #
       # `scripts/build_codex_package.py` is upstream's own builder for that
-      # layout: it source-builds the helper binaries, fetches ripgrep and zsh
+      # layout: it source-builds the helper binaries, fetches ripgrep
       # through the verified DotSlash manifests in `scripts/codex_package/`,
       # and writes the `codex-package.json` that `codex-rs/install-context`
       # requires before it will look in `codex-resources/` or `codex-path/` at
@@ -318,10 +318,11 @@ jobs:
             --force
 
           # The helpers the builder just compiled carry symbols for the same
-          # reason the entrypoint did. ripgrep and zsh arrive prebuilt from
-          # their DotSlash manifests, so they are left exactly as verified.
+          # reason the entrypoint did. ripgrep arrives prebuilt from its
+          # DotSlash manifest, so it is left exactly as verified.
           if [[ "${{ matrix.name }}" != win32-* ]]; then
             for helper in "vendor/$triple/bin/codex-code-mode-host" \
+                          "vendor/$triple/bin/codex-exec-server" \
                           "vendor/$triple/codex-resources/bwrap"; do
               [[ -f "$helper" ]] || continue
               before=$(stat -c%s "$helper" 2>/dev/null || stat -f%z "$helper")

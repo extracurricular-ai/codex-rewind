@@ -27,6 +27,7 @@ from .v2_all import FileChangePatchUpdatedNotification
 from .v2_all import FsChangedNotification
 from .v2_all import FuzzyFileSearchSessionCompletedNotification
 from .v2_all import FuzzyFileSearchSessionUpdatedNotification
+from .v2_all import GatewayOAuthChangedNotification
 from .v2_all import GuardianWarningNotification
 from .v2_all import HookCompletedNotification
 from .v2_all import HookStartedNotification
@@ -60,8 +61,10 @@ from .v2_all import ThreadDeletedNotification
 from .v2_all import ThreadGoalClearedNotification
 from .v2_all import ThreadGoalUpdatedNotification
 from .v2_all import ThreadNameUpdatedNotification
+from .v2_all import ThreadPredictionUpdatedNotification
 from .v2_all import ThreadProjectUpdatedNotification
 from .v2_all import ThreadQueueChangedNotification
+from .v2_all import ThreadReadStateChangedNotification
 from .v2_all import ThreadRealtimeClosedNotification
 from .v2_all import ThreadRealtimeErrorNotification
 from .v2_all import ThreadRealtimeItemAddedNotification
@@ -109,6 +112,7 @@ KnownNotificationPayload: TypeAlias = (
     | FsChangedNotification
     | FuzzyFileSearchSessionCompletedNotification
     | FuzzyFileSearchSessionUpdatedNotification
+    | GatewayOAuthChangedNotification
     | GuardianWarningNotification
     | HookCompletedNotification
     | HookStartedNotification
@@ -142,8 +146,10 @@ KnownNotificationPayload: TypeAlias = (
     | ThreadGoalClearedNotification
     | ThreadGoalUpdatedNotification
     | ThreadNameUpdatedNotification
+    | ThreadPredictionUpdatedNotification
     | ThreadProjectUpdatedNotification
     | ThreadQueueChangedNotification
+    | ThreadReadStateChangedNotification
     | ThreadRealtimeClosedNotification
     | ThreadRealtimeErrorNotification
     | ThreadRealtimeItemAddedNotification
@@ -172,6 +178,7 @@ KnownNotificationPayload: TypeAlias = (
 )
 
 NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
+    "account/gatewayOAuth/changed": GatewayOAuthChangedNotification,
     "account/login/completed": AccountLoginCompletedNotification,
     "account/rateLimits/updated": AccountRateLimitsUpdatedNotification,
     "account/updated": AccountUpdatedNotification,
@@ -227,8 +234,10 @@ NOTIFICATION_MODELS: dict[str, type[KnownNotificationPayload]] = {
     "thread/goal/cleared": ThreadGoalClearedNotification,
     "thread/goal/updated": ThreadGoalUpdatedNotification,
     "thread/name/updated": ThreadNameUpdatedNotification,
+    "thread/prediction/updated": ThreadPredictionUpdatedNotification,
     "thread/project/updated": ThreadProjectUpdatedNotification,
     "thread/queue/changed": ThreadQueueChangedNotification,
+    "thread/readState/changed": ThreadReadStateChangedNotification,
     "thread/realtime/closed": ThreadRealtimeClosedNotification,
     "thread/realtime/error": ThreadRealtimeErrorNotification,
     "thread/realtime/item/completed": ThreadRealtimeItemCompletedNotification,

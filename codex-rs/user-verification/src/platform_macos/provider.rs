@@ -15,16 +15,21 @@ use crate::UserVerificationRequestGuard;
 use crate::UserVerificationStatus;
 use crate::UserVerificationUnavailableReason;
 use crate::lifecycle_lock::LifecycleLock;
-use crate::native_operation::run_with_cancellation;
+use crate::native_operation::wait_with_cancellation;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use block2::RcBlock;
 use core_foundation::base::CFType;
 use core_foundation::base::TCFType as _;
 use objc2::rc::Retained;
+use objc2::runtime::Bool;
+use objc2_foundation::NSError;
 use objc2_foundation::NSString;
+use objc2_local_authentication::LAAccessControlOperation;
 use objc2_local_authentication::LABiometryType;
 use objc2_local_authentication::LAContext;
 use objc2_local_authentication::LAPolicy;
+use security_framework::access_control::SecAccessControl;
 use security_framework::base::Error as SecurityError;
 use security_framework::item::ItemClass;
 use security_framework::item::ItemSearchOptions;
@@ -39,6 +44,9 @@ use security_framework::key::KeyType;
 use security_framework::key::SecKey;
 use security_framework::key::Token;
 use security_framework_sys::base::errSecItemNotFound;
+use security_framework_sys::item::kSecAttrAccessControl;
+use security_framework_sys::item::kSecValueRef;
+use std::sync::mpsc;
 
 pub(crate) struct NativeProvider {
     pub(crate) namespace: UserVerificationKeyNamespace,
@@ -168,13 +176,85 @@ impl UserVerificationProvider for NativeProvider {
         } else {
             format!("{}\n\n{}", request.title, request.description)
         };
-        // The keychain query retains this context and uses its text for the signing prompt.
         unsafe {
             context.setLocalizedFallbackTitle(Some(&NSString::from_str("")));
             context.setLocalizedReason(&NSString::from_str(&reason));
         }
         check_biometrics(&context)?;
         guard.check()?;
+        // SecKeyCopyAttributes does not guarantee the stored item's access-control attribute.
+        let attributes = match key_query(&self.namespace.label, &noninteractive_context())
+            .load_refs(true)
+            .load_attributes(true)
+            .search()
+        {
+            Ok(results) => results.into_iter().find_map(|result| match result {
+                SearchResult::Dict(attributes) => Some(attributes),
+                _ => None,
+            }),
+            Err(error) if error.code() == errSecItemNotFound => {
+                return Err(UserVerificationError::Unavailable {
+                    reason: UserVerificationUnavailableReason::CredentialMissing,
+                    message: "no user-verification credential has been created".to_string(),
+                });
+            }
+            Err(error) => return Err(keychain_error(error)),
+        }
+        .ok_or_else(|| UserVerificationError::Failed {
+            reason: UserVerificationFailureReason::ProviderError,
+            message: "the user-verification key has no attributes".to_string(),
+        })?;
+        let key = attributes
+            .find(unsafe { kSecValueRef.cast() })
+            .and_then(|value| unsafe { CFType::wrap_under_get_rule(*value) }.downcast::<SecKey>())
+            .ok_or_else(|| UserVerificationError::Failed {
+                reason: UserVerificationFailureReason::ProviderError,
+                message: "the user-verification item has no key reference".to_string(),
+            })?;
+        key_protection::validate(&key)?;
+        let access = attributes
+            .find(unsafe { kSecAttrAccessControl.cast() })
+            .and_then(|value| {
+                unsafe { CFType::wrap_under_get_rule(*value) }.downcast::<SecAccessControl>()
+            })
+            .ok_or_else(|| UserVerificationError::Failed {
+                reason: UserVerificationFailureReason::ProviderError,
+                message: "the user-verification key has no access control".to_string(),
+            })?;
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let reply = RcBlock::new(move |success: Bool, error: *mut NSError| {
+            let result = if success.as_bool() {
+                Ok(())
+            } else if let Some(error) = unsafe { error.as_ref() } {
+                Err(error::classify(
+                    &error.domain().to_string(),
+                    error.code() as i64,
+                ))
+            } else {
+                Err(UserVerificationError::Failed {
+                    reason: UserVerificationFailureReason::ProviderError,
+                    message: "biometric authorization did not complete".to_string(),
+                })
+            };
+            let _ = done_tx.send(result);
+        });
+        guard.check()?;
+        // Keychain signing reconstructs its own context. Evaluate the key's policy here
+        // so cancellation invalidates the context that actually owns the prompt.
+        unsafe {
+            context.evaluateAccessControl_operation_localizedReason_reply(
+                &*access.as_concrete_TypeRef().cast(),
+                LAAccessControlOperation::UseKeySign,
+                &NSString::from_str(&reason),
+                &reply,
+            );
+        }
+        wait_with_cancellation(guard, done_rx, || unsafe { context.invalidate() })?;
+        // Fetch a new key reference with the authorized, noninteractive context. Signing
+        // must fail instead of opening another prompt if that authorization is unusable.
+        unsafe {
+            context.setInteractionNotAllowed(/*interaction_not_allowed*/ true)
+        };
         let key =
             find_key(&self.namespace.label, &context, KeyUse::Protected)?.ok_or_else(|| {
                 UserVerificationError::Unavailable {
@@ -184,21 +264,12 @@ impl UserVerificationProvider for NativeProvider {
             })?;
         let credential = key_info(&key)?;
         guard.check()?;
-        let signature = run_with_cancellation(
-            guard,
-            || {
-                key.create_signature(
-                    Algorithm::ECDSASignatureMessageX962SHA256,
-                    &request.challenge,
-                )
-                .map_err(|error| error::classify(&error.domain().to_string(), error.code() as i64))
-            },
-            || {
-                // LAContext remains on this thread. Invalidation cancels its pending
-                // keychain authentication, allowing the signer and lifecycle lock to exit.
-                unsafe { context.invalidate() };
-            },
-        );
+        let signature = key
+            .create_signature(
+                Algorithm::ECDSASignatureMessageX962SHA256,
+                &request.challenge,
+            )
+            .map_err(|error| error::classify(&error.domain().to_string(), error.code() as i64));
         guard.check()?;
         Ok(UserVerificationProof {
             credential_id: credential.credential_id,
@@ -217,7 +288,7 @@ fn noninteractive_context() -> Retained<LAContext> {
 }
 
 fn check_biometrics(context: &LAContext) -> Result<(), UserVerificationError> {
-    // canEvaluatePolicy only checks availability; the protected key triggers authentication.
+    // canEvaluatePolicy only checks availability; evaluating the key's policy authenticates.
     unsafe { context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics) }
         .map_err(|error| error::classify(&error.domain().to_string(), error.code() as i64))
 }
@@ -232,6 +303,25 @@ fn find_key(
     context: &LAContext,
     key_use: KeyUse,
 ) -> Result<Option<SecKey>, UserVerificationError> {
+    match key_query(label, context).load_refs(true).search() {
+        Ok(results) => {
+            let key = results.into_iter().find_map(|result| match result {
+                SearchResult::Ref(Reference::Key(key)) => Some(key),
+                _ => None,
+            });
+            if let Some(key) = &key
+                && matches!(key_use, KeyUse::Protected)
+            {
+                key_protection::validate(key)?;
+            }
+            Ok(key)
+        }
+        Err(error) if error.code() == errSecItemNotFound => Ok(None),
+        Err(error) => Err(keychain_error(error)),
+    }
+}
+
+fn key_query(label: &str, context: &LAContext) -> ItemSearchOptions {
     // Security accepts an LAContext object as kSecUseAuthenticationContext. Wrapping under
     // the get rule retains it, and ItemSearchOptions owns that retain for the query lifetime.
     let authentication = unsafe { CFType::wrap_under_get_rule(std::ptr::from_ref(context).cast()) };
@@ -241,24 +331,8 @@ fn find_key(
         .key_class(KeyClass::private())
         .label(label)
         .local_authentication_context(Some(authentication))
-        .load_refs(true)
         .limit(Limit::Max(1));
-    match options.search() {
-        Ok(results) => {
-            let key = results.into_iter().find_map(|result| match result {
-                SearchResult::Ref(Reference::Key(key)) => Some(key),
-                _ => None,
-            });
-            if let Some(key) = &key
-                && matches!(key_use, KeyUse::Protected)
-            {
-                key_protection::validate(&key.attributes())?;
-            }
-            Ok(key)
-        }
-        Err(error) if error.code() == errSecItemNotFound => Ok(None),
-        Err(error) => Err(keychain_error(error)),
-    }
+    options
 }
 
 fn create_key(label: &str) -> Result<SecKey, UserVerificationError> {
@@ -273,7 +347,7 @@ fn create_key(label: &str) -> Result<SecKey, UserVerificationError> {
         .set_access_control(access);
     let key = SecKey::new(&options)
         .map_err(|error| error::classify(&error.domain().to_string(), error.code() as i64))?;
-    key_protection::validate(&key.attributes())?;
+    key_protection::validate(&key)?;
     Ok(key)
 }
 

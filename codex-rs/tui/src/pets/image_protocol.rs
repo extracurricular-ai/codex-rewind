@@ -241,7 +241,7 @@ pub fn kitty_transmit_png_with_id(
         if index == 0 {
             let image_id = kitty_image_id_arg(image_id);
             command.push_str(&format!(
-                "{ESC}_Ga=T,t=d,f=100,c={columns},r={rows},q=2{image_id},m={more_flag};{chunk}{ST}",
+                "{ESC}_Ga=T,t=d,f=100,c={columns},r={rows},q=2{image_id},m={more_flag},C=1;{chunk}{ST}",
             ));
         } else {
             command.push_str(&format!("{ESC}_Gm={more_flag};{chunk}{ST}"));
@@ -262,7 +262,8 @@ pub fn kitty_transmit_png_file_with_id(
         .with_context(|| format!("canonicalize {}", path.display()))?;
     let payload = general_purpose::STANDARD.encode(path.to_string_lossy().as_bytes());
     let image_id = kitty_image_id_arg(image_id);
-    let command = format!("{ESC}_Ga=T,t=f,f=100,c={columns},r={rows},q=2{image_id};{payload}{ST}");
+    let command =
+        format!("{ESC}_Ga=T,t=f,f=100,c={columns},r={rows},q=2{image_id},C=1;{payload}{ST}");
 
     Ok(wrap_for_tmux_if_needed(&command))
 }
@@ -353,7 +354,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(command.starts_with("\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,m=0;"));
+        assert!(command.starts_with("\x1b_Ga=T,t=d,f=100,c=4,r=3,q=2,m=0,C=1;"));
         assert!(command.contains("cG5n"));
         assert!(command.ends_with("\x1b\\"));
     }
@@ -636,6 +637,7 @@ mod tests {
         term: Option<&str>,
     ) -> TerminalInfo {
         TerminalInfo {
+            backend: None,
             name,
             term_program: term_program.map(str::to_string),
             version: version.map(str::to_string),
@@ -691,7 +693,7 @@ mod tests {
 
         assert_eq!(
             command,
-            format!("\x1b_Ga=T,t=f,f=100,c=4,r=3,q=2,i=7;{payload}\x1b\\")
+            format!("\x1b_Ga=T,t=f,f=100,c=4,r=3,q=2,i=7,C=1;{payload}\x1b\\")
         );
     }
 }

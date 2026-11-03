@@ -13,7 +13,7 @@ use codex_connectors::ConnectorDirectoryCacheKey;
 use codex_connectors::apps_config_from_layer_stack;
 use codex_connectors::connector_runtime_context_key;
 use codex_exec_server::EnvironmentManager;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_tools::DiscoverableTool;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -89,16 +89,13 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
     loaded_plugin_app_connector_ids: &[String],
 ) -> anyhow::Result<Vec<DiscoverableTool>> {
     let connector_ids = tool_suggest_connector_ids(config, loaded_plugin_app_connector_ids);
-    let directory_connectors = codex_connectors::merge::merge_plugin_connectors(
-        cached_directory_connectors_for_tool_suggest_with_auth(config, auth).await,
-        connector_ids.iter().cloned(),
-    );
     let discoverable_connectors =
         codex_connectors::filter::filter_tool_suggest_discoverable_connectors(
-            directory_connectors,
+            cached_directory_connectors_for_tool_suggest_with_auth(config, auth),
             accessible_connectors,
-            &connector_ids,
+            connector_ids,
         )
+        .await
         .into_iter()
         .map(DiscoverableTool::from);
     let discoverable_plugins = list_tool_suggest_discoverable_plugins(
@@ -165,7 +162,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
     // TODO: Wire callers that already own an EnvironmentManager into
     // list_accessible_connectors_from_mcp_tools_with_environment_manager instead
     // of constructing a temporary manager here.
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
@@ -252,6 +249,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
             .then(|| Arc::clone(&auth_manager));
     let mcp_runtime = McpRuntime::new(McpRuntimeInput {
+        network_policy_metadata: None,
         startup_policy: McpStartupPolicy::Eager,
         config: Arc::clone(&mcp_config),
         plugins_available: false,
@@ -422,9 +420,9 @@ fn tool_suggest_connector_ids(
 async fn cached_directory_connectors_for_tool_suggest_with_auth(
     config: &Config,
     auth: Option<&CodexAuth>,
-) -> Vec<AppInfo> {
+) -> Arc<[AppInfo]> {
     if !config.features.enabled(Feature::Apps) {
-        return Vec::new();
+        return Arc::default();
     }
 
     let loaded_auth;
@@ -434,18 +432,18 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
         let Ok(auth_manager) =
             AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await
         else {
-            return Vec::new();
+            return Arc::default();
         };
         loaded_auth = auth_manager.auth().await;
         loaded_auth.as_ref()
     };
     let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) else {
-        return Vec::new();
+        return Arc::default();
     };
 
     let account_id = match auth.get_account_id() {
         Some(account_id) if !account_id.is_empty() => account_id,
-        _ => return Vec::new(),
+        _ => return Arc::default(),
     };
     let is_workspace_account = auth.is_workspace_account();
     let cache_context = ConnectorDirectoryCacheContext::new(

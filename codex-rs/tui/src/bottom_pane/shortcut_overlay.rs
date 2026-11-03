@@ -6,6 +6,8 @@
 
 use super::footer::FooterProps;
 use crate::key_hint;
+use crate::multi_agents::next_agent_shortcut;
+use crate::multi_agents::previous_agent_shortcut;
 use crate::shortcut_help::Group;
 use crate::shortcut_help::Shortcut;
 use crate::style::accent_color;
@@ -73,7 +75,17 @@ pub(super) fn lines(props: &FooterProps, width: u16) -> Vec<Line<'static>> {
     }
     session.push(hints.reasoning_down, "Less reasoning");
     session.push(hints.reasoning_up, "More reasoning");
+    session.push(hints.toggle_voice, "Voice");
     session.push(hints.agents, "Agents (empty prompt)");
+    session.entries.push(Shortcut {
+        key: format!(
+            "{} / {}",
+            previous_agent_shortcut().display_label(),
+            next_agent_shortcut().display_label()
+        ),
+        action: "Subagents (empty prompt)",
+    });
+    session.push(hints.focus_activity, "Inspect activity");
     session.entries.push(Shortcut::new(
         key_hint::ctrl(KeyCode::Char('c')),
         if props.is_task_running {
@@ -96,7 +108,11 @@ pub(super) fn lines(props: &FooterProps, width: u16) -> Vec<Line<'static>> {
         },
         Shortcut::new(key_hint::ctrl(KeyCode::Char(' ')), "Start selection"),
         Shortcut {
-            key: "ctrl+home / ctrl+end".into(),
+            key: format!(
+                "{} / {}",
+                key_hint::ctrl(KeyCode::Home).display_label(),
+                key_hint::ctrl(KeyCode::End).display_label()
+            ),
             action: "Top / latest",
         },
         // Keep both jump alternatives: the terminal may be on another OS over SSH.

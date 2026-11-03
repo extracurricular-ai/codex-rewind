@@ -12,12 +12,11 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::PrefixedWrappedHistoryCell;
 use crate::history_cell::ReasoningSummaryCell;
-use crate::history_cell::UserHistoryCell;
 use crate::history_cell::split_reasoning_summary_parts;
 use crate::inline_visualization::InlineVisualizationContext;
 use crate::legacy_core::config::Config;
 use codex_app_server_protocol::Thread;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
 use codex_protocol::items::UserMessageItem;
@@ -107,7 +106,7 @@ pub(crate) fn thread_to_transcript_cells(
             thread_items_to_transcript_cells(
                 thread_id,
                 &cwd,
-                turn.items,
+                turn.items.into_iter().map(|entry| entry.payload),
                 raw_reasoning_visibility,
                 config,
             )
@@ -124,7 +123,7 @@ pub(crate) fn thread_to_transcript_cells(
 pub(crate) fn thread_items_to_transcript_cells(
     thread_id: Option<ThreadId>,
     cwd: &AbsolutePathBuf,
-    items: impl IntoIterator<Item = ThreadItem>,
+    items: impl IntoIterator<Item = ThreadItemPayload>,
     raw_reasoning_visibility: RawReasoningVisibility,
     config: Option<&Config>,
 ) -> TranscriptCells {
@@ -134,7 +133,7 @@ pub(crate) fn thread_items_to_transcript_cells(
     let mut cells: TranscriptCells = Vec::new();
     let mut pending = None;
     for item in items {
-        if matches!(item, ThreadItem::Reasoning { .. })
+        if matches!(item, ThreadItemPayload::Reasoning { .. })
             && let Some(group) = &mut pending
         {
             for cell in item_to_cells(
@@ -156,7 +155,7 @@ pub(crate) fn thread_items_to_transcript_cells(
             continue;
         }
         match item {
-            item @ ThreadItem::McpToolCall { .. } => {
+            item @ ThreadItemPayload::McpToolCall { .. } => {
                 let Some(call) = tools::McpHistory::from_item(item) else {
                     PendingActivity::flush(&mut pending, &mut cells);
                     continue;
@@ -179,7 +178,7 @@ pub(crate) fn thread_items_to_transcript_cells(
                     cells.push(Arc::new(cell));
                 }
             }
-            item @ ThreadItem::CommandExecution { .. } => {
+            item @ ThreadItemPayload::CommandExecution { .. } => {
                 if matches!(pending, Some(PendingActivity::Computer(_))) {
                     PendingActivity::flush(&mut pending, &mut cells);
                 }
@@ -220,14 +219,14 @@ pub(crate) fn thread_items_to_transcript_cells(
 
 /// Project one item without changing the active widget or its turn lifecycle.
 fn item_to_cells(
-    item: ThreadItem,
+    item: ThreadItemPayload,
     cwd: &AbsolutePathBuf,
     raw_reasoning_visibility: RawReasoningVisibility,
     inline_visualization_context: Option<InlineVisualizationContext>,
 ) -> TranscriptCells {
     let mut cells: TranscriptCells = Vec::new();
     match item {
-        ThreadItem::UserMessage {
+        ThreadItemPayload::UserMessage {
             id,
             client_id,
             content,
@@ -252,31 +251,39 @@ fn item_to_cells(
                     .collect(),
             };
             let message = item.message();
-            let reply_text = crate::async_question_reply::display_text(&message);
-            let text_elements = if reply_text.is_some() {
-                Vec::new()
+            let replies = crate::async_question_reply::parse(&message).unwrap_or_default();
+            let (message, elements) = if replies.is_empty() {
+                (message, item.text_elements())
             } else {
-                item.text_elements()
+                (
+                    crate::async_question_reply::display_replies(&replies),
+                    Vec::new(),
+                )
             };
-            cells.push(Arc::new(UserHistoryCell {
-                spoken: false,
-                message: reply_text.unwrap_or(message),
-                text_elements,
-                local_image_paths: item.local_image_paths(),
-                remote_image_urls: item.image_urls(),
-            }));
+            let cell = crate::history_cell::new_user_prompt(
+                message,
+                elements,
+                item.local_image_paths(),
+                item.image_urls(),
+            );
+            cells.push(Arc::new(cell.with_async_replies(replies, cwd.as_path())));
         }
-        ThreadItem::AgentMessage { text, .. } => {
+        ThreadItemPayload::AgentMessage {
+            text, questions, ..
+        } => {
             let parsed = parse_assistant_markdown(&text, cwd.as_path());
             if !parsed.visible_markdown.trim().is_empty() {
-                cells.push(Arc::new(AgentMarkdownCell::new_with_inline_visualizations(
-                    parsed.visible_markdown,
-                    cwd.as_path(),
-                    inline_visualization_context,
-                )));
+                cells.push(Arc::new(
+                    AgentMarkdownCell::new_with_inline_visualizations(
+                        parsed.visible_markdown,
+                        cwd.as_path(),
+                        inline_visualization_context,
+                    )
+                    .with_questions(questions.as_deref().unwrap_or_default()),
+                ));
             }
         }
-        ThreadItem::FunctionCallOutput {
+        ThreadItemPayload::FunctionCallOutput {
             name,
             namespace,
             output,
@@ -296,7 +303,7 @@ fn item_to_cells(
                 )));
             }
         }
-        ThreadItem::Plan { text, .. } => {
+        ThreadItemPayload::Plan { text, .. } => {
             if !text.trim().is_empty() {
                 cells.push(Arc::new(crate::history_cell::new_proposed_plan(
                     text,
@@ -304,7 +311,7 @@ fn item_to_cells(
                 )));
             }
         }
-        ThreadItem::Reasoning {
+        ThreadItemPayload::Reasoning {
             id,
             summary,
             content,
@@ -329,7 +336,7 @@ fn item_to_cells(
                 cells.push(Arc::new(cell));
             }
         }
-        item @ ThreadItem::CommandExecution { .. } => {
+        item @ ThreadItemPayload::CommandExecution { .. } => {
             if let Some(command) = tools::CommandHistory::from_item(item) {
                 cells.push(Arc::new(command.into_cell()));
             }

@@ -8,6 +8,7 @@ use super::render;
 use super::render::Export;
 use super::render::Value;
 use super::render::ValuePart;
+use crate::shell_detect::ShellType;
 use std::collections::HashMap;
 
 /// Environment views used to render protected credential references into a shell snapshot.
@@ -106,7 +107,9 @@ pub fn prepare_snapshot_credentials(
             let next_credential = credential_keys
                 .iter()
                 .filter_map(|credential_key| {
-                    let dummy = discovered.get(*credential_key)?;
+                    let dummy = discovered
+                        .get(*credential_key)
+                        .filter(|dummy| !dummy.is_empty())?;
                     let real = real_credential_value(credential_key)?;
                     let allowed_key = allowed_brokered_keys
                         .iter()
@@ -296,11 +299,24 @@ pub fn prepare_snapshot_credentials(
                     return Some(Export::Captured(line));
                 }
                 return Some(Export::Assignment {
-                    declaration,
+                    declaration: if captured.shell_type == ShellType::Zsh
+                        && configured.contains_key(key)
+                    {
+                        format!("export {key}").into()
+                    } else {
+                        declaration.into()
+                    },
                     value: assignment,
                 });
             }
 
+            // Explicit scalar overrides must not inherit captured coercion attributes.
+            if captured.shell_type == ShellType::Zsh
+                && configured.contains_key(key)
+                && matches!(export.value, ExportValue::Plain)
+            {
+                return None;
+            }
             Some(Export::Captured(line))
         })
         .collect::<Vec<_>>();

@@ -9,13 +9,15 @@ use super::thread_events::ThreadBufferedEvent;
 use crate::app_event::AppEvent;
 use crate::app_event::ThreadTitleDestination;
 use crate::app_server_session::AppServerSession;
+use crate::app_server_session::ThreadSettingsOwner;
 use crate::temporary_structured_request::TemporaryStructuredThreadOptions;
 use crate::temporary_structured_request::run_temporary_structured_turn;
 use crate::temporary_structured_request::start_temporary_thread;
 use crate::temporary_structured_request::unsubscribe_temporary_thread;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadSource;
+use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
 use codex_protocol::models::MessagePhase;
@@ -38,23 +40,12 @@ struct GeneratedThreadTitle {
 }
 
 impl App {
-    pub(super) fn sync_thread_title_progress(&mut self) {
-        let pending = self.chat_widget.thread_id().is_some_and(|thread_id| {
-            self.pending_thread_titles
-                .keys()
-                .any(|(id, _)| *id == thread_id)
-        });
-        self.chat_widget
-            .set_thread_title_generation_pending(pending);
-    }
-
     pub(super) fn finish_thread_title_generation(
         &mut self,
         thread_id: ThreadId,
         destination: ThreadTitleDestination,
     ) {
         self.pending_thread_titles.remove(&(thread_id, destination));
-        self.sync_thread_title_progress();
     }
 
     /// A saved manual name supersedes any pending title generation for that thread.
@@ -67,7 +58,6 @@ impl App {
                 true
             }
         });
-        self.sync_thread_title_progress();
     }
 
     /// Start a hidden title-generation thread without blocking the UI loop.
@@ -78,13 +68,19 @@ impl App {
         destination: ThreadTitleDestination,
         prompt: String,
     ) {
+        if app_server.thread_params_mode().settings_owner() == ThreadSettingsOwner::Server {
+            if let ThreadTitleDestination::RenameSuggestion { request_id } = destination {
+                self.chat_widget
+                    .apply_thread_name_suggestion(thread_id, request_id, /*suggestion*/ None);
+            }
+            return;
+        }
         let std::collections::hash_map::Entry::Vacant(entry) =
             self.pending_thread_titles.entry((thread_id, destination))
         else {
             return;
         };
         let cancellation = entry.insert(CancellationToken::new()).clone();
-        self.sync_thread_title_progress();
         let request_handle = app_server.request_handle();
         let model = if self.chat_widget.config_ref().model_provider_id == "openai"
             && self.chat_widget.has_chatgpt_account()
@@ -228,7 +224,7 @@ impl App {
                 store
                     .turns
                     .iter()
-                    .flat_map(|turn| turn.items.iter())
+                    .flat_map(Turn::item_payloads)
                     .chain(store.buffer.iter().filter_map(|event| {
                         let ThreadBufferedEvent::Notification(notification) = event else {
                             return None;
@@ -239,7 +235,7 @@ impl App {
                             return None;
                         };
 
-                        Some(&notification.item)
+                        Some(&notification.item.payload)
                     }))
                     .filter(|item| seen.insert(item.id().to_string())),
             )
@@ -306,19 +302,19 @@ pub(super) fn thread_title_prompt(user_message: &str) -> String {
 /// Format recent substantive messages chronologically without trusting their markup.
 pub(super) fn recent_conversation_messages<'a, I>(items: I) -> Option<String>
 where
-    I: IntoIterator<Item = &'a ThreadItem>,
+    I: IntoIterator<Item = &'a ThreadItemPayload>,
     I::IntoIter: DoubleEndedIterator,
 {
     let mut messages = items
         .into_iter()
         .rev()
         .filter_map(|item| match item {
-            ThreadItem::UserMessage { content, .. } => {
+            ThreadItemPayload::UserMessage { content, .. } => {
                 let text = content
                     .iter()
                     .filter_map(|input| match input {
                         UserInput::Text { text, .. } => {
-                            Some(crate::ide_context::extract_prompt_request_with_offset(text).0)
+                            Some(crate::user_prompt::extract_prompt_request_with_offset(text).0)
                         }
                         _ => None,
                     })
@@ -327,7 +323,7 @@ where
 
                 (!text.trim().is_empty()).then_some(("user", text))
             }
-            ThreadItem::AgentMessage { text, phase, .. }
+            ThreadItemPayload::AgentMessage { text, phase, .. }
                 if !matches!(phase, Some(MessagePhase::Commentary)) && !text.trim().is_empty() =>
             {
                 Some(("assistant", text.clone()))

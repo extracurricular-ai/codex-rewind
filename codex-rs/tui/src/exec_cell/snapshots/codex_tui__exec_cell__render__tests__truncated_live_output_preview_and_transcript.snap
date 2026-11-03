@@ -26,9 +26,9 @@ expression: "(preview, compact, transcript)"
     ],
     [
         Line::from_iter([
-            Span::from("•").red().bold(),
+            Span::from("•").bold(),
             Span::from(" "),
-            Span::from("Failed (exit 1)").bold(),
+            Span::from("Exited (status 1)").bold(),
             Span::from(" "),
             Span::from("echo").fg(Color::Rgb(137, 180, 250)),
             Span::from(" output").fg(Color::Rgb(205, 214, 244)),

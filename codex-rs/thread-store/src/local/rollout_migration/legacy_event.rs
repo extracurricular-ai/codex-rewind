@@ -217,12 +217,13 @@ pub(super) fn completed_item(
                 id: event.call_id.clone(),
                 status: event.status.clone(),
                 revised_prompt: event.revised_prompt.clone(),
-                result: event.result.clone(),
+                image: event.image.clone(),
                 transparent_background: event.transparent_background,
                 failure: event.failure.clone(),
                 saved_path: event.saved_path.clone(),
+                input_images: event.input_images.clone(),
                 imagegen_request_id: None,
-                generation_id: None,
+                generation_id: event.generation_id.clone(),
             })),
             None,
         )),
@@ -258,6 +259,8 @@ pub(super) fn completed_item(
         )),
         EventMsg::SubAgentActivity(event) => Some((
             TurnItem::SubAgentActivity(SubAgentActivityItem {
+                model: event.model.clone(),
+                reasoning_effort: event.reasoning_effort.clone(),
                 id: event.event_id.clone(),
                 kind: event.kind,
                 agent_thread_id: event.agent_thread_id,
@@ -268,6 +271,7 @@ pub(super) fn completed_item(
         EventMsg::ExecCommandEnd(event) => Some((
             TurnItem::CommandExecution(CommandExecutionItem {
                 model_context: None,
+                sandbox_type: None,
                 id: event.call_id.clone(),
                 plugin_id: event.plugin_id.clone(),
                 script_path: event.script_path.clone(),
@@ -276,16 +280,12 @@ pub(super) fn completed_item(
                 cwd: event.cwd.clone(),
                 parsed_cmd: event.parsed_cmd.clone(),
                 source: event.source,
-                interaction_input: event.interaction_input.clone(),
+                interaction_input: None,
                 status: event.status.clone().into(),
-                stdout: (!event.stdout.is_empty()).then(|| event.stdout.clone()),
-                stderr: (!event.stderr.is_empty()).then(|| event.stderr.clone()),
                 aggregated_output: (!event.aggregated_output.is_empty())
                     .then(|| event.aggregated_output.clone()),
                 exit_code: Some(event.exit_code),
                 duration: Some(event.duration),
-                formatted_output: (!event.formatted_output.is_empty())
-                    .then(|| event.formatted_output.clone()),
             }),
             Some(event.turn_id.clone()),
         )),

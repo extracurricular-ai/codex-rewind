@@ -33,7 +33,7 @@ use rmcp::model::CallToolResult;
 use rmcp::model::ContentBlock;
 use rmcp::model::CustomRequest;
 use rmcp::model::ServerCapabilities;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::ServerRequest;
 use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
@@ -73,8 +73,8 @@ impl McpServerContributor<Config> for HostedVerificationServer {
 }
 
 impl ServerHandler for VerificationServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
@@ -156,7 +156,7 @@ async fn user_verification_mcp_round_trip_requires_proof_in_full_access() -> Res
                 OPENAI_ELICITATION_EXTENSION_ID.to_string(),
                 json!({"userVerification": {}}),
             )]),
-            environments: Some(vec![test.executor_environment().selection().clone()]),
+            environments: Some(vec![test.executor_environment().request()]),
             ..StartThreadOptions::new(test.config.clone())
         })
         .await?

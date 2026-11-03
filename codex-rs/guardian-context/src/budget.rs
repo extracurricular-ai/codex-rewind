@@ -10,6 +10,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 
 use crate::ComposedContext;
+use crate::composition::SectionContent;
 use crate::composition::SectionDelivery;
 use crate::composition::SectionOutput;
 
@@ -29,6 +30,33 @@ pub const REQUEST_TOKENS_BOUNDARIES: &[f64] = &[
     1_000_000.0,
     2_000_000.0,
 ];
+
+/// Returns a bounded, sortable label with 20k steps and a final 256k cutoff.
+/// Upper bounds are inclusive; zero belongs to the first bucket and values above 256k to the last.
+pub fn request_token_bucket(tokens: usize) -> &'static str {
+    const BOUNDARIES: [usize; 13] = [
+        20_000, 40_000, 60_000, 80_000, 100_000, 120_000, 140_000, 160_000, 180_000, 200_000,
+        220_000, 240_000, 256_000,
+    ];
+    const LABELS: [&str; 14] = [
+        "01_0-20k",
+        "02_20k-40k",
+        "03_40k-60k",
+        "04_60k-80k",
+        "05_80k-100k",
+        "06_100k-120k",
+        "07_120k-140k",
+        "08_140k-160k",
+        "09_160k-180k",
+        "10_180k-200k",
+        "11_200k-220k",
+        "12_220k-240k",
+        "13_240k-256k",
+        "14_256k-max",
+    ];
+    LABELS[BOUNDARIES.partition_point(|bound| tokens > *bound)]
+}
+
 /// One shared scale for the section metric's count, token and byte measurements.
 /// Buckets belong to the metric name, not its measurement tag.
 pub const SECTION_COST_BOUNDARIES: &[f64] = &[
@@ -95,7 +123,7 @@ pub struct SectionCost {
 impl SectionCost {
     fn add_content(mut self, item: &ContentItem) -> Self {
         match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 self.text_bytes = self.text_bytes.saturating_add(text.len());
             }
             ContentItem::InputImage {
@@ -145,36 +173,99 @@ impl ComposedContext {
 
     /// Stable section names and numeric costs; never exposes evidence in diagnostics.
     pub fn section_costs(&self) -> impl Iterator<Item = (&'static str, SectionCost)> + '_ {
-        self.sections.iter().map(|section| {
+        let mut costs: Vec<(&'static str, SectionCost)> = Vec::new();
+        for section in &self.sections {
             let cost = match &section.delivery {
                 SectionDelivery::UserContent(content) => content
                     .iter()
                     .map(|item| &item.content)
-                    .fold(SectionCost::default(), SectionCost::add_content),
-                SectionDelivery::Message(message) => match message.as_ref() {
+                    .fold(SectionCost::default(), |mut cost, item| match item {
+                        SectionContent::Transcript(text) => {
+                            cost.text_bytes =
+                                cost.text_bytes.saturating_add(text.rendered().text_bytes);
+                            cost
+                        }
+                        SectionContent::Other(item) => cost.add_content(item),
+                    }),
+                SectionDelivery::Message(message) => match &message.content.item {
                     ResponseItem::Message { content, .. } => content
                         .iter()
                         .fold(SectionCost::default(), SectionCost::add_content),
                     item => SectionCost {
-                        text_bytes: ByteCount::item(item),
+                        text_bytes: ByteCount::item(item).saturating_add(
+                            crate::native_tool_call::evidence_output(item)
+                                .as_ref()
+                                .map_or(0, ByteCount::item),
+                        ),
                         ..SectionCost::default()
                     },
                 },
             };
-            (section.id, cost)
-        })
+            // Native messages split a transcript into adjacent deliveries, but
+            // telemetry must still report one total for the logical section.
+            if let Some((id, total)) = costs.last_mut()
+                && *id == section.id
+            {
+                total.text_bytes = total.text_bytes.saturating_add(cost.text_bytes);
+                total.image_bytes = total.image_bytes.saturating_add(cost.image_bytes);
+                total.image_count = total.image_count.saturating_add(cost.image_count);
+            } else {
+                costs.push((section.id, cost));
+            }
+        }
+        costs.into_iter()
     }
 }
 
-/// Conservative estimate including roles, framing, metadata and opaque checkpoints.
+/// Coarse estimate including roles, framing, metadata and opaque checkpoints.
 /// Images reserve tokens separately from their wire bytes. This is a budgeting
 /// heuristic, not the model's tokenizer or a measurement of server-side usage.
 pub fn estimate_input_tokens(item: &ResponseItem) -> usize {
+    estimate_input_tokens_from_serialized_len(item, ByteCount::item(item))
+}
+
+/// Estimate input tokens while reusing the length of an existing serialization.
+/// `serialized_len` must be the byte length of the item's `serde_json` encoding.
+pub fn estimate_input_tokens_from_serialized_len(
+    item: &ResponseItem,
+    serialized_len: usize,
+) -> usize {
+    if serialized_len == usize::MAX {
+        return usize::MAX;
+    }
+    if let Some(encrypted_content) = compaction_ciphertext(item) {
+        let framing =
+            TruncationPolicy::Bytes(serialized_len.saturating_sub(encrypted_content.len()))
+                .token_budget();
+        let content =
+            codex_protocol::protocol::estimate_compaction_content_length(encrypted_content.len());
+        return framing.saturating_add(TruncationPolicy::Bytes(content).token_budget());
+    }
     let content = match item {
         ResponseItem::Message { content, .. } => content.as_slice(),
         _ => &[],
     };
-    adjusted_tokens(ByteCount::item(item), content)
+    adjusted_tokens(serialized_len, content)
+}
+
+fn compaction_ciphertext(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::Compaction {
+            encrypted_content, ..
+        }
+        | ResponseItem::ContextCompaction {
+            encrypted_content: Some(encrypted_content),
+            ..
+        } => Some(encrypted_content),
+        _ => None,
+    }
+}
+
+pub(super) fn section_content_tokens(item: &SectionContent) -> usize {
+    match item {
+        SectionContent::Transcript(record) => record.rendered().tokens,
+        SectionContent::Other(item) => content_tokens(item),
+    }
 }
 
 pub(super) fn content_tokens(item: &ContentItem) -> usize {
@@ -200,9 +291,11 @@ pub(super) fn section_tokens(section: &SectionOutput) -> usize {
     match &section.delivery {
         SectionDelivery::UserContent(content) => content
             .iter()
-            .map(|item| content_tokens(&item.content))
+            .map(|item| section_content_tokens(&item.content))
             .fold(content_framing_tokens(content.len()), usize::saturating_add),
-        SectionDelivery::Message(message) => estimate_input_tokens(message),
+        SectionDelivery::Message(message) => {
+            crate::native_tool_call::estimate_tokens(&message.content.item)
+        }
     }
 }
 
@@ -233,10 +326,10 @@ fn adjusted_tokens(mut bytes: usize, content: &[ContentItem]) -> usize {
 }
 
 #[derive(Default)]
-struct ByteCount(usize);
+pub(crate) struct ByteCount(usize);
 
 impl ByteCount {
-    fn item(item: &ResponseItem) -> usize {
+    pub(crate) fn item(item: &ResponseItem) -> usize {
         Self::measure(|counter| serde_json::to_writer(counter, item))
     }
 

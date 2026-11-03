@@ -27,12 +27,15 @@ jobs:
         run: python3 .github/scripts/verify_bazel_clippy_lints.py
 
       - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
-          version: "0.11.3"
+          version: "0.13.5"
 
       - name: Test downstream Python release resolution
         run: python3 -m unittest discover -s .github/scripts -p 'test_resolve_python_cli_release.py'
+
+      - name: Test release version comparison
+        run: python3 -m unittest discover -s .github/scripts -p 'test_releases.py'
 
       - name: Test PyPI release verification
         run: uv run --no-project --with packaging==26.2 python -m unittest discover -s .github/scripts -p 'test_verify_pypi_release.py'
@@ -54,7 +57,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: 22
+          node-version-file: .nvmrc
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

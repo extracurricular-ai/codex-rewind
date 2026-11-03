@@ -32,7 +32,10 @@ fn protected_attributes() -> CFMutableDictionary<CFString, CFType> {
 #[test]
 fn reuse_requires_secure_enclave_key_attributes() {
     let attributes = protected_attributes();
-    assert_eq!(validate(&attributes.to_immutable().to_untyped()), Ok(()));
+    assert_eq!(
+        validate_attributes(&attributes.to_immutable().to_untyped()),
+        Ok(())
+    );
     let alternatives = unsafe {
         [
             (kSecAttrTokenID, CFString::new("software").as_CFType()),
@@ -48,7 +51,7 @@ fn reuse_requires_secure_enclave_key_attributes() {
         let mut attributes = protected_attributes();
         attributes.set(unsafe { CFString::wrap_under_get_rule(attribute) }, value);
         assert_eq!(
-            validate(&attributes.to_immutable().to_untyped()),
+            validate_attributes(&attributes.to_immutable().to_untyped()),
             Err(UserVerificationError::Unavailable {
                 reason: UserVerificationUnavailableReason::ProviderUnavailable,
                 message: "the local credential has incompatible key protection; delete it before enrolling again"

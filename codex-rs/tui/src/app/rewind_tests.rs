@@ -57,7 +57,7 @@ async fn rewind_without_cached_turns(
         filename_ts,
         "2025-01-05T12:00:00Z",
         "unused preview",
-        Some("test-provider"),
+        Some(config.model_provider_id.as_str()),
         /*git_info*/ None,
     )
     .expect("materialized rollout should be created");
@@ -106,6 +106,7 @@ async fn rewind_without_cached_turns(
         );
         for item in [
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                turn_attribution: None,
                 turn_id: turn_id.to_string(),
                 root_turn_id: None,
                 trace_id: None,
@@ -132,6 +133,7 @@ async fn rewind_without_cached_turns(
                 }
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: None,
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 error: None,
@@ -257,23 +259,25 @@ async fn rewind_without_cached_turns(
     // user has to tell apart.
     let listed = app_server
         .thread_list(codex_app_server_protocol::ThreadListParams {
-            // `archived: false` is the filter `/resume` itself applies, so this
-            // asks the same question the user's session list does.
-            archived: Some(false),
             cursor: None,
             limit: None,
+            excluded_thread_ids: None,
             sort_key: None,
             sort_direction: None,
             model_providers: None,
             source_kinds: None,
             originators: None,
+            // `archived: false` is the filter `/resume` itself applies, so this
+            // asks the same question the user's session list does.
+            archived: Some(false),
             section_id: None,
-            parent_thread_id: None,
-            ancestor_thread_id: None,
+            project_id: None,
             cwd: None,
             use_state_db_only: false,
             search_term: None,
-            project_id: None,
+            parent_thread_id: None,
+            ancestor_thread_id: None,
+            attached_to_thread_id: None,
         })
         .await?
         .data

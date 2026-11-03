@@ -12,8 +12,17 @@ mod types;
 /// Maximum number of unresolved delegate callbacks allowed per host connection.
 pub const MAX_PENDING_DELEGATE_CALLS: usize = 1_024;
 
+/// Stdio connection support for the optional `session/open.outputTruncation` field.
+/// Each session selects its own setting after the connection hello.
+pub const BOUNDED_OUTPUT_CAPABILITY: &str = "bounded-output-v1";
+/// Maximum retained bytes between server-truncated observations.
+pub const BOUNDED_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+
 /// Negotiated support for cell execution resource limits on `session/open`.
 pub const SESSION_RESOURCE_LIMITS_CAPABILITY: &str = "session-cell-execution-resource-limits";
+
+/// Support for yielding an in-flight execute or wait observation.
+pub const YIELD_OBSERVATION_CAPABILITY: &str = "yield-observation";
 
 pub use codec::EncodedFrame;
 pub use codec::FramedReader;
@@ -35,6 +44,7 @@ pub use payload::WireContentItem;
 pub use payload::WireExecuteRequest;
 pub use payload::WireImageDetail;
 pub use payload::WireNestedToolCall;
+pub use payload::WireOutputTruncation;
 pub use payload::WireRuntimeResponse;
 pub use payload::WireSessionCellExecutionLimits;
 pub use payload::WireToolDefinition;

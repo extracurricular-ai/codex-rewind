@@ -1,5 +1,6 @@
 use crate::TransportError;
 use crate::error::ApiError;
+use crate::error::parse_terminal_provider_error;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
 use crate::rate_limits::parse_rate_limit_reached_type;
@@ -19,26 +20,55 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub fn map_api_error(err: ApiError) -> CodexErr {
+    let retry_after = match &err {
+        ApiError::Retryable { retry_after, .. }
+        | ApiError::RateLimitExceeded { retry_after, .. }
+        | ApiError::ServerOverloaded { retry_after }
+        | ApiError::PolicyCapacityUnavailable { retry_after }
+        | ApiError::Transport(TransportError::Http { retry_after, .. }) => *retry_after,
+        ApiError::Transport(_)
+        | ApiError::Api { .. }
+        | ApiError::Stream(_)
+        | ApiError::ContentFilter
+        | ApiError::ResponseIncomplete(_)
+        | ApiError::ContextWindowExceeded
+        | ApiError::QuotaExceeded
+        | ApiError::UsageNotIncluded
+        | ApiError::FlexUnavailable
+        | ApiError::RateLimit(_)
+        | ApiError::InvalidRequest { .. }
+        | ApiError::ModelNotFound { .. }
+        | ApiError::InvalidPrompt { .. }
+        | ApiError::CyberPolicy { .. }
+        | ApiError::BioPolicy { .. }
+        | ApiError::MisalignmentPolicyViolation { .. } => None,
+    };
+    let error = map_api_error_details(err);
+    match retry_after {
+        Some(retry_after) => error.with_retry_after(retry_after),
+        None => error,
+    }
+}
+
+fn map_api_error_details(err: ApiError) -> CodexErr {
     match err {
         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
-        ApiError::Retryable { message, delay } => {
-            let error = CodexErr::Stream(message);
-            match delay {
-                Some(delay) => error.with_retry_delay(delay),
-                None => error,
-            }
-        }
-        ApiError::RateLimitExceeded { message, delay } => {
-            let error = CodexErr::new(CodexErrorDetails::RateLimitExceeded(message));
-            match delay {
-                Some(delay) => error.with_retry_delay(delay),
-                None => error,
-            }
+        ApiError::Retryable { message, .. } => CodexErr::Stream(message),
+        ApiError::RateLimitExceeded { message, .. } => {
+            CodexErr::new(CodexErrorDetails::RateLimitExceeded(message))
         }
         ApiError::Stream(msg) => CodexErr::Stream(msg),
-        ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
+        ApiError::ContentFilter => CodexErr::new(CodexErrorDetails::ContentFilter),
+        ApiError::ResponseIncomplete(incomplete) => {
+            CodexErr::new(CodexErrorDetails::ResponseIncomplete(incomplete))
+        }
+        ApiError::ServerOverloaded { .. } => CodexErr::ServerOverloaded,
+        ApiError::PolicyCapacityUnavailable { .. } => {
+            CodexErr::new(CodexErrorDetails::PolicyCapacityUnavailable)
+        }
+        ApiError::FlexUnavailable => CodexErr::new(CodexErrorDetails::FlexUnavailable),
         ApiError::Api { status, message } => {
             let user_message = api_error_user_message(status, &message);
             CodexErr::UnexpectedStatus(UnexpectedResponseError {
@@ -53,6 +83,12 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             })
         }
         ApiError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+        ApiError::ModelNotFound { message, status } => {
+            CodexErr::new(CodexErrorDetails::ModelNotFound { message, status })
+        }
+        ApiError::InvalidPrompt { message } => {
+            CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
+        }
         ApiError::CyberPolicy { message } => {
             CodexErr::new(CodexErrorDetails::CyberPolicy { message })
         }
@@ -70,14 +106,22 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 url,
                 headers,
                 body,
+                ..
             } => {
                 let body_text = body.unwrap_or_default();
+                let parsed_body = serde_json::from_str::<Value>(&body_text).ok();
+                let provider_error = parsed_body.as_ref().and_then(|body| body.get("error"));
+                if let Some(error) = parse_terminal_provider_error(provider_error, Some(status)) {
+                    return map_api_error_details(error);
+                }
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&body_text)
-                    && let Some(error) = value.get("error")
+                    && let Some(error) = provider_error
                 {
                     match error.get("code").and_then(Value::as_str) {
+                        Some("policy_capacity_unavailable") => {
+                            return CodexErr::new(CodexErrorDetails::PolicyCapacityUnavailable);
+                        }
                         Some("server_is_overloaded") => return CodexErr::ServerOverloaded,
                         Some("slow_down") => {
                             return CodexErr::new(CodexErrorDetails::RateLimitExceeded(
@@ -94,8 +138,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
 
                 if (status == http::StatusCode::BAD_REQUEST
                     || status == http::StatusCode::FORBIDDEN)
-                    && let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                    && let Some(error) = parsed.get("error")
+                    && let Some(error) = provider_error
                     && error.get("code").and_then(Value::as_str)
                         == Some(MISALIGNMENT_POLICY_VIOLATION_ERROR_CODE)
                 {
@@ -116,13 +159,17 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                        && let Some(error) = parsed.get("error")
-                        && let Some(code @ (CYBER_POLICY_ERROR_CODE | BIO_POLICY_ERROR_CODE)) =
-                            error.get("code").and_then(Value::as_str)
+                    if let Some(error) = provider_error
+                        && let Some(
+                            code @ (CYBER_POLICY_ERROR_CODE
+                            | BIO_POLICY_ERROR_CODE
+                            | INVALID_PROMPT_ERROR_CODE),
+                        ) = error.get("code").and_then(Value::as_str)
                     {
                         let fallback_message = if code == BIO_POLICY_ERROR_CODE {
                             BIO_POLICY_FALLBACK_MESSAGE
+                        } else if code == INVALID_PROMPT_ERROR_CODE {
+                            INVALID_PROMPT_FALLBACK_MESSAGE
                         } else {
                             CYBER_POLICY_FALLBACK_MESSAGE
                         };
@@ -134,6 +181,8 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                             .unwrap_or_else(|| fallback_message.to_string());
                         if code == BIO_POLICY_ERROR_CODE {
                             CodexErr::new(CodexErrorDetails::BioPolicy { message })
+                        } else if code == INVALID_PROMPT_ERROR_CODE {
+                            CodexErr::new(CodexErrorDetails::InvalidPrompt { message })
                         } else {
                             CodexErr::new(CodexErrorDetails::CyberPolicy { message })
                         }
@@ -169,6 +218,12 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                             return CodexErr::UsageLimitReached(UsageLimitReachedError {
                                 plan_type: err.error.plan_type,
                                 resets_at,
+                                limit_window_minutes: err
+                                    .error
+                                    .limit_window_minutes
+                                    .as_ref()
+                                    .and_then(Value::as_u64)
+                                    .and_then(|minutes| u16::try_from(minutes).ok()),
                                 rate_limits: rate_limits.map(Box::new),
                                 promo_message,
                                 rate_limit_reached_type,
@@ -216,6 +271,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 request_id: None,
             }),
             TransportError::Timeout => CodexErr::RequestTimeout,
+            TransportError::Policy(denied) => CodexErr::Fatal(denied.to_string()),
             TransportError::Connection(source) => {
                 CodexErr::ConnectionFailed(ConnectionFailedError { source })
             }
@@ -234,6 +290,8 @@ const OAI_REQUEST_ID_HEADER: &str = "x-oai-request-id";
 const CF_RAY_HEADER: &str = "cf-ray";
 const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-error";
 const X_ERROR_JSON_HEADER: &str = "x-error-json";
+const INVALID_PROMPT_ERROR_CODE: &str = "invalid_prompt";
+const INVALID_PROMPT_FALLBACK_MESSAGE: &str = "Invalid request.";
 const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
 const CYBER_POLICY_FALLBACK_MESSAGE: &str =
     "This request has been flagged for possible cybersecurity risk.";
@@ -302,4 +360,5 @@ struct UsageErrorBody {
     error_type: Option<String>,
     plan_type: Option<PlanType>,
     resets_at: Option<i64>,
+    limit_window_minutes: Option<Value>,
 }

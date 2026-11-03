@@ -1,9 +1,10 @@
 use crate::function_tool::FunctionCallError;
+use crate::tools::context::ToolEnvironments;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolPayload;
 use crate::tools::handlers::mcp_resource_spec::create_read_mcp_resource_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_protocol::openai_models::ToolMessage;
 use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -12,13 +13,15 @@ use rmcp::model::ReadResourceRequestParams;
 
 use super::ReadResourceArgs;
 use super::ReadResourcePayload;
+use super::ResourceOperation;
 use super::ensure_model_can_access_mcp_server;
-use super::normalize_required_string;
-use super::parse_args;
-use super::parse_arguments;
+use super::resource_arguments;
+use super::resource_environments;
 use super::run_resource_operation;
 
-pub struct ReadMcpResourceHandler;
+pub struct ReadMcpResourceHandler {
+    spec: ToolSpec,
+}
 
 impl ToolExecutor<ToolInvocation> for ReadMcpResourceHandler {
     fn tool_name(&self) -> ToolName {
@@ -26,7 +29,7 @@ impl ToolExecutor<ToolInvocation> for ReadMcpResourceHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_read_mcp_resource_tool()
+        self.spec.clone()
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
@@ -42,6 +45,12 @@ impl ToolExecutor<ToolInvocation> for ReadMcpResourceHandler {
 }
 
 impl ReadMcpResourceHandler {
+    pub fn new(messages: Option<&ToolMessage>) -> Self {
+        Self {
+            spec: create_read_mcp_resource_tool(messages),
+        }
+    }
+
     async fn handle_call(
         &self,
         invocation: ToolInvocation,
@@ -56,20 +65,8 @@ impl ReadMcpResourceHandler {
         let turn = std::sync::Arc::clone(&step_context.turn);
         let mcp = &step_context.mcp;
 
-        let arguments = match payload {
-            ToolPayload::Function { arguments } => arguments,
-            _ => {
-                return Err(FunctionCallError::RespondToModel(
-                    "read_mcp_resource handler received unsupported payload".to_string(),
-                ));
-            }
-        };
-
-        let arguments = parse_arguments(arguments.as_str())?;
-        let args: ReadResourceArgs = parse_args(arguments.clone())?;
-        let ReadResourceArgs { server, uri } = args;
-        let server = normalize_required_string("server", server)?;
-        let uri = normalize_required_string("uri", uri)?;
+        let arguments = resource_arguments(&payload)?;
+        let ReadResourceArgs { server, uri } = ReadResourceArgs::parse(arguments.clone())?;
 
         let invocation = McpInvocation {
             server: server.clone(),
@@ -96,4 +93,11 @@ impl ReadMcpResourceHandler {
     }
 }
 
-impl CoreToolRuntime for ReadMcpResourceHandler {}
+impl CoreToolRuntime for ReadMcpResourceHandler {
+    fn environments_for_input(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<ToolEnvironments, FunctionCallError> {
+        resource_environments(invocation, ResourceOperation::Read)
+    }
+}

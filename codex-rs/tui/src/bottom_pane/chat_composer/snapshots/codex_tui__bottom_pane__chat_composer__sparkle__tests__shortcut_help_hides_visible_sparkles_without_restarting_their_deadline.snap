@@ -1,6 +1,5 @@
 ---
 source: tui/src/bottom_pane/chat_composer/sparkle_tests.rs
-assertion_line: 452
 expression: "snapshots.join(\"\\n\\n\")"
 ---
 expires during help: false
@@ -13,18 +12,20 @@ shortcut help:
   Keyboard shortcuts
 
   Compose                       Session
-  /        Commands             tab     Send message
-  @        Mention files        ⌥+,     Less reasoning
-  !        Shell command        ⌥+.     More reasoning
-  ctrl+j   New line             ctrl+c  Quit
-  ctrl+v   Paste image
-  ctrl+g   External editor      Transcript (open first)
-  ctrl+r   Search history       ctrl+t                 Open transcript
-  esc esc  Edit last message    f3                     Find text
-                                pgup / pgdn            Scroll
-                                ctrl+space             Start selection
-                                ctrl+home / ctrl+end   Top / latest
-                                shift+⌥+, / shift+⌥+.  Top / latest
+  /        Commands             tab      Send message
+  @        Mention files        ⌥,       Less reasoning
+  !        Shell command        ⌥.       More reasoning
+  ⌃j       New line             ⌥← / ⌥→  Subagents (empty prompt)
+  ⌃v       Paste image          f4       Inspect activity
+  ⌃g       External editor      ⌃c       Quit
+  ⌃r       Search history
+  esc esc  Edit last message    Transcript (open first)
+                                ⌃t            Open transcript
+                                f3            Find text
+                                pgup / pgdn   Scroll
+                                ⌃space        Start selection
+                                ⌃home / ⌃end  Top / latest
+                                ⇧⌥, / ⇧⌥.     Top / latest
 
   /keymap customize
 
@@ -47,18 +48,20 @@ shortcut help:
   Keyboard shortcuts
 
   Compose                       Session
-  /        Commands             tab     Send message
-  @        Mention files        ⌥+,     Less reasoning
-  !        Shell command        ⌥+.     More reasoning
-  ctrl+j   New line             ctrl+c  Quit
-  ctrl+v   Paste image
-  ctrl+g   External editor      Transcript (open first)
-  ctrl+r   Search history       ctrl+t                 Open transcript
-  esc esc  Edit last message    f3                     Find text
-                                pgup / pgdn            Scroll
-                                ctrl+space             Start selection
-                                ctrl+home / ctrl+end   Top / latest
-                                shift+⌥+, / shift+⌥+.  Top / latest
+  /        Commands             tab      Send message
+  @        Mention files        ⌥,       Less reasoning
+  !        Shell command        ⌥.       More reasoning
+  ⌃j       New line             ⌥← / ⌥→  Subagents (empty prompt)
+  ⌃v       Paste image          f4       Inspect activity
+  ⌃g       External editor      ⌃c       Quit
+  ⌃r       Search history
+  esc esc  Edit last message    Transcript (open first)
+                                ⌃t            Open transcript
+                                f3            Find text
+                                pgup / pgdn   Scroll
+                                ⌃space        Start selection
+                                ⌃home / ⌃end  Top / latest
+                                ⇧⌥, / ⇧⌥.     Top / latest
 
   /keymap customize
 

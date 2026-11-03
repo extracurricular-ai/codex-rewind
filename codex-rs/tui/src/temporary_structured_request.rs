@@ -2,7 +2,6 @@
 
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
-use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigReadResponse;
@@ -10,7 +9,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -48,6 +47,7 @@ pub(crate) struct TemporaryStructuredThreadOptions {
 ///
 /// Structured prompts can contain untrusted transcript text, so the effective app-server config is
 /// read first and every MCP server is explicitly disabled alongside built-in and extension tools.
+/// Approval policy is inherited from the server; the TUI rejects unexpected interaction requests.
 pub(crate) async fn start_temporary_thread(
     request_handle: &AppServerRequestHandle,
     options: TemporaryStructuredThreadOptions,
@@ -88,7 +88,7 @@ pub(crate) async fn start_temporary_thread(
         ("features.tool_suggest".to_string(), false.into()),
         ("features.unified_exec".to_string(), false.into()),
         ("features.view_image".to_string(), false.into()),
-        ("orchestrator.skills.enabled".to_string(), false.into()),
+        ("cloud.skills.enabled".to_string(), false.into()),
         ("skills.include_instructions".to_string(), false.into()),
         (
             "tools.experimental_request_user_input.enabled".to_string(),
@@ -143,7 +143,6 @@ pub(crate) async fn start_temporary_thread(
                     model: Some(model),
                     model_provider: Some(model_provider),
                     cwd: Some(cwd),
-                    approval_policy: Some(AskForApproval::Never),
                     sandbox: custom_permission_profile
                         .is_none()
                         .then_some(SandboxMode::ReadOnly),
@@ -217,7 +216,7 @@ pub(crate) async fn collect_structured_response(
     while let Some(notification) = notifications.recv().await {
         match notification {
             ServerNotification::ItemCompleted(completed) if completed.turn_id == turn_id => {
-                if let ThreadItem::AgentMessage { text, .. } = completed.item {
+                if let ThreadItemPayload::AgentMessage { text, .. } = completed.item.payload {
                     if text.len() > STRUCTURED_RESPONSE_MAX_BYTES {
                         return Err(eyre!(
                             "temporary structured response exceeds {STRUCTURED_RESPONSE_MAX_BYTES} bytes"

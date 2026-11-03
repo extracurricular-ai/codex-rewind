@@ -190,6 +190,17 @@ fn allows_shared_prefixes_with_distinct_completions() {
 }
 
 #[test]
+fn allows_super_modified_character_prefixes_and_leaders() {
+    let mut config = TuiKeymap::default();
+    config.global.leader = Some(binding("super-k"));
+    config.global.open_transcript = Some(binding("leader super-t"));
+    config.global.copy = Some(binding("super-o super-c"));
+
+    RuntimeKeymap::from_config(&config)
+        .expect("Super-modified characters do not intercept ordinary text input");
+}
+
+#[test]
 fn allows_plain_prefixes_in_vim_and_repeated_chords_in_all_contexts() {
     let mut config = TuiKeymap::default();
     config.vim_normal.move_line_start = Some(binding("g g"));
@@ -551,7 +562,7 @@ fn activity_context_preserves_list_chords_and_its_remapped_focus_toggle() {
     assert_eq!(
         matcher.pending_hint_items(&runtime.chords, /*width*/ 80),
         Some(vec![
-            ("ctrl+x".to_string(), "then".to_string()),
+            ("⌃x".to_string(), "then".to_string()),
             ("c".to_string(), "jump top".to_string()),
             ("esc".to_string(), "cancel".to_string()),
         ]),
@@ -580,7 +591,7 @@ fn pending_hint_skips_whole_oversized_configured_completions() {
         KeymapContextSet::new(KeymapContext::Global),
     );
     let mut scenes = Vec::new();
-    for width in [80, 32, 12] {
+    for width in [80, 32, 10] {
         let hints = matcher.pending_hint_items(&runtime.chords, width).unwrap();
         let line = crate::bottom_pane::footer_hint_items_line(&hints);
         assert!(line.width() <= usize::from(width));
@@ -589,9 +600,9 @@ fn pending_hint_skips_whole_oversized_configured_completions() {
     assert_eq!(
         scenes,
         [
-            "80: ctrl+x then · shift+⌥+f11 activity · ctrl+shift+⌥+f12 copy · esc cancel",
-            "32: shift+⌥+f11 inspect · esc cancel",
-            "12: esc cancel",
+            "80: ⌃x then · ⇧⌥f11 activity · ⌃⇧⌥f12 copy · esc cancel",
+            "32: ⇧⌥f11 inspect · ⌃⇧⌥f12 copy",
+            "10: esc cancel",
         ]
     );
 }
@@ -611,7 +622,7 @@ fn warning_context_keeps_local_chords_ahead_of_copy_and_hides_unreachable_hints(
     assert_eq!(
         matcher.pending_hint_items(&runtime.chords, /*width*/ 80),
         Some(vec![
-            ("ctrl+x".into(), "then".into()),
+            ("⌃x".into(), "then".into()),
             ("c".into(), "jump bottom".into()),
             ("esc".into(), "cancel".into()),
         ])

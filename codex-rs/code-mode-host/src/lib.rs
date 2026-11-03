@@ -29,6 +29,7 @@ use codex_code_mode_protocol::host::SESSION_RESOURCE_LIMITS_CAPABILITY;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
 use codex_code_mode_protocol::host::WireWaitOutcome;
+use codex_code_mode_protocol::host::YIELD_OBSERVATION_CAPABILITY;
 use codex_code_mode_runtime::InProcessCodeModeSession;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -43,12 +44,16 @@ use self::delegate::RemoteDelegate;
 use self::peer::HostPeer;
 
 pub use self::grpc::GrpcCodeModeHost;
+pub use self::process_metrics::CodeModeProcessMetricsCollector;
 pub use self::transport::DEFAULT_LISTEN_URL;
+pub use codex_code_mode_protocol::CodeModeProcessMetrics;
 
 mod delegate;
 mod grpc;
+mod grpc_stdio;
 mod grpc_transport;
 mod peer;
+mod process_metrics;
 mod transport;
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 256;
@@ -93,7 +98,20 @@ impl HostLimits {
     fields(otel.name = "code_mode_host.run_main")
 )]
 pub async fn run_main(listen_url: &str) -> Result<()> {
-    transport::run_transport(listen_url).await
+    transport::run_transport(listen_url, GrpcCodeModeHost::new()).await
+}
+
+/// Runs with an optional gRPC metrics collector initialized before sandbox entry.
+/// The legacy stdio transport remains unchanged.
+pub async fn run_main_with_process_metrics(
+    listen_url: &str,
+    collector: CodeModeProcessMetricsCollector,
+) -> Result<()> {
+    transport::run_transport(
+        listen_url,
+        GrpcCodeModeHost::with_process_metrics(collector),
+    )
+    .await
 }
 
 /// Runs one code-mode host connection over the process standard streams.
@@ -162,6 +180,9 @@ where
                 }
                 ClientToHost::CancelRequest { id } => {
                     state.cancel_request(id);
+                }
+                ClientToHost::YieldRequest { id } => {
+                    state.yield_request(id);
                 }
                 ClientToHost::DelegateResponse { id, result } => {
                     peer.complete(id, result.into_result()).await;
@@ -253,15 +274,20 @@ async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         return Ok(NegotiatedConnection::Rejected);
     }
 
-    let resource_limits_capability = Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY)?;
-    let resource_limits_requested = client_hello
-        .required_capabilities()
-        .contains(&resource_limits_capability)
-        || client_hello
-            .optional_capabilities()
-            .contains(&resource_limits_capability);
-    let host_capabilities =
-        CapabilitySet::try_new(resource_limits_requested.then_some(resource_limits_capability))?;
+    let host_capabilities = CapabilitySet::try_new(
+        [
+            SESSION_RESOURCE_LIMITS_CAPABILITY,
+            YIELD_OBSERVATION_CAPABILITY,
+        ]
+        .into_iter()
+        .map(Capability::new)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|capability| {
+            client_hello.required_capabilities().contains(capability)
+                || client_hello.optional_capabilities().contains(capability)
+        }),
+    )?;
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
@@ -305,7 +331,7 @@ impl HostState {
         // Include host admission and scheduling before the runtime observes the request.
         let received_at = Instant::now();
         let request_kind = RequestKind::from(&request);
-        let cancellation = self
+        let (cancellation, yield_signal) = self
             .requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -322,7 +348,7 @@ impl HostState {
         let request_task = self.request_tasks.spawn(async move {
             let _permit = permit;
             state
-                .handle_request(request_id, request, cancellation, received_at)
+                .handle_request(request_id, request, cancellation, yield_signal, received_at)
                 .await;
             state.finish_request(request_id);
         });
@@ -355,6 +381,7 @@ impl HostState {
         request_id: RequestId,
         request: HostRequest,
         cancellation: CancellationToken,
+        yield_signal: CancellationToken,
         received_at: Instant,
     ) {
         if let HostRequest::Execute { request, .. } = &request {
@@ -371,6 +398,7 @@ impl HostState {
             HostRequest::OpenSession {
                 session_id,
                 cell_execution_limits,
+                ..
             } => {
                 let result = CodeModeSessionCellExecutionLimits::try_from(
                     cell_execution_limits.unwrap_or_default(),
@@ -416,7 +444,7 @@ impl HostState {
                     session_id.clone(),
                     Arc::clone(&self.peer),
                 ));
-                let result = session.execute(request, delegate).await;
+                let result = session.execute(request, delegate, Some(yield_signal)).await;
                 match result {
                     Ok(started) => {
                         let cell_id = started.cell_id.clone();
@@ -441,6 +469,7 @@ impl HostState {
             HostRequest::Wait {
                 session_id,
                 request,
+                ..
             } => {
                 let result = match self.session(&session_id) {
                     Ok(session) => {
@@ -449,7 +478,7 @@ impl HostState {
                             _ = cancellation.cancelled() => {
                                 Err("code-mode request cancelled".to_string())
                             }
-                            result = session.wait(request.into()) => result.and_then(|outcome| {
+                            result = session.wait(request.into(), Some(yield_signal)) => result.and_then(|outcome| {
                                 let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
                                 Ok(HostResponse::WaitCompleted {
                                     outcome: WireWaitOutcome::try_from(outcome)
@@ -465,15 +494,20 @@ impl HostState {
             HostRequest::Terminate {
                 session_id,
                 cell_id,
+                ..
             } => {
                 let result = match self.session(&session_id) {
-                    Ok(session) => session.terminate(cell_id.into()).await.and_then(|outcome| {
-                        let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
-                        Ok(HostResponse::WaitCompleted {
-                            outcome: WireWaitOutcome::try_from(outcome)
-                                .map_err(|error| error.to_string())?,
-                        })
-                    }),
+                    Ok(session) => session
+                        .terminate(codex_code_mode_protocol::CellId::from(cell_id).into())
+                        .await
+                        .and_then(|outcome| {
+                            let outcome =
+                                outcome.with_code_mode_host_duration(received_at.elapsed());
+                            Ok(HostResponse::WaitCompleted {
+                                outcome: WireWaitOutcome::try_from(outcome)
+                                    .map_err(|error| error.to_string())?,
+                            })
+                        }),
                     Err(err) => Err(err),
                 };
                 self.respond(request_id, result);
@@ -557,6 +591,13 @@ impl HostState {
             .cancel(request_id);
     }
 
+    fn yield_request(&self, request_id: RequestId) {
+        self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .yield_observation(request_id);
+    }
+
     fn finish_request(&self, request_id: RequestId) {
         self.requests
             .lock()
@@ -623,6 +664,7 @@ impl RequestKind {
 struct ActiveRequest {
     kind: RequestKind,
     cancellation: CancellationToken,
+    yield_signal: CancellationToken,
 }
 
 #[derive(Default)]
@@ -637,19 +679,21 @@ impl RequestRegistry {
         &mut self,
         request_id: RequestId,
         kind: RequestKind,
-    ) -> Result<CancellationToken, anyhow::Error> {
+    ) -> Result<(CancellationToken, CancellationToken), anyhow::Error> {
         if self.active.contains_key(&request_id) || self.recent.contains(&request_id) {
             anyhow::bail!("duplicate code-mode request ID {request_id:?}");
         }
         let cancellation = CancellationToken::new();
+        let yield_signal = CancellationToken::new();
         self.active.insert(
             request_id,
             ActiveRequest {
                 kind,
                 cancellation: cancellation.clone(),
+                yield_signal: yield_signal.clone(),
             },
         );
-        Ok(cancellation)
+        Ok((cancellation, yield_signal))
     }
 
     fn cancel(&mut self, request_id: RequestId) {
@@ -657,6 +701,14 @@ impl RequestRegistry {
             && request.kind.is_cancellable()
         {
             request.cancellation.cancel();
+        }
+    }
+
+    fn yield_observation(&self, request_id: RequestId) {
+        if let Some(request) = self.active.get(&request_id)
+            && matches!(request.kind, RequestKind::Execute | RequestKind::Wait)
+        {
+            request.yield_signal.cancel();
         }
     }
 

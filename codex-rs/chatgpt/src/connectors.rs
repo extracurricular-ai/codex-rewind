@@ -90,7 +90,7 @@ pub async fn list_cached_all_connectors(
     let cache_context = connector_directory_cache_context(config, &auth);
     let connectors = codex_connectors::cached_directory_connectors(&cache_context)?;
     Some(merge_directory_and_plugin_connectors(
-        connectors,
+        connectors.to_vec(),
         plugin_apps,
     ))
 }
@@ -134,6 +134,8 @@ pub struct ConnectorMetadataReadResult {
 ///
 /// The store is created before awaiting the backend request, so a response that arrives after an
 /// account or backend change can only commit to the scope under which it was requested.
+/// Capture `auth` and `config.application_network_policy` together using
+/// `AuthManager::auth_with_http_client_factory` so the request retains that account's policy.
 pub async fn read_connector_metadata(
     config: &Config,
     auth: &CodexAuth,

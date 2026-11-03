@@ -100,7 +100,7 @@ impl CustomPromptView {
         };
         let hint = Line::from(vec![
             key_hint::plain(KeyCode::Enter).into(),
-            " submit · ".dim(),
+            format!(" {} · ", self.submit_label).dim(),
             key_hint::plain(KeyCode::Esc).into(),
             cancel_label.dim(),
         ]);

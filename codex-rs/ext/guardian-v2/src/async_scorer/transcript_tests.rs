@@ -3,6 +3,7 @@ use codex_extension_api::ConversationHistorySnapshot;
 use codex_extension_api::ResponseItem;
 use codex_guardian_context::ContextTarget;
 use codex_protocol::AgentPath;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -24,6 +25,19 @@ use super::MAX_TOOL_TRANSCRIPT_TOKENS;
 use super::TranscriptConfig;
 use super::TranscriptSource;
 
+// Existing rendering tests exercise the same fresh-conversation preparation and
+// delivery filtering as the classifier, without retaining the snapshot formatter.
+impl super::TranscriptConfig {
+    fn build_context(
+        &self,
+        input: ContextInput<'_>,
+    ) -> Result<codex_guardian_context::ComposedContext, codex_guardian_context::SectionError> {
+        let (mut context, _) = self.collect_context(input)?.compose(/*cursor*/ None, &[])?;
+        context.retain_new_instructions(&[]);
+        Ok(context)
+    }
+}
+
 struct TestConversationHistory<'a>(&'a [ResponseItem]);
 
 impl ConversationHistorySnapshot for TestConversationHistory<'_> {
@@ -42,9 +56,15 @@ impl ConversationHistorySnapshot for TestConversationHistory<'_> {
 
 fn assistant_message(text: impl Into<String>, phase: MessagePhase) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText { text: text.into() }],
+        content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
+            text: text.into(),
+        }],
         phase: Some(phase),
         internal_chat_message_metadata_passthrough: None,
     }
@@ -54,6 +74,8 @@ fn assistant_message(text: impl Into<String>, phase: MessagePhase) -> ResponseIt
 fn transcript_keeps_conversation_and_configured_sources() {
     let items = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -63,6 +85,8 @@ fn transcript_keeps_conversation_and_configured_sources() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "exec_command".to_string(),
             namespace: None,
@@ -91,6 +115,8 @@ fn transcript_keeps_conversation_and_configured_sources() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_string(),
             content: Vec::new(),
@@ -101,6 +127,7 @@ fn transcript_keeps_conversation_and_configured_sources() {
 
     let transcript = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -128,6 +155,7 @@ fn transcript_keeps_conversation_and_configured_sources() {
     let answers = ["assistant: Publish?\nuser: No.\n".to_string()];
     let context = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &root,
@@ -154,6 +182,8 @@ fn transcript_keeps_conversation_and_configured_sources() {
     assert_eq!(
         context.into_messages(),
         vec![ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
             id: None,
             role: "user".to_string(),
             content: expected_text
@@ -172,6 +202,7 @@ fn transcript_keeps_conversation_and_configured_sources() {
 
     let transcript = output_and_reasoning
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -200,6 +231,7 @@ fn transcript_keeps_conversation_and_configured_sources() {
 
     let transcript = calls_only
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -237,6 +269,7 @@ fn transcript_truncates_oversized_assistant_entries_without_splitting_characters
 
     let mut rendered = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -303,6 +336,7 @@ fn transcript_preserves_user_restrictions_before_final_assistant_messages() {
         ..TranscriptConfig::default()
     }
     .build_context(ContextInput {
+        permissions: None,
         target: ContextTarget::Async,
         history: &TestConversationHistory(&items),
         root_conversation: &[],
@@ -329,6 +363,8 @@ fn transcript_preserves_recent_tool_evidence_when_protected_messages_fill_entry_
         assistant_message(format!("final answer {index}"), MessagePhase::FinalAnswer)
     }));
     items.push(ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "exec_command".to_string(),
         namespace: None,
@@ -343,6 +379,7 @@ fn transcript_preserves_recent_tool_evidence_when_protected_messages_fill_entry_
         ..TranscriptConfig::default()
     }
     .build_context(ContextInput {
+        permissions: None,
         target: ContextTarget::Async,
         history: &TestConversationHistory(&items),
         root_conversation: &[],
@@ -383,6 +420,8 @@ fn transcript_reserves_five_recent_tool_entries_from_protected_messages() {
     for index in 0..3 {
         let call_id = format!("call-{index}");
         items.push(ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "exec_command".to_string(),
             namespace: None,
@@ -409,6 +448,7 @@ fn transcript_reserves_five_recent_tool_entries_from_protected_messages() {
 
     let transcript = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -465,6 +505,7 @@ fn rejected_commentary_does_not_evict_retained_message_evidence() {
         ..TranscriptConfig::default()
     }
     .build_context(ContextInput {
+        permissions: None,
         target: ContextTarget::Async,
         history: &TestConversationHistory(&items),
         root_conversation: &[],
@@ -506,6 +547,7 @@ fn transcript_evicts_protected_messages_in_cacheable_chunks() {
             }));
             config
                 .build_context(ContextInput {
+                    permissions: None,
                     target: ContextTarget::Async,
                     history: &TestConversationHistory(&items),
                     root_conversation: &[],
@@ -563,6 +605,8 @@ fn transcript_preserves_latest_final_when_reserved_tools_fill_entry_window() {
         user_message_item("Yes."),
     ];
     items.extend((0..3).map(|index| ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "exec_command".to_string(),
         namespace: None,
@@ -577,6 +621,7 @@ fn transcript_preserves_latest_final_when_reserved_tools_fill_entry_window() {
         ..TranscriptConfig::default()
     }
     .build_context(ContextInput {
+        permissions: None,
         target: ContextTarget::Async,
         history: &TestConversationHistory(&items),
         root_conversation: &[],
@@ -616,9 +661,13 @@ fn transcript_does_not_protect_legacy_inter_agent_instructions() {
     );
     let items = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: serde_json::to_string(&communication)
                     .expect("legacy inter-agent communication should serialize"),
             }],
@@ -626,15 +675,21 @@ fn transcript_does_not_protect_legacy_inter_agent_instructions() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "I found a $450 flight. Should I book it?".to_string(),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "exec_command".to_string(),
             namespace: None,
@@ -650,6 +705,7 @@ fn transcript_does_not_protect_legacy_inter_agent_instructions() {
         ..TranscriptConfig::default()
     }
     .build_context(ContextInput {
+        permissions: None,
         target: ContextTarget::Async,
         history: &TestConversationHistory(&items),
         root_conversation: &[],
@@ -676,6 +732,8 @@ fn transcript_does_not_protect_legacy_inter_agent_instructions() {
 fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
     let mut items = (0..8)
         .map(|index| ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -686,6 +744,8 @@ fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
         })
         .collect::<Vec<_>>();
     items.extend((0..12).map(|index| ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "exec_command".to_string(),
         namespace: None,
@@ -697,6 +757,7 @@ fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
 
     let transcript = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -749,6 +810,8 @@ fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
         .expect("at least one tool entry should be retained")
         .to_string();
     items.push(ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "exec_command".to_string(),
         namespace: None,
@@ -759,6 +822,7 @@ fn transcript_reserves_separate_budget_for_recent_tool_evidence() {
     });
     let next_transcript = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -801,13 +865,21 @@ fn transcript_preserves_newest_manual_approval_when_message_budget_overflows() {
         .max(TruncationPolicy::Bytes(approval_entry.len()).token_budget());
     let items = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText { text: older_text }],
+            content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
+                text: older_text,
+            }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -823,6 +895,7 @@ fn transcript_preserves_newest_manual_approval_when_message_budget_overflows() {
         ..TranscriptConfig::default()
     }
     .build_context(ContextInput {
+        permissions: None,
         target: ContextTarget::Async,
         history: &TestConversationHistory(&items),
         root_conversation: &[],
@@ -844,6 +917,8 @@ fn rejected_message_does_not_evict_retained_tool_entries() {
     let user_text = "Inspect the workspace.";
     let user_entry = format!("[1] user: {user_text}\n");
     let mut items = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -853,6 +928,8 @@ fn rejected_message_does_not_evict_retained_tool_entries() {
         internal_chat_message_metadata_passthrough: None,
     }];
     items.extend((0..40).map(|index| ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "exec_command".to_string(),
         namespace: None,
@@ -862,9 +939,13 @@ fn rejected_message_does_not_evict_retained_tool_entries() {
         internal_chat_message_metadata_passthrough: None,
     }));
     items.push(ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "This message has no remaining budget.".to_string(),
         }],
         phase: None,
@@ -883,6 +964,7 @@ fn rejected_message_does_not_evict_retained_tool_entries() {
         ..TranscriptConfig::default()
     }
     .build_context(ContextInput {
+        permissions: None,
         target: ContextTarget::Async,
         history: &TestConversationHistory(&items),
         root_conversation: &[],
@@ -907,6 +989,8 @@ fn transcript_evicts_non_user_entries_in_cacheable_chunks() {
     };
     let build_transcript = |tool_call_count| {
         let mut items = vec![ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -917,6 +1001,8 @@ fn transcript_evicts_non_user_entries_in_cacheable_chunks() {
         }];
         items.extend(
             (0..tool_call_count).map(|index| ResponseItem::FunctionCall {
+                status: None,
+                encrypted_content: None,
                 id: None,
                 name: "exec_command".to_string(),
                 namespace: None,
@@ -928,6 +1014,7 @@ fn transcript_evicts_non_user_entries_in_cacheable_chunks() {
         );
         config
             .build_context(ContextInput {
+                permissions: None,
                 target: ContextTarget::Async,
                 history: &TestConversationHistory(&items),
                 root_conversation: &[],
@@ -981,6 +1068,8 @@ fn transcript_truncates_tool_results_using_standard_budget() {
     let output = format!("first {} last", "evidence ".repeat(5_000));
     let items = vec![
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "node_repl__run".to_owned(),
             namespace: None,
@@ -1001,6 +1090,7 @@ fn transcript_truncates_tool_results_using_standard_budget() {
 
     let transcript = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -1037,6 +1127,8 @@ fn configured_reasoning_counts_against_message_budget() {
                 let text = format!("user turn {index}: {}", "authorization ".repeat(repeats));
                 expected.push(format!("[{}] user: {text}\n", index + 1));
                 ResponseItem::Message {
+                    status: None,
+                    encrypted_content: None,
                     id: None,
                     role: "user".to_string(),
                     content: vec![ContentItem::InputText { text }],
@@ -1062,6 +1154,7 @@ fn configured_reasoning_counts_against_message_budget() {
             ..TranscriptConfig::default()
         }
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -1084,6 +1177,8 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
         "A".repeat(TruncationPolicy::Tokens(MAX_MESSAGE_TRANSCRIPT_TOKENS).byte_budget() + 1);
     let items = vec![
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -1125,6 +1220,7 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::ImageGenerationCall {
+            encrypted_content: None,
             id: None,
             status: "completed".to_string(),
             revised_prompt: Some("A screenshot.".to_string()),
@@ -1132,6 +1228,7 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::ToolSearchCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("search-1".to_string()),
             status: Some("completed".to_string()),
@@ -1151,6 +1248,7 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
 
     let transcript = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -1173,8 +1271,8 @@ fn transcript_omits_media_payloads_and_keeps_readable_content() {
 }
 
 #[test]
-fn transcript_omits_encrypted_messages_arguments_and_tool_outputs() {
-    let items = vec![
+fn transcript_preserves_encrypted_agent_messages_and_omits_other_encrypted_fields() {
+    let mut items = vec![
         ResponseItem::AgentMessage {
             id: None,
             author: "worker".to_string(),
@@ -1194,6 +1292,8 @@ fn transcript_omits_encrypted_messages_arguments_and_tool_outputs() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "exec_command".to_string(),
             namespace: None,
@@ -1217,9 +1317,13 @@ fn transcript_omits_encrypted_messages_arguments_and_tool_outputs() {
             internal_chat_message_metadata_passthrough: None,
         },
     ];
+    let mut native = items[0].clone();
+    native.set_id(Some(ResponseItemId::from_server("amsg_parent".to_owned())));
+    items.extend([native.clone(), native.clone()]);
 
-    let transcript = TranscriptConfig::default()
+    let context = TranscriptConfig::default()
         .build_context(ContextInput {
+            permissions: None,
             target: ContextTarget::Async,
             history: &TestConversationHistory(&items),
             root_conversation: &[],
@@ -1231,14 +1335,30 @@ fn transcript_omits_encrypted_messages_arguments_and_tool_outputs() {
             node_repl_images: None,
         })
         .expect("collect transcript")
-        .transcript_entries();
+        .into_messages();
     assert_eq!(
-        transcript,
-        vec![
-            "[1] assistant: Agent message from worker:\nThe workspace is ready.\n",
-            "[2] tool exec_command call: {}\n",
-            "[3] tool exec_command result: Command completed.\n",
-        ]
+        context
+            .iter()
+            .filter(|item| matches!(item, ResponseItem::AgentMessage { .. }))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![items[0].clone(), native]
+    );
+    let text = context
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => Some(content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|content| match content {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        text,
+        ">>> TRANSCRIPT START\n[2] assistant: Agent message from worker:\nThe workspace is ready.\n[3] tool exec_command call: {}\n[4] tool exec_command result: Command completed.\n>>> TRANSCRIPT END\n\n"
     );
 }
 
@@ -1247,7 +1367,7 @@ trait TranscriptEntries {
     fn transcript_entries(self) -> Vec<String>;
 }
 
-impl TranscriptEntries for super::RenderedContext {
+impl TranscriptEntries for codex_guardian_context::ComposedContext {
     fn transcript_entries(self) -> Vec<String> {
         let messages = self.into_messages();
         let [ResponseItem::Message { role, content, .. }] = messages.as_slice() else {

@@ -1,4 +1,4 @@
-//! Disconnects preserve editable input but never automatically retry queued submissions.
+//! Disconnects preserve input and reconcile confirmed submissions before resuming unsent queues.
 //! Unavailable threads retain uncertain prompts in recovered queues before clearing activity.
 
 use super::realtime::RealtimeConversationPhase;
@@ -6,53 +6,87 @@ use super::*;
 use crate::bottom_pane::RestrictedInputMode;
 
 impl ChatWidget {
-    pub(crate) fn pause_for_disconnect(&mut self) {
-        self.cancel_startup_submission();
-        self.cancel_image_submission();
-        // The app-server transport can fail while the separate WebRTC helper
-        // still sends microphone audio. Retire local media before showing offline UI.
+    pub(crate) fn record_realtime_disconnect_failure(&mut self) {
         if matches!(
             self.realtime_conversation.phase,
             RealtimeConversationPhase::Starting | RealtimeConversationPhase::Active
         ) || self.realtime_retry_cleanup_pending()
         {
-            self.record_realtime_failure();
+            self.record_realtime_failure(RealtimeFailureCause::AppServerDisconnect);
         }
+    }
+
+    pub(crate) fn pause_for_disconnect(&mut self) {
+        self.pause_for_disconnect_inner(/*preserve_startup_input*/ false);
+    }
+
+    pub(crate) fn pause_for_rejected_startup(&mut self) {
+        self.pause_for_disconnect_inner(/*preserve_startup_input*/ true);
+    }
+
+    fn pause_for_disconnect_inner(&mut self, preserve_startup_input: bool) {
+        self.permission_discovery = None;
+        self.invalidate_permission_discovery();
+        if !preserve_startup_input {
+            self.cancel_startup_submission();
+        }
+        self.cancel_image_submission();
+        // The app-server transport can fail while the separate WebRTC helper
+        // still sends microphone audio. Retire local media before showing offline UI.
+        self.record_realtime_disconnect_failure();
         let _ = self.reset_realtime_conversation();
         if let Some(questions) = &mut self.bottom_pane.questions {
             questions.delivery_enabled = false;
         }
-        self.input_queue.recovered_queue = true;
         self.input_queue.suppress_queue_autosend = true;
-        self.set_initial_user_message_submit_suppressed(/*suppressed*/ true);
-        if let Some(message) = self.initial_user_message.take() {
-            self.restore_user_message_to_composer(message);
+        if !preserve_startup_input {
+            self.set_initial_user_message_submit_suppressed(/*suppressed*/ true);
+            if let Some(message) = self.initial_user_message.take() {
+                self.restore_user_message_to_composer(message);
+            }
         }
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane
             .set_interrupt_hint_visible(/*visible*/ false);
-        self.set_status_header("Reconnecting to app-server…".to_string());
-        self.set_footer_hint_override(Some(vec![("ctrl+c".into(), "quit".into())]));
-        self.add_error_message("Connection lost. Attempting to reconnect…".into());
+        self.set_status_header("Reconnecting to server…".to_string());
+        self.set_footer_hint_override(Some(vec![(
+            crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
+            "quit".into(),
+        )]));
     }
 
     /// Restore local input only after replay, which can otherwise move interrupted queues into the draft.
-    pub(crate) fn restore_reconnected_input(&mut self, input: Option<ThreadInputState>) {
+    pub(crate) fn restore_reconnected_input(
+        &mut self,
+        input: Option<ThreadInputState>,
+        confirmed_message_ids: &[String],
+    ) {
         let running = self.turn_lifecycle.agent_turn_running;
+        let reconnect_pending = input.as_ref().is_some_and(|input| input.reconnect_pending);
         if let Some(mut input) = input {
-            // Its acceptance is unknown. Keep a local copy for manual recovery without
-            // comparing against partial history or automatically submitting it again.
+            // Navigation can continue an unresolved recovery while new steers are in flight.
+            input.reconnect_pending |= input.has_unconfirmed_messages();
+            // Pending compact/review requests have no message receipt to reconcile.
+            input.recovered_queue |=
+                input.user_turn_pending_start && input.safety_buffering_prompt.is_none();
+            // Only an exact submission ID confirms receipt; missing or legacy history
+            // must never cause us to retry an already submitted message automatically.
             if input.user_turn_pending_start
                 && let Some(prompt) = input.safety_buffering_prompt.take()
             {
                 input.queued_user_messages.push_front(QueuedUserMessage {
                     source: input.safety_buffering_source,
+                    delivery: if input.reconnect_pending {
+                        MessageDelivery::Unconfirmed(input.pending_user_message_client_id.take())
+                    } else {
+                        MessageDelivery::Unsent
+                    },
                     ..QueuedUserMessage::from(prompt)
                 });
                 input
                     .queued_user_message_history_records
                     .push_front(UserMessageHistoryRecord::UserMessageText);
-                input.recovered_queue = true;
+                input.recovered_queue |= !input.reconnect_pending;
             }
             input.current_collaboration_mode = self.current_collaboration_mode.clone();
             // Keep the local selection for older servers. Replay reapplies a supplied mode.
@@ -67,8 +101,45 @@ impl ChatWidget {
                 },
             );
         }
+        if reconnect_pending || self.input_queue.has_unconfirmed_messages() {
+            self.reconcile_recovered_messages(confirmed_message_ids);
+        }
+        if reconnect_pending
+            && let Some(message) = self
+                .input_queue
+                .queued_user_messages
+                .iter()
+                .find(|message| matches!(message.delivery, MessageDelivery::Unconfirmed(_)))
+        {
+            let preview = user_message_preview_text(message, /*history_record*/ None);
+            let preview = if preview.trim().is_empty() {
+                "message with attachments".into()
+            } else {
+                crate::text_formatting::truncate_text(&preview, /*max_graphemes*/ 80)
+            };
+            let notice =
+                format!("Couldn't confirm whether “{preview}” was sent. It hasn't been resent.");
+            self.add_info_message(notice, /*hint*/ None);
+        }
         self.turn_lifecycle.restore_running(running, Instant::now());
         self.update_task_running_state();
+    }
+
+    pub(super) fn reconcile_recovered_messages(&mut self, confirmed_message_ids: &[String]) {
+        let mut index = 0;
+        self.input_queue.queued_user_messages.retain(|message| {
+            let confirmed = matches!(&message.delivery,
+                MessageDelivery::Unconfirmed(Some(id)) if confirmed_message_ids.contains(id));
+            if confirmed {
+                self.input_queue
+                    .queued_user_message_history_records
+                    .remove(index);
+            } else {
+                index += 1;
+            }
+            !confirmed
+        });
+        self.refresh_pending_input_preview();
     }
 
     pub(crate) fn pause_unavailable_thread(&mut self) {
@@ -87,6 +158,9 @@ impl ChatWidget {
                 .queued_user_messages
                 .push_front(QueuedUserMessage {
                     source: self.safety_buffering_source,
+                    delivery: MessageDelivery::Unconfirmed(
+                        self.input_queue.pending_user_message_client_id.clone(),
+                    ),
                     ..QueuedUserMessage::from(prompt)
                 });
             self.input_queue
@@ -99,12 +173,59 @@ impl ChatWidget {
         self.refresh_pending_input_preview();
     }
 
-    pub(crate) fn handle_disconnected_view_key(&mut self, key: KeyEvent) {
-        self.bottom_pane.handle_key_event(key);
+    pub(crate) fn handle_disconnected_view_key(
+        &mut self,
+        key: KeyEvent,
+        activation_key: Option<crate::key_hint::KeyBinding>,
+    ) {
+        if crate::key_hint::ctrl(KeyCode::Char('c')).is_press(key) {
+            let _ = self.cancel_active_disconnected_view();
+        } else {
+            self.bottom_pane
+                .handle_key_event_with_activation_key(key, activation_key);
+        }
+    }
+
+    pub(crate) fn active_view_accepts_input_when_disconnected(&self) -> bool {
+        self.bottom_pane
+            .active_view_accepts_input_when_disconnected()
+    }
+
+    pub(crate) fn cancel_active_disconnected_view(&mut self) -> bool {
+        let had_view = self.active_view_accepts_input_when_disconnected();
+        if had_view {
+            self.revert_terminal_title_setup_preview();
+            let _ = self.bottom_pane.on_ctrl_c();
+        }
+        had_view
+    }
+
+    pub(crate) fn active_view_is(&self, view_id: &'static str) -> bool {
+        self.bottom_pane.active_view_id() == Some(view_id)
     }
 
     pub(crate) fn handle_restricted_key(&mut self, key: KeyEvent, mode: RestrictedInputMode) {
         if self.external_writer_view {
+            return;
+        }
+        let startup_key_handled = self.input_queue.startup_submission.is_some()
+            && !self.startup_submission_has_protected_input()
+            && (key.code == KeyCode::Null || self.handle_startup_submission_key(key));
+        if mode == RestrictedInputMode::Disconnected {
+            self.set_footer_hint_override(Some(vec![(
+                crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
+                "quit".into(),
+            )]));
+        }
+        if startup_key_handled {
+            return;
+        }
+        if self.input_queue.startup_submission.is_some()
+            && !self.startup_submission_has_protected_input()
+        {
+            // Cursor movement must preserve the confirmed draft's paste provenance.
+            let result = self.bottom_pane.handle_key_event(key);
+            self.handle_composer_input_result(result, /*had_modal_or_popup*/ false);
             return;
         }
         if self.handle_question_key(key) {

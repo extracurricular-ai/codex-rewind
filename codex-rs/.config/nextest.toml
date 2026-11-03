@@ -6,14 +6,21 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 retries = 1
 
 [[profile.default.overrides]]
-# This case validates and copies both the initial and replacement debug package.
-filter = 'package(codex-cli) & binary(app_server_daemon) & test(=packaged_daemon_start_and_explicit_replacement)'
-slow-timeout = { period = "1m", terminate-after = 3 }
+# These cases cold-start a daemon before confirming a second launch with new settings.
+filter = 'package(codex-cli) & binary(daemon_startup) & test(requires_confirmation_to_disable_)'
+slow-timeout = { period = "1m", terminate-after = 2 }
 
 [[profile.default.overrides]]
-# These cases copy a full debug CLI package and launch its new executable.
-filter = 'package(codex-cli) & binary(app_server_daemon) & test(packaged_daemon_)'
+# This case validates and copies both the initial and replacement debug package.
+filter = 'package(codex-cli) & binary(=app_server_daemon_package) & test(=packaged_daemon_start_and_explicit_replacement)'
+slow-timeout = { period = "1m", terminate-after = 3 }
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+# These copies must not compete with other tests on the same runner.
+filter = 'package(codex-cli) & binary(=app_server_daemon_package)'
 slow-timeout = { period = "1m", terminate-after = 2 }
+threads-required = "num-test-threads"
 
 [profile.default.junit]
 path = "junit.xml"
@@ -36,6 +43,9 @@ max-threads = 4
 max-threads = 1
 
 [test-groups.windows_sandbox_legacy_sessions]
+max-threads = 1
+
+[test-groups.windows_sandbox_accounts]
 max-threads = 1
 
 [test-groups.windows_process_heavy]
@@ -76,6 +86,17 @@ test-group = 'app_server_integration_local'
 # sensitive to Windows runner process-startup stalls when many cases launch at once.
 filter = 'package(codex-core) & kind(test) & test(apply_patch_cli)'
 test-group = 'core_apply_patch_cli_integration'
+
+[[profile.default.overrides]]
+# These cases share the runner's elevated sandbox accounts. Queue them before
+# starting their timeout; their file lock still coordinates other test processes.
+platform = 'cfg(windows)'
+filter = '''
+    (package(codex-core) & binary(windows_sandbox)) |
+    (package(codex-exec-server) & test(file_system_elevated_relative_read_denial_uses_policy_cwd)) |
+    (package(codex-windows-sandbox) & test(elevated_non_tty_cmd_forwards_env_output_and_exit))
+'''
+test-group = 'windows_sandbox_accounts'
 
 [[profile.default.overrides]]
 # These tests create restricted-token Windows child processes and private desktops.

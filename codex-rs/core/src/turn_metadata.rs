@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +37,7 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::turn_input::ResponsesApiClientMetadataUpdate;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_git_discovery::GitRootDiscovery;
 
@@ -49,6 +49,10 @@ const CODEX_VERSION_KEY: &str = "codex_version";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const USER_INPUT_REQUESTED_DURING_TURN_KEY: &str = "user_input_requested_during_turn";
 const WORKSPACE_KIND_KEY: &str = "workspace_kind";
+
+fn is_targeted_continuation(value: &str) -> bool {
+    serde_json::from_str::<Value>(value).is_ok_and(|value| value.get("review_target").is_some())
+}
 
 /// Captured execution settings shared by Responses and MCP metadata.
 pub(crate) struct ExecutionMetadata<'a> {
@@ -272,9 +276,33 @@ impl TurnMetadataState {
         &self,
         execution: ExecutionMetadata<'_>,
     ) -> Option<serde_json::Value> {
-        let mut responses_metadata = self.mcp_metadata_template();
+        self.current_meta_value_for_tool_request(self.mcp_metadata_template(), execution)
+    }
+
+    pub(crate) fn current_meta_value_for_extension_request(
+        &self,
+        execution: ExecutionMetadata<'_>,
+    ) -> Option<serde_json::Value> {
+        // Native extensions need configured Responses metadata for request attribution,
+        // which the MCP template omits for external servers.
+        self.current_meta_value_for_tool_request(self.responses_metadata_template(), execution)
+    }
+
+    fn current_meta_value_for_tool_request(
+        &self,
+        mut responses_metadata: CodexResponsesMetadata,
+        execution: ExecutionMetadata<'_>,
+    ) -> Option<serde_json::Value> {
+        if responses_metadata
+            .extra
+            .get("misalignment_override")
+            .is_some_and(|value| is_targeted_continuation(value))
+        {
+            // A review target is for Responses admission, not external tools or hooks.
+            responses_metadata.extra.remove("misalignment_override");
+        }
         execution.apply_to(&mut responses_metadata);
-        // Never serialize harness-owned tool inventory for external MCP servers.
+        // Never serialize harness-owned tool inventory for tool requests.
         responses_metadata.tool_namespaces_info = None;
         let Value::Object(mut metadata) = responses_metadata.turn_metadata_value()? else {
             return None;
@@ -306,11 +334,22 @@ impl TurnMetadataState {
         window_id: String,
         request_kind: CodexResponsesRequestKind,
     ) -> CodexResponsesMetadata {
+        let mut metadata = self.responses_metadata_template();
+        if matches!(request_kind, CodexResponsesRequestKind::Compaction(_))
+            && metadata
+                .extra
+                .get("misalignment_override")
+                .is_some_and(|value| is_targeted_continuation(value))
+        {
+            // Target-based intent belongs to the pending turn, not compaction. Preserve the
+            // legacy timestamp path until servers can admit pre-turn compaction separately.
+            metadata.extra.remove("misalignment_override");
+        }
         CodexResponsesMetadata {
             installation_id,
             window_id,
             request_kind: Some(request_kind),
-            ..self.responses_metadata_template()
+            ..metadata
         }
     }
 
@@ -360,26 +399,44 @@ impl TurnMetadataState {
         self.root_turn_id.get().cloned()
     }
 
-    pub(crate) fn set_responsesapi_client_metadata(
+    pub(crate) fn update_responsesapi_client_metadata(
         &self,
-        responsesapi_client_metadata: HashMap<String, String>,
+        update: ResponsesApiClientMetadataUpdate,
     ) {
-        *self
+        let replacement = update.replacement.map(filter_extra_metadata);
+        let patch = update.patch.map(filter_extra_metadata).unwrap_or_default();
+        if replacement.is_none() && patch.is_empty() {
+            return;
+        }
+        let mut current = self
             .responsesapi_client_metadata
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            filter_extra_metadata(responsesapi_client_metadata);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let continuation = current
+            .get("misalignment_override")
+            .filter(|value| is_targeted_continuation(value))
+            .cloned();
+        if let Some(replacement) = replacement {
+            *current = replacement;
+        }
+        current.extend(patch);
+        if let Some(continuation) = continuation {
+            // Steering may update other metadata, but cannot replace the reviewed block.
+            current.insert("misalignment_override".to_string(), continuation);
+        }
     }
 
     pub(crate) fn set_responses_api_metadata(
         &self,
         responses_api_metadata: BTreeMap<String, String>,
     ) {
+        let mut metadata = filter_extra_metadata(responses_api_metadata);
+        // Only explicit per-turn metadata can acknowledge a reviewed block.
+        metadata.remove("misalignment_override");
         *self
             .responses_api_metadata
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            filter_extra_metadata(responses_api_metadata);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = metadata;
     }
 
     pub(crate) fn workspace_kind(&self) -> Option<String> {

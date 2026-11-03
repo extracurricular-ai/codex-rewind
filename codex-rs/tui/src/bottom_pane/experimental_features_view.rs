@@ -1,6 +1,6 @@
 //! Experimental controls with popup-owned discovery and configured enablement.
 //! Failed saves retain intent for explicit retry; cancellation remains available.
-//! Server voice discovery is gated by the client package's native runtime.
+//! Retired stable features stay hidden even if an older server reports them as beta.
 
 use crate::experimental_features::FeatureWriteResult;
 use codex_app_server_protocol::ExperimentalFeature;
@@ -54,7 +54,6 @@ pub(crate) struct ExperimentalFeatureItem {
 
 pub(crate) struct ExperimentalFeaturesView {
     features: Vec<ExperimentalFeatureItem>,
-    voice_supported: bool,
     initial_enabled: Vec<bool>,
     unconfirmed: Vec<String>,
     catalog_rx: Option<oneshot::Receiver<Result<Vec<ExperimentalFeature>, String>>>,
@@ -84,7 +83,6 @@ impl ExperimentalFeaturesView {
             }
             .to_string(),
             thread_id,
-            voice_supported: codex_realtime_webrtc::RealtimeWebrtcSession::is_supported(),
             write_rx: None,
             catalog_rx,
             unconfirmed: Vec::new(),
@@ -161,48 +159,6 @@ impl ExperimentalFeaturesView {
         }
 
         rows
-    }
-
-    fn move_up(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
-            return;
-        }
-        self.state.move_up_wrap(len);
-        self.state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
-    }
-
-    fn move_down(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
-            return;
-        }
-        self.state.move_down_wrap(len);
-        self.state.ensure_visible(len, MAX_POPUP_ROWS.min(len));
-    }
-
-    fn page_up(&mut self) {
-        let len = self.visible_len();
-        let visible = MAX_POPUP_ROWS.min(len);
-        self.state.page_up_clamped(len, visible);
-    }
-
-    fn page_down(&mut self) {
-        let len = self.visible_len();
-        let visible = MAX_POPUP_ROWS.min(len);
-        self.state.page_down_clamped(len, visible);
-    }
-
-    fn jump_top(&mut self) {
-        let len = self.visible_len();
-        let visible = MAX_POPUP_ROWS.min(len);
-        self.state.jump_top(len, visible);
-    }
-
-    fn jump_bottom(&mut self) {
-        let len = self.visible_len();
-        let visible = MAX_POPUP_ROWS.min(len);
-        self.state.jump_bottom(len, visible);
     }
 
     fn toggle_selected(&mut self) {
@@ -326,8 +282,7 @@ impl BottomPaneView for ExperimentalFeaturesView {
                 let mut count = 0;
                 for feature in features {
                     if feature.stage != ExperimentalFeatureStage::Beta
-                        || (feature.name == Feature::RealtimeConversation.key()
-                            && !self.voice_supported)
+                        || matches!(feature.name.as_str(), "worktrees" | "realtime_conversation")
                     {
                         continue;
                     }
@@ -375,13 +330,22 @@ impl BottomPaneView for ExperimentalFeaturesView {
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if let Some(action) = self.keymap.vertical_action_for(key_event) {
+            let len = self.visible_len();
+            if len == 0
+                && matches!(
+                    action,
+                    crate::keymap::ListAction::MoveUp | crate::keymap::ListAction::MoveDown
+                )
+            {
+                return;
+            }
+            self.state
+                .apply_vertical_action(action, len, MAX_POPUP_ROWS.min(len));
+            return;
+        }
+
         match key_event {
-            _ if self.keymap.move_up.is_pressed(key_event) => self.move_up(),
-            _ if self.keymap.move_down.is_pressed(key_event) => self.move_down(),
-            _ if self.keymap.page_up.is_pressed(key_event) => self.page_up(),
-            _ if self.keymap.page_down.is_pressed(key_event) => self.page_down(),
-            _ if self.keymap.jump_top.is_pressed(key_event) => self.jump_top(),
-            _ if self.keymap.jump_bottom.is_pressed(key_event) => self.jump_bottom(),
             KeyEvent {
                 code: KeyCode::Char(' '),
                 modifiers: KeyModifiers::NONE,

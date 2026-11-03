@@ -97,7 +97,7 @@ use crate::pager_overlay::Overlay;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::tui;
 use crate::tui::TuiEvent;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
 use codex_features::Feature;
@@ -132,7 +132,41 @@ pub(crate) struct BacktrackState {
     /// Whether the "file changes will not be restored" hint has been shown;
     /// it is surfaced at most once per session.
     pub(crate) file_restore_hint_shown: bool,
+    /// Consume held-key input after a fresh press acts on transcript select mode.
+    pub(crate) select_exit_key: Option<crate::key_hint::KeyBinding>,
+    /// Preserve the initiating key while a select-and-follow copy is pending.
+    pub(crate) pending_select_exit_key: Option<(u64, crate::key_hint::KeyBinding)>,
     origin: Option<browsing::BrowsingOrigin>,
+}
+
+impl BacktrackState {
+    pub(crate) fn observe_pending_select_exit_key(&mut self, event: KeyEvent) {
+        if event.kind == KeyEventKind::Release
+            && self.pending_select_exit_key.is_some_and(|(_, binding)| {
+                binding.parts() == crate::key_hint::KeyBinding::from_event(event).parts()
+            })
+        {
+            self.pending_select_exit_key = None;
+        }
+    }
+
+    pub(crate) fn finish_pending_select_exit_key(
+        &mut self,
+        completed_id: u64,
+        select_mode_closed: bool,
+    ) -> Option<crate::key_hint::KeyBinding> {
+        match self.pending_select_exit_key {
+            Some((id, key)) if id == completed_id => {
+                self.pending_select_exit_key = None;
+                select_mode_closed.then_some(key)
+            }
+            Some((id, _)) if id < completed_id => {
+                self.pending_select_exit_key = None;
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A user-visible backtrack choice that can be reopened in the current thread.
@@ -316,10 +350,21 @@ impl App {
             return;
         }
         let _ = tui.enter_alt_screen();
-        self.overlay = Some(Overlay::new_transcript(
-            self.transcript_cells.clone(),
-            self.keymap.pager.clone(),
-        ));
+        self.overlay = Some(
+            Overlay::new_transcript(
+                self.transcript_cells.clone(),
+                self.keymap.pager.clone(),
+                self.local_settings
+                    .copy_on_select(&codex_terminal_detection::terminal_info()),
+                self.local_settings
+                    .tui
+                    .mouse_scroll_speed
+                    .unwrap_or(/*default*/ 1.0),
+            )
+            .with_copy_on_select_clear_selection(
+                self.local_settings.tui.copy_on_select_clear_selection,
+            ),
+        );
         if self.scrollback_has_older_history
             && let Some(Overlay::Transcript(overlay)) = self.overlay.as_mut()
         {
@@ -496,6 +541,13 @@ impl App {
     /// source of truth for the active cell and its cache invalidation key, and because `App` owns
     /// overlay lifecycle and frame scheduling for animations.
     fn overlay_forward_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
+        let select_exit_key = Self::transcript_select_exit_key(&event);
+        if matches!(
+            &event,
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained
+        ) {
+            self.chat_widget.refresh_terminal_program_status();
+        }
         let width = tui.terminal.last_known_screen_size.width.max(/*other*/ 1);
         let footer = self.prompt_navigation_footer(width.saturating_sub(/*rhs*/ 2));
         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
@@ -511,7 +563,9 @@ impl App {
             ))
             && let Some(Overlay::Transcript(t)) = &mut self.overlay
         {
-            tui.set_overlay_input(tui::OverlayInput::Transcript)?;
+            let was_select_mode = t.is_select_mode();
+            let pending_follow_before = t.pending_follow_id();
+            tui.set_mouse_capture(tui::MouseCapture::Enabled)?;
             t.motion = crate::motion::MotionMode::from_animations_enabled(
                 self.local_settings.tui.animations && self.local_settings.tui.effects.shimmer,
             );
@@ -519,6 +573,9 @@ impl App {
             let chat_widget = &self.chat_widget;
             let detailed = t.is_detailed();
             let size = tui.prepare_draw_size()?;
+            t.sync_search_live_tail(size.width.max(/*other*/ 1), active_key, |width| {
+                chat_widget.active_cell_transcript_hyperlink_lines(width)
+            });
             t.sync_live_tail(size.width.max(/*other*/ 1), active_key, |width| {
                 if detailed {
                     chat_widget.active_cell_transcript_hyperlink_lines(width)
@@ -535,16 +592,33 @@ impl App {
             let result =
                 if input { t.draw(tui) } else { Ok(()) }.and_then(|()| t.handle_event(tui, event));
             if result.is_err() {
-                let _ = tui.set_overlay_input(tui::OverlayInput::Default);
+                let _ = tui.set_mouse_capture(tui::MouseCapture::Inherit);
             }
-            result?;
+            let completed_copy = result?;
             let close_overlay = t.is_done();
+            let select_mode_closed = was_select_mode && (!t.is_select_mode() || close_overlay);
+            let pending_follow_id = t.pending_follow_id();
             if !close_overlay
                 && active_key.is_some_and(|key| key.animation_tick.is_some())
                 && t.is_scrolled_to_bottom()
             {
                 tui.frame_requester()
                     .schedule_frame_in(std::time::Duration::from_millis(50));
+            }
+            if pending_follow_id != pending_follow_before
+                && let (Some(id), Some(key)) = (pending_follow_id, select_exit_key)
+            {
+                self.backtrack.pending_select_exit_key = Some((id, key));
+            }
+            let completed_exit_key = completed_copy.and_then(|completed_id| {
+                self.backtrack
+                    .finish_pending_select_exit_key(completed_id, select_mode_closed)
+            });
+            if select_mode_closed {
+                self.backtrack.select_exit_key = select_exit_key.or(completed_exit_key);
+                if select_exit_key.is_some() {
+                    self.backtrack.pending_select_exit_key = None;
+                }
             }
             if close_overlay {
                 self.close_transcript_overlay(tui);
@@ -669,12 +743,12 @@ pub(crate) fn backtrack_revert_before_turn_id(
                     &previous.items
                 };
                 is_hidden_nested_review_turn(previous, turn)
-                    && previous_items
-                        .iter()
-                        .any(|item| matches!(item, ThreadItem::EnteredReviewMode { .. }))
-                    && previous_items
-                        .iter()
-                        .any(|item| matches!(item, ThreadItem::ExitedReviewMode { .. }))
+                    && previous_items.iter().any(|item| {
+                        matches!(&item.payload, ThreadItemPayload::EnteredReviewMode { .. })
+                    })
+                    && previous_items.iter().any(|item| {
+                        matches!(&item.payload, ThreadItemPayload::ExitedReviewMode { .. })
+                    })
             });
         let first_item = if turn_index == start_turn {
             start_item
@@ -683,21 +757,22 @@ pub(crate) fn backtrack_revert_before_turn_id(
         };
         // Clipped items affect whether an input is a steer, but were never displayed and
         // therefore must not change the transcript's review visibility or prompt ordinals.
-        let mut user_messages_in_turn = turn.items[..first_item]
-            .iter()
-            .filter(|item| matches!(item, ThreadItem::UserMessage { .. }))
+        let mut user_messages_in_turn = turn
+            .item_payloads()
+            .take(first_item)
+            .filter(|item| matches!(item, ThreadItemPayload::UserMessage { .. }))
             .count();
-        for item in &turn.items[first_item..] {
+        for item in turn.item_payloads().skip(first_item) {
             let content = match item {
-                ThreadItem::EnteredReviewMode { .. } => {
+                ThreadItemPayload::EnteredReviewMode { .. } => {
                     review_mode = true;
                     continue;
                 }
-                ThreadItem::ExitedReviewMode { .. } => {
+                ThreadItemPayload::ExitedReviewMode { .. } => {
                     review_mode = false;
                     continue;
                 }
-                ThreadItem::UserMessage { content, .. } => content,
+                ThreadItemPayload::UserMessage { content, .. } => content,
                 _ => continue,
             };
             let is_steer = user_messages_in_turn > 0;
@@ -755,19 +830,17 @@ pub(crate) fn is_hidden_nested_review_turn(previous: &Turn, turn: &Turn) -> bool
         || turn.status != TurnStatus::Interrupted
         || turn.completed_at.is_some()
         || !previous
-            .items
-            .iter()
-            .any(|item| matches!(item, ThreadItem::EnteredReviewMode { .. }))
+            .item_payloads()
+            .any(|item| matches!(item, ThreadItemPayload::EnteredReviewMode { .. }))
         || !previous
-            .items
-            .iter()
-            .any(|item| matches!(item, ThreadItem::ExitedReviewMode { .. }))
+            .item_payloads()
+            .any(|item| matches!(item, ThreadItemPayload::ExitedReviewMode { .. }))
     {
         return false;
     }
 
-    let mut user_messages = turn.items.iter().filter_map(|item| match item {
-        ThreadItem::UserMessage { content, .. } => Some(content),
+    let mut user_messages = turn.item_payloads().filter_map(|item| match item {
+        ThreadItemPayload::UserMessage { content, .. } => Some(content),
         _ => None,
     });
     matches!(
@@ -867,6 +940,7 @@ mod tests {
     use crate::bottom_pane::MentionBinding;
     use crate::history_cell::AgentMessageCell;
     use crate::history_cell::HistoryCell;
+    use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::UserInput;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
@@ -885,11 +959,44 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn pending_select_exit_key_ends_on_completion_or_release() {
+        let key = crate::key_hint::KeyBinding::from_event(KeyCode::Enter.into());
+        let mut state = BacktrackState {
+            pending_select_exit_key: Some((7, key)),
+            ..BacktrackState::default()
+        };
+
+        assert_eq!(
+            state.finish_pending_select_exit_key(
+                /*completed_id*/ 7, /*select_mode_closed*/ false,
+            ),
+            None
+        );
+        assert_eq!(state.pending_select_exit_key, None);
+        state.pending_select_exit_key = Some((8, key));
+        state.observe_pending_select_exit_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(state.pending_select_exit_key, None);
+        state.pending_select_exit_key = Some((9, key));
+        assert_eq!(
+            state.finish_pending_select_exit_key(
+                /*completed_id*/ 9, /*select_mode_closed*/ true,
+            ),
+            Some(key)
+        );
+        assert_eq!(state.pending_select_exit_key, None);
+    }
+
     fn turn(turn_id: &str, status: TurnStatus, user_messages: usize) -> Turn {
         Turn {
             id: turn_id.to_string(),
+            root_turn_id: None,
             items: (0..user_messages)
-                .map(|index| ThreadItem::UserMessage {
+                .map(|index| ThreadItemPayload::UserMessage {
                     id: format!("user-{index}"),
                     client_id: None,
                     content: vec![UserInput::Text {
@@ -897,6 +1004,7 @@ mod tests {
                         text_elements: Vec::new(),
                     }],
                 })
+                .map(ThreadItem::untimed)
                 .collect(),
             items_view: codex_app_server_protocol::TurnItemsView::Full,
             status,
@@ -920,7 +1028,7 @@ mod tests {
     #[test]
     fn backtrack_revert_before_turn_id_resolves_first_and_later_prompts() {
         let mut hidden = turn("hidden", TurnStatus::Completed, /*user_messages*/ 1);
-        let ThreadItem::UserMessage { content, .. } = &mut hidden.items[0] else {
+        let ThreadItemPayload::UserMessage { content, .. } = &mut hidden.items[0].payload else {
             unreachable!()
         };
         *content = vec![UserInput::Text {
@@ -1061,15 +1169,17 @@ mod tests {
         );
         review_turn.items.insert(
             /*index*/ 0,
-            ThreadItem::EnteredReviewMode {
+            ThreadItem::untimed(ThreadItemPayload::EnteredReviewMode {
                 id: "review-start".to_string(),
                 review: "changes against main".to_string(),
-            },
+            }),
         );
-        review_turn.items.push(ThreadItem::ExitedReviewMode {
-            id: "review-end".to_string(),
-            review: "review complete".to_string(),
-        });
+        review_turn
+            .items
+            .push(ThreadItem::untimed(ThreadItemPayload::ExitedReviewMode {
+                id: "review-end".to_string(),
+                review: "review complete".to_string(),
+            }));
         let turns = vec![
             turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
             review_turn,
@@ -1107,14 +1217,14 @@ mod tests {
             "Review the current code changes (staged, unstaged, and untracked files).";
         let review_turn = Turn {
             items: vec![
-                ThreadItem::EnteredReviewMode {
+                ThreadItem::untimed(ThreadItemPayload::EnteredReviewMode {
                     id: "review-start".to_string(),
                     review: review_hint.to_string(),
-                },
-                ThreadItem::ExitedReviewMode {
+                }),
+                ThreadItem::untimed(ThreadItemPayload::ExitedReviewMode {
                     id: "review-end".to_string(),
                     review: "review complete".to_string(),
-                },
+                }),
             ],
             ..turn(
                 "turn-review",
@@ -1124,7 +1234,7 @@ mod tests {
         };
         let review_child_turn = Turn {
             items: (0..2)
-                .map(|index| ThreadItem::UserMessage {
+                .map(|index| ThreadItemPayload::UserMessage {
                     id: format!("review-prompt-{index}"),
                     client_id: None,
                     content: vec![UserInput::Text {
@@ -1132,6 +1242,7 @@ mod tests {
                         text_elements: Vec::new(),
                     }],
                 })
+                .map(ThreadItem::untimed)
                 .collect(),
             ..turn(
                 "turn-review-child",
@@ -1173,7 +1284,7 @@ mod tests {
     #[test]
     fn backtrack_revert_before_turn_id_restores_canonical_mention_bindings() {
         let mut selected_turn = turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1);
-        selected_turn.items = vec![ThreadItem::UserMessage {
+        selected_turn.items = vec![ThreadItem::untimed(ThreadItemPayload::UserMessage {
             id: "selected-prompt".to_string(),
             client_id: None,
             content: vec![
@@ -1194,7 +1305,7 @@ mod tests {
                     path: "app://google_calendar".to_string(),
                 },
             ],
-        }];
+        })];
         let turns = vec![
             turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
             selected_turn,
@@ -1269,7 +1380,7 @@ mod tests {
         assert!(!has_backtrack_target(&cells));
 
         cells.push(Arc::new(UserHistoryCell {
-            spoken: false,
+            presentation: Default::default(),
             message: "hello".to_string(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),

@@ -4,6 +4,7 @@ pub(crate) mod execute_spec;
 mod output;
 mod response_adapter;
 mod telemetry;
+mod tool_definitions;
 mod wait_handler;
 pub(crate) mod wait_spec;
 
@@ -45,8 +46,7 @@ use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_utils_audio::estimate_audio_token_count;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
-use codex_utils_output_truncation::truncate_function_output_items_with_policy;
+use codex_utils_output_truncation::formatted_truncate_function_output_items_with_policy;
 
 use delegate::CodeModeCellDelegate;
 use delegate::CodeModeDispatchBroker;
@@ -54,6 +54,7 @@ use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use output::CodeModeToolOutput;
 use response_adapter::into_function_call_output_content_items;
+pub(crate) use tool_definitions::prepare_code_mode_tool_definitions;
 pub(crate) use wait_handler::CodeModeWaitHandler;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
@@ -133,25 +134,30 @@ impl CodeModeService {
         request
             .yield_time_ms
             .get_or_insert(self.default_exec_yield_time_ms);
+        let preempt = step_context.preempt.clone();
         let delegate = Arc::new(CodeModeCellDelegate {
             broker: Arc::clone(&self.dispatch_broker),
             step_context,
         });
-        self.session().await?.execute(request, delegate).await
+        self.session()
+            .await?
+            .execute(request, delegate, preempt)
+            .await
     }
 
     pub(crate) async fn wait(
         &self,
         request: codex_code_mode::WaitRequest,
+        preempt: Option<CancellationToken>,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
-        self.session().await?.wait(request).await
+        self.session().await?.wait(request, preempt).await
     }
 
     pub(crate) async fn terminate(
         &self,
         cell_id: CellId,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
-        self.session().await?.terminate(cell_id).await
+        self.session().await?.terminate(cell_id.into()).await
     }
 
     pub(crate) async fn interrupt_active_cells(&self) {
@@ -163,7 +169,7 @@ impl CodeModeService {
                 .active_cell_ids()
                 .into_iter()
                 .map(|cell_id| async move {
-                    if let Err(error) = session.terminate(cell_id.clone()).await {
+                    if let Err(error) = session.terminate(cell_id.clone().into()).await {
                         tracing::warn!(%cell_id, %error, "failed to terminate interrupted code-mode cell");
                     }
                 }),
@@ -314,16 +320,7 @@ fn truncate_code_mode_result(
 ) -> Vec<FunctionCallOutputContentItem> {
     let max_output_tokens = resolve_max_tokens(max_output_tokens);
     let policy = TruncationPolicy::Tokens(max_output_tokens);
-    if items
-        .iter()
-        .all(|item| matches!(item, FunctionCallOutputContentItem::InputText { .. }))
-    {
-        let (truncated_items, _) =
-            formatted_truncate_text_content_items_with_policy(&items, policy);
-        return truncated_items;
-    }
-
-    truncate_function_output_items_with_policy(&items, policy, estimate_audio_token_count)
+    formatted_truncate_function_output_items_with_policy(items, policy, estimate_audio_token_count)
 }
 
 // Submit synchronously so the recorder sees the call before the cell's dispatch gate closes.
@@ -338,6 +335,7 @@ fn submit_nested_tool(
     impl std::future::Future<Output = Result<JsonValue, FunctionCallError>> + Send + 'static,
     FunctionCallError,
 > {
+    let dispatch_started = std::time::Instant::now();
     let CodeModeNestedToolCall {
         cell_id,
         runtime_tool_call_id,
@@ -354,6 +352,9 @@ fn submit_nested_tool(
         target: "codex_otel.trace_safe",
         tracing::Level::INFO,
         event.name = "codex.code_mode.nested_tool_dispatched",
+        tool_name = tool_name.name.as_str(),
+        tool_namespace = call_trace::namespace(&tool_name),
+        tool_source = "code_mode",
         conversation.id = %thread_id,
         turn_id = turn_id.as_str(),
         cell.id = telemetry::trace_id(cell_id.as_str()),
@@ -374,6 +375,7 @@ fn submit_nested_tool(
                 &tool_name,
                 &call_id,
                 call_trace::Source::CodeMode,
+                dispatch_started.elapsed(),
             );
             return Err(FunctionCallError::RespondToModel(error));
         }

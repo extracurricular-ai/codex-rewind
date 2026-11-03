@@ -1,7 +1,9 @@
 //! Typed, bounded v2 memory context.
 
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
 
@@ -9,6 +11,11 @@ use codex_utils_output_truncation::truncate_text;
 pub enum MemoryContextFragment {
     ReadInstructions(String),
     ExtractionEvidence(String),
+}
+
+impl MemoryContextFragment {
+    /// Content classification for memory read-path instructions.
+    pub const READ_INSTRUCTIONS_KIND: &str = "memories.instructions";
 }
 
 impl ContextualUserFragment for MemoryContextFragment {
@@ -21,14 +28,11 @@ impl ContextualUserFragment for MemoryContextFragment {
     fn content_kind(&self) -> ContentItemKind {
         ContentItemKind(
             match self {
-                Self::ReadInstructions(_) => "memories.instructions",
+                Self::ReadInstructions(_) => Self::READ_INSTRUCTIONS_KIND,
                 Self::ExtractionEvidence(_) => "memories.extraction_evidence",
             }
             .to_string(),
         )
-    }
-    fn requires_separate_message(&self) -> bool {
-        true
     }
     fn markers(&self) -> (&'static str, &'static str) {
         Self::type_markers()
@@ -36,8 +40,8 @@ impl ContextualUserFragment for MemoryContextFragment {
     fn type_markers() -> (&'static str, &'static str) {
         ("", "")
     }
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let (Self::ReadInstructions(text) | Self::ExtractionEvidence(text)) = self;
-        truncate_text(text, TruncationPolicy::Bytes(8_900))
+        input_text(truncate_text(text, TruncationPolicy::Bytes(8_900)))
     }
 }

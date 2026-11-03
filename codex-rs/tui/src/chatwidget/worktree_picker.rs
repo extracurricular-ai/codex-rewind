@@ -1,4 +1,4 @@
-//! Worktree choices for local, feature-enabled session commands.
+//! Worktree choices for local session commands.
 //!
 //! Shared picker presentation preserves request identity and action safety checks.
 
@@ -14,9 +14,7 @@ const BROWSER_VIEW_ID: &str = "managed-worktrees";
 
 impl ChatWidget {
     pub(super) fn managed_worktree_available(&self) -> bool {
-        self.config.features.enabled(Feature::Worktrees)
-            && self.local_worktree_operations
-            && get_git_repo_root(self.config.cwd.as_path()).is_some()
+        self.local_worktree_operations && get_git_repo_root(self.config.cwd.as_path()).is_some()
     }
 
     pub(super) fn show_session_checkout_picker(
@@ -46,7 +44,7 @@ impl ChatWidget {
             title: Some(title.into()),
             items: vec![
                 SelectionItem {
-                    name: "Current checkout".to_string(),
+                    name: "Use current Git worktree".to_string(),
                     description: Some("Keep using the current working directory".to_string()),
                     actions: vec![Box::new(move |tx| match mode {
                         ManagedWorktreeMode::New => {
@@ -64,8 +62,11 @@ impl ChatWidget {
                     ..Default::default()
                 },
                 SelectionItem {
-                    name: "New worktree".to_string(),
-                    description: Some("Create an isolated managed checkout".to_string()),
+                    name: "Create new Git worktree".to_string(),
+                    description: Some(
+                        "Create a separate checkout of this repository in another directory"
+                            .to_string(),
+                    ),
                     actions: vec![Box::new(move |tx| {
                         tx.send(AppEvent::StartManagedWorktree {
                             mode,
@@ -82,12 +83,6 @@ impl ChatWidget {
     }
 
     pub(super) fn show_managed_worktree_picker(&mut self) {
-        if !self.config.features.enabled(Feature::Worktrees) {
-            self.add_error_message(
-                "Enable worktrees in your Codex configuration to create a worktree.".to_string(),
-            );
-            return;
-        }
         if !self.managed_worktree_available() {
             self.add_error_message("Managed worktrees require a local Git repository.".to_string());
             return;
@@ -376,7 +371,7 @@ impl ChatWidget {
                     ..Default::default()
                 },
             ],
-            ..SelectionViewParams::picker()
+            ..SelectionViewParams::confirmation()
         });
     }
 }

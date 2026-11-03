@@ -22,6 +22,7 @@ use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
+pub(crate) use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::SandboxCommand;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
@@ -128,10 +129,11 @@ pub(crate) use super::approvals::ApprovalAction;
 pub(crate) struct PermissionRequestPayload {
     pub tool_name: HookToolName,
     pub tool_input: serde_json::Value,
+    pub tool_cwd: Option<PathUri>,
 }
 
 impl PermissionRequestPayload {
-    pub(crate) fn bash(command: String, description: Option<String>) -> Self {
+    pub(crate) fn bash(command: String, description: Option<String>, cwd: PathUri) -> Self {
         let mut tool_input = serde_json::Map::new();
         tool_input.insert("command".to_string(), serde_json::Value::String(command));
         if let Some(description) = description {
@@ -144,6 +146,7 @@ impl PermissionRequestPayload {
         Self {
             tool_name: HookToolName::bash(),
             tool_input: serde_json::Value::Object(tool_input),
+            tool_cwd: Some(cwd),
         }
     }
 }
@@ -230,22 +233,35 @@ pub(crate) fn default_exec_approval_requirement(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SandboxOverride {
-    NoOverride,
-    BypassSandboxFirstAttempt,
+pub(crate) fn ensure_native_sandbox(
+    sandbox_override: SandboxOverride,
+    sandbox: SandboxType,
+) -> Result<(), ToolError> {
+    if sandbox_override == SandboxOverride::EscalatedSandboxWithRestrictions
+        && sandbox == SandboxType::None
+    {
+        return Err(ToolError::Rejected(
+            "command escalation with denied reads requires an available filesystem sandbox"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn sandbox_override_for_first_attempt(
     sandbox_permissions: SandboxPermissions,
     exec_approval_requirement: &ExecApprovalRequirement,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    already_approved: bool,
 ) -> SandboxOverride {
-    // Deny-read restrictions are part of the active permission policy. Running
-    // without a filesystem sandbox would discard them, even if the command was
-    // otherwise approved by rules or explicit escalation.
+    // Only actual approval of an explicit escalation may widen the filesystem;
+    // a command allow rule does not authorize removing filesystem restrictions.
     if !unsandboxed_execution_allowed(file_system_sandbox_policy) {
-        return SandboxOverride::NoOverride;
+        return if sandbox_permissions.requires_escalated_permissions() && already_approved {
+            SandboxOverride::EscalatedSandboxWithRestrictions
+        } else {
+            SandboxOverride::NoOverride
+        };
     }
 
     // ExecPolicy `Allow` can intentionally imply full trust (Skip + bypass_sandbox=true),
@@ -385,6 +401,7 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 }
 
 pub(crate) struct SandboxAttempt<'a> {
+    pub sandbox_override: SandboxOverride,
     pub sandbox: SandboxType,
     /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
     pub sandbox_requested: bool,
@@ -472,7 +489,7 @@ impl<'a> SandboxAttempt<'a> {
         }
     }
 
-    pub fn env_for(
+    pub async fn env_for(
         &self,
         command: SandboxCommand,
         options: ExecOptions,
@@ -480,7 +497,7 @@ impl<'a> SandboxAttempt<'a> {
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
         let network = self.network_proxy(network);
-        let request = self
+        let mut request = self
             .manager
             .transform(SandboxTransformRequest {
                 command,
@@ -495,15 +512,17 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_level: self.windows_sandbox_level,
             })
             .map_err(CodexErr::from)?;
+        request.sandbox_override = self.sandbox_override;
         let workspace_roots = self
             .workspace_roots
             .iter()
             .map(PathUri::to_abs_path)
             .collect::<std::io::Result<Vec<_>>>()?;
         crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, workspace_roots)
+            .await
     }
 
-    pub fn env_for_exec_server(
+    pub async fn env_for_exec_server(
         &self,
         command: SandboxCommand,
         options: ExecOptions,
@@ -513,7 +532,7 @@ impl<'a> SandboxAttempt<'a> {
             self.exec_server_permissions,
             command.additional_permissions.as_ref(),
         );
-        let request = self
+        let mut request = self
             .manager
             .transform(SandboxTransformRequest {
                 command,
@@ -529,15 +548,15 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_level: self.windows_sandbox_level,
             })
             .map_err(CodexErr::from)?;
-        let mut exec_request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
-            request,
-            options,
-            Vec::new(),
-        )?;
+        request.sandbox_override = self.sandbox_override;
+        let mut exec_request =
+            crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, Vec::new())
+                .await?;
         exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {
                 permissions: exec_server_permissions,
+                sandbox_override: self.sandbox_override,
                 cwd: exec_request.windows_sandbox_policy_cwd.clone(),
                 workspace_roots: self.workspace_roots.to_vec(),
                 user_home_dir: None,

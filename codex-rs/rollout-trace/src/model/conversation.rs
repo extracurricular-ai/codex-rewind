@@ -25,6 +25,10 @@ use super::session::ExecutionWindow;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConversationItem {
     pub item_id: ConversationItemId,
+    /// Original Responses item ID, scoped to this thread. Retained for joining
+    /// history acceptance and exact inference without matching rendered text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_item_id: Option<String>,
     pub thread_id: AgentThreadId,
     /// Runtime activation that first introduced this item locally, when known.
     pub codex_turn_id: Option<CodexTurnId>,
@@ -134,6 +138,9 @@ pub enum ConversationPart {
     PayloadRef {
         label: String,
         raw_payload_id: RawPayloadId,
+        /// Content identity across snapshots, independent of the containing payload file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_sha256: Option<String>,
     },
 }
 

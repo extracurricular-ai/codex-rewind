@@ -214,8 +214,9 @@ parse_release_metadata() {
   # so the record boundaries inserted by fold do not change the document.
   LC_ALL=C fold -b -w 4096 | LC_ALL=C awk '
     function finish_string(value) {
-      if (object_depth == 1 && key == "tag_name") {
-        print "tag_name\t" value
+      if (object_depth == 1 &&
+          (key == "tag_name" || key == "version" || key == "target" || key == "entrypoint")) {
+        print key "\t" value
       } else if (object_depth == asset_object_depth) {
         if (key == "name") {
           asset_name = value
@@ -758,6 +759,170 @@ cleanup_stale_install_artifacts() {
   fi
 }
 
+record_standalone_releases_in_use() {
+  # /proc also catches old clients with no session records. On macOS lsof
+  # checks every open file in the release, including running helper programs.
+  if [ "$os" = "linux" ]; then
+    [ -r /proc/self/mountinfo ] && [ -L /proc/self/exe ] || return 1
+    # hidepid can omit other users' processes entirely; do not assume an
+    # incomplete process listing proves an older release is unused.
+    if grep -E '(^|[ ,])hidepid=[^0, ]' /proc/self/mountinfo >/dev/null; then
+      return 1
+    fi
+    : > "$tmp_dir/in-use" || return 1
+    for process in /proc/[0-9]*; do
+      if executable="$(readlink "$process/exe" 2>/dev/null)"; then
+        printf 'n%s\n' "$executable" >> "$tmp_dir/in-use" || return 1
+      elif [ -d "$process" ]; then
+        # Even same-user ssh-agent/systemd processes may deny exe inspection.
+        # Only an unreadable Codex or bundled helper prevents safe pruning.
+        process_name="$(cat "$process/comm" 2>/dev/null)" || {
+          [ ! -d "$process" ] && continue
+          return 1
+        }
+        # Linux truncates comm to 15 bytes, including the code-mode host.
+        case "$process_name" in
+          codex* | rg | bwrap)
+            # A zombie has no files left open, even if its parent never reaps it.
+            grep -Eq '^State:[[:space:]]*Z' "$process/status" 2>/dev/null && continue
+            [ ! -d "$process" ] && continue
+            return 1
+            ;;
+        esac
+      fi
+    done
+  else
+    # macOS lsof silently omits other users' processes, even with no errors.
+    # ps can still report their executable names. As on Linux, decline to
+    # prune when an uninspectable Codex or helper may be using a release.
+    current_uid="$(id -u)" || return 1
+    ps -axo uid=,comm= > "$tmp_dir/processes" || return 1
+    [ -s "$tmp_dir/processes" ] || return 1
+    while read -r process_uid process_name; do
+      [ "$process_uid" = "$current_uid" ] && continue
+      case "${process_name##*/}" in
+        codex* | rg | bwrap) return 1 ;;
+      esac
+    done < "$tmp_dir/processes"
+    if /usr/sbin/lsof -nP -F n +D "$releases" > "$tmp_dir/in-use" 2> "$tmp_dir/lsof-error"; then
+      :
+    else
+      # macOS lsof +D can return 1 with matches when some files are not open.
+      # Keep those matches, but reject other failures and any stderr below.
+      [ "$?" -eq 1 ] || return 1
+    fi
+    [ ! -s "$tmp_dir/lsof-error" ] || return 1
+  fi
+}
+
+release_is_unused() {
+  if [ "$os" = "linux" ]; then
+    path_field="n$1"
+  else
+    # lsof +D scopes the scan to this tree, but may escape bytes in CODEX_HOME.
+    # Match the installer-owned ASCII path, including the temporary retirement name.
+    path_field="/packages/${STANDALONE_ROOT##*/}/releases/${1#"$releases"/}"
+  fi
+  # Appending / also matches a process whose cwd is the release root itself.
+  LC_ALL=C RELEASE_PATH="$path_field/" awk 'index($0 "/", ENVIRON["RELEASE_PATH"]) { exit 1 }' "$tmp_dir/in-use"
+}
+
+# Run under the install lock, after the visible command has been verified.
+# Only retire ordinary, manifest-owned packages; never retry a retired tree.
+prune_standalone_releases() (
+  [ ! -L "$CODEX_HOME_DIR/packages" ] &&
+    [ ! -L "$STANDALONE_ROOT" ] && [ ! -L "$RELEASES_DIR" ] || return 1
+  releases="$(cd -P "$RELEASES_DIR" && pwd)" || return 1
+  # Local process inspection cannot establish whether a network home is in
+  # use on another host. df -l excludes remotely mounted filesystems.
+  df -lP "$releases" > /dev/null 2> "$tmp_dir/df-error" || return 1
+  [ ! -s "$tmp_dir/df-error" ] || return 1
+  selected="$(cd -P "$CURRENT_LINK" && pwd)" || return 1
+  history="$(cat "$STANDALONE_ROOT/selection-history")" || return 1
+  previous="$(printf '%s\n' "$history" | sed -n '2p')"
+  case "$previous" in
+    */* | . | ..) return 1 ;;
+  esac
+  identity="$(LC_ALL=C stat -c '%d %i %.9Z' "$CURRENT_LINK" 2>/dev/null ||
+    LC_ALL=C stat -f '%d %i %Fc' "$CURRENT_LINK")" || return 1
+  [ "$selected" = "$releases/${selected##*/}" ] &&
+    [ "$history" = "$(printf '%s\n%s\n%s' "${selected##*/}" "$previous" "$identity")" ] ||
+    return 1
+  record_standalone_releases_in_use || return 1
+  restore_candidate=""
+  # A stopped install must not strand a late-starting release in retirement.
+  trap 'if [ -n "$restore_candidate" ] && [ -d "$retired/release" ] &&
+    [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+    mv "$retired/release" "$candidate" && rmdir "$retired"
+  fi' EXIT
+  trap 'exit 1' HUP INT TERM
+
+  for candidate in "$releases"/*; do
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] &&
+      [ "$candidate" != "$selected" ] && [ "${candidate##*/}" != "$previous" ] || continue
+    release_is_unused "$candidate" || continue
+    [ -f "$candidate/codex-package.json" ] && [ ! -L "$candidate/codex-package.json" ] || continue
+    metadata="$(parse_release_metadata < "$candidate/codex-package.json")" || continue
+    version="$(printf '%s\n' "$metadata" | awk -F '\t' '$1 == "version" {print $2}')"
+    target="$(printf '%s\n' "$metadata" | awk -F '\t' '$1 == "target" {print $2}')"
+    entrypoint="$(printf '%s\n' "$metadata" | awk -F '\t' '$1 == "entrypoint" {print $2}')"
+    [ "${candidate##*/}" = "$version-$target" ] && [ "$version" != "latest" ] &&
+      [ "$entrypoint" = "bin/codex" ] && [ -f "$candidate/bin/codex" ] || continue
+    validate_version "$version" >/dev/null 2>&1 || continue
+    case "$target" in
+      aarch64-apple-darwin | x86_64-apple-darwin | aarch64-unknown-linux-musl | x86_64-unknown-linux-musl) ;;
+      *) continue ;;
+    esac
+
+    # Reject symlinks (except the installer's own alias), special files and
+    # mounts before rm -r. find -xdev alone would not protect nested mounts.
+    [ "$(readlink "$candidate/codex" 2>/dev/null)" = "bin/codex" ] || continue
+    if ! find "$candidate" -xdev ! -type f ! -type d ! -path "$candidate/codex" -print > "$tmp_dir/unowned"; then
+      continue
+    fi
+    [ ! -s "$tmp_dir/unowned" ] || continue
+    if [ "$os" = "linux" ]; then
+      # mountinfo escapes spaces, tabs, newlines, and backslashes in paths.
+      if ! CODEX_PRUNE_RELEASE="$candidate" LC_ALL=C awk '
+        BEGIN { release = ENVIRON["CODEX_PRUNE_RELEASE"] }
+        { path = $5; gsub(/\\040/, " ", path); gsub(/\\011/, "\t", path)
+          gsub(/\\012/, "\n", path); gsub(/\\134/, "\\", path)
+          if (path == release || index(path, release "/") == 1) found = 1 }
+        END { exit found ? 1 : 0 }
+      ' /proc/self/mountinfo; then
+        continue
+      fi
+    else
+      device="$(stat -f '%d' "$releases")" || return 1
+      if ! find "$candidate" -xdev -exec stat -f '%d' {} + > "$tmp_dir/devices"; then
+        continue
+      fi
+      grep -vxF "$device" "$tmp_dir/devices" >/dev/null && continue
+    fi
+
+    retired="$(mktemp -d "$releases/.retired.XXXXXXXX")" || return 1
+    restore_candidate=1
+    if mv "$candidate" "$retired/release"; then
+      # Block new launches at the original path before the final use check.
+      # Some systems report the old executable path, so check both names.
+      if ! record_standalone_releases_in_use ||
+        ! release_is_unused "$candidate" || ! release_is_unused "$retired/release"; then
+        [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || return 1
+        mv "$retired/release" "$candidate" && rmdir "$retired" || return 1
+        restore_candidate=""
+        continue
+      fi
+      # Once proved unused, never restore a possibly partially deleted tree.
+      restore_candidate=""
+      find "$retired" -xdev -depth -delete || return 1
+    else
+      restore_candidate=""
+      rmdir "$retired"
+      return 1
+    fi
+  done
+)
+
 replace_path_with_symlink() {
   link_path="$1"
   link_target="$2"
@@ -960,6 +1125,9 @@ install_package_release() {
   if [ -f "$stage_release/codex-resources/bwrap" ]; then
     chmod 0755 "$stage_release/codex-resources/bwrap"
   fi
+  if [ -f "$stage_release/bin/codex-exec-server" ]; then
+    chmod 0755 "$stage_release/bin/codex-exec-server"
+  fi
   ln -sf "bin/codex" "$stage_release/codex"
 
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
@@ -1013,6 +1181,10 @@ release_dir_is_complete() {
         [ -x "$release_dir/codex" ] &&
         [ -x "$release_dir/codex-path/rg" ] ||
         return 1
+      # Older canonical packages do not advertise or contain the executor.
+      if grep -Eq '"execServer"[[:space:]]*:' "$release_dir/codex-package.json"; then
+        [ -x "$release_dir/bin/codex-exec-server" ] || return 1
+      fi
       ;;
     legacy-platform-npm)
       [ -x "$release_dir/codex" ] &&
@@ -1268,7 +1440,27 @@ if [ "$DAEMON_ONLY" = "1" ] && [ "${CODEX_INSTALL_DEFER_SELECTION:-0}" != "1" ];
     exit 1
   fi
 fi
-update_current_link "$release_dir"
+if [ "${CODEX_INSTALL_DEFER_SELECTION:-0}" != "1" ]; then
+  # A no-op must not replace the selection link: history is bound to it.
+  selected_dir="$(cd -P "$release_dir" && pwd)"
+  previous_dir="$(cd -P "$CURRENT_LINK" 2>/dev/null && pwd)" || previous_dir=""
+  if [ "$previous_dir" != "$selected_dir" ]; then
+    update_current_link "$release_dir"
+    if ! (
+      history="$STANDALONE_ROOT/selection-history"
+      # GNU and BSD stat both inspect the link itself by default.
+      selection_id="$(LC_ALL=C stat -c '%d %i %.9Z' "$CURRENT_LINK" 2>/dev/null ||
+        LC_ALL=C stat -f '%d %i %Fc' "$CURRENT_LINK")"
+      printf '%s\n%s\n%s\n' "$release_name" "${previous_dir##*/}" "$selection_id" > "$history.tmp.$$"
+      mv -f "$history.tmp.$$" "$history"
+    ); then
+      warn "Could not record installation selection; pruning will be skipped."
+    fi
+  fi
+else
+  # Do not publish history for a migration until Rust has committed the cutover.
+  update_current_link "$release_dir"
+fi
 if [ "$RELEASE" = "latest" ]; then
   printf '%s' "$release_name" > "$AUTO_UPDATE_VERSION.tmp.$$"
   mv -f "$AUTO_UPDATE_VERSION.tmp.$$" "$AUTO_UPDATE_VERSION"
@@ -1282,6 +1474,9 @@ fi
 update_visible_command "$release_dir"
 add_to_path
 verify_visible_command
+if ! prune_standalone_releases; then
+  warn "Could not safely inspect old Codex releases; skipped remaining cleanup."
+fi
 release_install_lock
 handle_conflicting_install
 

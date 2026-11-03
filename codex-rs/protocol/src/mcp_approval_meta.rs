@@ -17,6 +17,18 @@ pub const APPROVALS_REVIEWER_KEY: &str = "approvals_reviewer";
 pub const PERSIST_KEY: &str = "persist";
 pub const PERSIST_SESSION: &str = "session";
 pub const PERSIST_ALWAYS: &str = "always";
+/// Set where cancellation originates, before user actions and runtime failures
+/// are flattened into the same elicitation action. Absence means unknown.
+pub const CANCELLATION_REASON_KEY: &str = "codex_approval_cancellation_reason";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpApprovalCancellationReason {
+    User,
+    Interrupted,
+    NonInteractive,
+}
+
 pub const SOURCE_KEY: &str = "source";
 pub const SOURCE_CONNECTOR: &str = "connector";
 pub const CONNECTOR_ID_KEY: &str = "connector_id";

@@ -45,6 +45,9 @@ pub(super) fn test_thread_metadata(
 ) -> ThreadMetadata {
     let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp");
     ThreadMetadata {
+        creator_user_id: None,
+        attached_thread_parent_id: None,
+        creator_account_id: None,
         originator: None,
         id: thread_id,
         rollout_path: codex_home.join(format!("rollout-{thread_id}.jsonl")),

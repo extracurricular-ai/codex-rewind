@@ -13,7 +13,6 @@ use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
@@ -24,13 +23,15 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tasks::AnySessionTask;
-use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
+    /// Present when input admission is closed; cancelled when the final batch is recorded.
+    /// Reservations that have not started still accept inputs.
+    pub(crate) finishing: Option<CancellationToken>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
 }
 
@@ -39,9 +40,8 @@ pub(crate) struct ActiveTurn {
 /// State machine:
 /// - A turn starts in `CurrentTurn`, so queued child mail can join the next
 ///   model request for that turn.
-/// - After user-visible terminal output is recorded, we switch to `NextTurn`
-///   to leave late child mail queued instead of extending an already shown
-///   answer.
+/// - After a terminal answer is recorded, even an empty one, we switch to
+///   `NextTurn` to leave late child mail queued instead of extending the answer.
 /// - If the same task later gets explicit same-turn work again (a steered user
 ///   prompt or a tool call after an untagged preamble), we reopen `CurrentTurn`
 ///   so that pending child mail is drained into that follow-up request.
@@ -50,7 +50,7 @@ pub(crate) enum MailboxDeliveryPhase {
     /// Incoming mailbox messages can still be consumed by the current turn.
     #[default]
     CurrentTurn,
-    /// The current turn already emitted visible final answer text; mailbox
+    /// The current turn already emitted a terminal answer; mailbox
     /// messages should remain queued for a later turn.
     NextTurn,
 }
@@ -59,6 +59,7 @@ impl Default for ActiveTurn {
     fn default() -> Self {
         Self {
             task: None,
+            finishing: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
         }
     }
@@ -94,8 +95,6 @@ pub(crate) struct TurnState {
     pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pub(crate) pending_input: TurnInputQueue,
     mailbox_delivery_phase: MailboxDeliveryPhase,
-    granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
-    strict_auto_review_enabled: bool,
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
@@ -108,14 +107,16 @@ pub(crate) struct TurnState {
 /// Host receipt metadata follows the response through the asynchronous tool waiter.
 pub(crate) struct AcceptedUserInputResponse {
     pub(crate) response: RequestUserInputResponse,
-    /// Absent in legacy mode, which does not reserve or persist acceptance order.
-    pub(crate) acceptance_order: Option<u64>,
+    /// Order reserved when the host accepts this response.
+    pub(crate) acceptance_order: u64,
 }
 
 pub(crate) struct PendingRequestPermissions {
     pub(crate) tx_response: oneshot::Sender<RequestPermissionsResponse>,
     pub(crate) requested_permissions: RequestPermissionProfile,
     pub(crate) environment: TurnEnvironment,
+    /// Background cells can request permissions after a different turn becomes active.
+    pub(crate) turn_context: Arc<TurnContext>,
 }
 
 impl TurnState {
@@ -217,38 +218,5 @@ impl TurnState {
 
     pub(crate) fn set_mailbox_delivery_phase(&mut self, phase: MailboxDeliveryPhase) {
         self.mailbox_delivery_phase = phase;
-    }
-
-    pub(crate) fn record_granted_permissions(
-        &mut self,
-        environment_id: &str,
-        permissions: AdditionalPermissionProfile,
-    ) {
-        let granted_permissions = merge_permission_profiles(
-            self.granted_permissions_by_environment_id
-                .get(environment_id),
-            Some(&permissions),
-        );
-        if let Some(granted_permissions) = granted_permissions {
-            self.granted_permissions_by_environment_id
-                .insert(environment_id.to_string(), granted_permissions);
-        }
-    }
-
-    pub(crate) fn granted_permissions(
-        &self,
-        environment_id: &str,
-    ) -> Option<AdditionalPermissionProfile> {
-        self.granted_permissions_by_environment_id
-            .get(environment_id)
-            .cloned()
-    }
-
-    pub(crate) fn enable_strict_auto_review(&mut self) {
-        self.strict_auto_review_enabled = true;
-    }
-
-    pub(crate) fn strict_auto_review_enabled(&self) -> bool {
-        self.strict_auto_review_enabled
     }
 }

@@ -81,10 +81,12 @@ fn snapshot_capture_selects_declarations_and_environment() -> Result<()> {
             )
             .unwrap();
             let output = Command::new(shell)
-                .args(["-c", &script])
+                .args(["-c", &format!("readonly CODEX_THREAD_ID; {script}")])
                 .env_clear()
                 .env("HOME", dir.path())
                 .env("PATH", "/usr/bin:/bin")
+                .env("CODEX_THREAD_ID", "capture-thread")
+                .env("CODEX_TOOL_CALL_ID", "profile-call")
                 .env("APP_SETTING", "value")
                 .output()?;
             assert!(output.status.success(), "{shell}: {output:?}");
@@ -103,6 +105,55 @@ fn snapshot_capture_selects_declarations_and_environment() -> Result<()> {
                 (declarations, environment),
                 "{shell}"
             );
+            if !declarations || !environment {
+                continue;
+            }
+
+            // Both replay paths must preserve current metadata from a full capture.
+            let replay_environment = HashMap::from([
+                ("CODEX_THREAD_ID".to_string(), "capture-thread".to_string()),
+                ("CODEX_TOOL_CALL_ID".to_string(), "profile-call".to_string()),
+                ("APP_SETTING".to_string(), "value".to_string()),
+            ]);
+            let empty = HashMap::new();
+            let brokered = prepare_snapshot_credentials(
+                &captured,
+                SnapshotCredentialEnvironment {
+                    original: &replay_environment,
+                    restored: &replay_environment,
+                    allowed: &replay_environment,
+                    ..empty_snapshot_credentials(&empty, &|_| true)
+                },
+                |_| true,
+            )
+            .expect("metadata is not a credential");
+            for snapshot in [
+                captured.render_script(
+                    &codex_protocol::config_types::ShellEnvironmentPolicy::default(),
+                ),
+                brokered.script,
+            ] {
+                assert!(!snapshot.contains("CODEX_THREAD_ID"), "{shell}: {snapshot}");
+                assert!(
+                    !snapshot.contains("CODEX_TOOL_CALL_ID"),
+                    "{shell}: {snapshot}"
+                );
+                let path = dir.path().join("snapshot.sh");
+                std::fs::write(&path, snapshot)?;
+                let replay = Command::new(shell)
+                    .args(["-c", "set -e; . \"$1\"; printf '%s|%s|%s' \"$CODEX_THREAD_ID\" \"$CODEX_TOOL_CALL_ID\" \"$APP_SETTING\"", "replay"])
+                    .arg(&path)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("CODEX_THREAD_ID", "current-thread")
+                    .env("CODEX_TOOL_CALL_ID", "current-call")
+                    .output()?;
+                assert!(replay.status.success(), "{shell}: {replay:?}");
+                assert_eq!(
+                    replay.stdout, b"current-thread|current-call|value",
+                    "{shell}"
+                );
+            }
         }
     }
     Ok(())
@@ -2231,5 +2282,77 @@ fn rewrite_snapshot_credentials(
 fn captured_script(shell_type: ShellType, source: &str) -> Result<String> {
     let captured =
         CapturedSnapshot::parse(shell_type, source.as_bytes()).context("invalid native capture")?;
-    Ok(captured.render_script())
+    Ok(captured.render_script(&codex_protocol::config_types::ShellEnvironmentPolicy::default()))
+}
+
+#[test]
+fn streamed_snapshot_preserves_alias_and_option_parse_order() -> Result<()> {
+    for (shell, shell_type, options, expected) in [
+        (
+            "/bin/bash",
+            ShellType::Bash,
+            "shopt -s expand_aliases",
+            "onetwohelper",
+        ),
+        (
+            "/bin/zsh",
+            ShellType::Zsh,
+            "module_path=()\nsetopt RC_QUOTES",
+            "one'twohelper",
+        ),
+        (
+            "/bin/zsh",
+            ShellType::Zsh,
+            "module_path=()\nsetopt NO_RC_QUOTES",
+            "onetwohelper",
+        ),
+    ] {
+        if !std::path::Path::new(shell).exists() {
+            continue;
+        }
+        let dir = tempdir()?;
+        let setup = format!(
+            "{options}\nhelper() {{ printf helper; }}\nfunction : () {{ exit 41; }}\nalias snapshot_alias=\"printf 'one''two'\"\n"
+        );
+        let mut results = Vec::new();
+        // Cover V1's native source, V2's source, and V2's environment fallback.
+        for (source_capture, source_replay) in [(false, true), (true, true), (true, false)] {
+            let capture = if source_capture {
+                super::snapshot_source_capture_script(shell_type, CAPTURE_NON_INTERACTIVE)
+            } else {
+                snapshot_capture_script(shell_type, CAPTURE_NON_INTERACTIVE)
+            }
+            .unwrap();
+            let shadow = if source_capture && shell_type == ShellType::Zsh {
+                "alias alias=false\n"
+            } else {
+                ""
+            };
+            let output = Command::new(shell)
+                .args(["-c", &format!("{setup}{shadow}{capture}")])
+                .output()?;
+            assert!(output.status.success(), "{shell}: {output:?}");
+            let captured = CapturedSnapshot::parse(shell_type, &output.stdout).unwrap();
+            let path = dir.path().join("state");
+            std::fs::write(&path, captured.render_state())?;
+            let restore = if source_replay {
+                ". \"$1\""
+            } else {
+                "eval \"$(cat \"$1\")\""
+            };
+            let command =
+                format!("{restore}\n\\alias snapshot_alias\neval snapshot_alias\nhelper\n");
+            let output = Command::new(shell)
+                .args(["-c", &command, "snapshot-test"])
+                .arg(&path)
+                .output()?;
+            assert!(output.status.success(), "{shell}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("snapshot_alias="));
+            assert!(String::from_utf8_lossy(&output.stdout).ends_with(expected));
+            results.push((output.stdout, output.stderr));
+        }
+        assert_eq!(results[0], results[1], "{shell}");
+        assert_eq!(results[0], results[2], "{shell}");
+    }
+    Ok(())
 }

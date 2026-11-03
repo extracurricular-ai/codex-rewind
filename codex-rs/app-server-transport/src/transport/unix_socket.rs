@@ -7,6 +7,9 @@ use std::path::Path;
 
 use super::TransportEvent;
 use crate::transport::websocket::run_websocket_connection;
+use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
+use crate::websocket_compression::WebSocketCompression;
+use crate::websocket_compression::ZSTD_STREAM_PROTOCOL;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -45,9 +48,32 @@ pub async fn start_control_socket_acceptor(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
 ) -> IoResult<JoinHandle<()>> {
+    let (listener, socket_guard) = bind_private_daemon_socket(socket_path.as_path()).await?;
+    info!(
+        socket_path = %socket_guard.socket_path.display(),
+        "app-server control socket listening"
+    );
+
+    Ok(tokio::spawn(run_control_socket_acceptor(
+        listener,
+        transport_event_tx,
+        shutdown_token,
+        socket_guard,
+        daemon_shutdown_access,
+        compression,
+    )))
+}
+
+/// Binds a private daemon socket, retaining its advertised path as a rendezvous
+/// alias on Unix. Keep the guard alive for as long as the listener is in use.
+pub async fn bind_private_daemon_socket(
+    socket_path: &Path,
+) -> IoResult<(UnixListener, DaemonSocketFileGuard)> {
+    let socket_path = AbsolutePathBuf::from_absolute_path(socket_path)?;
     #[cfg(unix)]
-    let (socket_path, rendezvous_path, _startup_lock) = {
+    let (socket_path, rendezvous_path, mut startup_lock) = {
         use std::os::unix::fs::MetadataExt;
 
         if let Some(parent) = socket_path.as_path().parent() {
@@ -74,9 +100,9 @@ pub async fn start_control_socket_acceptor(
         }
         codex_uds::prepare_shared_daemon_socket_directory()?;
         let physical_path = protected_socket_path(socket_path.as_path())?;
-        let lock = acquire_app_server_startup_lock(AbsolutePathBuf::from_absolute_path_checked(
-            physical_path.with_extension("lock"),
-        )?)
+        let lock = acquire_removable_app_server_startup_lock(
+            AbsolutePathBuf::from_absolute_path_checked(physical_path.with_extension("lock"))?,
+        )
         .await?;
         prepare_control_socket_path(socket_path.as_path()).await?;
         (
@@ -95,10 +121,16 @@ pub async fn start_control_socket_acceptor(
     };
     prepare_control_socket_path(socket_path.as_path()).await?;
     let listener = UnixListener::bind(socket_path.as_path()).await?;
-    let socket_guard = ControlSocketFileGuard {
+    #[cfg(unix)]
+    {
+        startup_lock.remove_on_drop = true;
+    }
+    let socket_guard = DaemonSocketFileGuard {
         socket_path,
         #[cfg(unix)]
         rendezvous_path,
+        #[cfg(unix)]
+        _startup_lock: startup_lock,
         #[cfg(windows)]
         _directory_guard: directory_guard,
     };
@@ -108,26 +140,18 @@ pub async fn start_control_socket_acceptor(
         socket_guard.socket_path.as_path(),
         socket_guard.rendezvous_path.as_path(),
     )?;
-    info!(
-        socket_path = %socket_guard.socket_path.display(),
-        "app-server control socket listening"
-    );
-
-    Ok(tokio::spawn(run_control_socket_acceptor(
-        listener,
-        transport_event_tx,
-        shutdown_token,
-        socket_guard,
-        daemon_shutdown_access,
-    )))
+    #[cfg(unix)]
+    socket_guard._startup_lock._file.unlock()?;
+    Ok((listener, socket_guard))
 }
 
 async fn run_control_socket_acceptor(
     mut listener: UnixListener,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
-    socket_guard: ControlSocketFileGuard,
+    socket_guard: DaemonSocketFileGuard,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
 ) {
     let _socket_guard = socket_guard;
     loop {
@@ -157,6 +181,7 @@ async fn run_control_socket_acceptor(
         let transport_event_tx = transport_event_tx.clone();
         tokio::spawn(async move {
             let mut shutdown_request = false;
+            let mut negotiated_compression = WebSocketCompression::Plain;
             let websocket_config = WebSocketConfig::default();
             let max_unfragmented_message_bytes = [
                 websocket_config.max_frame_size,
@@ -176,6 +201,17 @@ async fn run_control_socket_acceptor(
                             return Err(rejection);
                         }
                         shutdown_request = true;
+                    } else if compression == WebSocketCompression::Zstd
+                        && request
+                            .headers()
+                            .get(WEBSOCKET_COMPRESSION_HEADER)
+                            .is_some_and(|value| value == ZSTD_STREAM_PROTOCOL)
+                    {
+                        negotiated_compression = WebSocketCompression::Zstd;
+                        response.headers_mut().insert(
+                            WEBSOCKET_COMPRESSION_HEADER,
+                            HeaderValue::from_static(ZSTD_STREAM_PROTOCOL),
+                        );
                     }
                     if let Some(max_bytes) = max_unfragmented_message_bytes {
                         response.headers_mut().insert(
@@ -200,7 +236,13 @@ async fn run_control_socket_acceptor(
                 return;
             }
             let (websocket_writer, websocket_reader) = websocket_stream.split();
-            run_websocket_connection(websocket_writer, websocket_reader, transport_event_tx).await;
+            run_websocket_connection(
+                websocket_writer,
+                websocket_reader,
+                transport_event_tx,
+                negotiated_compression,
+            )
+            .await;
         });
     }
     info!("control socket acceptor shutting down");
@@ -278,6 +320,36 @@ async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
     tokio::fs::remove_file(socket_path).await
 }
 
+/// Return a verified local socket endpoint, independent of the advertised Unix alias.
+/// A socket bound directly at the advertised path (e.g. SSH forwarding) is not ours on Unix.
+pub fn verified_local_daemon_socket(socket_path: &Path) -> IoResult<Option<AbsolutePathBuf>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let protected = protected_socket_path(socket_path)?;
+        if std::fs::read_link(socket_path).ok().as_deref() != Some(protected.as_path()) {
+            return Ok(None);
+        }
+        let directory = std::fs::symlink_metadata(codex_uds::shared_daemon_socket_directory()?)?;
+        // Match the daemon's bind-time check without creating or repairing the directory.
+        if directory.is_dir()
+            && directory.uid() == unsafe { libc::geteuid() }
+            && directory.mode() & 0o777 == 0o700
+        {
+            return AbsolutePathBuf::from_absolute_path(protected).map(Some);
+        }
+        Ok(None)
+    }
+    #[cfg(windows)]
+    {
+        // The TUI revalidates this directory and verifies the peer at connection time,
+        // using the same connect_local_daemon path as implicit startup.
+        let (path, _directory) = codex_uds::validate_private_socket_path(socket_path)?;
+        AbsolutePathBuf::from_absolute_path_checked(path).map(Some)
+    }
+}
+
 #[cfg(unix)]
 fn protected_socket_path(rendezvous_path: &Path) -> IoResult<std::path::PathBuf> {
     use sha2::Digest;
@@ -297,6 +369,10 @@ fn protected_socket_path(rendezvous_path: &Path) -> IoResult<std::path::PathBuf>
 
 pub struct AppServerStartupLock {
     _file: std::fs::File,
+    #[cfg(unix)]
+    removable_path: Option<AbsolutePathBuf>,
+    #[cfg(unix)]
+    remove_on_drop: bool,
 }
 
 pub async fn acquire_app_server_startup_lock(
@@ -313,10 +389,108 @@ pub async fn acquire_app_server_startup_lock(
             .write(true)
             .open(startup_lock_path.as_path())?;
         file.lock()?;
-        Ok(AppServerStartupLock { _file: file })
+        Ok(AppServerStartupLock {
+            _file: file,
+            #[cfg(unix)]
+            removable_path: None,
+            #[cfg(unix)]
+            remove_on_drop: false,
+        })
     })
     .await
     .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?
+}
+
+#[cfg(unix)]
+pub(super) async fn acquire_removable_app_server_startup_lock(
+    startup_lock_path: AbsolutePathBuf,
+) -> IoResult<AppServerStartupLock> {
+    let parent = startup_lock_path.as_path().parent().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidInput, "startup lock must have a parent")
+    })?;
+    codex_uds::prepare_private_socket_directory(parent).await?;
+    loop {
+        let startup_lock_path = startup_lock_path.clone();
+        let attempt = tokio::task::spawn_blocking(move || {
+            try_acquire_removable_app_server_startup_lock(startup_lock_path)
+        })
+        .await
+        .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))?;
+        match attempt {
+            Ok(lock) => return Ok(lock),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl AppServerStartupLock {
+    fn remove_file(&self) -> IoResult<()> {
+        let Some(path) = self.removable_path.as_ref() else {
+            return Ok(());
+        };
+        match self._file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+        startup_lock_file_matches_path(&self._file, path.as_path())?
+            .then(|| std::fs::remove_file(path.as_path()))
+            .transpose()
+            .map(|_| ())
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn try_acquire_removable_app_server_startup_lock(
+    startup_lock_path: AbsolutePathBuf,
+) -> IoResult<AppServerStartupLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(startup_lock_path.as_path())?;
+    file.try_lock()?;
+    if !startup_lock_file_matches_path(&file, startup_lock_path.as_path())? {
+        return Err(ErrorKind::WouldBlock.into());
+    }
+    Ok(AppServerStartupLock {
+        _file: file,
+        removable_path: Some(startup_lock_path),
+        remove_on_drop: false,
+    })
+}
+
+#[cfg(unix)]
+impl Drop for AppServerStartupLock {
+    fn drop(&mut self) {
+        if self.remove_on_drop
+            && let Err(err) = self.remove_file()
+        {
+            warn!(
+                lock_path = ?self.removable_path,
+                %err,
+                "failed to remove app-server startup lock file"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn startup_lock_file_matches_path(file: &std::fs::File, path: &Path) -> IoResult<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let locked_metadata = file.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(path_metadata) => Ok(locked_metadata.dev() == path_metadata.dev()
+            && locked_metadata.ino() == path_metadata.ino()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(unix)]
@@ -335,16 +509,19 @@ async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {
     Ok(())
 }
 
-struct ControlSocketFileGuard {
+/// Owns the socket files and startup lock until the listener is shut down.
+pub struct DaemonSocketFileGuard {
     socket_path: AbsolutePathBuf,
     #[cfg(unix)]
     rendezvous_path: AbsolutePathBuf,
+    #[cfg(unix)]
+    _startup_lock: AppServerStartupLock,
     // Keep the directory pinned until after the socket file is removed in Drop.
     #[cfg(windows)]
     _directory_guard: std::os::windows::io::OwnedHandle,
 }
 
-impl Drop for ControlSocketFileGuard {
+impl Drop for DaemonSocketFileGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if std::fs::read_link(self.rendezvous_path.as_path())

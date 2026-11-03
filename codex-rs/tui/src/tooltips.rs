@@ -3,8 +3,6 @@ use crate::keymap::keymap_action_id;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use codex_config::types::TuiKeymap;
 use codex_features::FEATURES;
-use codex_features::Feature;
-use codex_features::FeatureSpec;
 use codex_protocol::account::PlanType;
 use lazy_static::lazy_static;
 use rand::Rng;
@@ -21,16 +19,10 @@ const ANNOUNCEMENT_TIP_URL: &str =
 const IS_MACOS: bool = cfg!(target_os = "macos");
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
 
-const APP_TOOLTIP: &str = "Try the **Desktop app**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
+const WINDOWS_APP_TOOLTIP: &str = "Use the **desktop app**. Install it from https://chatgpt.com/codex?app-landing-page=true and run `codex app`.";
 const MACOS_APP_TOOLTIP: &str =
-    "Run `codex app` to open the Desktop app (it installs on macOS if needed).";
-const LINUX_APP_TOOLTIP: &str = "Try the **Desktop app** on Linux: install it from https://learn.chatgpt.com/docs/linux/linux-app and run 'chatgpt'.";
-const FAST_TOOLTIP: &str =
-    "*New* Use **/fast** to enable our fastest inference with increased plan usage.";
-const OTHER_TOOLTIP: &str = "*New* Build faster with the **Desktop app**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
-const OTHER_TOOLTIP_NON_MAC: &str = "*New* Build faster with Codex.";
-const FREE_GO_TOOLTIP: &str =
-    "*New* For a limited time, Codex is included in your plan for free – let’s build together.";
+    "Use the **desktop app**. Run `codex app` to open it. It installs automatically if needed.";
+const LINUX_APP_TOOLTIP: &str = "Use the **desktop app**. Install it from https://learn.chatgpt.com/docs/linux/linux-app and run `chatgpt`.";
 
 const RAW_TOOLTIPS: &str = include_str!("../assets/tooltips.txt");
 
@@ -39,42 +31,24 @@ lazy_static! {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .chain(if IS_MACOS {
-            Some(MACOS_APP_TOOLTIP)
-        } else {
-            linux_app_tooltip(LinuxDesktopSession::current())
-        })
+        .chain(app_tooltip())
         .collect();
     static ref ALL_TOOLTIPS: Vec<&'static str> = {
         let mut tips = Vec::new();
         tips.extend(TOOLTIPS.iter().copied());
-        tips.extend(experimental_tooltips(
-            FEATURES,
-            codex_realtime_webrtc::RealtimeWebrtcSession::is_supported,
-        ));
+        tips.extend(
+            FEATURES
+                .iter()
+                .filter_map(|spec| spec.stage.experimental_announcement()),
+        );
         tips
     };
 }
 
-fn experimental_tooltips(
-    features: &[FeatureSpec],
-    voice_supported: impl Fn() -> bool,
-) -> Vec<&'static str> {
-    features
-        .iter()
-        .filter(|spec| spec.id != Feature::RealtimeConversation || voice_supported())
-        .filter_map(|spec| spec.stage.experimental_announcement())
-        .collect()
-}
-
 /// Pick a random tooltip to show to the user when starting Codex.
-pub(crate) fn get_tooltip(
-    plan: Option<PlanType>,
-    fast_mode_enabled: bool,
-    keymap: &TuiKeymap,
-) -> Option<String> {
+pub(crate) fn get_tooltip(plan: Option<PlanType>, keymap: &TuiKeymap) -> Option<String> {
     let mut rng = rand::rng();
-    preferred_tooltip(&mut rng, plan, fast_mode_enabled).or_else(|| pick_tooltip(&mut rng, keymap))
+    preferred_tooltip(&mut rng, plan).or_else(|| pick_tooltip(&mut rng, keymap))
 }
 
 /// Apply the shared announcement and promotion policy before falling back to local tips.
@@ -82,7 +56,6 @@ pub(crate) fn get_tooltip(
 pub(crate) fn preferred_tooltip<R: Rng + ?Sized>(
     rng: &mut R,
     plan: Option<PlanType>,
-    fast_mode_enabled: bool,
 ) -> Option<String> {
     if let Some(announcement) = announcement::fetch_announcement_tip(plan) {
         return Some(announcement);
@@ -90,30 +63,7 @@ pub(crate) fn preferred_tooltip<R: Rng + ?Sized>(
 
     // Leave small chance for a random tooltip to be shown.
     if rng.random_ratio(/*numerator*/ 8, /*denominator*/ 10) {
-        match plan {
-            Some(plan_type)
-                if matches!(
-                    plan_type,
-                    PlanType::Plus | PlanType::Enterprise | PlanType::Pro | PlanType::ProLite
-                ) || plan_type.is_team_like()
-                    || plan_type.is_business_like() =>
-            {
-                if let Some(tooltip) = pick_paid_tooltip(rng, fast_mode_enabled) {
-                    return Some(tooltip.to_string());
-                }
-            }
-            Some(PlanType::Go) | Some(PlanType::Free) => {
-                return Some(FREE_GO_TOOLTIP.to_string());
-            }
-            _ => {
-                let tooltip = if IS_MACOS {
-                    OTHER_TOOLTIP
-                } else {
-                    OTHER_TOOLTIP_NON_MAC
-                };
-                return Some(tooltip.to_string());
-            }
-        }
+        return app_tooltip().map(str::to_string);
     }
 
     None
@@ -149,26 +99,13 @@ fn linux_app_tooltip(session: LinuxDesktopSession) -> Option<&'static str> {
     (session.has_display && !session.is_wsl).then_some(LINUX_APP_TOOLTIP)
 }
 
-fn paid_app_tooltip() -> Option<&'static str> {
-    if IS_MACOS || IS_WINDOWS {
-        Some(APP_TOOLTIP)
+fn app_tooltip() -> Option<&'static str> {
+    if IS_MACOS {
+        Some(MACOS_APP_TOOLTIP)
+    } else if IS_WINDOWS {
+        Some(WINDOWS_APP_TOOLTIP)
     } else {
         linux_app_tooltip(LinuxDesktopSession::current())
-    }
-}
-
-/// Paid users spend most startup sessions in a dedicated promo slot rather than the
-/// generic random tip pool. Keep this business logic explicit: we currently split
-/// that slot between the app promo and Fast mode, but suppress the Fast promo once
-/// the user already has Fast mode enabled.
-fn pick_paid_tooltip<R: Rng + ?Sized>(
-    rng: &mut R,
-    fast_mode_enabled: bool,
-) -> Option<&'static str> {
-    if fast_mode_enabled || rng.random_bool(0.5) {
-        paid_app_tooltip()
-    } else {
-        Some(FAST_TOOLTIP)
     }
 }
 
@@ -201,9 +138,13 @@ pub(crate) fn resolved_tooltips(
         .filter_map(move |tip| render_tooltip(tip, keymap))
 }
 
+pub(crate) fn tooltip_templates() -> impl Iterator<Item = &'static str> {
+    ALL_TOOLTIPS.iter().copied()
+}
+
 /// Substitute `{key:context.action}` with the current primary shortcut in a Markdown code span.
 /// Skip the tip if a placeholder is invalid or its action has no binding.
-fn render_tooltip(mut template: &str, keymap: Option<&RuntimeKeymap>) -> Option<String> {
+pub(crate) fn render_tooltip(mut template: &str, keymap: Option<&RuntimeKeymap>) -> Option<String> {
     let mut rendered = String::new();
     while let Some((prefix, rest)) = template.split_once("{key:") {
         let (action, suffix) = rest.split_once('}')?;
@@ -434,43 +375,6 @@ mod tests {
     use rand::rngs::StdRng;
 
     #[test]
-    fn experimental_voice_tooltip_requires_runtime_support() {
-        let mut features = FEATURES.to_vec();
-        features
-            .iter_mut()
-            .find(|spec| spec.id == Feature::RealtimeConversation)
-            .unwrap()
-            .stage = codex_features::Stage::Experimental {
-            name: "Voice conversations",
-            menu_description: "Talk with Codex using /voice.",
-            announcement: "NEW: Voice conversations can now be enabled from /experimental. Restart Codex after enabling, then use /voice.",
-        };
-        let unavailable = experimental_tooltips(&features, || false);
-        let available = experimental_tooltips(&features, || true);
-        let voice_tip = features
-            .iter()
-            .find(|spec| spec.id == Feature::RealtimeConversation)
-            .and_then(|spec| spec.stage.experimental_announcement())
-            .expect("voice has an experimental announcement");
-        assert_eq!(
-            unavailable,
-            available
-                .iter()
-                .copied()
-                .filter(|tip| *tip != voice_tip)
-                .collect::<Vec<_>>()
-        );
-        insta::assert_snapshot!(
-            "experimental_voice_tooltip",
-            available
-                .into_iter()
-                .filter(|tip| *tip == voice_tip)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
     fn random_tooltip_returns_some_tip_when_available() {
         let mut rng = StdRng::seed_from_u64(42);
         assert!(pick_tooltip(&mut rng, &TuiKeymap::default()).is_some());
@@ -488,36 +392,53 @@ mod tests {
     }
 
     #[test]
+    fn desktop_app_tips_render_at_narrow_width() {
+        let cwd = std::env::current_dir().unwrap();
+        for (platform, tip) in [
+            ("macos", MACOS_APP_TOOLTIP),
+            ("windows", WINDOWS_APP_TOOLTIP),
+            ("linux", LINUX_APP_TOOLTIP),
+        ] {
+            let rendered = render_tooltip_lines(tip, /*width*/ 40, &cwd)
+                .iter()
+                .map(|line| format!("{:?} {:?}", line.line, line.hyperlinks))
+                .collect::<Vec<_>>()
+                .join("\n");
+            insta::assert_snapshot!(format!("desktop_app_tip_{platform}"), rendered);
+        }
+    }
+
+    #[test]
     fn desktop_app_tooltip_uses_supported_platform_launcher() {
         let tooltip = TOOLTIPS
             .iter()
             .copied()
-            .find(|tip| tip.contains("Desktop app"));
+            .find(|tip| tip.contains("desktop app"));
 
         if linux_app_tooltip(LinuxDesktopSession::current()).is_some() {
             let tooltip = tooltip.expect("Linux should advertise the desktop app");
-            assert_eq!(paid_app_tooltip(), Some(tooltip));
+            assert_eq!(app_tooltip(), Some(tooltip));
         } else if IS_MACOS {
             let tooltip = tooltip.expect("macOS should advertise the desktop app");
-            insta::assert_snapshot!(tooltip, @"Run `codex app` to open the Desktop app (it installs on macOS if needed).");
-            assert_eq!(paid_app_tooltip(), Some(APP_TOOLTIP));
+            assert_eq!(app_tooltip(), Some(tooltip));
         } else if IS_WINDOWS {
-            assert_eq!(tooltip, None);
-            assert_eq!(paid_app_tooltip(), Some(APP_TOOLTIP));
+            let tooltip = tooltip.expect("Windows should advertise the desktop app");
+            assert_eq!(app_tooltip(), Some(tooltip));
         } else {
             assert_eq!(tooltip, None);
-            assert_eq!(paid_app_tooltip(), None);
+            assert_eq!(app_tooltip(), None);
         }
     }
 
     #[test]
     fn linux_desktop_app_tooltip_requires_graphical_native_session() {
-        let tooltip = linux_app_tooltip(LinuxDesktopSession {
-            has_display: true,
-            is_wsl: false,
-        })
-        .expect("graphical native Linux should advertise the desktop app");
-        insta::assert_snapshot!(tooltip, @"Try the **Desktop app** on Linux: install it from https://learn.chatgpt.com/docs/linux/linux-app and run 'chatgpt'.");
+        assert_eq!(
+            linux_app_tooltip(LinuxDesktopSession {
+                has_display: true,
+                is_wsl: false,
+            }),
+            Some(LINUX_APP_TOOLTIP)
+        );
 
         assert_eq!(
             linux_app_tooltip(LinuxDesktopSession {
@@ -536,30 +457,24 @@ mod tests {
     }
 
     #[test]
-    fn paid_tooltip_pool_rotates_between_promos() {
-        let mut seen = std::collections::BTreeSet::new();
-        for seed in 0..32 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            seen.insert(pick_paid_tooltip(
-                &mut rng, /*fast_mode_enabled*/ false,
-            ));
+    fn plans_use_platform_app_tip() {
+        for plan in [
+            Some(PlanType::Free),
+            Some(PlanType::Go),
+            Some(PlanType::Plus),
+            Some(PlanType::Pro),
+            None,
+        ] {
+            let mut seen = std::collections::BTreeSet::new();
+            for seed in 0..32 {
+                let mut rng = StdRng::seed_from_u64(seed);
+                seen.insert(preferred_tooltip(&mut rng, plan));
+            }
+            assert_eq!(
+                seen,
+                std::collections::BTreeSet::from([None, app_tooltip().map(str::to_string)])
+            );
         }
-
-        let expected = std::collections::BTreeSet::from([paid_app_tooltip(), Some(FAST_TOOLTIP)]);
-        assert_eq!(seen, expected);
-    }
-
-    #[test]
-    fn paid_tooltip_pool_skips_fast_when_fast_mode_is_enabled() {
-        let mut seen = std::collections::BTreeSet::new();
-        for seed in 0..8 {
-            let mut rng = StdRng::seed_from_u64(seed);
-            seen.insert(pick_paid_tooltip(&mut rng, /*fast_mode_enabled*/ true));
-        }
-
-        let expected = std::collections::BTreeSet::from([paid_app_tooltip()]);
-        assert_eq!(seen, expected);
-        assert!(!seen.contains(&Some(FAST_TOOLTIP)));
     }
 
     #[test]

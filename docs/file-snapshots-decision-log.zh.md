@@ -423,6 +423,16 @@
 
 72. **协议生成入口已由上游修复。** 本版本使用 `just write-app-server-schema` 和 `--experimental`,普通生成还会更新 Python SDK。继续重生成本 fork 的恢复接口,不要只接受上游的压缩预生成文件。决策 64 的手工调用只适用于旧基线。
 
+### 上游同步 rust-v0.156.1 → rust-v0.166.0(2026-11-03)
+
+73. **后台服务兼容性改用上游的通用 feature 检查。** 上游已按会话所需的 feature 检查服务能力,不再维护旧的手工白名单。保留这套实现,并在兼容性测试中加入 `file_snapshots` 缺失的场景;开启文件快照时仍不能复用不支持它的服务。Rewind 分叉同时适配新的 `selected_server_profile` 接口,新增的普通分叉调用明确传入 `restore_files = false`。
+
+74. **快照依赖的 Git index 功能需要同步锁文件。** 上游升级到 gix 0.89 后,本 fork 启用的 `index` 功能需要 gix-index 0.57、gix-bitmap 0.6 和 filetime 0.2.29。更新 Cargo 锁文件后同步生成 Bazel 锁文件,保留上游其他依赖的锁定版本。
+
+75. **发布包新增独立的 `codex-exec-server`。** 沿用上游打包脚本收集该 helper,并把它加入 fork 构建工作流的 strip 列表。启动器和新增 Rust 测试仍使用本 fork 的 `codexr` 名称;协议的稳定、实验性预生成包和 Python SDK 都必须重新生成,保留恢复文件与撤销恢复接口。
+
+本次在 Linux 上完成 447 项定向 Rust 回归(424 项单测及 TUI 回归、23 项文件快照与服务端集成)、5 项启动器测试、27 项打包测试,以及格式检查、schema 生成和 npm 启动器包校验。`codexr` 构建成功,版本为 0.166.0。未运行全工作区测试或跨平台发布 dry run。
+
 ## 四、已知但暂不处理
 
 41. **resume 之后,会话 UI 不显示 apply_patch 的 diff**(你报的,2026-08-13)。

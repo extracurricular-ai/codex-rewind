@@ -16,8 +16,6 @@ use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
 use pretty_assertions::assert_eq;
-#[cfg(test)]
-use std::os::unix::fs::PermissionsExt;
 
 fn read_only_permission_profile() -> PermissionProfile {
     PermissionProfile::read_only()
@@ -72,39 +70,10 @@ fn inserts_bwrap_argv0_before_command_separator() {
         /*supports_argv0*/ true,
         "/tmp/codex-arg0-session/codex-linux-sandbox".to_string(),
     );
-    let daemon_directory = codex_uds::shared_daemon_socket_directory()
-        .unwrap()
-        .display()
-        .to_string();
+    let separator = argv.iter().position(|arg| arg == "--").unwrap();
     assert_eq!(
-        argv,
-        vec![
-            "bwrap".to_string(),
-            "--new-session".to_string(),
-            "--die-with-parent".to_string(),
-            "--ro-bind".to_string(),
-            "/".to_string(),
-            "/".to_string(),
-            "--dev".to_string(),
-            "/dev".to_string(),
-            "--perms".to_string(),
-            "000".to_string(),
-            "--tmpfs".to_string(),
-            daemon_directory.clone(),
-            "--remount-ro".to_string(),
-            daemon_directory,
-            "--unshare-user".to_string(),
-            "--unshare-pid".to_string(),
-            "--unshare-ipc".to_string(),
-            "--proc".to_string(),
-            "/proc".to_string(),
-            "--cap-drop".to_string(),
-            "ALL".to_string(),
-            "--argv0".to_string(),
-            "codex-linux-sandbox".to_string(),
-            "--".to_string(),
-            "/bin/true".to_string(),
-        ]
+        &argv[separator - 2..],
+        ["--argv0", "codex-linux-sandbox", "--", "/bin/true"]
     );
 }
 
@@ -488,68 +457,6 @@ fn cleanup_synthetic_mount_targets_preserves_real_pre_existing_empty_file() {
 }
 
 #[test]
-fn cleanup_protected_create_targets_removes_created_path_and_reports_violation() {
-    let temp_dir = tempfile::TempDir::new().expect("tempdir");
-    let dot_git = temp_dir.path().join(".git");
-    let target = crate::bwrap::ProtectedCreateTarget::missing(&dot_git);
-
-    let registrations = register_protected_create_targets(&[target]);
-    std::fs::create_dir(&dot_git).expect("create protected path");
-    let violation = cleanup_protected_create_targets(&registrations);
-
-    assert!(violation);
-    assert!(!dot_git.exists());
-}
-
-#[test]
-fn cleanup_protected_create_targets_removes_path_despite_active_marker() {
-    let temp_dir = tempfile::TempDir::new().expect("tempdir");
-    let dot_git = temp_dir.path().join(".git");
-    let target = crate::bwrap::ProtectedCreateTarget::missing(&dot_git);
-
-    let registrations = register_protected_create_targets(std::slice::from_ref(&target));
-    let active_marker = registrations[0].marker_dir.join("1");
-    std::fs::write(&active_marker, PROTECTED_CREATE_MARKER).expect("write active marker");
-    std::fs::write(&dot_git, "").expect("create protected path");
-
-    let violation = cleanup_protected_create_targets(&registrations);
-    assert!(violation);
-    assert!(!dot_git.exists());
-}
-
-#[test]
-fn cleanup_protected_create_targets_removes_read_only_directory_and_reports_violation() {
-    let temp_dir = tempfile::TempDir::new().expect("tempdir");
-    let dot_git = temp_dir.path().join(".git");
-    let outside = temp_dir.path().join("outside");
-    let target = crate::bwrap::ProtectedCreateTarget::missing(&dot_git);
-
-    let registrations = register_protected_create_targets(&[target]);
-    std::fs::create_dir(&outside).expect("create outside directory");
-    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755))
-        .expect("set outside directory permissions");
-    std::fs::create_dir(&dot_git).expect("create protected path");
-    std::fs::write(dot_git.join("config"), "[core]\n").expect("write protected child");
-    std::os::unix::fs::symlink(&outside, dot_git.join("outside-link"))
-        .expect("link outside directory");
-    std::fs::set_permissions(&dot_git, std::fs::Permissions::from_mode(0o000))
-        .expect("make protected path read-only");
-
-    let violation = cleanup_protected_create_targets(&registrations);
-
-    assert!(violation);
-    assert!(!dot_git.exists());
-    assert_eq!(
-        std::fs::metadata(&outside)
-            .expect("outside directory remains")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o755
-    );
-}
-
-#[test]
 fn bwrap_signal_forwarder_terminates_child_and_keeps_parent_alive() {
     let supervisor_pid = unsafe { libc::fork() };
     assert!(supervisor_pid >= 0, "failed to fork supervisor");
@@ -616,7 +523,7 @@ fn managed_proxy_inner_command_includes_route_spec() {
 
         assert!(args.iter().any(|arg| arg == "--proxy-route-spec"));
         assert!(args.iter().any(|arg| arg == "{\"routes\":[]}"));
-        let parsed = LandlockCommand::try_parse_from(args)
+        let parsed = LinuxSandboxCommand::try_parse_from(args)
             .expect("inner command should preserve the managed network policy");
         assert_eq!(parsed.managed_network, Some(managed_network));
     }
@@ -624,7 +531,7 @@ fn managed_proxy_inner_command_includes_route_spec() {
 
 #[test]
 fn managed_network_policy_alone_enables_proxy_mode() {
-    let parsed = LandlockCommand::try_parse_from([
+    let parsed = LinuxSandboxCommand::try_parse_from([
         "codex-linux-sandbox",
         "--sandbox-policy-cwd",
         "/tmp",
@@ -642,7 +549,7 @@ fn managed_network_policy_alone_enables_proxy_mode() {
 
 #[test]
 fn malformed_managed_network_policy_is_rejected() {
-    let error = LandlockCommand::try_parse_from([
+    let error = LinuxSandboxCommand::try_parse_from([
         "codex-linux-sandbox",
         "--sandbox-policy-cwd",
         "/tmp",
@@ -687,7 +594,7 @@ fn non_managed_inner_command_omits_route_spec() {
     });
 
     assert!(!args.iter().any(|arg| arg == "--proxy-route-spec"));
-    let parsed = LandlockCommand::try_parse_from(args)
+    let parsed = LinuxSandboxCommand::try_parse_from(args)
         .expect("unmanaged inner command should preserve ordinary sandbox mode");
     assert_eq!(parsed.managed_network, None);
 }

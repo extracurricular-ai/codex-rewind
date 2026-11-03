@@ -7,7 +7,10 @@ use codex_core::TurnInputRequest;
 use codex_core::config::Constrained;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_core::config::RolloutBudgetConfig;
+use codex_core::context::GuardianContextMode;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
+use codex_history::RolloutItem;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -17,6 +20,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::user_input::UserInput;
+use core_test_support::ThreadIdle;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -36,42 +40,61 @@ use test_case::test_case;
 use super::image_rollout::RecordingFileAttachmentStore;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(160_000, &[0, 0]; "complete_instructions_fit")]
-#[test_case(28_000, &[0, 1]; "oversized_history_compacts_then_truncates")]
-#[test_case(16_000, &[1]; "first_review_can_shorten_oversized_instructions")]
-async fn review_preserves_user_instructions_until_request_budgeting(
-    window: i64,
-    compactions_per_turn: &[usize],
-) -> Result<()> {
+async fn independent_review_preserves_oversized_instruction_order() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
         "Guardian approval actions require host-native paths"
     );
     let server = responses::start_mock_server().await;
-    let test = test_codex()
-        .with_model_info_override("gpt-5.6-luna", move |model| {
-            model.context_window = Some(window);
-        })
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(Arc::new(ThreadIdle));
+    let mut test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_model_info_override("gpt-5.6-luna", |model| model.context_window = Some(28_000))
         .with_model_info_override("gpt-5.5", |model| {
             model.auto_review_model_override = Some("gpt-5.6-luna".to_owned());
         })
         .with_config(|config| {
+            config
+                .features
+                .disable(Feature::GuardianReuseParentCompaction)
+                .expect("review the legacy transcript rather than the opaque checkpoint");
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+            config.model_auto_compact_token_limit = Some(1_000_000);
         })
         .build_with_auto_env(&server)
         .await?;
+    let old_history: Vec<RolloutItem> = serde_json::from_value(json!([{
+        "type": "compacted",
+        "payload": {
+            "message": "Historical checkpoint without producer metadata.",
+            "replacement_history": [{
+                "type": "compaction",
+                "id": "old-checkpoint",
+                "encrypted_content": "legacy opaque context"
+            }]
+        }
+    }]))?;
+    test.codex.ensure_rollout_materialized().await;
+    test.codex.append_rollout_items(&old_history).await?;
+    test.codex =
+        super::guardian_checkpoint_migration::resume(&test, &test.codex, old_history).await?;
+    assert_eq!(
+        GuardianContextMode::from_history(
+            test.codex.conversation_history_snapshot().await.as_ref()
+        ),
+        GuardianContextMode::Independent,
+    );
     let command = json!({
         "cmd": "echo complete-instructions",
         "sandbox_permissions": "require_escalated",
         "justification": "Run the requested command."
     })
     .to_string();
-    let events = compactions_per_turn
-        .iter()
-        .enumerate()
-        .flat_map(|(turn, compactions)| {
+    let events = (0..2)
+        .flat_map(|turn| {
             let mut events = vec![
                 sse(vec![
                     ev_function_call(&format!("exec-{turn}"), "exec_command", &command),
@@ -89,13 +112,17 @@ async fn review_preserves_user_instructions_until_request_budgeting(
                     ev_completed(&format!("done-{turn}")),
                 ]),
             ];
-            for _ in 0..*compactions {
+            if turn == 1 {
                 events.insert(
                     /*index*/ 1,
                     sse(vec![
                         json!({
                             "type": "response.output_item.done",
-                            "item": {"type": "compaction", "encrypted_content": "Earlier reviewer context."},
+                            "item": {
+                                "type": "compaction",
+                                "id": "review-summary",
+                                "encrypted_content": "Earlier reviewer context."
+                            }
                         }),
                         ev_completed("review-compaction"),
                     ]),
@@ -110,34 +137,32 @@ async fn review_preserves_user_instructions_until_request_budgeting(
         "{padding}Run the requested echo command. You may edit scratch files only.{padding}"
     );
     test.submit_text_turn(&initial).await?;
-    // This whole message exceeds the old transcript allowance. A following
-    // restriction must still reach the reviewer, with the original source order.
+    ThreadIdle::wait(&test.codex).await;
     let followup = format!("{padding}{padding}Keep all files private.{padding}{padding}");
     let approval = format!(
         "{}\nApproved action: {command}",
         codex_guardian_context::MANUAL_APPROVAL_DEVELOPER_PREFIX
     );
     let restriction = "Revoke permission to edit files. Only run the echo command.";
-    // V2 retains the first review's user input. The smallest window exercises
-    // first-review truncation only; the larger windows cover follow-up delivery.
-    if compactions_per_turn.len() == 2 {
-        test.codex
-            .inject_response_items(vec![
-                responses::user_message_item(&followup),
-                ResponseItem::Message {
-                    id: None,
-                    role: "developer".to_owned(),
-                    content: vec![ContentItem::InputText {
-                        text: approval.clone(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            ])
-            .await?;
-        test.submit_text_turn(restriction).await?;
-    }
-    let (compact_requests, requests): (Vec<_>, Vec<_>) = responses
+    test.codex
+        .inject_response_items(vec![
+            responses::user_message_item(&followup),
+            ResponseItem::Message {
+                status: None,
+                encrypted_content: None,
+                id: None,
+                role: "developer".to_owned(),
+                content: vec![ContentItem::InputText {
+                    text: approval.clone(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ])
+        .await?;
+    test.submit_text_turn(restriction).await?;
+    ThreadIdle::wait(&test.codex).await;
+    let (compactions, requests): (Vec<_>, Vec<_>) = responses
         .requests()
         .into_iter()
         .partition(|request| !request.inputs_of_type("compaction_trigger").is_empty());
@@ -145,53 +170,35 @@ async fn review_preserves_user_instructions_until_request_budgeting(
         .iter()
         .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
         .collect::<Vec<_>>();
-    assert_eq!(reviews.len(), compactions_per_turn.len());
-    let initial_inputs = reviews[0].message_input_text_groups("user");
-    let initial_context = initial_inputs.last().expect("first review input").concat();
-    if compactions_per_turn[0] == 0 {
-        assert!(initial_context.contains(&initial));
-    } else {
-        assert!(initial_context.contains("<truncated omitted_approx_tokens="));
-    }
-    assert_eq!(
-        compact_requests.len(),
-        compactions_per_turn.iter().sum::<usize>()
-    );
-    if let Some(review) = reviews.get(1) {
-        let delta_inputs = review.message_input_text_groups("user");
-        let delta = delta_inputs.last().expect("delta review input");
-        let delta_context = delta.concat();
-        if window == 160_000 {
-            assert!(delta_context.contains(&followup));
-        } else {
-            assert!(delta_context.contains("<truncated omitted_approx_tokens="));
-            assert!(
-                delta_context.contains(
-                    "User instructions and prior approvals may be incomplete where marked."
-                )
-            );
-        }
-        let approval_start = delta_context
-            .find(&approval)
-            .expect("complete prior approval");
-        let restriction_start = delta_context.find(restriction).expect("later restriction");
-        assert!(approval_start + approval.len() < restriction_start);
-        assert!(
-            !delta_context.contains(&initial),
-            "old entries are not resent"
-        );
-        assert_eq!(
-            reviews[0].body_json()["client_metadata"]["thread_id"],
-            review.body_json()["client_metadata"]["thread_id"]
-        );
-    }
+    assert_eq!((compactions.len(), reviews.len()), (1, 2));
     assert!(
-        requests
+        reviews[0]
+            .message_input_text_groups("user")
             .last()
-            .expect("parent resumes after review")
-            .function_call_output(&format!("exec-{}", reviews.len() - 1))
-            .to_string()
-            .contains("complete-instructions")
+            .expect("first review")
+            .concat()
+            .contains(&initial)
+    );
+    let groups = reviews[1].message_input_text_groups("user");
+    let delta = groups.last().expect("follow-up review").concat();
+    assert!(delta.contains("<truncated omitted_approx_tokens="));
+    assert!(
+        delta.contains("User instructions and prior approvals may be incomplete where marked.")
+    );
+    let transcript = delta
+        .split_once(">>> TRANSCRIPT DELTA START\n")
+        .expect("legacy transcript delta")
+        .1
+        .split_once(">>> TRANSCRIPT DELTA END\n")
+        .expect("legacy transcript delta end")
+        .0;
+    let approval_start = transcript.find(&approval).expect("complete prior approval");
+    let restriction_start = transcript.find(restriction).expect("later restriction");
+    assert!(approval_start + approval.len() < restriction_start);
+    assert!(!delta.contains(&initial), "old entries are not resent");
+    assert_eq!(
+        reviews[0].body_json()["client_metadata"]["thread_id"],
+        reviews[1].body_json()["client_metadata"]["thread_id"]
     );
     test.codex.shutdown_and_wait().await?;
     Ok(())
@@ -201,6 +208,7 @@ async fn review_preserves_user_instructions_until_request_budgeting(
 enum ReviewerResponse {
     Decision,
     ToolContinuation,
+    CachedCompactionContinuation,
     FileImageContinuation,
     UncompactableContinuation,
     CompactionError,
@@ -210,9 +218,10 @@ enum ReviewerResponse {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(1, ReviewerResponse::Decision; "required_context_fails_closed")]
 #[test_case(4_500, ReviewerResponse::ToolContinuation; "oversized_tool_continuation_compacts")]
+#[test_case(7_000, ReviewerResponse::CachedCompactionContinuation; "cached_compaction_fits_reviewer_budget")]
 #[test_case(4_500, ReviewerResponse::FileImageContinuation; "uploaded_original_image_history_compacts")]
-#[test_case(4_500, ReviewerResponse::UncompactableContinuation; "ineffective_compaction_fails_closed")]
-#[test_case(4_500, ReviewerResponse::CompactionError; "compaction_service_error_does_not_request_user_approval")]
+#[test_case(5_000, ReviewerResponse::UncompactableContinuation; "ineffective_compaction_fails_closed")]
+#[test_case(5_000, ReviewerResponse::CompactionError; "compaction_service_error_does_not_request_user_approval")]
 #[test_case(6_000, ReviewerResponse::NextReview; "incoming_review_compacts_existing_history")]
 async fn review_respects_complete_context_budget(
     window: i64,
@@ -268,6 +277,7 @@ async fn review_respects_complete_context_budget(
                 .expect("test permits time reminders");
             config.current_time_reminder = Some(CurrentTimeReminderConfig::default());
             config.rollout_budget = Some(RolloutBudgetConfig {
+                enforce_limit: true,
                 limit_tokens: 1_000_000,
                 reminder_at_remaining_tokens: Vec::new(),
                 sampling_token_weight: 1.0,
@@ -277,6 +287,7 @@ async fn review_respects_complete_context_budget(
     if matches!(
         reviewer_response,
         ReviewerResponse::ToolContinuation
+            | ReviewerResponse::CachedCompactionContinuation
             | ReviewerResponse::FileImageContinuation
             | ReviewerResponse::UncompactableContinuation
             | ReviewerResponse::CompactionError
@@ -328,6 +339,11 @@ async fn review_respects_complete_context_budget(
                         })
                         .to_string(),
                     ),
+                    ReviewerResponse::CachedCompactionContinuation => ev_custom_tool_call(
+                        "reviewer-inspect",
+                        "exec",
+                        "text('inspection-output'.repeat(1000));",
+                    ),
                     ReviewerResponse::ToolContinuation
                     | ReviewerResponse::UncompactableContinuation
                     | ReviewerResponse::CompactionError => ev_custom_tool_call(
@@ -349,7 +365,9 @@ async fn review_respects_complete_context_budget(
     }
     if matches!(
         reviewer_response,
-        ReviewerResponse::ToolContinuation | ReviewerResponse::FileImageContinuation
+        ReviewerResponse::ToolContinuation
+            | ReviewerResponse::CachedCompactionContinuation
+            | ReviewerResponse::FileImageContinuation
     ) {
         events.insert(
             /*index*/ 2,
@@ -395,6 +413,13 @@ async fn review_respects_complete_context_budget(
             ReviewerResponse::UncompactableContinuation
         ) {
             "still oversized ".repeat(/*n*/ 4_000)
+        } else if matches!(
+            reviewer_response,
+            ReviewerResponse::CachedCompactionContinuation
+        ) {
+            // The opaque wire payload also carries cached token IDs. It must fit
+            // after compaction without being shortened or forcing another review.
+            format!("Previous review evidence.{}", "a".repeat(/*n*/ 18_000))
         } else {
             "Previous review evidence and inspection results.".to_owned()
         };
@@ -450,7 +475,9 @@ async fn review_respects_complete_context_budget(
     } else {
         let recovered = matches!(
             reviewer_response,
-            ReviewerResponse::ToolContinuation | ReviewerResponse::FileImageContinuation
+            ReviewerResponse::ToolContinuation
+                | ReviewerResponse::CachedCompactionContinuation
+                | ReviewerResponse::FileImageContinuation
         );
         assert_eq!(requests.len(), if recovered { 4 } else { 3 });
         assert_eq!(guardian_requests.len(), if recovered { 2 } else { 1 });
@@ -458,13 +485,16 @@ async fn review_respects_complete_context_budget(
             assert_eq!(compact_requests.len(), 1);
             let compact = &compact_requests[0];
             if matches!(reviewer_response, ReviewerResponse::FileImageContinuation) {
-                assert_eq!(
-                    image_store
-                        .uploads
-                        .lock()
-                        .expect("image upload tracker lock is not poisoned")
-                        .len(),
-                    1
+                let uploads = image_store
+                    .uploads
+                    .lock()
+                    .expect("image upload tracker lock is not poisoned");
+                let [upload] = uploads.as_slice() else {
+                    panic!("persistent Guardian should upload one image");
+                };
+                assert!(
+                    !upload.ephemeral,
+                    "persistent Guardian should request durable attachment storage"
                 );
                 // The file reservation also protects the compaction request itself: an output
                 // larger than its window is replaced before the summary request is sent.
@@ -486,6 +516,17 @@ async fn review_respects_complete_context_budget(
                     .to_string()
                     .contains("Previous review evidence")
             );
+            if matches!(
+                reviewer_response,
+                ReviewerResponse::CachedCompactionContinuation
+            ) {
+                let checkpoints = guardian_requests[1].inputs_of_type("compaction");
+                assert_eq!(
+                    checkpoints[0]["encrypted_content"],
+                    format!("Previous review evidence.{}", "a".repeat(/*n*/ 18_000)),
+                    "budgeting must preserve the complete encrypted checkpoint"
+                );
+            }
             assert_eq!(
                 guardian_requests[0].body_json()["client_metadata"]["thread_id"],
                 recovered["client_metadata"]["thread_id"]
@@ -657,11 +698,26 @@ async fn oversized_action_preserves_review_policy_and_next_review(
         "justification": "Run the requested command.",
     })
     .to_string();
+    let assistant_evidence = [
+        "commentary evidence ".repeat(/*n*/ 1_300),
+        "final evidence ".repeat(/*n*/ 1_600),
+    ];
+    let mut parent_events = Vec::new();
+    if matches!(review, OversizedActionReview::Fits) {
+        let mut commentary = ev_assistant_message("history-commentary", &assistant_evidence[0]);
+        commentary["item"]["phase"] = json!("commentary");
+        parent_events.push(commentary);
+        parent_events.push(ev_assistant_message(
+            "history-final",
+            &assistant_evidence[1],
+        ));
+    }
+    parent_events.extend([
+        ev_function_call("oversized", "exec_command", &oversized),
+        ev_completed("oversized"),
+    ]);
     let mut events = vec![
-        sse(vec![
-            ev_function_call("oversized", "exec_command", &oversized),
-            ev_completed("oversized"),
-        ]),
+        sse(parent_events),
         sse(vec![
             ev_function_call("next", "exec_command", &next),
             ev_completed("next"),
@@ -759,8 +815,20 @@ async fn oversized_action_preserves_review_policy_and_next_review(
     assert_eq!(reviews.len(), if fits { 2 } else { 1 });
     if fits {
         let parts = reviews[0].message_input_texts("user");
-        assert!(parts.concat().contains(&oversized_command));
+        let context = parts.concat();
+        assert!(context.contains(&oversized_command));
         assert!(parts.iter().all(|part| part.len() <= 36_000));
+        let transcript = context
+            .split_once(">>> TRANSCRIPT START\n")
+            .expect("full transcript")
+            .1
+            .split_once(">>> TRANSCRIPT END\n")
+            .expect("full transcript end")
+            .0;
+        for text in &assistant_evidence {
+            let capped = codex_guardian_context::truncate_text(text, /*max_tokens*/ 5_000);
+            assert!(transcript.contains(&format!("assistant: {capped}\n")));
+        }
     }
     let context = reviews
         .last()
@@ -768,6 +836,9 @@ async fn oversized_action_preserves_review_policy_and_next_review(
         .message_input_texts("user")
         .concat();
     assert!(context.contains("echo complete-action-review"));
+    let historical_arguments =
+        codex_guardian_context::truncate_text(&oversized, /*max_tokens*/ 1_000);
+    assert!(context.contains(&format!("tool exec_command call: {historical_arguments}\n")));
     assert!(
         requests
             .last()

@@ -1,9 +1,94 @@
-//! Snapshot coverage for draft text and live voice controls in the composer.
+//! Snapshot coverage for draft text, plugin mentions, shortcuts, and live voice controls.
 
 use super::tests::new_test_composer;
+use super::tests::snapshot_composer_state_with_width;
+use super::tests::test_plugin_summary;
+use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::footer::FooterMode;
+use crate::key_hint;
+use crate::key_hint::ShortcutHint;
+use crate::keymap::RuntimeKeymap;
 use crate::render::renderable::Renderable;
+use codex_plugin::PluginCapabilitySummary;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyModifiers;
+use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+
+#[test]
+fn plugin_mention_uses_display_name_for_opaque_id() {
+    snapshot_composer_state_with_width(
+        "plugin_mention_uses_display_name_for_opaque_id",
+        /*width*/ 100,
+        /*enhanced_keys_supported*/ false,
+        |composer| {
+            let plugin_name = "app-6a6b12e06c5c8191ac5d5252fa5f92c8";
+            composer.set_mentions_v2_enabled(/*enabled*/ true);
+            composer.set_plugin_mentions(Some(vec![PluginCapabilitySummary {
+                display_name: "Postman".to_string(),
+                ..test_plugin_summary(plugin_name, "")
+            }]));
+            composer.set_text_content("@Postm".to_string(), Vec::new(), Vec::new());
+            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+            assert_eq!(
+                composer.mention_bindings(),
+                vec![MentionBinding {
+                    sigil: '@',
+                    mention: "Postman".to_string(),
+                    path: format!("plugin://{plugin_name}@test"),
+                }]
+            );
+        },
+    );
+}
+
+#[test]
+fn shortcut_footer_displays_configured_chords() {
+    use codex_config::types::KeybindingSpec;
+    use codex_config::types::KeybindingsSpec;
+    use codex_config::types::TuiKeymap;
+
+    let mut config = TuiKeymap::default();
+    config.global.open_external_editor = Some(KeybindingsSpec::One(KeybindingSpec(
+        "ctrl-g ctrl-g".to_string(),
+    )));
+    config.editor.insert_newline = Some(KeybindingsSpec::One(KeybindingSpec(
+        "ctrl-x enter".to_string(),
+    )));
+    let keymap = RuntimeKeymap::from_config(&config).expect("valid composer chords");
+    let (mut composer, _rx) = new_test_composer();
+    composer.set_keymap_bindings(&keymap);
+    composer.footer.mode = FooterMode::ShortcutOverlay;
+
+    let hints = composer.footer_props().key_hints;
+    assert_eq!(
+        hints.external_editor,
+        Some(ShortcutHint::Chord {
+            prefix: key_hint::ctrl(KeyCode::Char('g')),
+            completion: key_hint::ctrl(KeyCode::Char('g')),
+        })
+    );
+    assert_eq!(
+        hints.insert_newline,
+        Some(ShortcutHint::Chord {
+            prefix: key_hint::ctrl(KeyCode::Char('x')),
+            completion: key_hint::plain(KeyCode::Enter),
+        })
+    );
+
+    snapshot_composer_state_with_width(
+        "footer_mode_configured_key_chords",
+        /*width*/ 100,
+        /*enhanced_keys_supported*/ false,
+        |composer| {
+            composer.set_keymap_bindings(&keymap);
+            composer.footer.mode = FooterMode::ShortcutOverlay;
+        },
+    );
+}
 
 #[test]
 fn draft_and_voice_composer_snapshots() {

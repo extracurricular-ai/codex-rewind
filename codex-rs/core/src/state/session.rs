@@ -1,25 +1,27 @@
 //! Session-wide mutable state.
 
-use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructionsProvenance;
+#[cfg(test)]
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_sandboxing::policy_transforms::merge_permission_profiles;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use crate::TurnStartOptions;
 use crate::context_manager::ContextManager;
 use crate::context_manager::HistoryReplacement;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
+use crate::session::startup_prewarm::SessionStartupPrewarmHandle;
 use crate::session::time_reminder::CurrentTimeReminderState;
-use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use codex_history::ResponseItemEnvelope;
+use codex_history::TurnAttribution;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -27,12 +29,12 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnContextItem;
-use codex_utils_output_truncation::TruncationPolicy;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
-/// Runtime request effort, initially unset and established by prewarm or sampling.
+/// Runtime request effort, inherited from a parent or established by prewarm or sampling.
 /// Successful compaction allows a fresh baseline without an override.
+#[derive(Clone)]
 pub(crate) enum ReasoningEffortPin {
     Unset,
     Compacted,
@@ -68,6 +70,8 @@ impl ReasoningEffortPin {
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
+    /// Catalog to carry across compaction, independent of an explicit resume override.
+    pub(crate) persisted_dynamic_tools: Arc<[DynamicToolSpec]>,
     /// Plugin selection of the last admitted task; settings updates take effect on the next task.
     pub(crate) active_disabled_plugin_ids: Vec<String>,
     /// Persisted origin of the session base instructions, when known.
@@ -77,7 +81,6 @@ pub(crate) struct SessionState {
     pub(crate) history_reset: CancellationToken,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) latest_token_usage_record: Option<TokenUsageRecord>,
-    pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
     /// Settings used by the latest regular user turn, used for turn-to-turn
@@ -87,19 +90,24 @@ pub(crate) struct SessionState {
     /// Latest task admitted in this runtime, retained across completion and history edits.
     /// Cleared by standalone settings changes to invalidate pending continuation.
     pub(crate) last_started_turn_id: Option<String>,
+    /// Latest regular turn, retained across completion, settings changes, and compaction.
+    pub(crate) turn_attribution: Option<TurnAttribution>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
+    pub(crate) async_compaction: crate::session::async_compaction::AsyncCompactionState,
     /// Original request effort for the current model while configuration updates remain active.
     pub(crate) reasoning_effort_pin: ReasoningEffortPin,
-    /// Startup prewarmed session prepared during session initialization.
+    /// Set under the state lock before shutdown takes the last warmup handle.
+    pub(crate) shutting_down: bool,
+    /// Background model warmup scheduled at startup or while resuming an idle thread.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     /// Retained after completion so later turns do not repeat speculative captures.
     pub(crate) shell_snapshot_prewarm: Option<AbortOnDropHandle<()>>,
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
-    granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
+    initial_settings_pending: bool,
 }
 
 impl SessionState {
@@ -120,36 +128,30 @@ impl SessionState {
     ) -> Self {
         Self {
             active_disabled_plugin_ids: Vec::new(),
+            persisted_dynamic_tools: Arc::clone(&session_configuration.dynamic_tools),
             session_configuration,
             base_instructions_provenance: None,
             history,
             history_reset: CancellationToken::new(),
             latest_rate_limits: None,
             latest_token_usage_record: None,
-            server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             last_started_turn_id: None,
+            turn_attribution: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
+            async_compaction: crate::session::async_compaction::AsyncCompactionState::default(),
             reasoning_effort_pin: ReasoningEffortPin::Unset,
+            shutting_down: false,
             startup_prewarm: None,
             shell_snapshot_prewarm: None,
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
-            granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
+            initial_settings_pending: true,
         }
-    }
-
-    // History helpers
-    pub(crate) fn record_items<I>(&mut self, items: I, policy: TruncationPolicy)
-    where
-        I: IntoIterator,
-        I::Item: std::ops::Deref<Target = ResponseItem>,
-    {
-        self.history.record_items(items, policy);
     }
 
     pub(crate) fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
@@ -164,12 +166,19 @@ impl SessionState {
 
     pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {
         self.next_turn_is_first = value;
+        self.initial_settings_pending = value;
     }
 
     pub(crate) fn take_next_turn_is_first(&mut self) -> bool {
         let is_first_turn = self.next_turn_is_first;
         self.next_turn_is_first = false;
         is_first_turn
+    }
+
+    pub(crate) fn take_initial_settings_pending(&mut self) -> bool {
+        let pending = self.initial_settings_pending;
+        self.initial_settings_pending = false;
+        pending
     }
 
     pub(crate) fn clone_history(&self) -> ContextManager {
@@ -202,6 +211,7 @@ impl SessionState {
                 .history
                 .replace_compacted(items, reviewer_compaction_hash.as_deref()),
             HistoryReplacement::Reset => {
+                self.turn_attribution = None;
                 self.history.replace_annotated(items);
                 true
             }
@@ -264,13 +274,30 @@ impl SessionState {
         self.history.reference_context_item()
     }
 
+    pub(crate) fn recovered_turn_start_options(&self, turn_id: &str) -> TurnStartOptions {
+        self.turn_attribution
+            .as_ref()
+            .filter(|attribution| attribution.turn_id == turn_id)
+            .map(TurnAttribution::start_options)
+            .unwrap_or_else(|| TurnStartOptions {
+                // Older rollouts only persisted the root on the model-context record.
+                root_turn_id: self
+                    .reference_context_item()
+                    .filter(|context| context.turn_id.as_deref() == Some(turn_id))
+                    .and_then(|context| context.root_turn_id),
+                ..Default::default()
+            })
+    }
+
     // Token/rate limit helpers
     pub(crate) fn update_token_info_from_usage(
         &mut self,
         usage: &TokenUsage,
         model_context_window: Option<i64>,
+        includes_reasoning: bool,
     ) {
-        self.history.update_token_info(usage, model_context_window);
+        self.history
+            .update_token_info(usage, model_context_window, includes_reasoning);
     }
 
     pub(crate) fn ensure_auto_compact_window_server_prefill_from_usage(
@@ -352,17 +379,8 @@ impl SessionState {
         self.history.set_token_usage_full(context_window);
     }
 
-    pub(crate) fn get_total_token_usage(&self, server_reasoning_included: bool) -> i64 {
-        self.history
-            .get_total_token_usage(server_reasoning_included)
-    }
-
-    pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {
-        self.server_reasoning_included = included;
-    }
-
-    pub(crate) fn server_reasoning_included(&self) -> bool {
-        self.server_reasoning_included
+    pub(crate) fn get_total_token_usage(&self) -> i64 {
+        self.history.get_total_token_usage()
     }
 
     pub(crate) fn record_mcp_dependency_prompted<I>(&mut self, names: I)
@@ -417,31 +435,6 @@ impl SessionState {
         &mut self,
     ) -> Option<codex_hooks::SessionStartSource> {
         self.pending_session_start_sources.pop_front()
-    }
-
-    pub(crate) fn record_granted_permissions(
-        &mut self,
-        environment_id: &str,
-        permissions: AdditionalPermissionProfile,
-    ) {
-        let granted_permissions = merge_permission_profiles(
-            self.granted_permissions_by_environment_id
-                .get(environment_id),
-            Some(&permissions),
-        );
-        if let Some(granted_permissions) = granted_permissions {
-            self.granted_permissions_by_environment_id
-                .insert(environment_id.to_string(), granted_permissions);
-        }
-    }
-
-    pub(crate) fn granted_permissions(
-        &self,
-        environment_id: &str,
-    ) -> Option<AdditionalPermissionProfile> {
-        self.granted_permissions_by_environment_id
-            .get(environment_id)
-            .cloned()
     }
 }
 

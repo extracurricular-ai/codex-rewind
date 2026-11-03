@@ -6,20 +6,41 @@ use pretty_assertions::assert_eq;
 use super::response_input_to_code_mode_result;
 
 #[test]
-fn code_mode_text_preserves_file_backed_image_id() {
+fn code_mode_text_preserves_message_content() {
     let response = ResponseInputItem::Message {
         role: "user".to_string(),
-        content: vec![ContentItem::InputImage {
-            image: ImageReference::File {
-                file_id: "file_123".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "Input text".to_string(),
             },
-            detail: None,
-        }],
+            ContentItem::OutputText {
+                text: "Output text".to_string(),
+                annotations: Some(vec![serde_json::json!({"type": "citation"})]),
+                logprobs: Some(vec![serde_json::json!({"token": "Output"})]),
+            },
+            ContentItem::InputImage {
+                image: ImageReference::File {
+                    file_id: "file_123".to_string(),
+                },
+                detail: None,
+            },
+            ContentItem::InputImage {
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                },
+                detail: None,
+            },
+            ContentItem::InputAudio {
+                audio_url: "data:audio/wav;base64,def".to_string(),
+            },
+        ],
         phase: None,
     };
 
     assert_eq!(
         response_input_to_code_mode_result(response),
-        serde_json::json!("file_123")
+        serde_json::json!(
+            "Input text\nOutput text\nfile_123\ndata:image/png;base64,abc\ndata:audio/wav;base64,def"
+        )
     );
 }

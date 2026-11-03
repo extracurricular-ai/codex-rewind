@@ -2,6 +2,7 @@
 //! Worktrees start at the repository default branch and bind only the new session.
 
 use super::*;
+use crate::app_server_session::is_server_shutting_down_error;
 use crate::startup_draft::StartupDraftInitialScreen;
 use crate::startup_draft::StartupDraftPump;
 use crate::startup_draft::StartupDraftSessionAction;
@@ -31,9 +32,10 @@ impl App {
     fn agents_overview_retained_worktree_error(
         &mut self,
         checkout: &codex_worktree::ManagedWorktree,
+        title: Option<&'static str>,
         reason: impl std::fmt::Display,
     ) {
-        self.add_agents_overview_error(format!("{reason} A checkout was retained at {}; remove it with `git worktree remove <checkout-path>` from the source repository if it is no longer needed.", checkout.root.display()));
+        self.show_agents_overview_error(title, format!("{reason} A checkout was retained at {}; remove it with `git worktree remove <checkout-path>` from the source repository if it is no longer needed.", checkout.root.display()));
     }
 
     pub(in crate::app) async fn new_agents_overview_session(
@@ -61,8 +63,11 @@ impl App {
         if let Some(cwd) = cwd.as_ref() {
             display_config.cwd = cwd.clone();
         }
-        draft.apply_config(&display_config);
-        tui.terminal.clear()?;
+        draft.apply_settings(
+            &crate::local_settings::LocalSettings::from(&display_config),
+            display_config.cwd.as_path(),
+        );
+        draft.show(tui)?;
         // Keep the large session-start future off the TUI's stack in dev builds.
         let result = Box::pin(self.start_agents_overview_session(
             tui,
@@ -74,6 +79,10 @@ impl App {
         .await;
         if self.current_displayed_thread_id() != previous_thread {
             draft.flush_pending_paste_newline(tui).await?;
+            self.chat_widget
+                .empty_state_animation
+                .borrow_mut()
+                .continue_from(&mut draft.blossom.borrow_mut());
             self.chat_widget.restore_startup_draft(draft.take_draft());
         } else {
             // Retain edits if setup fails so retrying `n` does not lose the draft.
@@ -99,6 +108,7 @@ impl App {
             if let Some((_, checkout)) = &managed_worktree {
                 self.agents_overview_retained_worktree_error(
                     checkout,
+                    /*title*/ None,
                     "Could not start the session.",
                 );
             }
@@ -111,12 +121,20 @@ impl App {
             if let Some((_, checkout)) = &managed_worktree {
                 self.agents_overview_retained_worktree_error(
                     checkout,
+                    /*title*/ None,
                     "Could not load the new session settings.",
                 );
             }
             return Ok(AppRunControl::Continue);
         };
         let selected_profile = self.chat_widget.thread_id().and_then(|thread_id| {
+            if let Some(selection) = self
+                .agents_overview
+                .requested_permission_profiles
+                .get(&thread_id)
+            {
+                return Some(selection.clone());
+            }
             let source = self.chat_widget.config_ref();
             let active = source.permissions.active_permission_profile()?;
             (self
@@ -133,7 +151,7 @@ impl App {
         });
         let local_settings = self.local_settings.reloaded(&config);
         if let Some(draft) = startup_draft.as_deref_mut() {
-            draft.apply_config(&config);
+            draft.apply_settings(&local_settings, config.cwd.as_path());
         }
         let result = StartupDraftPump::run_with_optional_draft(
             startup_draft.as_deref_mut(),
@@ -150,13 +168,27 @@ impl App {
         let started = match result {
             Ok(started) => started,
             Err(error) => {
-                if let Some((_, checkout)) = &managed_worktree {
-                    self.agents_overview_retained_worktree_error(
-                        checkout,
-                        format!("Failed to start session: {error}"),
+                let (title, message) = if matches!(
+                    error.downcast_ref::<TypedRequestError>(),
+                    Some(TypedRequestError::Server { source, .. })
+                        if is_server_shutting_down_error(source)
+                ) {
+                    let mut message = String::from(
+                        "New sessions are paused while active turns finish or are canceled. The default shutdown wait is up to one minute.",
                     );
+                    if !matches!(self.app_server_target, AppServerTarget::Embedded) {
+                        message.push_str(
+                            " If the server restarts, Codex will reconnect automatically.",
+                        );
+                    }
+                    (Some("Codex's background server is shutting down"), message)
                 } else {
-                    self.add_agents_overview_error(format!("Failed to start session: {error}"));
+                    (None, format!("Failed to start session: {error}"))
+                };
+                if let Some((_, checkout)) = &managed_worktree {
+                    self.agents_overview_retained_worktree_error(checkout, title, message);
+                } else {
+                    self.show_agents_overview_error(title, message);
                 }
                 return Ok(AppRunControl::Continue);
             }
@@ -179,7 +211,7 @@ impl App {
                 };
             if let Err(error) = result {
                 let _ = app_server.thread_unsubscribe(thread_id).await;
-                self.agents_overview_retained_worktree_error(checkout, error);
+                self.agents_overview_retained_worktree_error(checkout, /*title*/ None, error);
                 return Ok(AppRunControl::Continue);
             }
         }
@@ -202,6 +234,7 @@ impl App {
             if let Some((_, checkout)) = &managed_worktree {
                 self.agents_overview_retained_worktree_error(
                     checkout,
+                    /*title*/ None,
                     "Could not open the new session.",
                 );
             }
@@ -221,12 +254,10 @@ impl App {
         {
             return;
         }
-        if !self.config.features.enabled(Feature::Worktrees)
-            || crate::uses_remote_workspace_or_environment(
-                &self.app_server_target,
-                self.environment_manager.as_ref(),
-            )
-        {
+        if crate::uses_remote_workspace_or_environment(
+            &self.app_server_target,
+            self.environment_manager.as_ref(),
+        ) {
             self.add_agents_overview_error(
                 "Managed worktrees require local worktree support.".to_string(),
             );

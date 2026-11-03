@@ -47,6 +47,7 @@ fn trace_context_from_request<T>(request: &Request<T>) -> Option<W3cTraceContext
 #[derive(Clone)]
 pub struct GrpcCodeModeHost {
     state: Arc<GrpcHostState>,
+    process_metrics: Option<Arc<crate::process_metrics::ProcessMetrics>>,
 }
 
 impl GrpcCodeModeHost {
@@ -54,6 +55,17 @@ impl GrpcCodeModeHost {
     pub fn new() -> Self {
         Self {
             state: Arc::new(GrpcHostState::new()),
+            process_metrics: None,
+        }
+    }
+
+    /// Uses a collector whose resources were prepared before sandbox entry.
+    pub fn with_process_metrics(collector: crate::CodeModeProcessMetricsCollector) -> Self {
+        Self {
+            process_metrics: Some(Arc::new(crate::process_metrics::ProcessMetrics::new(
+                collector,
+            ))),
+            ..Self::new()
         }
     }
 
@@ -139,7 +151,7 @@ impl GrpcCodeModeHost {
         let execution_id = request.execution_id.clone();
         let request = conversions::execute_request(request)?;
         let cell_permit = self.state.cell_permit()?;
-        session.reserve_execution(&execution_id)?;
+        let yield_signal = session.reserve_execution(&execution_id)?;
         let mut admission = ExecutionAdmission {
             session: Arc::clone(&session),
             execution_id: Some(execution_id.clone()),
@@ -148,7 +160,7 @@ impl GrpcCodeModeHost {
             _ = session.closed.cancelled() => {
                 return Err(Status::cancelled("code-mode session is closed"));
             }
-            result = session.runtime.execute(request, Arc::new(delegate::GrpcDelegate::new(Arc::downgrade(&session)))) => {
+            result = session.runtime.execute(request, Arc::new(delegate::GrpcDelegate::new(Arc::downgrade(&session))), Some(yield_signal)) => {
                 result.map_err(Status::failed_precondition)?
             }
         };
@@ -234,6 +246,7 @@ impl GrpcCodeModeHost {
         let request = WaitRequest {
             cell_id: CellId::new(request.cell_id),
             yield_time_ms: request.yield_time_ms,
+            max_output_tokens: None,
         };
         let outcome = tokio::select! {
             biased;
@@ -243,14 +256,12 @@ impl GrpcCodeModeHost {
             _ = session.closed.cancelled() => {
                 return Err(Status::cancelled("code-mode session is closed"));
             }
-            outcome = session.runtime.wait(request) => {
+            outcome = session.runtime.wait(request, Some(registration.yield_signal())) => {
                 outcome.map_err(Status::failed_precondition)?
             }
         };
         let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
-        let response = conversions::wait_response(outcome)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        Ok(Response::new(response))
+        conversions::wait_response(outcome).map_err(|error| Status::internal(error.to_string()))
     }
 
     async fn cancel_wait_request(
@@ -264,6 +275,24 @@ impl GrpcCodeModeHost {
         Ok(Response::new(proto::CancelWaitResponse {}))
     }
 
+    async fn yield_observation_request(
+        &self,
+        request: proto::YieldObservationRequest,
+    ) -> Result<Response<proto::YieldObservationResponse>, Status> {
+        let _permit = self.state.control_permit()?;
+        let session = self.state.session(&request.session_id)?;
+        match request.observation {
+            Some(proto::yield_observation_request::Observation::ExecutionId(id)) => {
+                session.yield_execution(&id)?;
+            }
+            Some(proto::yield_observation_request::Observation::WaitId(id)) => {
+                session.yield_wait(&id)?;
+            }
+            None => return Err(Status::invalid_argument("missing code-mode observation ID")),
+        }
+        Ok(Response::new(proto::YieldObservationResponse {}))
+    }
+
     async fn terminate_request(
         &self,
         request: proto::TerminateRequest,
@@ -274,9 +303,7 @@ impl GrpcCodeModeHost {
         let _permit = self.state.request_permit()?;
         let outcome = session.terminate(CellId::new(request.cell_id)).await?;
         let outcome = outcome.with_code_mode_host_duration(received_at.elapsed());
-        let response = conversions::wait_response(outcome)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        Ok(Response::new(response))
+        conversions::wait_response(outcome).map_err(|error| Status::internal(error.to_string()))
     }
 }
 
@@ -287,6 +314,23 @@ impl Default for GrpcCodeModeHost {
 }
 
 impl CodeModeHost for GrpcCodeModeHost {
+    fn get_process_metrics<'a, 'async_trait>(
+        &'a self,
+        _request: Request<proto::GetProcessMetricsRequest>,
+    ) -> GrpcFuture<'async_trait, proto::GetProcessMetricsResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.process_metrics
+                .as_ref()
+                .ok_or_else(|| Status::unimplemented("process metrics are unsupported"))?
+                .sample()
+                .await
+        })
+    }
+
     type OpenSessionStream = GrpcStream<proto::SessionEvent>;
     type SubscribeToToolCallsStream = GrpcStream<proto::ToolCall>;
     type ExecuteStream = GrpcStream<proto::ExecuteEvent>;
@@ -405,6 +449,17 @@ impl CodeModeHost for GrpcCodeModeHost {
         Box::pin(self.cancel_wait_request(request.into_inner()))
     }
 
+    fn yield_observation<'a, 'async_trait>(
+        &'a self,
+        request: Request<proto::YieldObservationRequest>,
+    ) -> GrpcFuture<'async_trait, proto::YieldObservationResponse>
+    where
+        'a: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.yield_observation_request(request.into_inner()))
+    }
+
     fn terminate<'a, 'async_trait>(
         &'a self,
         request: Request<proto::TerminateRequest>,
@@ -424,7 +479,9 @@ struct ExecutionAdmission {
 
 impl ExecutionAdmission {
     fn disarm(&mut self) {
-        self.execution_id = None;
+        if let Some(execution_id) = self.execution_id.take() {
+            self.session.retire_execution_observation(&execution_id);
+        }
     }
 }
 

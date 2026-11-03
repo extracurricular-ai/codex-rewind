@@ -4,6 +4,7 @@ use crate::config::Constrained;
 use crate::config::ConstraintError;
 use crate::config::ConstraintResult;
 use codex_config::ConfigRequirements;
+use codex_features::Features;
 use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::manager::ModelsManager;
 use codex_otel::SessionTelemetry;
@@ -25,8 +26,7 @@ pub(crate) struct StepSettings {
     pub(crate) collaboration_mode: CollaborationMode,
     /// `None` follows the pinned model's default.
     pub(crate) reasoning_summary: Option<ReasoningSummary>,
-    /// Normalized requested tier. Startup retains initial-model filtering;
-    /// resolution filters the effective tier against the pinned model.
+    /// Normalized requested tier; resolution filters it against the pinned model.
     pub(crate) service_tier: Option<String>,
     pub(crate) personality: Option<Personality>,
     pub(crate) approval_policy: Constrained<AskForApproval>,
@@ -57,16 +57,13 @@ impl ResolvedStepSettings {
     pub(super) fn new(
         selected: Arc<StepSettings>,
         model_info: Arc<ModelInfo>,
-        fast_mode_enabled: bool,
+        features: &Features,
     ) -> Self {
         let reasoning_summary = selected
             .reasoning_summary
             .unwrap_or(model_info.default_reasoning_summary);
-        let service_tier = super::get_service_tier(
-            selected.service_tier.clone(),
-            fast_mode_enabled,
-            &model_info,
-        );
+        let service_tier =
+            super::get_service_tier(selected.service_tier.clone(), features, &model_info);
         Self {
             selected,
             model_info,
@@ -122,25 +119,23 @@ impl ResolvedStepSettings {
     }
 
     /// Applies sparse edits to the retained selection, preserving pinned metadata
-    /// unless model or personality selection changes, then resolves request values.
+    /// unless the model changes, then resolves request values.
     pub(super) async fn apply_update(
         &self,
         update: &StepSettingsUpdate,
         constraints: &StepSettingsConstraints<'_>,
         models_manager: &dyn ModelsManager,
         overrides: &ModelInfoOverrides,
-        fast_mode_enabled: bool,
+        features: &Features,
     ) -> ConstraintResult<Self> {
         let selected = self.selected.apply(update, constraints)?;
-        let model_info = if selected.collaboration_mode.model()
-            == self.selected.collaboration_mode.model()
-            && selected.personality == self.selected.personality
-        {
-            Arc::clone(&self.model_info)
-        } else {
-            Arc::new(selected.resolve_model_info(models_manager, overrides).await)
-        };
-        let mut next = Self::new(Arc::new(selected), model_info, fast_mode_enabled);
+        let model_info =
+            if selected.collaboration_mode.model() == self.selected.collaboration_mode.model() {
+                Arc::clone(&self.model_info)
+            } else {
+                Arc::new(selected.resolve_model_info(models_manager, overrides).await)
+            };
+        let mut next = Self::new(Arc::new(selected), model_info, features);
         next.mcp_approvals_reviewer_override = update
             .approvals_reviewer
             .or(self.mcp_approvals_reviewer_override);
@@ -232,8 +227,7 @@ pub(crate) struct StepSettingsUpdate {
 }
 
 /// Constraints used when applying and validating a candidate settings version.
-/// Future settings use the proposed environment; active settings use the
-/// environment already admitted for that execution.
+/// Each caller supplies the permissions of the target environment selection.
 pub(crate) struct StepSettingsConstraints<'a> {
     pub(crate) requirements: &'a ConfigRequirements,
     pub(crate) guardian_approval_enabled: bool,

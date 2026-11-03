@@ -10,7 +10,7 @@ expression: popup
 
   sla
 
-› [-] Slack      Available   Press Enter to install or view plugin details.
+› [-] Slack      Available   Press Enter to install or view plugin details
 
 
 
@@ -19,4 +19,4 @@ expression: popup
 
 
 
-  ←/→ tabs · enter details · space toggle · esc close
+  ←/→ tabs · enter details · tab toggle · esc close

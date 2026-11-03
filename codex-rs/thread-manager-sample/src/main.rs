@@ -13,7 +13,7 @@ use codex_core_api::AltScreenMode;
 use codex_core_api::ApprovalsReviewer;
 use codex_core_api::Arg0DispatchPaths;
 use codex_core_api::AskForApproval;
-use codex_core_api::AuthCredentialsStoreMode;
+use codex_core_api::AuthKeyringBackendKind;
 use codex_core_api::AuthManager;
 use codex_core_api::AutoCompactTokenLimitScope;
 use codex_core_api::CodexAppsToolsCache;
@@ -21,11 +21,15 @@ use codex_core_api::CodexHomeUserInstructionsProvider;
 use codex_core_api::CodexThread;
 use codex_core_api::Config;
 use codex_core_api::ConfigLayerStack;
+use codex_core_api::ConfigLoadOptions;
+use codex_core_api::ConfigRequirements;
+use codex_core_api::ConfigRequirementsToml;
 use codex_core_api::Constrained;
 use codex_core_api::EnvironmentManager;
 use codex_core_api::EventMsg;
-use codex_core_api::ExecServerRuntimePaths;
+use codex_core_api::ExecServerRuntimeOptions;
 use codex_core_api::ExtensionRegistryBuilder;
+use codex_core_api::Feature;
 use codex_core_api::Features;
 use codex_core_api::GhostSnapshotConfig;
 use codex_core_api::History;
@@ -34,7 +38,6 @@ use codex_core_api::ModelAvailabilityNuxConfig;
 use codex_core_api::MultiAgentV2Config;
 use codex_core_api::NewThread;
 use codex_core_api::Notice;
-use codex_core_api::OAuthCredentialsStoreMode;
 use codex_core_api::OPENAI_PROVIDER_ID;
 use codex_core_api::OtelConfig;
 use codex_core_api::PermissionProfile;
@@ -59,14 +62,17 @@ use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
 use codex_core_api::WebSearchMode;
 use codex_core_api::arg0_dispatch_or_else;
+use codex_core_api::bootstrap_auth_config;
 use codex_core_api::build_models_manager;
 use codex_core_api::built_in_model_providers;
 use codex_core_api::find_codex_home;
 use codex_core_api::init_state_db;
 use codex_core_api::install_image_generation_extension;
 use codex_core_api::item_event_to_server_notification;
+use codex_core_api::load_config_toml_with_layer_stack;
 use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::passthrough_image_store;
+use codex_core_api::resolve_bootstrap_respect_system_proxy;
 use codex_core_api::resolve_installation_id;
 use codex_core_api::set_default_originator;
 use codex_core_api::thread_store_from_config;
@@ -114,12 +120,12 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         args.prompt.join(" ")
     };
 
-    let config = new_config(args.model, arg0_paths)?;
+    let config = new_config(args.model, arg0_paths).await?;
     let state_db = init_state_db(&config).await;
 
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?;
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
@@ -176,9 +182,52 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<Config> {
+async fn new_config(
+    model: Option<String>,
+    arg0_paths: Arg0DispatchPaths,
+) -> anyhow::Result<Config> {
     let codex_home = find_codex_home().context("find Codex home")?;
     let cwd = AbsolutePathBuf::current_dir().context("resolve current directory")?;
+    // Resolve auth through the shared bootstrap path so cargo-run builds retain the configured
+    // secure store instead of the full Config loader's local-development file-store override.
+    let bootstrap = load_config_toml_with_layer_stack(
+        codex_home.as_path(),
+        Some(&cwd),
+        Vec::new(),
+        ConfigLoadOptions::default(),
+    )
+    .await
+    .context("load authentication configuration")?;
+    let auth_config = bootstrap_auth_config(codex_home.as_path(), &bootstrap)?;
+    let requirements = bootstrap.config_layer_stack.requirements();
+    let requirements_toml = bootstrap.config_layer_stack.requirements_toml();
+    // Preserve auth restrictions for every manager rebuilt from Config without importing
+    // execution settings, plugins, or hooks from the bootstrap configuration.
+    let config_layer_stack = ConfigLayerStack::new(
+        Vec::new(),
+        ConfigRequirements {
+            allowed_login_methods: requirements.allowed_login_methods.clone(),
+            allowed_chatgpt_workspaces: requirements.allowed_chatgpt_workspaces.clone(),
+            ..Default::default()
+        },
+        ConfigRequirementsToml {
+            allowed_login_methods: requirements_toml.allowed_login_methods.clone(),
+            allowed_chatgpt_workspaces: requirements_toml.allowed_chatgpt_workspaces.clone(),
+            ..Default::default()
+        },
+    )?;
+    let mcp_oauth_credentials_store_mode = bootstrap
+        .config_toml
+        .mcp_oauth_credentials_store
+        .unwrap_or_default();
+    let respect_system_proxy = resolve_bootstrap_respect_system_proxy(
+        &bootstrap.config_toml,
+        bootstrap
+            .config_layer_stack
+            .requirements()
+            .feature_requirements
+            .as_ref(),
+    )?;
     let model_provider_id = OPENAI_PROVIDER_ID.to_string();
     let model_providers = built_in_model_providers(/*openai_base_url*/ None);
     let model_provider = model_providers
@@ -187,16 +236,21 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         .clone();
 
     let mut config = Config {
-        config_layer_stack: ConfigLayerStack::default(),
+        application_network_policy: Default::default(),
+        application_auth_route_config: Some(auth_config.auth_route_config.clone()),
+        config_layer_stack,
+        plugins: Default::default(),
         startup_warnings: Vec::new(),
         bypass_hook_trust: false,
         model,
+        daybreak_enabled: false,
         service_tier: None,
         review_model: None,
         model_context_window: None,
         model_auto_compact_token_limit: None,
         model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope::Total,
         model_post_turn_compact_threshold_percent: 0,
+        async_compaction_threshold_percent: 65,
         model_provider_id,
         model_provider,
         personality: None,
@@ -214,15 +268,22 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         base_instructions_provenance: None,
         developer_instructions: None,
         guardian_policy_config: None,
+        guardian_extra_policy: None,
         guardian_policy_template: None,
+        guardian_transcript_mode: Default::default(),
+        guardian_conversation_history_prompt: None,
+        guardian_conversation_history_max_output_tokens: None,
+        guardian_circuit_break_action: Default::default(),
+        guardian_review_timeout: Some(std::time::Duration::from_secs(90)),
         include_permissions_instructions: false,
         include_apps_instructions: false,
         include_collaboration_mode_instructions: false,
         include_skill_instructions: false,
         skill_max_context_tokens: None,
-        orchestrator_skills_enabled: false,
+        cloud_skill_enabled: false,
         orchestrator_mcp_enabled: false,
         include_environment_context: false,
+        include_environment_context_time: true,
         compact_prompt: None,
         notify: None,
         tui_notifications: TuiNotificationSettings::default(),
@@ -234,6 +295,10 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tui_auto_recap: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
         tui_fullscreen_transcript: false,
+        tui_mouse_scroll_speed: None,
+        tui_copy_on_select: Default::default(),
+        tui_copy_on_select_clear_selection: false,
+        tui_right_click_paste: Default::default(),
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
         tui_status_line_use_colors: true,
@@ -244,18 +309,20 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tui_pet_anchor: TuiPetAnchor::Composer,
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         tui_keymap: TuiKeymap::default(),
+        tui_quick_dials: BTreeMap::new(),
         tui_session_picker_view: SessionPickerViewMode::Dense,
+        tui_agents_overview_grouping: Default::default(),
         tui_resume_cwd: None,
         tui_vim_mode_default: false,
         tui_question_esc_back: true,
         cwd: cwd.clone(),
         workspace_roots: vec![cwd],
         workspace_roots_explicit: false,
-        cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        cli_auth_credentials_store_mode: auth_config.auth_credentials_store_mode,
         mcp_servers: Constrained::allow_any(HashMap::new()),
         mcp_enterprise_managed_auth: None,
         non_prefixed_mcp_tool_servers: None,
-        mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::File,
+        mcp_oauth_credentials_store_mode,
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         mcp_optional_startup_grace: std::time::Duration::from_secs(1),
@@ -271,24 +338,32 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         agent_max_depth: 1,
         agent_roles: BTreeMap::new(),
         memories: MemoriesConfig::default(),
-        sqlite: SqliteConfig::from_sqlite_home(codex_home.clone()),
+        sqlite: SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            codex_home.clone(),
+            /*enforce_delete_on_nfs*/ false,
+        ),
         log_dir: codex_home.join("log").to_path_buf(),
         codex_home,
         history: History::default(),
         ephemeral: true,
+        allow_persistent_dynamic_tool_updates: false,
         extra_config: None,
         file_opener: UriBasedFileOpener::VsCode,
         codex_self_exe: arg0_paths.codex_self_exe,
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe,
+        main_execve_wrapper_exe: None,
         zsh_path: None,
         model_reasoning_effort: None,
         plan_mode_reasoning_effort: None,
         model_reasoning_summary: None,
         model_catalog: None,
         model_verbosity: None,
-        chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
-        respect_system_proxy: false,
+        chatgpt_base_url: auth_config
+            .chatgpt_base_url
+            .clone()
+            .unwrap_or_else(|| "https://chatgpt.com/backend-api/".to_string()),
+        chatgpt_base_url_is_explicit: auth_config.chatgpt_base_url.is_some(),
+        respect_system_proxy,
         apps_mcp_product_sku: None,
         responses_api_metadata: BTreeMap::new(),
         realtime_audio: RealtimeAudioConfig::default(),
@@ -300,8 +375,8 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         experimental_realtime_ws_startup_context: None,
         experimental_realtime_start_instructions: None,
         experimental_thread_store: ThreadStoreConfig::Local,
-        forced_chatgpt_workspace_id: None,
-        forced_login_method: None,
+        forced_chatgpt_workspace_id: auth_config.forced_chatgpt_workspace_id.clone(),
+        forced_login_method: auth_config.forced_login_method,
         web_search_mode: Constrained::allow_any(WebSearchMode::Disabled),
         web_search_config: None,
         experimental_request_user_input_enabled: true,
@@ -309,7 +384,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tool_registry: Default::default(),
         code_mode: Default::default(),
         background_terminal_max_timeout: 300_000,
-        thread_unload_delay: std::time::Duration::from_secs(60),
+        thread_unload_delay: std::time::Duration::from_secs(/*secs*/ 60),
         ghost_snapshot: GhostSnapshotConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
         max_goal_token_budget: None,
@@ -319,6 +394,9 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         current_time_reminder: None,
         sleep_tool_mode: Default::default(),
         features: Default::default(),
+        prefer_mxc: false,
+
+        runtime_feature_defaults: Default::default(),
         suppress_unstable_features_warning: false,
         active_project: ProjectConfig { trust_level: None },
         notices: Notice::default(),
@@ -333,6 +411,11 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         .features
         .set(Features::with_defaults())
         .context("configure default features")?;
+    // AuthManager and MCP both derive their credential backend from Config.
+    config.features.set_enabled(
+        Feature::SecretAuthStorage,
+        auth_config.keyring_backend_kind == AuthKeyringBackendKind::Secrets,
+    )?;
     Ok(config)
 }
 

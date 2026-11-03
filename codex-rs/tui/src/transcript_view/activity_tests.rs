@@ -33,13 +33,7 @@ fn visible_updates_and_empty_tail_cells_do_not_report_activity() {
     assert!(view.unseen_activity);
     render(&mut view, &cells, /*height*/ 8);
     assert!(!view.unseen_activity);
-    assert_eq!(
-        view.footer(/*width*/ 80, MotionMode::Reduced)
-            .unwrap()
-            .text
-            .to_string(),
-        "esc latest"
-    );
+    assert!(view.footer(/*width*/ 80, MotionMode::Reduced).is_none());
 }
 
 #[test]
@@ -80,9 +74,9 @@ fn escape_closes_selection_and_search_before_returning_to_latest() {
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     view.handle_key(escape, &cells);
     assert!(view.selection.is_none());
-    assert!(view.is_search_active());
+    assert!(view.is_search_editing());
     view.handle_key(escape, &cells);
-    assert!(!view.is_search_active());
+    assert!(!view.is_search_editing());
     assert!(!view.is_following());
     assert!(matches!(
         view.handle_key(escape, &cells),

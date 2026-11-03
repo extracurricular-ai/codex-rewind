@@ -2,6 +2,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -14,6 +15,7 @@ use codex_state::ThreadMetadata;
 use super::LocalThreadStore;
 use super::helpers::distinct_thread_metadata_title;
 use super::helpers::git_info_from_parts;
+use super::helpers::has_guardian_default_title;
 use super::helpers::permission_profile_from_metadata_value;
 use super::helpers::rollout_path_is_archived;
 use super::helpers::set_thread_name;
@@ -33,6 +35,24 @@ pub(super) async fn read_thread(
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
     let sqlite_metadata = read_sqlite_metadata(store, thread_id).await;
+    if !params.include_history
+        && let Some((path, meta)) =
+            super::live_writer::unpersisted_session_meta(store, thread_id).await
+        && sqlite_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.rollout_path == path && metadata.archived_at.is_none())
+    {
+        // A new writer already owns its metadata. Missing JSONL is intentional, so neither
+        // filesystem discovery nor compression-race retries can find anything more authoritative.
+        return match sqlite_metadata {
+            Some(metadata) => Ok(stored_thread_from_metadata(store, metadata, Some(meta)).await),
+            // Preserve the saved-thread contract used by fork/resume. A live but untouched
+            // thread has no stored record yet; its absence is known without searching history.
+            None => Err(ThreadStoreError::InvalidRequest {
+                message: format!("no rollout found for thread id {thread_id}"),
+            }),
+        };
+    }
     let persisted_model_settings = sqlite_metadata
         .as_ref()
         .map(|metadata| (metadata.model.clone(), metadata.reasoning_effort.clone()));
@@ -198,7 +218,7 @@ fn reject_paginated_history(thread: &StoredThread, include_history: bool) -> Thr
     Ok(())
 }
 
-async fn resolve_requested_rollout_path(
+pub(super) async fn resolve_requested_rollout_path(
     store: &LocalThreadStore,
     rollout_path: std::path::PathBuf,
 ) -> ThreadStoreResult<std::path::PathBuf> {
@@ -226,17 +246,39 @@ async fn resolve_requested_rollout_path(
         }
         _ => {}
     }
-    let Some(path) = codex_rollout::existing_rollout_path(path.as_path()).await else {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: format!(
-                "failed to resolve rollout path `{}`: file does not exist",
-                path.display()
-            ),
-        });
-    };
-    std::fs::canonicalize(path.as_path()).map_err(|err| ThreadStoreError::InvalidRequest {
-        message: format!("failed to resolve rollout path `{}`: {err}", path.display()),
-    })
+    // Compression can replace the physical file after lookup, before canonicalization.
+    // Resolve again from the requested path so either representation remains usable.
+    let mut retries_remaining = 3;
+    loop {
+        let resolved_path = match codex_rollout::existing_rollout_path(path.as_path()).await {
+            Some(path) => path,
+            None if retries_remaining > 0 => {
+                retries_remaining -= 1;
+                continue;
+            }
+            None => {
+                return Err(ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "failed to resolve rollout path `{}`: file does not exist",
+                        path.display()
+                    ),
+                });
+            }
+        };
+        match std::fs::canonicalize(&resolved_path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && retries_remaining > 0 => {
+                retries_remaining -= 1;
+            }
+            result => {
+                return result.map_err(|err| ThreadStoreError::InvalidRequest {
+                    message: format!(
+                        "failed to resolve rollout path `{}`: {err}",
+                        resolved_path.display()
+                    ),
+                });
+            }
+        }
+    }
 }
 
 async fn attach_history_if_requested(
@@ -252,8 +294,14 @@ async fn attach_history_if_requested(
             message: format!("failed to load thread history for thread {thread_id}"),
         });
     };
+    let before = super::history_revision::read(&path).await;
     let items = load_history_items(&path).await?;
-    thread.history = Some(StoredThreadHistory { thread_id, items });
+    let after = super::history_revision::read(&path).await;
+    thread.history = Some(StoredThreadHistory {
+        revision: before.filter(|revision| Some(revision) == after.as_ref()),
+        thread_id,
+        items,
+    });
     Ok(())
 }
 
@@ -347,6 +395,14 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
             });
         }
     };
+    Ok(stored_thread_from_metadata(store, metadata, session_meta).await)
+}
+
+async fn stored_thread_from_metadata(
+    store: &LocalThreadStore,
+    metadata: ThreadMetadata,
+    session_meta: Option<SessionMeta>,
+) -> StoredThread {
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
     let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
     let history_mode = session_meta
@@ -363,7 +419,7 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
     thread.forked_from_id = forked_from_id;
     thread.history_mode = history_mode;
     thread.name = name;
-    Ok(thread)
+    thread
 }
 
 pub(super) fn stored_thread_from_state_metadata(
@@ -437,14 +493,16 @@ async fn thread_name_from_metadata(
     match history_mode {
         ThreadHistoryMode::Paginated => sqlite_thread_name(metadata),
         ThreadHistoryMode::Legacy => {
-            if let Some(title) = distinct_thread_metadata_title(metadata) {
-                Some(title)
+            let title = distinct_thread_metadata_title(metadata);
+            if title.is_some() && !has_guardian_default_title(metadata) {
+                title
             } else {
                 find_thread_name_by_id(store.config.codex_home.as_path(), &metadata.id)
                     .await
                     .ok()
                     .flatten()
                     .filter(|name| !name.trim().is_empty())
+                    .or(title)
             }
         }
     }

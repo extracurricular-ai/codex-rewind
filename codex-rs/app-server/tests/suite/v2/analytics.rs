@@ -15,7 +15,7 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -60,6 +60,71 @@ use wiremock::matchers::path_regex;
 const SERVICE_VERSION: &str = "0.0.0-test";
 
 #[tokio::test]
+async fn usage_limit_window_reaches_turn_analytics() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "usage limit reached",
+                "plan_type": "pro",
+                "limit_window_minutes": 300
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_provider_config("supports_websockets = false")
+        .write(codex_home.path())?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
+
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let thread = app_server
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread;
+    let completed = app_server
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![UserInput::Text {
+                text: "Hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+
+    let event = wait_for_matching_analytics_event(&server, Duration::from_secs(30), |event| {
+        event["event_type"] == "codex_turn_event"
+            && event["event_params"]["turn_id"] == completed.turn.id
+    })
+    .await?;
+    let params = &event["event_params"];
+    assert_eq!(
+        json!([
+            params["status"],
+            params["turn_error"],
+            params["codex_error_kind"],
+            params["usage_limit_window_minutes"],
+        ]),
+        json!(["failed", "usageLimitExceeded", "usage_limit_reached", 300])
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn guardian_review_turns_and_tools_reach_analytics() -> Result<()> {
     skip_if_no_network!(Ok(()));
     const PRIVATE: &str = "guardian-private-content";
@@ -67,8 +132,17 @@ async fn guardian_review_turns_and_tools_reach_analytics() -> Result<()> {
     let server = responses::start_mock_server().await;
     let codex_home = TempDir::new()?;
     mount_analytics_capture(&server, codex_home.path()).await?;
+    let catalog_path = codex_home.path().join("guardian-models.json");
+    std::fs::write(
+        &catalog_path,
+        serde_json::to_vec(&bundled_models_response()?)?,
+    )?;
     MockResponsesConfig::new(&server.uri())
-        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
+        .with_root_config(&format!(
+            "chatgpt_base_url = \"{}\"\nmodel_catalog_json = {}",
+            server.uri(),
+            serde_json::to_string(&catalog_path)?
+        ))
         .with_provider_config("supports_websockets = false")
         .enable_feature(Feature::GuardianApproval)
         .disable_feature(Feature::Apps)
@@ -374,8 +448,8 @@ async fn multi_agent_v2_tools_emit_collaborator_analytics() -> Result<()> {
         .items;
     let child_thread_id = items
         .iter()
-        .find_map(|item| match item {
-            ThreadItem::SubAgentActivity {
+        .find_map(|item| match &item.payload {
+            ThreadItemPayload::SubAgentActivity {
                 id,
                 agent_thread_id,
                 ..
@@ -386,12 +460,14 @@ async fn multi_agent_v2_tools_emit_collaborator_analytics() -> Result<()> {
     assert!(
         !items
             .iter()
-            .any(|item| matches!(item, ThreadItem::CollabAgentToolCall { .. }))
+            .any(|item| matches!(&item.payload, ThreadItemPayload::CollabAgentToolCall { .. }))
     );
     let activity_ids = items
         .iter()
-        .filter_map(|item| match item {
-            ThreadItem::SubAgentActivity { id, .. } if id.starts_with("call-") => Some(id.as_str()),
+        .filter_map(|item| match &item.payload {
+            ThreadItemPayload::SubAgentActivity { id, .. } if id.starts_with("call-") => {
+                Some(id.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -453,61 +529,74 @@ async fn multi_agent_v2_tools_emit_collaborator_analytics() -> Result<()> {
     Ok(())
 }
 
-fn set_metrics_exporter(config: &mut codex_core::config::Config) {
-    config.otel.metrics_exporter = OtelExporterKind::OtlpHttp {
-        endpoint: "http://localhost:4318".to_string(),
-        headers: HashMap::new(),
-        protocol: OtelHttpProtocol::Json,
-        tls: None,
-    };
-}
-
 #[tokio::test]
-async fn app_server_default_analytics_disabled_without_flag() -> Result<()> {
+async fn metrics_exporters_respect_analytics_preferences() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
-    set_metrics_exporter(&mut config);
-    config.analytics_enabled = None;
+    for exporter in [
+        OtelExporterKind::None,
+        OtelExporterKind::Statsig,
+        OtelExporterKind::OtlpHttp {
+            endpoint: "http://localhost:4318".to_string(),
+            headers: HashMap::new(),
+            protocol: OtelHttpProtocol::Json,
+            tls: None,
+        },
+        OtelExporterKind::OtlpGrpc {
+            endpoint: "http://localhost:4317".to_string(),
+            headers: HashMap::new(),
+            tls: None,
+        },
+    ] {
+        config.otel.metrics_exporter = exporter;
+        for analytics_enabled in [None, Some(false), Some(true)] {
+            config.analytics_enabled = analytics_enabled;
+            for default_analytics_enabled in [false, true] {
+                let expected_metrics = match config.otel.metrics_exporter {
+                    OtelExporterKind::None => false,
+                    // The built-in exporter is disabled in debug builds even with consent.
+                    OtelExporterKind::Statsig => {
+                        !cfg!(debug_assertions)
+                            && analytics_enabled.unwrap_or(default_analytics_enabled)
+                    }
+                    OtelExporterKind::OtlpHttp { .. } | OtelExporterKind::OtlpGrpc { .. } => true,
+                };
+                let provider = codex_core::otel_init::build_provider(
+                    &config,
+                    SERVICE_VERSION,
+                    Some("codex-app-server"),
+                    default_analytics_enabled,
+                )
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                let metrics = provider.as_ref().and_then(|otel| otel.metrics());
+                let metrics_enabled = metrics.is_some();
+                // Exercise the nonempty export path that concurrent tests can
+                // trigger through process-global metrics.
+                let record_result = metrics
+                    .map(|metrics| {
+                        metrics.counter("codex.test.analytics_preferences", /*inc*/ 1, &[])
+                    })
+                    .transpose();
+                if let Some(provider) = provider {
+                    // Keep Tokio running while the gRPC exporter flushes; a
+                    // synchronous drop can deadlock this current-thread runtime.
+                    provider
+                        .shutdown_with_timeout(Duration::from_secs(/*secs*/ 5))
+                        .await?;
+                }
+                record_result?;
+                assert_eq!(
+                    metrics_enabled, expected_metrics,
+                    "exporter={:?}, analytics={analytics_enabled:?}, default={default_analytics_enabled}",
+                    config.otel.metrics_exporter,
+                );
+            }
+        }
+    }
 
-    let provider = codex_core::otel_init::build_provider(
-        &config,
-        SERVICE_VERSION,
-        Some("codex-app-server"),
-        /*default_analytics_enabled*/ false,
-    )
-    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-
-    // With analytics unset in the config and the default flag is false, metrics are disabled.
-    // A provider may still exist for non-metrics telemetry, so check metrics specifically.
-    let has_metrics = provider.as_ref().and_then(|otel| otel.metrics()).is_some();
-    assert_eq!(has_metrics, false);
-    Ok(())
-}
-
-#[tokio::test]
-async fn app_server_default_analytics_enabled_with_flag() -> Result<()> {
-    let codex_home = TempDir::new()?;
-    let mut config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .build()
-        .await?;
-    set_metrics_exporter(&mut config);
-    config.analytics_enabled = None;
-
-    let provider = codex_core::otel_init::build_provider(
-        &config,
-        SERVICE_VERSION,
-        Some("codex-app-server"),
-        /*default_analytics_enabled*/ true,
-    )
-    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-
-    // With analytics unset in the config and the default flag is true, metrics are enabled.
-    let has_metrics = provider.as_ref().and_then(|otel| otel.metrics()).is_some();
-    assert_eq!(has_metrics, true);
     Ok(())
 }
 
@@ -808,8 +897,8 @@ async fn assert_plugin_measurement_analytics(remote: bool, background: bool) -> 
     let model = bundled_models_response()?
         .models
         .into_iter()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("bundled gpt-5.4 model");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5 model");
     let models = [
         ("initial-model", ReasoningEffort::Low),
         ("invoking-model", ReasoningEffort::High),
@@ -842,8 +931,6 @@ default_mode_request_user_input = true
 plugins = true
 remote_plugin = false
 unified_exec = true
-shell_zsh_fork = false
-unified_exec_zsh_fork = false
 
 [plugins."{METRICS_PLUGIN_ID}"]
 enabled = true
@@ -963,6 +1050,7 @@ enabled = true
     assert_eq!(
         json!({
             "model_slug": command_event["event_params"]["model_slug"],
+            "sandbox_backend": command_event["event_params"]["sandbox_backend"],
             "reasoning_effort": command_event["event_params"]["reasoning_effort"],
             "plugin_id": command_event["event_params"]["plugin_id"],
             "script_path": command_event["event_params"]["script_path"],
@@ -971,6 +1059,7 @@ enabled = true
         }),
         json!({
             "model_slug": "invoking-model",
+            "sandbox_backend": if cfg!(target_os = "macos") { "seatbelt" } else { "seccomp" },
             "reasoning_effort": "high",
             "plugin_id": METRICS_PLUGIN_ID,
             "script_path": "scripts/run.sh",

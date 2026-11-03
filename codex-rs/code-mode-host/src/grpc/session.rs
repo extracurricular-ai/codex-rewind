@@ -58,7 +58,9 @@ pub(super) struct SessionState {
     pub(super) cells: HashMap<String, ExecutionState>,
     pending_executions: HashSet<String>,
     pending_closures: HashSet<String>,
-    seen_executions: BoundedIds,
+    pub(super) seen_executions: BoundedIds,
+    pub(super) execution_yields: HashMap<String, CancellationToken>,
+    pub(super) yielded_executions: BoundedIds,
     pub(super) subscriptions: Vec<ToolSubscription>,
     pub(super) next_subscription: usize,
     pub(super) pending_invocations: HashMap<Uuid, PendingInvocation>,
@@ -66,6 +68,7 @@ pub(super) struct SessionState {
     pub(super) waits: HashMap<String, ActiveWait>,
     pub(super) seen_waits: BoundedIds,
     pub(super) cancelled_waits: BoundedIds,
+    pub(super) yielded_waits: BoundedIds,
 }
 
 pub(super) struct ExecutionState {
@@ -121,6 +124,7 @@ impl GrpcHostState {
             .try_send(Ok(proto::SessionEvent {
                 event: Some(proto::session_event::Event::Opened(proto::SessionOpened {
                     session_id: id.to_string(),
+                    output_truncation: None,
                 })),
             }))
             .map_err(|_| Status::internal("failed to publish the opened code-mode session"))?;
@@ -260,13 +264,16 @@ impl GrpcSession {
             _ = self.closed.cancelled() => {
                 Err(Status::cancelled("code-mode session is closed"))
             }
-            result = self.runtime.terminate(cell_id) => {
+            result = self.runtime.terminate(cell_id.into()) => {
                 result.map_err(Status::failed_precondition)
             }
         }
     }
 
-    pub(super) fn reserve_execution(&self, execution_id: &str) -> Result<(), Status> {
+    pub(super) fn reserve_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<CancellationToken, Status> {
         validation::identifier(execution_id, "execution ID")?;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if self.closed.is_cancelled() {
@@ -284,7 +291,14 @@ impl GrpcSession {
             )));
         }
         state.pending_executions.insert(execution_id.to_string());
-        Ok(())
+        let yield_signal = CancellationToken::new();
+        if state.yielded_executions.remove(execution_id) {
+            yield_signal.cancel();
+        }
+        state
+            .execution_yields
+            .insert(execution_id.to_string(), yield_signal.clone());
+        Ok(yield_signal)
     }
 
     pub(super) fn admit_execution(
@@ -323,6 +337,7 @@ impl GrpcSession {
         let cell_id = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.pending_executions.remove(execution_id);
+            state.execution_yields.remove(execution_id);
             state
                 .cells
                 .iter()

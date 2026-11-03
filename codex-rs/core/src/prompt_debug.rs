@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use codex_exec_server::EnvironmentManager;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::UserInstructionsProvider;
 use codex_login::AuthManager;
@@ -37,7 +37,7 @@ pub async fn build_prompt_input(
             .await
             .map_err(|err| CodexErr::Fatal(err.to_string()))?;
 
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
@@ -106,9 +106,19 @@ pub(crate) async fn build_prompt_input_from_session(
     let prompt_input = sess
         .clone_history()
         .await
-        .for_prompt(&step_context.settings.model_info.input_modalities);
+        .for_prompt(
+            &step_context.settings.model_info.input_modalities,
+            sess.services.image_store.as_ref(),
+        )
+        .await;
     let base_instructions = sess.get_base_instructions().await;
-    let prompt = build_prompt(prompt_input, step_context.as_ref(), base_instructions);
+    let prompt = build_prompt(
+        prompt_input,
+        step_context.as_ref(),
+        base_instructions,
+        sess.current_window_uses_incremental_tools(&step_context)
+            .await,
+    );
 
     Ok(prompt.input)
 }

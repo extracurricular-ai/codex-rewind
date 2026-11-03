@@ -6,12 +6,19 @@ use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::TestAppServer;
 use app_test_support::encode_id_token;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_models_cache;
 use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::CodexErrorInfo;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -38,13 +45,14 @@ async fn config(home: &TempDir, backend: &MockServer) -> Result<()> {
             backend.uri()
         ),
     )?;
+    // Routing uses a plain HTTP fixture; restricted policies require HTTPS/WSS.
     Mock::given(method("GET")).and(path("/backend-api/wham/config/bundle"))
         .respond_with(|request: &wiremock::Request| {
             let account_id = request.headers.get("chatgpt-account-id").expect("workspace header")
                 .to_str().expect("workspace header text");
             ResponseTemplate::new(200).set_body_json(json!({"requirements_toml": {"enterprise_managed": [{
                 "id": "workspace-policy", "name": "Workspace policy",
-                "contents": format!("[application.network.domains]\n'{account_id}.example' = 'allow'"),
+                "contents": format!("[application.network]\nenabled = false\n[application.network.domains]\n'{account_id}.example' = 'allow'"),
             }]}}))
         }).mount(backend).await;
     Ok(())
@@ -100,7 +108,7 @@ async fn saved_workspace_is_discovered_once_and_not_the_default_account(
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "accounts": [
                 {"id": "other", "workspace_backend_origin": "https://other.example", "account_routing_override": "us"},
-                {"id": "selected", "workspace_backend_origin": "https://gov.chatgpt.com", "account_routing_override": "NO_CONSTRAINT"}
+                {"id": "selected", "name": "Selected workspace", "workspace_backend_origin": "https://gov.chatgpt.com", "account_routing_override": "NO_CONSTRAINT"}
             ], "default_account_id": "other"
         })).set_delay(Duration::from_secs(accounts_delay_secs)))
         .expect(if accounts_delay_secs > 5 { 2 } else { 1 })
@@ -116,7 +124,8 @@ async fn saved_workspace_is_discovered_once_and_not_the_default_account(
                     .set_delay(Duration::from_secs(bundle_delay_secs)),
             )
             .with_priority(1)
-            .expect(2)
+            // Startup and account hydration each retry this delayed response via proxy fallback.
+            .expect(4)
             .mount(&backend)
             .await;
     }
@@ -149,7 +158,7 @@ async fn saved_workspace_is_discovered_once_and_not_the_default_account(
         Some(json!({"authMode": "chatgpt", "planType": plan_type}))
     );
     let expected = json!({
-        "account": {"type": "chatgpt", "email": "user@example.com", "planType": plan_type},
+        "account": {"type": "chatgpt", "email": "user@example.com", "planType": plan_type, "workspaceName": "Selected workspace"},
         "requiresOpenaiAuth": true, "workspaceRouting": routing("selected", "https://gov.chatgpt.com", "NO_CONSTRAINT")
     });
     assert_eq!(read(&mut server).await?, expected);
@@ -176,7 +185,7 @@ async fn saved_chatgpt_login_without_selected_workspace_preserves_account() -> R
     let mut server = start(&home).await?;
     assert_eq!(
         read(&mut server).await?,
-        json!({"account": {"type": "chatgpt", "email": null, "planType": "pro"},
+        json!({"account": {"type": "chatgpt", "email": null, "planType": "pro", "workspaceName": null},
             "requiresOpenaiAuth": true, "workspaceRouting": null})
     );
     backend.verify().await;
@@ -236,9 +245,79 @@ async fn stable_clients_do_not_treat_failed_workspace_discovery_as_unrestricted(
         .await;
     assert_eq!(
         read(&mut server).await?,
-        json!({"account": {"type": "chatgpt", "email": null, "planType": "pro"},
+        json!({"account": {"type": "chatgpt", "email": null, "planType": "pro", "workspaceName": null},
             "requiresOpenaiAuth": true, "workspaceRouting": routing("selected", "https://chatgpt.com", "NO_CONSTRAINT")})
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reused_refresh_token_tells_the_user_to_sign_in_again() -> Result<()> {
+    let backend = MockServer::start().await;
+    Mock::given(path("/backend-api/wham/config/bundle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&backend)
+        .await;
+    Mock::given(path("/backend-api/wham/accounts/check"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&backend)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": {"code": "refresh_token_reused"}
+        })))
+        .mount(&backend)
+        .await;
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "chatgpt_base_url = '{0}/backend-api'\nopenai_base_url = '{0}/backend-api/codex'\ncli_auth_credentials_store = 'file'\n",
+            backend.uri()
+        ),
+    )?;
+    write_models_cache(home.path()).await?;
+    write_chatgpt_auth(
+        home.path(),
+        ChatGptAuthFixture::new("stale-token")
+            .account_id("selected")
+            .plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let refresh_url = format!("{}/oauth/token", backend.uri());
+    let mut server = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .with_env_overrides(&[
+            ("OPENAI_API_KEY", None),
+            (REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, Some(&refresh_url)),
+        ])
+        .build_initialized_with_timeout(READ_TIMEOUT)
+        .await?;
+    let thread = server
+        .start_thread(ThreadStartParams::default())
+        .await?
+        .thread;
+    let completed = timeout(
+        READ_TIMEOUT,
+        server.start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id,
+            input: vec![UserInput::Text {
+                text: "hi".into(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        }),
+    )
+    .await??;
+    assert_eq!(completed.turn.status, TurnStatus::Failed);
+    let error = completed.turn.error.expect("failed turn error");
+    assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Unauthorized));
+    assert!(
+        error.message.contains("refresh token was already used"),
+        "{error}"
+    );
+    assert!(error.message.contains("sign in again"), "{error}");
     Ok(())
 }
 
@@ -277,8 +356,8 @@ async fn login_and_workspace_switch_notify_after_routing_is_ready_then_logout_cl
         assert_eq!(
             requirements["requirements"]["application"],
             json!({"network": {
-                "enabled": true, "domains": {format!("{account}.example"): "allow"}
-            }})
+                "enabled": false, "domains": {format!("{account}.example"): "allow"}
+            }, "storage": null})
         );
     }
     let request = server.send_logout_account_request().await?;
@@ -393,19 +472,32 @@ async fn api_only_login_does_not_discover_chatgpt_routing() -> Result<()> {
     Ok(())
 }
 
+#[test_case(
+    json!({"requirements_toml": {"enterprise_managed": [{
+        "id": "invalid", "name": "Invalid requirements", "contents": "application = 'sk-test-private-value'",
+    }]}}),
+    "failed to load workspace requirements: cloud config: invalid bundle";
+    "invalid_requirements"
+)]
+#[test_case(
+    json!({"config_toml": {"enterprise_managed": [{
+        "id": "sk-test-private-id", "name": "sk-test-private-name", "contents": "model = 123",
+    }]}}),
+    "failed to load workspace requirements: invalid non-file configuration at line 1, column 9";
+    "invalid_non_file_config"
+)]
 #[tokio::test]
-async fn failed_workspace_requirements_do_not_fall_back_to_startup_config() -> Result<()> {
+async fn failed_workspace_requirements_do_not_fall_back_to_startup_config(
+    bundle: Value,
+    expected_message: &str,
+) -> Result<()> {
     let backend = MockServer::start().await;
     let home = TempDir::new()?;
     config(&home, &backend).await?;
     let mut server = start(&home).await?;
     backend.reset().await;
     Mock::given(path("/backend-api/wham/config/bundle"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"requirements_toml": {"enterprise_managed": [{
-                "id": "invalid", "name": "Invalid requirements", "contents": "application = true",
-            }]}}),
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bundle))
         .mount(&backend)
         .await;
     Mock::given(path("/backend-api/wham/accounts/check"))
@@ -419,7 +511,10 @@ async fn failed_workspace_requirements_do_not_fall_back_to_startup_config() -> R
         server.read_stream_until_notification_message("account/login/completed"),
     )
     .await??;
-    assert_eq!(notification.params.unwrap()["success"], false);
+    assert_eq!(
+        notification.params.expect("account/login/completed params")["success"],
+        false
+    );
     let request = server
         .send_get_account_request(GetAccountParams {
             refresh_token: false,
@@ -430,7 +525,8 @@ async fn failed_workspace_requirements_do_not_fall_back_to_startup_config() -> R
         server.read_stream_until_error_message(RequestId::Integer(request)),
     )
     .await??;
-    assert_eq!(error.error.message, "failed to load workspace requirements");
+    assert_eq!(error.error.code, -32603);
+    assert_eq!(error.error.message, expected_message);
     backend.verify().await;
     Ok(())
 }

@@ -407,35 +407,17 @@ fn worktree_rejects_remote_defaults_before_allocation() -> anyhow::Result<()> {
 }
 
 #[test]
-fn worktree_rejects_disabled_features_and_ignored_config_before_allocation() -> anyhow::Result<()> {
-    for (config, args, expected) in [
-        (
-            "",
-            vec!["--ignore-user-config", "prompt"],
-            "--worktree cannot be combined with --ignore-user-config",
-        ),
-        (
-            "features.worktrees = false",
-            vec!["prompt"],
-            "--enable worktrees",
-        ),
-        (
-            "features.worktrees = false",
-            vec!["fork", "missing"],
-            "--enable worktrees",
-        ),
-        (
-            "features.worktrees = true",
-            vec!["-c", "features.worktrees=false", "prompt"],
-            "--enable worktrees",
-        ),
-    ] {
-        let test = test_codex_exec();
-        fs::write(test.home_path().join("config.toml"), config)?;
-        let output = test.cmd().arg("--worktree").args(args).output()?;
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
-        assert!(!test.home_path().join("worktrees").exists());
-    }
+fn worktree_rejects_ignored_config_before_allocation() -> anyhow::Result<()> {
+    let test = test_codex_exec();
+    let output = test
+        .cmd()
+        .args(["--worktree", "--ignore-user-config", "prompt"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--worktree cannot be combined with --ignore-user-config")
+    );
+    assert!(!test.home_path().join("worktrees").exists());
     Ok(())
 }

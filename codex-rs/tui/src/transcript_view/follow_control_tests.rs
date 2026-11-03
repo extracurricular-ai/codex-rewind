@@ -130,10 +130,15 @@ fn copying_selection_at_bottom_does_not_show_back_to_bottom() {
     view.begin_selection(&cells, /*column*/ 0, /*row*/ 2, /*clicks*/ 2);
     view.end_drag();
     let selected = view.selected_text(&cells).expect("selected word");
-    view.copy_selected_text_with(&cells, &selected, |text| {
-        assert_eq!(text, "needle");
-        Ok(crate::clipboard_copy::CopyStatus::Confirmed)
-    })
+    view.copy_selected_text_with(
+        &cells,
+        &selected,
+        /*clear_selection*/ true,
+        |text, _format| {
+            assert_eq!(text, "needle");
+            Ok(crate::clipboard_copy::CopyStatus::Confirmed)
+        },
+    )
     .expect("successful copy");
 
     let after = paint(&mut view, &cells, /*width*/ 40);
@@ -153,17 +158,17 @@ fn copying_selection_at_bottom_does_not_show_back_to_bottom() {
 fn closing_find_at_bottom_does_not_show_back_to_bottom() {
     let cells = vec![cell("one\ntwo\nthree\nfour\nneedle")];
     let mut view = TranscriptView::default();
-    let before = paint(&mut view, &cells, /*width*/ 40);
+    paint(&mut view, &cells, /*width*/ 40);
     view.begin_selection(&cells, /*column*/ 0, /*row*/ 2, /*clicks*/ 2);
     view.end_drag();
     view.begin_search();
     view.paste_search("needle");
     assert!(!view.advance_search(&cells));
-    paint(&mut view, &cells, /*width*/ 40);
+    let before = paint(&mut view, &cells, /*width*/ 40);
 
-    view.handle_key(KeyCode::Esc.into(), &cells);
+    view.handle_key(KeyCode::Enter.into(), &cells);
     let after = paint(&mut view, &cells, /*width*/ 40);
-    assert!(!view.is_search_active());
+    assert!(!view.is_search_editing());
     assert!(!view.is_following());
     assert!(view.tail_visible);
     assert!(view.follow_control.area.is_none());
@@ -221,9 +226,12 @@ fn copying_live_selection_retains_the_displayed_revision() {
     view.sync_live_tail(/*width*/ 40, /*key*/ None, |_| {
         Some(vec![HyperlinkLine::from("changed live text")])
     });
-    view.copy_selected_text_with(&cells, &selected, |_| {
-        Ok(crate::clipboard_copy::CopyStatus::Confirmed)
-    })
+    view.copy_selected_text_with(
+        &cells,
+        &selected,
+        /*clear_selection*/ true,
+        |_, _format| Ok(crate::clipboard_copy::CopyStatus::Confirmed),
+    )
     .unwrap();
     let buffer = paint(&mut view, &cells, /*width*/ 40);
     assert!(!view.is_following());

@@ -103,8 +103,10 @@ impl ThreadRequestProcessor {
         if let Err(err) = thread
             .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::TurnAborted(
                 TurnAbortedEvent {
+                    root_turn_id: None,
                     turn_id: Some(saved.turn_id.clone()),
                     reason: TurnAbortReason::Interrupted,
+                    error: None,
                     started_at: None,
                     completed_at: None,
                     duration_ms: None,

@@ -14,7 +14,7 @@ use codex_utils_output_truncation::truncate_text;
 
 pub(super) fn content_item_token_count(item: &ContentItem) -> usize {
     match item {
-        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+        ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
             approx_token_count(text)
         }
         ContentItem::InputImage { image, detail } => usize::try_from(
@@ -72,7 +72,7 @@ pub(super) fn truncate_message_to_token_budget(
         }
         let mut item = content.pop()?;
         match item.content_mut() {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            ContentItem::InputText { text } | ContentItem::OutputText { text, .. } => {
                 if remaining == 0 {
                     continue;
                 }
@@ -96,5 +96,8 @@ pub(super) fn truncate_message_to_token_budget(
     }
     retained.reverse();
     set_annotated_content(&mut envelope.item, retained)?;
+    if let Some(metadata) = &mut envelope.metadata {
+        metadata.mark_retained_sources_incomplete();
+    }
     Some(envelope)
 }

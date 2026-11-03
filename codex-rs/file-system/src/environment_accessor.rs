@@ -6,6 +6,7 @@ use crate::ExecutorFileSystem;
 use crate::ExecutorFileSystemFuture;
 use crate::FileMetadata;
 use crate::FileSystemReadStream;
+use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::GetMetadataOptions;
 use crate::ReadDirectoryEntry;
@@ -14,7 +15,9 @@ use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::WriteFileOptions;
+use bytes::Bytes;
 use codex_utils_path_uri::PathUri;
+use futures::stream::BoxStream;
 use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -42,6 +45,13 @@ pub trait EnvironmentAccess: Send + Sync {
         &'a self,
         path: &'a PathUri,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
+
+    /// Replaces a file through [`ExecutorFileSystem::write_file_stream`] with captured permissions.
+    fn write_file_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+    ) -> ExecutorFileSystemFuture<'a, u64>;
 
     fn write_file<'a>(
         &'a self,
@@ -208,6 +218,15 @@ impl EnvironmentAccess for FileSystemEnvironmentAccessor<'_> {
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         self.file_system
             .read_file_stream(path, self.key.sandbox.as_deref())
+    }
+
+    fn write_file_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: BoxStream<'a, FileSystemResult<Bytes>>,
+    ) -> ExecutorFileSystemFuture<'a, u64> {
+        self.file_system
+            .write_file_stream(path, contents, self.key.sandbox.as_deref())
     }
 
     fn write_file<'a>(

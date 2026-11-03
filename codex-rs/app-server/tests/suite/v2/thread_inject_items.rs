@@ -11,6 +11,7 @@ use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -87,15 +88,21 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history(
 
     let injected_text = "Injected assistant context";
     let injected_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: injected_text.to_string(),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
     let developer_item = |text: &str| ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -189,6 +196,7 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history(
                     AdditionalContextEntry {
                         value: application_context_text.to_string(),
                         kind: AdditionalContextKind::Application,
+                        name: None,
                     },
                 ),
                 (
@@ -196,6 +204,7 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history(
                     AdditionalContextEntry {
                         value: untrusted_context_text.to_string(),
                         kind: AdditionalContextKind::Untrusted,
+                        name: None,
                     },
                 ),
             ])),
@@ -297,6 +306,7 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history(
             thread_id: thread.id.clone(),
             input: Vec::new(),
             tool_output: Some(Box::new(TurnToolOutput {
+                retain: false,
                 name: "send_message_to_thread".to_string(),
                 namespace: Some("codex_app".to_string()),
                 output: FunctionCallOutputBody::Text("Start a delegated turn.".to_string()),
@@ -323,10 +333,16 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history(
     assert_eq!(turn.id, turn_started.turn.id);
     assert_eq!(turn_started.turn.status, TurnStatus::InProgress);
     assert_eq!(item_completed.turn_id, turn_started.turn.id);
-    assert_eq!(item_started.item, item_completed.item);
+    assert_eq!(
+        item_completed.item,
+        ThreadItem {
+            completed_at_ms: Some(item_completed.completed_at_ms),
+            ..item_started.item
+        }
+    );
     assert!(matches!(
-        &item_completed.item,
-        ThreadItem::FunctionCallOutput {
+        &item_completed.item.payload,
+        ThreadItemPayload::FunctionCallOutput {
             name,
             namespace,
             output: FunctionCallOutputBody::Text(output),
@@ -560,6 +576,8 @@ async fn thread_inject_items_adds_raw_response_items_after_a_turn() -> Result<()
     .await??;
 
     let injected_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -654,4 +672,90 @@ fn response_item_text_position(items: &[Value], needle: &str) -> Option<usize> {
                     .is_some_and(|text| text.contains(needle))
             })
     })
+}
+
+#[tokio::test]
+async fn turn_tool_output_retention_preserves_sender_metadata() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("delegated-turn")]),
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    app.initialize().await?;
+    let request = app
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread, .. } = app.read_response(request).await?;
+    let source_thread_id = ThreadId::new();
+    let output = format!(
+        "<codex_delegation>\n  <source_thread_id>{source_thread_id}</source_thread_id>\n  <input>Investigate the failing tests.</input>\n</codex_delegation>"
+    );
+    let request = app
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: Vec::new(),
+            tool_output: Some(Box::new(TurnToolOutput {
+                name: "send_message_to_thread".to_string(),
+                namespace: Some("codex_app".to_string()),
+                output: FunctionCallOutputBody::Text(output.clone()),
+                retain: true,
+            })),
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = app.read_response(request).await?;
+    app.read_stream_until_notification_message("turn/completed")
+        .await?;
+    let model_outputs = response_mock
+        .single_request()
+        .inputs_of_type("function_call_output")
+        .into_iter()
+        .map(responses::strip_metadata_from_json)
+        .map(strip_response_item_ids_from_json)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_outputs,
+        vec![json!({
+            "type": "function_call_output",
+            "name": "send_message_to_thread",
+            "namespace": "codex_app",
+            "output": output,
+        })]
+    );
+    let rollout_path = thread.path.as_ref().context("thread path missing")?;
+    let InitialHistory::Resumed(history) =
+        RolloutRecorder::get_rollout_history(rollout_path).await?
+    else {
+        panic!("expected persisted history");
+    };
+    let envelope = history
+        .history
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::ResponseItem(envelope)
+                if matches!(envelope.item, ResponseItem::FunctionCallOutput { .. }) =>
+            {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .context("delegation output should be saved")?;
+    let metadata = envelope.metadata.as_ref().context("output metadata")?;
+    assert!(metadata.client_authored);
+    let sender_messages = metadata
+        .sender_user_messages
+        .as_ref()
+        .context("sender context must be preserved")?;
+    assert_eq!(
+        sender_messages.receiver_message_id,
+        envelope.item.id().unwrap().to_string()
+    );
+    Ok(())
 }

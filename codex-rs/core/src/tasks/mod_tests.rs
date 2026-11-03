@@ -137,7 +137,7 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
         .with_runtime_reader(),
     )
     .expect("in-memory metrics client");
-    let (mut session, mut turn_context, _receiver) = make_session_and_context_with_rx().await;
+    let (mut session, mut turn_context, receiver) = make_session_and_context_with_rx().await;
     let session_telemetry = session
         .services
         .session_telemetry
@@ -171,6 +171,7 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
                 total_tokens: 1_000,
                 ..TokenUsage::default()
             }),
+            /*includes_reasoning*/ false,
         )
         .await
         .expect("earlier session usage should be recorded");
@@ -193,7 +194,11 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
         };
         // Local pre-turn compaction records usage with the previous model's context.
         session
-            .update_token_usage_info(&previous_context, Some(&compaction_usage))
+            .update_token_usage_info(
+                &previous_context,
+                Some(&compaction_usage),
+                /*includes_reasoning*/ false,
+            )
             .await
             .expect("compaction usage should be recorded");
         expected_usage.push((previous_context.model_info().slug.clone(), compaction_usage));
@@ -225,6 +230,9 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
                     &turn_context,
                     &response_context.initial_settings,
                     Some(&response_usage),
+                    crate::session::TokenUsageContext::Sampling {
+                        includes_reasoning: false,
+                    },
                 )
                 .await
                 .expect("response usage should be recorded");
@@ -243,7 +251,21 @@ async fn turn_completion_metrics_follow_model_switch(scenario: UsageScenario) {
     } else {
         Ok(None)
     };
+    let expected_root = turn_context.root_turn_id();
     session.on_task_finished(turn_context, task_result).await;
+    let mut terminal_root = None;
+    while let Ok(event) = receiver.try_recv() {
+        match event.msg {
+            codex_protocol::protocol::EventMsg::TurnComplete(event) => {
+                terminal_root = event.root_turn_id;
+            }
+            codex_protocol::protocol::EventMsg::TurnAborted(event) => {
+                terminal_root = event.root_turn_id;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(terminal_root, Some(expected_root));
 
     let snapshot = metrics.snapshot().expect("runtime metrics snapshot");
     let token_usage_metric = find_metric(&snapshot, TURN_TOKEN_USAGE_METRIC);
@@ -477,5 +499,75 @@ fn emit_compact_metric_records_auto_local() {
             ("manual".to_string(), "false".to_string()),
             ("type".to_string(), "local".to_string()),
         ])
+    );
+}
+
+struct UncooperativeTimedTask {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+impl SessionTask for UncooperativeTimedTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "session_task.uncooperative_timing"
+    }
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<Session>,
+        context: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        let timing = &context.turn_timing_state;
+        timing.enable_critical_path();
+        let batch = codex_direct_tool_timing::ToolBatchTiming::default();
+        let now = std::time::Instant::now();
+        let _blocking;
+        let _work = timing.direct_tool_timings.start_turn_direct_call(
+            "uncooperative",
+            &context.sub_id,
+            batch.clone(),
+            now,
+            timing.snapshot_path(now),
+        );
+        _blocking = timing.begin_tool_blocking(Some(batch));
+        let _review = _work.start_review();
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hard_abort_drops_timing_guards_before_profile_completion() {
+    let (session, context, _receiver) = make_session_and_context_with_rx().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    session
+        .spawn_task(
+            Arc::clone(&context),
+            Vec::new(),
+            UncooperativeTimedTask {
+                entered: Arc::clone(&entered),
+            },
+        )
+        .await;
+    entered.notified().await;
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+    // The task's review and tool guards are gone before abort completion.
+    assert!(
+        context
+            .turn_timing_state
+            .direct_tool_timings
+            .owner_for_turn("uncooperative", &context.sub_id)
+            .is_none()
+    );
+    assert_eq!(
+        context
+            .turn_timing_state
+            .snapshot_path(std::time::Instant::now()),
+        None
     );
 }

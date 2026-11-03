@@ -45,6 +45,7 @@ async fn state_runtime(config: &Config) -> std::io::Result<Arc<codex_state::Stat
 
 async fn start_app_server(config: Config) -> color_eyre::Result<AppServerSession> {
     Ok(AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         codex_app_server_client::AppServerClient::InProcess(
             start_test_embedded_app_server(config).await?,
         ),

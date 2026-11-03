@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 const MAX_REALTIME_DELEGATION_FIELD_BYTES: usize = 4 * 1024;
 const TRUNCATION_MARKER: &str = "…";
@@ -48,7 +50,7 @@ impl ContextualUserFragment for RealtimeDelegation<'_> {
         ("<realtime_delegation>", "</realtime_delegation>")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let input = escape_xml_text_bounded(self.input, Retain::Start);
         let source = match self.source {
             RealtimeDelegationSource::Handoff => "",
@@ -58,12 +60,12 @@ impl ContextualUserFragment for RealtimeDelegation<'_> {
         };
         if let Some(transcript_delta) = self.transcript_delta.filter(|text| !text.is_empty()) {
             let transcript_delta = escape_xml_text_bounded(transcript_delta, Retain::End);
-            return format!(
+            return input_text(format!(
                 "\n{source}  <input>{input}</input>\n  <transcript_delta>{transcript_delta}</transcript_delta>\n"
-            );
+            ));
         }
 
-        format!("\n{source}  <input>{input}</input>\n")
+        input_text(format!("\n{source}  <input>{input}</input>\n"))
     }
 }
 

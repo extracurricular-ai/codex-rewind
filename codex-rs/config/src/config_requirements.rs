@@ -5,6 +5,7 @@ pub use codex_model_provider_info::ResidencyRequirement;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::config_types::ToolResultLogConfig;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -39,6 +40,8 @@ use crate::mcp_types::AppToolApproval;
 use crate::permissions_toml::PermissionProfileToml;
 use crate::types::AuthCredentialsStoreMode;
 use crate::types::FeedbackConfigToml;
+use crate::types::OtelConfigToml;
+use crate::types::OtelExporterKind;
 use crate::types::WindowsSandboxModeToml;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +169,7 @@ pub struct ConfigRequirements {
     pub cli_auth_credentials_store: Option<Sourced<AuthCredentialsStoreMode>>,
     pub chatgpt_base_url: Option<Sourced<String>>,
     pub sqlite_home: Option<Sourced<AbsolutePathBuf>>,
+    pub unsafe_enforce_sqlite_journal_mode: Option<Sourced<bool>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
     pub model_provider: Option<Sourced<String>>,
@@ -188,6 +192,8 @@ pub struct ConfigRequirements {
     pub mcp_servers: Option<Sourced<BTreeMap<String, McpServerRequirement>>>,
     pub plugins: Option<Sourced<BTreeMap<String, PluginRequirementsToml>>>,
     pub marketplaces: Option<Sourced<MarketplaceRequirementsToml>>,
+    // Keep OTEL boxed in both forms so unset values do not inflate ConfigLayerStack/Config stack frames.
+    pub otel: Option<Box<Sourced<OtelRequirementsToml>>>,
     pub exec_policy: Option<Sourced<RequirementsExecPolicy>>,
     pub enforce_residency: ConstrainedWithSource<Option<ResidencyRequirement>>,
     /// Managed network constraints derived from requirements.
@@ -199,6 +205,8 @@ pub struct ConfigRequirements {
     pub additional_developer_instructions: Option<Sourced<String>>,
     /// Source for the managed guardian policy config, when one is configured.
     pub guardian_policy_config_source: Option<RequirementSource>,
+    /// Source for the managed extra guardian policy, when one is configured.
+    pub guardian_extra_policy_source: Option<RequirementSource>,
 }
 
 impl Default for ConfigRequirements {
@@ -209,6 +217,7 @@ impl Default for ConfigRequirements {
             cli_auth_credentials_store: None,
             chatgpt_base_url: None,
             sqlite_home: None,
+            unsafe_enforce_sqlite_journal_mode: None,
             log_dir: None,
             model_catalog_json: None,
             model_provider: None,
@@ -246,6 +255,7 @@ impl Default for ConfigRequirements {
             mcp_servers: None,
             plugins: None,
             marketplaces: None,
+            otel: None,
             exec_policy: None,
             enforce_residency: ConstrainedWithSource::new(
                 Constrained::allow_any(/*initial_value*/ None),
@@ -256,6 +266,7 @@ impl Default for ConfigRequirements {
             filesystem: None,
             additional_developer_instructions: None,
             guardian_policy_config_source: None,
+            guardian_extra_policy_source: None,
         }
     }
 }
@@ -429,6 +440,9 @@ pub struct NetworkRequirementsToml {
     pub dangerously_allow_non_loopback_proxy: Option<bool>,
     pub dangerously_allow_all_unix_sockets: Option<bool>,
     pub domains: Option<NetworkDomainPermissionsToml>,
+    /// Host patterns routed to the existing network approval flow before ordinary allow rules.
+    /// Explicit denials take precedence; approval caching, hooks, and reviewer routing still apply.
+    pub review_domains: Option<Vec<String>>,
     /// When true, only managed `allowed_domains` are respected while managed
     /// network enforcement is active. User allowlist entries are ignored.
     pub managed_allowed_domains_only: Option<bool>,
@@ -468,6 +482,7 @@ struct RawNetworkRequirementsToml {
     dangerously_allow_non_loopback_proxy: Option<bool>,
     dangerously_allow_all_unix_sockets: Option<bool>,
     domains: Option<NetworkDomainPermissionsToml>,
+    review_domains: Option<Vec<String>>,
     #[serde(default)]
     allowed_domains: Option<Vec<String>>,
     /// When true, only managed `allowed_domains` are respected while managed
@@ -496,6 +511,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             dangerously_allow_non_loopback_proxy,
             dangerously_allow_all_unix_sockets,
             domains,
+            review_domains,
             allowed_domains,
             managed_allowed_domains_only,
             denied_domains,
@@ -507,13 +523,13 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
 
         if domains.is_some() && (allowed_domains.is_some() || denied_domains.is_some()) {
             return Err(D::Error::custom(
-                "`experimental_network.domains` cannot be combined with legacy `allowed_domains` or `denied_domains`",
+                "`domains` cannot be combined with legacy `allowed_domains` or `denied_domains` in managed network requirements",
             ));
         }
 
         if unix_sockets.is_some() && allow_unix_sockets.is_some() {
             return Err(D::Error::custom(
-                "`experimental_network.unix_sockets` cannot be combined with legacy `allow_unix_sockets`",
+                "`unix_sockets` cannot be combined with legacy `allow_unix_sockets` in managed network requirements",
             ));
         }
 
@@ -526,6 +542,7 @@ impl<'de> Deserialize<'de> for NetworkRequirementsToml {
             dangerously_allow_all_unix_sockets,
             domains: domains
                 .or_else(|| legacy_domain_permissions_from_lists(allowed_domains, denied_domains)),
+            review_domains,
             managed_allowed_domains_only,
             unix_sockets: unix_sockets
                 .or_else(|| legacy_unix_socket_permissions_from_list(allow_unix_sockets)),
@@ -577,6 +594,7 @@ pub struct NetworkConstraints {
     pub dangerously_allow_non_loopback_proxy: Option<bool>,
     pub dangerously_allow_all_unix_sockets: Option<bool>,
     pub domains: Option<NetworkDomainPermissionsToml>,
+    pub review_domains: Option<Vec<String>>,
     /// When true, only managed `allowed_domains` are respected while managed
     /// network enforcement is active. User allowlist entries are ignored.
     pub managed_allowed_domains_only: Option<bool>,
@@ -605,6 +623,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             dangerously_allow_non_loopback_proxy,
             dangerously_allow_all_unix_sockets,
             domains,
+            review_domains,
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
@@ -618,6 +637,7 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
             dangerously_allow_non_loopback_proxy,
             dangerously_allow_all_unix_sockets,
             domains,
+            review_domains,
             managed_allowed_domains_only,
             unix_sockets,
             allow_local_binding,
@@ -867,6 +887,10 @@ impl fmt::Display for WebSearchModeRequirement {
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowsRequirementsToml {
     pub allowed_sandbox_implementations: Option<Vec<WindowsSandboxImplementationToml>>,
+    /// False blocks both explicit MXC configuration and automatic selection.
+    pub allow_mxc: Option<bool>,
+    /// Require MXC as the selected local Windows backend.
+    pub require_mxc: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -879,6 +903,8 @@ pub enum WindowsSandboxImplementationToml {
 impl WindowsRequirementsToml {
     pub fn is_empty(&self) -> bool {
         self.allowed_sandbox_implementations.is_none()
+            && self.allow_mxc.is_none()
+            && self.require_mxc.is_none()
     }
 }
 
@@ -1024,11 +1050,17 @@ pub(crate) fn merge_app_requirements_descending(
 /// Base config deserialized from system `requirements.toml` or MDM.
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsToml {
+    /// Required customer-hosted configuration server. Only local managed requirements may configure it.
+    pub config_server: Option<crate::ConfigServer>,
     pub allowed_login_methods: Option<Vec<ForcedLoginMethod>>,
     pub allowed_chatgpt_workspaces: Option<Vec<String>>,
     pub cli_auth_credentials_store: Option<AuthCredentialsStoreMode>,
     pub chatgpt_base_url: Option<String>,
     pub sqlite_home: Option<AbsolutePathBuf>,
+    /// Require migration of existing WAL databases on NFS before opening writable pools.
+    /// Unsafe: other clients on all hosts must remain stopped during replacement.
+    /// Allows accessible shared files; mode bits are preserved, but ownership and ACLs are not.
+    pub unsafe_enforce_sqlite_journal_mode: Option<bool>,
     pub log_dir: Option<AbsolutePathBuf>,
     pub model_catalog_json: Option<AbsolutePathBuf>,
     /// Exact provider selection, overriding local and session configuration.
@@ -1059,10 +1091,12 @@ pub struct ConfigRequirementsToml {
     pub mcp_servers: Option<BTreeMap<String, McpServerRequirement>>,
     pub plugins: Option<BTreeMap<String, PluginRequirementsToml>>,
     pub marketplaces: Option<MarketplaceRequirementsToml>,
+    pub otel: Option<Box<OtelRequirementsToml>>,
     pub apps: Option<AppsRequirementsToml>,
     pub rules: Option<RequirementsExecPolicyToml>,
     pub enforce_residency: Option<ResidencyRequirement>,
-    #[serde(rename = "experimental_network")]
+    /// Shared managed network constraints; `experimental_network` remains an alias.
+    #[serde(rename = "network_proxy", alias = "experimental_network")]
     pub network: Option<NetworkRequirementsToml>,
     pub application: Option<ApplicationRequirementsToml>,
     pub permissions: Option<PermissionsRequirementsToml>,
@@ -1070,6 +1104,50 @@ pub struct ConfigRequirementsToml {
     pub models: Option<ModelsRequirementsToml>,
     pub additional_developer_instructions: Option<String>,
     pub guardian_policy_config: Option<String>,
+    pub guardian_extra_policy: Option<String>,
+}
+
+/// OTEL settings that may be managed through `requirements.toml`.
+///
+/// Tool-result limits are optional here because `config.toml` defaults them,
+/// while requirements must distinguish unset from managed-to-default.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OtelRequirementsToml {
+    pub tool_result: Option<ToolResultLogConfig>,
+    pub log_user_prompt: Option<bool>,
+    pub log_agent_responses: Option<bool>,
+    pub log_guardian_assessments: Option<bool>,
+    pub environment: Option<String>,
+    pub exporter: Option<OtelExporterKind>,
+    pub trace_exporter: Option<OtelExporterKind>,
+    pub metrics_exporter: Option<OtelExporterKind>,
+    pub span_attributes: Option<HashMap<String, String>>,
+    pub tracestate: Option<BTreeMap<String, BTreeMap<String, String>>>,
+}
+
+impl OtelRequirementsToml {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tool_result.is_none()
+            && self.log_user_prompt.is_none()
+            && self.log_agent_responses.is_none()
+            && self.log_guardian_assessments.is_none()
+            && self.environment.is_none()
+            && self.exporter.is_none()
+            && self.trace_exporter.is_none()
+            && self.metrics_exporter.is_none()
+            && !self.has_metadata()
+    }
+
+    fn has_metadata(&self) -> bool {
+        self.span_attributes
+            .as_ref()
+            .is_some_and(|fields| !fields.is_empty())
+            || self
+                .tracestate
+                .as_ref()
+                .is_some_and(|members| members.values().any(|fields| !fields.is_empty()))
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -1134,11 +1212,13 @@ impl<T> std::ops::Deref for Sourced<T> {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsWithSources {
+    pub config_server: Option<Sourced<crate::ConfigServer>>,
     pub allowed_login_methods: Option<Sourced<Vec<ForcedLoginMethod>>>,
     pub allowed_chatgpt_workspaces: Option<Sourced<Vec<String>>>,
     pub cli_auth_credentials_store: Option<Sourced<AuthCredentialsStoreMode>>,
     pub chatgpt_base_url: Option<Sourced<String>>,
     pub sqlite_home: Option<Sourced<AbsolutePathBuf>>,
+    pub unsafe_enforce_sqlite_journal_mode: Option<Sourced<bool>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
     pub model_provider: Option<Sourced<String>>,
@@ -1165,6 +1245,7 @@ pub struct ConfigRequirementsWithSources {
     pub mcp_servers: Option<Sourced<BTreeMap<String, McpServerRequirement>>>,
     pub plugins: Option<Sourced<BTreeMap<String, PluginRequirementsToml>>>,
     pub marketplaces: Option<Sourced<MarketplaceRequirementsToml>>,
+    pub otel: Option<Box<Sourced<OtelRequirementsToml>>>,
     pub apps: Option<Sourced<AppsRequirementsToml>>,
     pub rules: Option<Sourced<RequirementsExecPolicyToml>>,
     pub enforce_residency: Option<Sourced<ResidencyRequirement>>,
@@ -1175,6 +1256,7 @@ pub struct ConfigRequirementsWithSources {
     pub models: Option<Sourced<ModelsRequirementsToml>>,
     pub additional_developer_instructions: Option<Sourced<String>>,
     pub guardian_policy_config: Option<Sourced<String>>,
+    pub guardian_extra_policy: Option<Sourced<String>>,
 }
 
 impl ConfigRequirementsWithSources {
@@ -1196,11 +1278,13 @@ impl ConfigRequirementsWithSources {
         // Destructure without `..` so adding fields to `ConfigRequirementsToml`
         // forces this merge logic to be updated.
         let ConfigRequirementsToml {
+            config_server: _,
             allowed_login_methods: _,
             allowed_chatgpt_workspaces: _,
             cli_auth_credentials_store: _,
             chatgpt_base_url: _,
             sqlite_home: _,
+            unsafe_enforce_sqlite_journal_mode: _,
             log_dir: _,
             model_catalog_json: _,
             model_provider: _,
@@ -1228,6 +1312,7 @@ impl ConfigRequirementsWithSources {
             mcp_servers: _,
             plugins: _,
             marketplaces: _,
+            otel: _,
             apps: _,
             rules: _,
             enforce_residency: _,
@@ -1238,6 +1323,7 @@ impl ConfigRequirementsWithSources {
             models: _,
             additional_developer_instructions: _,
             guardian_policy_config: _,
+            guardian_extra_policy: _,
         } = &other;
 
         let mut other = other;
@@ -1248,16 +1334,25 @@ impl ConfigRequirementsWithSources {
         {
             other.guardian_policy_config = None;
         }
+        if other
+            .guardian_extra_policy
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            other.guardian_extra_policy = None;
+        }
         fill_missing_take!(
             self,
             other,
             source,
             {
+                config_server,
                 allowed_login_methods,
                 allowed_chatgpt_workspaces,
                 cli_auth_credentials_store,
                 chatgpt_base_url,
                 sqlite_home,
+                unsafe_enforce_sqlite_journal_mode,
                 log_dir,
                 model_catalog_json,
                 model_provider,
@@ -1292,8 +1387,15 @@ impl ConfigRequirementsWithSources {
                 models,
                 additional_developer_instructions,
                 guardian_policy_config,
+                guardian_extra_policy,
             }
         );
+
+        if self.otel.is_none()
+            && let Some(value) = other.otel.take()
+        {
+            self.otel = Some(Box::new(Sourced::new(*value, source.clone())));
+        }
 
         if let Some(incoming_auto_review) = other.auto_review.take() {
             if let Some(existing_auto_review) = self.auto_review.as_mut() {
@@ -1338,11 +1440,13 @@ impl ConfigRequirementsWithSources {
 
     pub fn into_toml(self) -> ConfigRequirementsToml {
         let ConfigRequirementsWithSources {
+            config_server,
             allowed_login_methods,
             allowed_chatgpt_workspaces,
             cli_auth_credentials_store,
             chatgpt_base_url,
             sqlite_home,
+            unsafe_enforce_sqlite_journal_mode,
             log_dir,
             model_catalog_json,
             model_provider,
@@ -1369,6 +1473,7 @@ impl ConfigRequirementsWithSources {
             mcp_servers,
             plugins,
             marketplaces,
+            otel,
             apps,
             rules,
             enforce_residency,
@@ -1379,13 +1484,17 @@ impl ConfigRequirementsWithSources {
             models,
             additional_developer_instructions,
             guardian_policy_config,
+            guardian_extra_policy,
         } = self;
         ConfigRequirementsToml {
+            config_server: config_server.map(|sourced| sourced.value),
             allowed_login_methods: allowed_login_methods.map(|sourced| sourced.value),
             allowed_chatgpt_workspaces: allowed_chatgpt_workspaces.map(|sourced| sourced.value),
             cli_auth_credentials_store: cli_auth_credentials_store.map(|sourced| sourced.value),
             chatgpt_base_url: chatgpt_base_url.map(|sourced| sourced.value),
             sqlite_home: sqlite_home.map(|sourced| sourced.value),
+            unsafe_enforce_sqlite_journal_mode: unsafe_enforce_sqlite_journal_mode
+                .map(|sourced| sourced.value),
             log_dir: log_dir.map(|sourced| sourced.value),
             model_catalog_json: model_catalog_json.map(|sourced| sourced.value),
             model_provider: model_provider.map(|sourced| sourced.value),
@@ -1414,6 +1523,7 @@ impl ConfigRequirementsWithSources {
             mcp_servers: mcp_servers.map(|sourced| sourced.value),
             plugins: plugins.map(|sourced| sourced.value),
             marketplaces: marketplaces.map(|sourced| sourced.value),
+            otel: otel.map(|sourced| Box::new(sourced.value)),
             apps: apps.map(|sourced| sourced.value),
             rules: rules.map(|sourced| sourced.value),
             enforce_residency: enforce_residency.map(|sourced| sourced.value),
@@ -1425,6 +1535,7 @@ impl ConfigRequirementsWithSources {
             additional_developer_instructions: additional_developer_instructions
                 .map(|sourced| sourced.value),
             guardian_policy_config: guardian_policy_config.map(|sourced| sourced.value),
+            guardian_extra_policy: guardian_extra_policy.map(|sourced| sourced.value),
         }
     }
 }
@@ -1470,6 +1581,11 @@ impl From<SandboxMode> for SandboxModeRequirement {
 }
 
 impl ConfigRequirementsToml {
+    /// Whether local administration requires a remotely delivered managed bundle.
+    pub fn requires_remote_config(&self) -> bool {
+        self.config_server.is_some()
+    }
+
     pub fn apply_remote_sandbox_config(&mut self, hostname: Option<&str>) {
         let Some(remote_sandbox_config) = self.remote_sandbox_config.as_ref() else {
             return;
@@ -1487,11 +1603,13 @@ impl ConfigRequirementsToml {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.allowed_login_methods.is_none()
+        self.config_server.is_none()
+            && self.allowed_login_methods.is_none()
             && self.allowed_chatgpt_workspaces.is_none()
             && self.cli_auth_credentials_store.is_none()
             && self.chatgpt_base_url.is_none()
             && self.sqlite_home.is_none()
+            && self.unsafe_enforce_sqlite_journal_mode.is_none()
             && self.log_dir.is_none()
             && self.model_catalog_json.is_none()
             && self.model_provider.is_none()
@@ -1547,16 +1665,23 @@ impl ConfigRequirementsToml {
                 .as_ref()
                 .is_none_or(MarketplaceRequirementsToml::is_empty)
             && self
+                .otel
+                .as_deref()
+                .is_none_or(OtelRequirementsToml::is_empty)
+            && self
                 .apps
                 .as_ref()
                 .is_none_or(AppsRequirementsToml::is_empty)
             && self.rules.is_none()
             && self.enforce_residency.is_none()
             && self.network.is_none()
-            && self
-                .application
-                .as_ref()
-                .is_none_or(|application| application.network.is_none())
+            && self.application.as_ref().is_none_or(|application| {
+                application.network.is_none()
+                    && application
+                        .storage
+                        .as_deref()
+                        .is_none_or(crate::ApplicationStorageRequirementsToml::is_empty)
+            })
             && self.permissions.is_none()
             && self.auto_review.as_ref().is_none_or(|auto_review| {
                 auto_review.ignore_rules.as_ref().is_none_or(Vec::is_empty)
@@ -1572,6 +1697,10 @@ impl ConfigRequirementsToml {
             && self.additional_developer_instructions.is_none()
             && self
                 .guardian_policy_config
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            && self
+                .guardian_extra_policy
                 .as_deref()
                 .is_none_or(|value| value.trim().is_empty())
     }
@@ -1592,6 +1721,13 @@ impl ConfigRequirementsToml {
         apply_exact!(chatgpt_base_url);
         apply_exact!(sqlite_home);
         apply_exact!(log_dir);
+        if let Some(storage) = self
+            .application
+            .as_ref()
+            .and_then(|application| application.storage.as_ref())
+        {
+            storage.apply_to_config(config);
+        }
         apply_exact!(model_catalog_json);
         apply_exact!(model_provider);
         if let Some(providers) = &self.model_providers {
@@ -1611,10 +1747,23 @@ impl ConfigRequirementsToml {
         if let Some(enabled) = self.feedback.as_ref().and_then(|feedback| feedback.enabled) {
             config.feedback.get_or_insert_default().enabled = Some(enabled);
         }
+        if let Some(requirements) = &self.otel
+            && !requirements.is_empty()
+        {
+            apply_otel_requirements(config.otel.get_or_insert_default(), requirements);
+        }
     }
 
     /// Returns the exact managed field affected by editing `segments`.
     pub fn exact_requirement_for_config_path(&self, segments: &[String]) -> Option<&'static str> {
+        if let Some(field) = self
+            .application
+            .as_ref()
+            .and_then(|application| application.storage.as_ref())
+            .and_then(|storage| storage.exact_requirement_for_config_path(segments))
+        {
+            return Some(field);
+        }
         if self.model_providers.as_ref().is_some_and(|providers| {
             providers
                 .keys()
@@ -1622,7 +1771,8 @@ impl ConfigRequirementsToml {
         }) {
             return Some("model_providers");
         }
-        let managed_fields: [(bool, &[&str], &'static str); 9] = [
+        let otel = self.otel.as_ref();
+        let managed_fields: [(bool, &[&str], &'static str); 17] = [
             (
                 self.model_provider.is_some(),
                 &["model_provider"],
@@ -1663,6 +1813,46 @@ impl ConfigRequirementsToml {
                 &["chatgpt_base_url"],
                 "chatgpt_base_url",
             ),
+            (
+                otel.is_some_and(|otel| otel.tool_result.is_some()),
+                &["otel", "tool_result"],
+                "otel.tool_result",
+            ),
+            (
+                otel.is_some_and(|otel| otel.log_user_prompt.is_some()),
+                &["otel", "log_user_prompt"],
+                "otel.log_user_prompt",
+            ),
+            (
+                otel.is_some_and(|otel| otel.log_agent_responses.is_some()),
+                &["otel", "log_agent_responses"],
+                "otel.log_agent_responses",
+            ),
+            (
+                otel.is_some_and(|otel| otel.log_guardian_assessments.is_some()),
+                &["otel", "log_guardian_assessments"],
+                "otel.log_guardian_assessments",
+            ),
+            (
+                otel.is_some_and(|otel| otel.environment.is_some()),
+                &["otel", "environment"],
+                "otel.environment",
+            ),
+            (
+                otel.is_some_and(|otel| otel.exporter.is_some()),
+                &["otel", "exporter"],
+                "otel.exporter",
+            ),
+            (
+                otel.is_some_and(|otel| otel.trace_exporter.is_some()),
+                &["otel", "trace_exporter"],
+                "otel.trace_exporter",
+            ),
+            (
+                otel.is_some_and(|otel| otel.metrics_exporter.is_some()),
+                &["otel", "metrics_exporter"],
+                "otel.metrics_exporter",
+            ),
         ];
 
         managed_fields
@@ -1670,7 +1860,131 @@ impl ConfigRequirementsToml {
             .find_map(|(is_managed, managed_path, field)| {
                 (is_managed && config_paths_overlap(segments, managed_path)).then_some(field)
             })
+            .or_else(|| {
+                otel.and_then(|otel| {
+                    exact_otel_metadata_requirement_for_config_path(otel, segments)
+                })
+            })
     }
+}
+
+macro_rules! otel_merge_functions {
+    ($($field:ident),+ $(,)?) => {
+        /// Merges the supplied fields and reports whether this layer contributed a requirement.
+        pub(crate) fn merge_otel_requirements(
+            requirements: &mut Option<OtelRequirementsToml>,
+            higher_priority: &OtelRequirementsToml,
+        ) -> bool {
+            let mut contributed = false;
+            $(if let Some(value) = &higher_priority.$field {
+                requirements.get_or_insert_default().$field = Some(value.clone());
+                contributed = true;
+            })+
+            if higher_priority.has_metadata() {
+                let target = requirements.get_or_insert_default();
+                merge_otel_metadata(
+                    &mut target.span_attributes,
+                    &mut target.tracestate,
+                    higher_priority,
+                );
+                contributed = true;
+            }
+            contributed
+        }
+
+        /// Applies managed OTEL values and reports whether any configured value was overridden.
+        pub fn apply_otel_requirements(
+            config: &mut OtelConfigToml,
+            requirements: &OtelRequirementsToml,
+        ) -> bool {
+            let mut conflict = false;
+            $(if let Some(value) = &requirements.$field {
+                conflict |= config.$field.as_ref().is_some_and(|current| current != value);
+                config.$field = Some(value.clone());
+            })+
+            conflict |= merge_otel_metadata(
+                &mut config.span_attributes,
+                &mut config.tracestate,
+                requirements,
+            );
+            conflict
+        }
+    };
+}
+
+otel_merge_functions!(
+    tool_result,
+    log_user_prompt,
+    log_agent_responses,
+    log_guardian_assessments,
+    environment,
+    exporter,
+    trace_exporter,
+    metrics_exporter,
+);
+
+fn merge_otel_metadata(
+    span_attributes: &mut Option<HashMap<String, String>>,
+    tracestate: &mut Option<BTreeMap<String, BTreeMap<String, String>>>,
+    requirements: &OtelRequirementsToml,
+) -> bool {
+    let mut conflict = false;
+    if let Some(attributes) = &requirements.span_attributes
+        && !attributes.is_empty()
+    {
+        let configured = span_attributes.get_or_insert_default();
+        for (key, value) in attributes {
+            conflict |= configured
+                .insert(key.clone(), value.clone())
+                .is_some_and(|configured| configured != *value);
+        }
+    }
+    if let Some(members) = &requirements.tracestate {
+        for (member, fields) in members.iter().filter(|(_, fields)| !fields.is_empty()) {
+            let configured = tracestate
+                .get_or_insert_default()
+                .entry(member.clone())
+                .or_default();
+            for (key, value) in fields {
+                conflict |= configured
+                    .insert(key.clone(), value.clone())
+                    .is_some_and(|configured| configured != *value);
+            }
+        }
+    }
+    conflict
+}
+
+fn exact_otel_metadata_requirement_for_config_path(
+    requirements: &OtelRequirementsToml,
+    segments: &[String],
+) -> Option<&'static str> {
+    if requirements
+        .span_attributes
+        .as_ref()
+        .is_some_and(|attributes| {
+            attributes.keys().any(|key| {
+                config_paths_overlap(segments, &["otel", "span_attributes", key.as_str()])
+            })
+        })
+    {
+        return Some("otel.span_attributes");
+    }
+
+    requirements
+        .tracestate
+        .as_ref()
+        .is_some_and(|members| {
+            members.iter().any(|(member, fields)| {
+                fields.keys().any(|field| {
+                    config_paths_overlap(
+                        segments,
+                        &["otel", "tracestate", member.as_str(), field.as_str()],
+                    )
+                })
+            })
+        })
+        .then_some("otel.tracestate")
 }
 
 fn config_paths_overlap(segments: &[String], managed_path: &[&str]) -> bool {
@@ -1708,11 +2022,13 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
         // defaults also remain there because they are initialization values;
         // model-specific auto-review requirements are runtime constraints.
         let ConfigRequirementsWithSources {
+            config_server: _,
             allowed_login_methods,
             allowed_chatgpt_workspaces,
             cli_auth_credentials_store,
             chatgpt_base_url,
             sqlite_home,
+            unsafe_enforce_sqlite_journal_mode,
             log_dir,
             model_catalog_json,
             model_provider,
@@ -1739,6 +2055,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             mcp_servers,
             plugins,
             marketplaces,
+            otel,
             apps: _apps,
             rules,
             enforce_residency,
@@ -1749,6 +2066,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             models: _,
             additional_developer_instructions,
             guardian_policy_config,
+            guardian_extra_policy,
         } = toml;
 
         let auto_review_required_models = auto_review
@@ -1894,11 +2212,17 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 /*source*/ None,
             ),
         };
-        let windows_sandbox_mode = match windows {
+        let mxc_requirement_source = windows
+            .as_ref()
+            .filter(|windows| windows.value.allow_mxc == Some(false))
+            .map(|windows| windows.source.clone());
+        let mut windows_sandbox_mode = match windows {
             Some(Sourced {
                 value:
                     WindowsRequirementsToml {
                         allowed_sandbox_implementations: Some(implementations),
+                        allow_mxc: _,
+                        require_mxc: _,
                     },
                 source: requirement_source,
             }) => {
@@ -1944,6 +2268,8 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 value:
                     WindowsRequirementsToml {
                         allowed_sandbox_implementations: None,
+                        allow_mxc: _,
+                        require_mxc: _,
                     },
                 ..
             })
@@ -1952,6 +2278,18 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                 /*source*/ None,
             ),
         };
+        if let Some(requirement_source) = mxc_requirement_source {
+            windows_sandbox_mode.add_validator(move |candidate| match candidate {
+                Some(WindowsSandboxModeToml::Mxc) => Err(ConstraintError::InvalidValue {
+                    field_name: "windows.sandbox",
+                    candidate: format!("{candidate:?}"),
+                    allowed: "windows.allow_mxc = false".to_string(),
+                    requirement_source: requirement_source.clone(),
+                }),
+                Some(WindowsSandboxModeToml::Elevated | WindowsSandboxModeToml::Unelevated)
+                | None => Ok(()),
+            })?;
+        }
         let exec_policy = match rules {
             Some(Sourced { value, source }) => {
                 let policy = value.to_requirements_policy().map_err(|err| {
@@ -2075,12 +2413,14 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             Sourced::new(FilesystemConstraints::from(value), source)
         });
         let guardian_policy_config_source = guardian_policy_config.map(|sourced| sourced.source);
+        let guardian_extra_policy_source = guardian_extra_policy.map(|sourced| sourced.source);
         Ok(ConfigRequirements {
             allowed_login_methods,
             allowed_chatgpt_workspaces,
             cli_auth_credentials_store,
             chatgpt_base_url,
             sqlite_home,
+            unsafe_enforce_sqlite_journal_mode,
             log_dir,
             model_catalog_json,
             model_provider,
@@ -2103,6 +2443,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             mcp_servers,
             plugins,
             marketplaces,
+            otel,
             exec_policy,
             enforce_residency,
             network,
@@ -2110,6 +2451,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             filesystem,
             additional_developer_instructions,
             guardian_policy_config_source,
+            guardian_extra_policy_source,
         })
     }
 }
@@ -2146,7 +2488,6 @@ mod tests {
     use crate::ComputerUseMacosRequirementsToml;
     use crate::ComputerUseWindowsExeRequirementToml;
     use crate::ComputerUseWindowsRequirementsToml;
-    use crate::HookEventsToml;
     use crate::McpServerCommandMatcher;
     use crate::McpServerIdentity;
     use crate::McpServerValueMatcher;
@@ -2218,6 +2559,93 @@ mod tests {
         }
     }
 
+    #[test_case::test_case(&["otel"], Some("otel.tool_result"); "otel_parent")]
+    #[test_case::test_case(&["otel", "tool_result"], Some("otel.tool_result"); "tool_result")]
+    #[test_case::test_case(&["otel", "tool_result", "max_bytes"], Some("otel.tool_result"); "tool_result_max_bytes")]
+    #[test_case::test_case(&["otel", "log_user_prompt"], Some("otel.log_user_prompt"); "log_user_prompt")]
+    #[test_case::test_case(&["otel", "environment"], Some("otel.environment"); "environment")]
+    #[test_case::test_case(&["otel", "exporter", "otlp-http", "endpoint"], Some("otel.exporter"); "exporter_endpoint")]
+    #[test_case::test_case(&["otel", "trace_exporter"], Some("otel.trace_exporter"); "trace_exporter")]
+    #[test_case::test_case(&["otel", "metrics_exporter"], Some("otel.metrics_exporter"); "metrics_exporter")]
+    #[test_case::test_case(&["otel", "span_attributes"], Some("otel.span_attributes"); "span_attributes")]
+    #[test_case::test_case(&["otel", "span_attributes", "service.name"], Some("otel.span_attributes"); "span_attributes_service_name")]
+    #[test_case::test_case(&["otel", "span_attributes", "other"], None; "span_attributes_other")]
+    #[test_case::test_case(&["otel", "tracestate"], Some("otel.tracestate"); "tracestate")]
+    #[test_case::test_case(&["otel", "tracestate", "managed", "tenant"], Some("otel.tracestate"); "tracestate_managed_tenant")]
+    #[test_case::test_case(&["otel", "tracestate", "managed"], Some("otel.tracestate"); "tracestate_managed")]
+    #[test_case::test_case(&["otel", "tracestate", "managed", "region"], None; "tracestate_managed_region")]
+    #[test_case::test_case(&["otel", "tracestate", "other"], None; "tracestate_other")]
+    #[test_case::test_case(&["otel", "tracestate", "empty"], None; "tracestate_empty")]
+    fn otel_requirements_project_exact_values_and_lock_only_managed_map_entries(
+        segments: &[&str],
+        expected: Option<&str>,
+    ) -> Result<()> {
+        let requirements: ConfigRequirementsToml = from_str(
+            r#"
+[otel]
+tool_result = { max_bytes = 1024 }
+log_user_prompt = false
+environment = "managed"
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+span_attributes = { "service.name" = "managed" }
+tracestate = { managed = { tenant = "enterprise" }, empty = {} }
+"#,
+        )?;
+        let mut configured: ConfigToml = from_str(
+            r#"
+[otel]
+tool_result = { max_bytes = 4096 }
+log_user_prompt = true
+environment = "user"
+exporter = "statsig"
+trace_exporter = { otlp-grpc = { endpoint = "https://user.example" } }
+metrics_exporter = "statsig"
+span_attributes = { "service.name" = "user", other = "preserved" }
+tracestate = { managed = { tenant = "user", region = "us" }, other = { keep = "yes" } }
+"#,
+        )?;
+
+        requirements.apply_exact_to_config(&mut configured);
+        assert_eq!(
+            configured,
+            from_str::<ConfigToml>(
+                r#"
+[otel]
+tool_result = { max_bytes = 1024 }
+log_user_prompt = false
+environment = "managed"
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+span_attributes = { "service.name" = "managed", other = "preserved" }
+tracestate = { managed = { tenant = "enterprise", region = "us" }, other = { keep = "yes" } }
+"#
+            )?
+        );
+        assert!(!requirements.is_empty());
+
+        let segments = segments.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            requirements.exact_requirement_for_config_path(&segments),
+            expected,
+        );
+
+        for empty in [
+            "[otel]",
+            "[otel.span_attributes]",
+            "[otel.tracestate.empty]",
+        ] {
+            let requirements: ConfigRequirementsToml = from_str(empty)?;
+            assert!(requirements.is_empty(), "{empty}");
+            let mut configured = ConfigToml::default();
+            requirements.apply_exact_to_config(&mut configured);
+            assert_eq!(configured.otel, None, "{empty}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn composite_requirement_source_flattens_and_deduplicates_sources() {
         let mdm_source = RequirementSource::MdmManagedPreferences {
@@ -2239,11 +2667,13 @@ mod tests {
 
     fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources {
         let ConfigRequirementsToml {
+            config_server,
             allowed_login_methods,
             allowed_chatgpt_workspaces,
             cli_auth_credentials_store,
             chatgpt_base_url,
             sqlite_home,
+            unsafe_enforce_sqlite_journal_mode,
             log_dir,
             model_catalog_json,
             model_provider,
@@ -2271,6 +2701,7 @@ mod tests {
             mcp_servers,
             plugins,
             marketplaces,
+            otel,
             apps,
             rules,
             enforce_residency,
@@ -2281,8 +2712,11 @@ mod tests {
             models,
             additional_developer_instructions,
             guardian_policy_config,
+            guardian_extra_policy,
         } = toml;
         ConfigRequirementsWithSources {
+            config_server: config_server
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_login_methods: allowed_login_methods
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_chatgpt_workspaces: allowed_chatgpt_workspaces
@@ -2292,6 +2726,8 @@ mod tests {
             chatgpt_base_url: chatgpt_base_url
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             sqlite_home: sqlite_home.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            unsafe_enforce_sqlite_journal_mode: unsafe_enforce_sqlite_journal_mode
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             log_dir: log_dir.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             model_catalog_json: model_catalog_json
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -2335,6 +2771,7 @@ mod tests {
             mcp_servers: mcp_servers.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             plugins: plugins.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             marketplaces: marketplaces.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            otel: otel.map(|value| Box::new(Sourced::new(*value, RequirementSource::Unknown))),
             apps: apps.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             rules: rules.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             enforce_residency: enforce_residency
@@ -2347,6 +2784,8 @@ mod tests {
             additional_developer_instructions: additional_developer_instructions
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             guardian_policy_config: guardian_policy_config
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            guardian_extra_policy: guardian_extra_policy
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
         }
     }
@@ -2531,6 +2970,7 @@ mod tests {
         assert_eq!(
             requirements.browser_use,
             Some(BrowserUseRequirementsToml {
+                extension: None,
                 allow_webmcp: None,
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
@@ -2764,6 +3204,7 @@ mod tests {
             entries: BTreeMap::from([("personality".to_string(), true)]),
         };
         let browser_use = BrowserUseRequirementsToml {
+            extension: None,
             allow_webmcp: None,
             allow_history_access: Some(false),
             disable_auto_review: Some(true),
@@ -2801,20 +3242,25 @@ mod tests {
         };
         let windows = WindowsRequirementsToml {
             allowed_sandbox_implementations: Some(vec![WindowsSandboxImplementationToml::Elevated]),
+            allow_mxc: None,
+            require_mxc: Some(true),
         };
         let enforce_residency = ResidencyRequirement::Us;
         let enforce_source = source.clone();
         let additional_developer_instructions = "Follow the company policy.".to_string();
         let guardian_policy_config = "Use the company-managed guardian policy.".to_string();
+        let guardian_extra_policy = "Use the company-managed extra policy.".to_string();
 
         // Intentionally constructed without `..Default::default()` so adding a new field to
         // `ConfigRequirementsToml` forces this test to be updated.
         let other = ConfigRequirementsToml {
+            config_server: None,
             allowed_login_methods: Some(vec![ForcedLoginMethod::Chatgpt]),
             allowed_chatgpt_workspaces: Some(vec!["managed-workspace".to_string()]),
             cli_auth_credentials_store: Some(AuthCredentialsStoreMode::Keyring),
             chatgpt_base_url: Some("https://managed.example/backend-api/".to_string()),
             sqlite_home: Some(sqlite_home.clone()),
+            unsafe_enforce_sqlite_journal_mode: Some(true),
             log_dir: Some(log_dir.clone()),
             model_catalog_json: Some(model_catalog_json.clone()),
             model_provider: Some("gateway".to_string()),
@@ -2842,6 +3288,10 @@ mod tests {
             mcp_servers: None,
             plugins: None,
             marketplaces: None,
+            otel: Some(Box::new(OtelRequirementsToml {
+                environment: Some("managed".to_string()),
+                ..Default::default()
+            })),
             apps: None,
             rules: None,
             enforce_residency: Some(enforce_residency),
@@ -2852,6 +3302,7 @@ mod tests {
             models: Some(models.clone()),
             additional_developer_instructions: Some(additional_developer_instructions.clone()),
             guardian_policy_config: Some(guardian_policy_config.clone()),
+            guardian_extra_policy: Some(guardian_extra_policy.clone()),
         };
 
         target.merge_unset_fields(source.clone(), other);
@@ -2859,6 +3310,7 @@ mod tests {
         assert_eq!(
             target,
             ConfigRequirementsWithSources {
+                config_server: None,
                 allowed_login_methods: Some(Sourced::new(
                     vec![ForcedLoginMethod::Chatgpt],
                     source.clone(),
@@ -2876,6 +3328,10 @@ mod tests {
                     source.clone(),
                 )),
                 sqlite_home: Some(Sourced::new(sqlite_home, source.clone())),
+                unsafe_enforce_sqlite_journal_mode: Some(Sourced::new(
+                    /*value*/ true,
+                    source.clone()
+                )),
                 log_dir: Some(Sourced::new(log_dir, source.clone())),
                 model_catalog_json: Some(Sourced::new(model_catalog_json, source.clone())),
                 model_provider: Some(Sourced::new("gateway".to_string(), source.clone())),
@@ -2929,6 +3385,13 @@ mod tests {
                 mcp_servers: None,
                 plugins: None,
                 marketplaces: None,
+                otel: Some(Box::new(Sourced::new(
+                    OtelRequirementsToml {
+                        environment: Some("managed".to_string()),
+                        ..Default::default()
+                    },
+                    source.clone(),
+                ))),
                 apps: None,
                 rules: None,
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
@@ -2941,7 +3404,8 @@ mod tests {
                     additional_developer_instructions,
                     source.clone(),
                 )),
-                guardian_policy_config: Some(Sourced::new(guardian_policy_config, source)),
+                guardian_policy_config: Some(Sourced::new(guardian_policy_config, source.clone())),
+                guardian_extra_policy: Some(Sourced::new(guardian_extra_policy, source)),
             }
         );
     }
@@ -3005,14 +3469,18 @@ mod tests {
         let mut populated_target = ConfigRequirementsWithSources::default();
         let populated_requirements: ConfigRequirementsToml = from_str(
             r#"
+                unsafe_enforce_sqlite_journal_mode = true
                 allowed_approval_policies = ["never"]
+                guardian_extra_policy = "Use the managed extra policy."
             "#,
         )?;
         populated_target.merge_unset_fields(existing_source.clone(), populated_requirements);
 
         let source: ConfigRequirementsToml = from_str(
             r#"
+                unsafe_enforce_sqlite_journal_mode = false
                 allowed_approval_policies = ["on-request"]
+                guardian_extra_policy = "Use the lower-priority extra policy."
             "#,
         )?;
         let source_location = RequirementSource::MdmManagedPreferences {
@@ -3024,9 +3492,13 @@ mod tests {
         assert_eq!(
             populated_target,
             ConfigRequirementsWithSources {
+                unsafe_enforce_sqlite_journal_mode: Some(Sourced::new(
+                    /*value*/ true,
+                    existing_source.clone()
+                )),
                 allowed_approval_policies: Some(Sourced::new(
                     vec![AskForApproval::Never],
-                    existing_source,
+                    existing_source.clone(),
                 )),
                 allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
@@ -3053,6 +3525,10 @@ mod tests {
                 permissions: None,
                 models: None,
                 guardian_policy_config: None,
+                guardian_extra_policy: Some(Sourced::new(
+                    "Use the managed extra policy.".to_string(),
+                    existing_source,
+                )),
                 ..Default::default()
             }
         );
@@ -3066,29 +3542,35 @@ mod tests {
             RequirementSource::LegacyManagedConfigTomlFromMdm,
             ConfigRequirementsToml {
                 guardian_policy_config: Some("   \n\t".to_string()),
+                guardian_extra_policy: Some("   \n\t".to_string()),
                 ..Default::default()
             },
         );
+        let source = RequirementSource::SystemRequirementsToml {
+            file: system_requirements_toml_file_for_test().expect("system requirements.toml path"),
+        };
         target.merge_unset_fields(
-            RequirementSource::SystemRequirementsToml {
-                file: system_requirements_toml_file_for_test()
-                    .expect("system requirements.toml path"),
-            },
+            source.clone(),
             ConfigRequirementsToml {
                 guardian_policy_config: Some("Use the system guardian policy.".to_string()),
+                guardian_extra_policy: Some("Use the system extra policy.".to_string()),
                 ..Default::default()
             },
         );
 
         assert_eq!(
-            target.guardian_policy_config,
-            Some(Sourced::new(
-                "Use the system guardian policy.".to_string(),
-                RequirementSource::SystemRequirementsToml {
-                    file: system_requirements_toml_file_for_test()
-                        .expect("system requirements.toml path"),
-                },
-            )),
+            target,
+            ConfigRequirementsWithSources {
+                guardian_policy_config: Some(Sourced::new(
+                    "Use the system guardian policy.".to_string(),
+                    source.clone(),
+                )),
+                guardian_extra_policy: Some(Sourced::new(
+                    "Use the system extra policy.".to_string(),
+                    source,
+                )),
+                ..Default::default()
+            },
         );
     }
 
@@ -3099,27 +3581,36 @@ mod tests {
 guardian_policy_config = """
 Use the cloud-managed guardian policy.
 """
+guardian_extra_policy = """
+Use the cloud-managed extra policy.
+"""
 "#,
         )?;
 
         assert_eq!(
-            requirements.guardian_policy_config.as_deref(),
-            Some("Use the cloud-managed guardian policy.\n")
+            requirements,
+            ConfigRequirementsToml {
+                guardian_policy_config: Some(
+                    "Use the cloud-managed guardian policy.\n".to_string()
+                ),
+                guardian_extra_policy: Some("Use the cloud-managed extra policy.\n".to_string()),
+                ..Default::default()
+            }
         );
         Ok(())
     }
 
     #[test]
     fn blank_guardian_policy_config_is_empty() -> Result<()> {
-        let requirements: ConfigRequirementsToml = from_str(
-            r#"
-guardian_policy_config = """
+        for key in ["guardian_policy_config", "guardian_extra_policy"] {
+            let requirements: ConfigRequirementsToml =
+                from_str(&format!("{key} = \"\"\"\n\n\"\"\"\n"))?;
+            assert!(requirements.is_empty(), "{key}");
 
-"""
-"#,
-        )?;
-
-        assert!(requirements.is_empty());
+            let requirements: ConfigRequirementsToml =
+                from_str(&format!("{key} = \"Use the managed policy.\"\n"))?;
+            assert!(!requirements.is_empty(), "{key}");
+        }
         Ok(())
     }
 
@@ -3731,6 +4222,9 @@ allowed_approvals_reviewers = ["user"]
 
     #[test]
     fn deserialize_allowed_windows_sandbox_implementations() -> Result<()> {
+        let requirements: ConfigRequirementsToml = from_str("[windows]\nrequire_mxc = true")?;
+        assert!(!requirements.is_empty());
+
         let toml_str = r#"
             [windows]
             allowed_sandbox_implementations = ["elevated"]
@@ -3761,6 +4255,22 @@ allowed_approvals_reviewers = ["user"]
                 .is_ok()
         );
         assert!(requirements.windows_sandbox_mode.can_set(&None).is_err());
+
+        for allow_mxc in [true, false] {
+            let config = from_str(&format!("{toml_str}\nallow_mxc = {allow_mxc}"))?;
+            let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
+            let constraint = &requirements.windows_sandbox_mode;
+            assert_eq!(
+                [
+                    Some(WindowsSandboxModeToml::Elevated),
+                    Some(WindowsSandboxModeToml::Unelevated),
+                    Some(WindowsSandboxModeToml::Mxc),
+                    None,
+                ]
+                .map(|mode| constraint.can_set(&mode).is_ok()),
+                [true, false, allow_mxc, false]
+            );
+        }
 
         Ok(())
     }
@@ -4307,7 +4817,7 @@ command = "python3 /enterprise/hooks/pre.py"
             .set(ManagedHooksRequirementsToml {
                 managed_dir: Some(std::path::PathBuf::from("/other/hooks")),
                 windows_managed_dir: None,
-                hooks: HookEventsToml::default(),
+                hooks: Default::default(),
             })
             .expect_err("managed hooks should reject drift");
 
@@ -4319,6 +4829,38 @@ command = "python3 /enterprise/hooks/pre.py"
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn network_proxy_and_experimental_network_are_equivalent_aliases() -> Result<()> {
+        let parse = |table: &str| {
+            from_str::<ConfigRequirementsToml>(&format!(
+                "[{table}]\nenabled = true\nmanaged_allowed_domains_only = true\n\
+                 [{table}.domains]\n\"api.example.com\" = \"allow\""
+            ))
+        };
+        assert_eq!(parse("network_proxy")?, parse("experimental_network")?);
+
+        for values in ["", "enabled = true"] {
+            let both = format!("[network_proxy]\n{values}\n[experimental_network]\n{values}");
+            assert!(from_str::<ConfigRequirementsToml>(&both).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn network_proxy_does_not_reserve_the_managed_network_profile() -> Result<()> {
+        let requirements: ConfigRequirementsToml = from_str(
+            "[network_proxy]\nenabled = true\n[permissions.network]\nextends = ':workspace'",
+        )?;
+        assert!(
+            requirements
+                .permissions
+                .expect("managed permissions")
+                .profiles
+                .contains_key("network")
+        );
         Ok(())
     }
 
@@ -4432,6 +4974,7 @@ command = "python3 /enterprise/hooks/pre.py"
             allow_upstream_proxy = false
             dangerously_allow_all_unix_sockets = true
             allowed_domains = ["api.example.com", "*.openai.com"]
+            review_domains = ["review.example.com", "*.review.example.com"]
             managed_allowed_domains_only = true
             denied_domains = ["blocked.example.com"]
             allow_unix_sockets = ["/tmp/example.sock"]
@@ -4488,6 +5031,14 @@ command = "python3 /enterprise/hooks/pre.py"
         );
         assert_eq!(sourced_network.value.allow_local_binding, Some(false));
 
+        assert_eq!(
+            sourced_network.value.review_domains,
+            Some(vec![
+                "review.example.com".to_string(),
+                "*.review.example.com".to_string()
+            ])
+        );
+
         Ok(())
     }
 
@@ -4505,8 +5056,7 @@ command = "python3 /enterprise/hooks/pre.py"
         .expect_err("mixed network domain shapes should fail");
 
         assert!(
-            err.to_string()
-                .contains("`experimental_network.domains` cannot be combined"),
+            err.to_string().contains("`domains` cannot be combined"),
             "unexpected error: {err:#}"
         );
 
@@ -4523,7 +5073,7 @@ command = "python3 /enterprise/hooks/pre.py"
 
         assert!(
             err.to_string()
-                .contains("`experimental_network.unix_sockets` cannot be combined"),
+                .contains("`unix_sockets` cannot be combined"),
             "unexpected error: {err:#}"
         );
     }

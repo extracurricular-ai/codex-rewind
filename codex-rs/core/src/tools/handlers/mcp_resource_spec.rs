@@ -1,9 +1,11 @@
+use codex_protocol::openai_models::ToolMessage;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use codex_tools::with_catalog_tool_message;
 use std::collections::BTreeMap;
 
-pub fn create_list_mcp_resources_tool() -> ToolSpec {
+pub fn create_list_mcp_resources_tool(messages: Option<&ToolMessage>) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "server".to_string(),
@@ -20,17 +22,18 @@ pub fn create_list_mcp_resources_tool() -> ToolSpec {
         ),
     ]);
 
-    ToolSpec::Function(ResponsesApiTool {
+    let tool = ResponsesApiTool {
         name: "list_mcp_resources".to_string(),
         description: "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
         output_schema: None,
-    })
+    };
+    ToolSpec::Function(with_catalog_tool_message(tool, messages))
 }
 
-pub fn create_list_mcp_resource_templates_tool() -> ToolSpec {
+pub fn create_list_mcp_resource_templates_tool(messages: Option<&ToolMessage>) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "server".to_string(),
@@ -48,17 +51,18 @@ pub fn create_list_mcp_resource_templates_tool() -> ToolSpec {
         ),
     ]);
 
-    ToolSpec::Function(ResponsesApiTool {
+    let tool = ResponsesApiTool {
         name: "list_mcp_resource_templates".to_string(),
         description: "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
         output_schema: None,
-    })
+    };
+    ToolSpec::Function(with_catalog_tool_message(tool, messages))
 }
 
-pub fn create_read_mcp_resource_tool() -> ToolSpec {
+pub fn create_read_mcp_resource_tool(messages: Option<&ToolMessage>) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "server".to_string(),
@@ -76,7 +80,7 @@ pub fn create_read_mcp_resource_tool() -> ToolSpec {
         ),
     ]);
 
-    ToolSpec::Function(ResponsesApiTool {
+    let tool = ResponsesApiTool {
         name: "read_mcp_resource".to_string(),
         description:
             "Read a specific resource from an MCP server given the server name and resource URI."
@@ -89,7 +93,8 @@ pub fn create_read_mcp_resource_tool() -> ToolSpec {
             Some(false.into()),
         ),
         output_schema: None,
-    })
+    };
+    ToolSpec::Function(with_catalog_tool_message(tool, messages))
 }
 
 #[cfg(test)]

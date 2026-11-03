@@ -87,9 +87,17 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
             ResponseItem::CustomToolCall { id, call_id, .. }
                 if !custom_tool_output_ids.contains(call_id.as_str()) =>
             {
-                error_or_panic(format!(
-                    "Custom tool call output is missing for call id: {call_id}"
-                ));
+                // Preserved-prefix forks mark copied calls as inherited. A call still
+                // running in the parent has no output in the child's snapshot.
+                if !envelope
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.inherited_user_message)
+                {
+                    error_or_panic(format!(
+                        "Custom tool call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::CustomToolCallOutput {
@@ -107,9 +115,17 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItemEnvelope>)
                 call_id: Some(call_id),
                 ..
             } if !function_output_ids.contains(call_id.as_str()) => {
-                error_or_panic(format!(
-                    "Local shell call output is missing for call id: {call_id}"
-                ));
+                // Preserved-prefix forks mark copied calls as inherited. A call still
+                // running in the parent has no output in the child's snapshot.
+                if !envelope
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.inherited_user_message)
+                {
+                    error_or_panic(format!(
+                        "Local shell call output is missing for call id: {call_id}"
+                    ));
+                }
                 missing_outputs_to_insert.push((
                     idx,
                     ResponseItemEnvelope::new(ResponseItem::FunctionCallOutput {
@@ -356,11 +372,8 @@ pub(crate) fn strip_images_when_unsupported(
                     for content_item in content_items.iter() {
                         match content_item {
                             FunctionCallOutputContentItem::InputImage { .. } => {
-                                normalized_content_items.push(
-                                    FunctionCallOutputContentItem::InputText {
-                                        text: UnsupportedMedia::IMAGE.render(),
-                                    },
-                                );
+                                normalized_content_items
+                                    .push(UnsupportedMedia::IMAGE.render().into());
                             }
                             _ => normalized_content_items.push(content_item.clone()),
                         }
@@ -407,9 +420,7 @@ pub(crate) fn strip_audio_when_unsupported(
                             content_item,
                             FunctionCallOutputContentItem::InputAudio { .. }
                         ) {
-                            *content_item = FunctionCallOutputContentItem::InputText {
-                                text: UnsupportedMedia::AUDIO.render(),
-                            };
+                            *content_item = UnsupportedMedia::AUDIO.render().into();
                         }
                     }
                 }

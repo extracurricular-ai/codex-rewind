@@ -17,7 +17,6 @@ fn editor() -> AsyncQuestions {
         /*disable_paste_burst*/ true,
         RuntimeKeymap::defaults(),
     );
-    editor.next_hint = Some(crate::key_hint::alt(KeyCode::Up).into());
     editor.append(
         "message",
         &[
@@ -26,6 +25,49 @@ fn editor() -> AsyncQuestions {
         ],
     );
     editor
+}
+
+#[test]
+fn taking_pending_drafts_preserves_order_expands_pastes_and_skips_blank_drafts() {
+    let mut editor = editor();
+    editor.state.pending[0].question.title = "First\n\n".into();
+    editor.set_expanded(/*expanded*/ true);
+    let large_answer = "typed answer ".repeat(/*n*/ 200);
+    editor.handle_paste(large_answer.clone());
+    editor.navigate(/*forward*/ true);
+    editor.handle_key_event(KeyEvent::from(KeyCode::Char('2')));
+    editor.handle_paste(" other answer ".into());
+    editor.append("blank", &[question("Blank?", /*options*/ None)]);
+
+    assert_eq!(
+        editor.take_pending_drafts(),
+        vec![
+            format!("> First\n>\n\n{}", large_answer.trim()),
+            "> Second\n\nother answer".to_string()
+        ]
+    );
+    assert_eq!((editor.unanswered_count(), editor.expanded), (0, false));
+    assert!(editor.submission.is_none());
+}
+
+#[test]
+fn taking_pending_drafts_bounds_question_titles_without_truncating_answers() {
+    for (character, retained_count) in [("a", 512), ("界", 170), ("\x07", 0)] {
+        let mut editor = editor();
+        editor.state.pending[0].question.title =
+            character.repeat(codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS + 1);
+        let answer = "typed answer ".repeat(/*n*/ 200);
+        editor.handle_paste(answer.clone());
+
+        assert_eq!(
+            editor.take_pending_drafts(),
+            vec![format!(
+                "> {}…\n\n{}",
+                character.repeat(retained_count),
+                answer.trim(),
+            )]
+        );
+    }
 }
 
 #[test]
@@ -96,6 +138,94 @@ fn long_prompt_keeps_the_active_input_visible() {
     let text = buffer_text(&buffer);
     assert!(text.contains("visible answer"));
     insta::assert_snapshot!("long_prompt_active_input", text);
+}
+
+#[test]
+fn wrapped_question_url_keeps_its_complete_destination() {
+    let url = "https://github.com/openai/codex/pull/12345?diff=split";
+    let mut editor = editor();
+    editor.navigate(/*forward*/ true);
+    editor.state.pending[1].question.title = format!("Review this change ({url})?");
+
+    let width = 40;
+    let full_height = editor.desired_height(width);
+    for height in [full_height, 4] {
+        let buffer = render_editor(&editor, width, height);
+        let linked_text = buffer
+            .content
+            .iter()
+            .filter_map(|cell| {
+                let symbol = cell.symbol();
+                symbol.contains("\x1b]8;;").then(|| {
+                    let text = crate::terminal_hyperlinks::strip_osc8(symbol);
+                    assert_eq!(
+                        symbol,
+                        crate::terminal_hyperlinks::osc8_hyperlink(url, &text)
+                    );
+                    text
+                })
+            })
+            .collect::<String>();
+        if height == full_height {
+            assert_eq!(linked_text, url);
+            insta::assert_snapshot!(
+                "question_wrapped_url",
+                crate::terminal_hyperlinks::strip_osc8(&buffer_text(&buffer))
+            );
+        } else {
+            assert!(!linked_text.is_empty());
+            assert!(url.starts_with(&linked_text));
+            assert_ne!(linked_text, url);
+        }
+    }
+}
+
+#[test]
+fn markdown_question_preserves_formatting_and_link_destinations() {
+    let url = "https://example.com/diagnostics?view=full";
+    let title = format!(
+        "Run **this command**:\n\n```sh\nprintf '診断'\n```\nThen review the [diagnostics]({url})?\n"
+    );
+    let mut rendered = Vec::new();
+    for line_ending in ["\n", "\r\n"] {
+        let mut editor = editor();
+        editor.state.pending[0].question.title = title.replace('\n', line_ending);
+
+        for width in [20, 60] {
+            let height = editor.desired_height(width);
+            let buffer = render_editor(&editor, width, height);
+            let linked_text = buffer
+                .content
+                .iter()
+                .filter_map(|cell| {
+                    let symbol = cell.symbol();
+                    symbol.contains("\x1b]8;;").then(|| {
+                        let text = crate::terminal_hyperlinks::strip_osc8(symbol);
+                        assert_eq!(
+                            symbol,
+                            crate::terminal_hyperlinks::osc8_hyperlink(url, &text)
+                        );
+                        text
+                    })
+                })
+                .collect::<String>();
+            assert!(linked_text.contains("diagnostics"));
+            let text = crate::terminal_hyperlinks::strip_osc8(&buffer_text(&buffer));
+            if width == 60 {
+                let bold_text = buffer
+                    .content
+                    .iter()
+                    .filter(|cell| cell.modifier.contains(Modifier::BOLD))
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>();
+                assert!(bold_text.contains("this command"));
+                assert!(!bold_text.contains("Run "));
+                rendered.push(text);
+            }
+        }
+    }
+    assert_eq!(rendered[0], rendered[1]);
+    insta::assert_snapshot!("question_multiline", rendered[0]);
 }
 
 #[test]
@@ -246,7 +376,7 @@ fn question_options_reserve_wrapped_height_at_the_width_boundary() {
     let mut editor = editor();
     editor.state.pending.remove(/*index*/ 0);
     editor.state.pending[0].question.options =
-        Some(vec!["abcdefgh ijklmno".into(), "pqrstuvw xyzabcd".into()]);
+        Some(vec!["abcdefgh *ijklmno*".into(), "pqrstuvw xyzabcd".into()]);
     editor.restore_current_draft();
 
     // The five-column option prefix makes each named choice exactly 21 columns.
@@ -427,7 +557,7 @@ fn existing_cross_context_keymaps_load_without_misleading_submit_hints() {
         let mut editor = editor();
         editor.navigate(/*forward*/ true);
         editor.set_keymap(&keymap);
-        insta::allow_duplicates! { insta::assert_snapshot!(editor.footer_lines(/*width*/ 100, /*option_tip*/ None)[0].to_string(), @"ctrl+] skip   ⌥+↓ prev question"); }
+        insta::allow_duplicates! { insta::assert_snapshot!(editor.footer_lines(/*width*/ 100, /*option_tip*/ None)[0].to_string(), @"⌃] skip   ⇧→ prev question"); }
         editor.handle_key_event(KeyEvent::from(KeyCode::F(12)));
         assert!(editor.submission.is_none());
     }
@@ -459,15 +589,20 @@ fn named_choices_share_selection_while_other_keeps_its_inline_cursor() {
         || {
             let mut editor = editor();
             editor.navigate(/*forward*/ true);
+            editor.state.pending[1].question.options =
+                Some(vec!["*Named* [guide](https://example.com)".into()]);
+            let linked_g = crate::terminal_hyperlinks::osc8_hyperlink("https://example.com", "g");
             for width in [40, 80] {
                 editor.select_option(/*index*/ 0);
                 let buffer = render_editor(&editor, width, /*height*/ 16);
+                assert!(buffer.content.iter().any(|cell| cell.symbol() == linked_g));
                 let cell = buffer
                     .content
                     .iter()
                     .find(|cell| cell.symbol() == "N")
                     .unwrap();
                 assert_eq!(cell.bg, crate::bottom_pane::selection_style().bg.unwrap());
+                assert!(cell.modifier.contains(Modifier::ITALIC));
                 editor.select_option(/*index*/ 1);
                 let buffer = render_editor(&editor, width, /*height*/ 16);
                 let cursor = editor.cursor_pos(buffer.area).unwrap();

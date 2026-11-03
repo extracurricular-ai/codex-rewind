@@ -9,6 +9,8 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use codex_code_mode::RuntimeResponse;
+use codex_extension_api::CodeModeCellTiming;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
@@ -20,7 +22,9 @@ use super::telemetry::CodeModeToolCallGuard;
 use super::telemetry::trace_id;
 use super::wait_spec::create_wait_tool;
 
-pub struct CodeModeWaitHandler;
+pub struct CodeModeWaitHandler {
+    spec: ToolSpec,
+}
 
 #[derive(Debug, Deserialize)]
 struct ExecWaitArgs {
@@ -52,7 +56,7 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_wait_tool()
+        self.spec.clone()
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -64,6 +68,15 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
 }
 
 impl CodeModeWaitHandler {
+    pub(crate) fn new(
+        description_override: Option<&str>,
+        parameters_override: Option<&str>,
+    ) -> Self {
+        Self {
+            spec: create_wait_tool(description_override, parameters_override),
+        }
+    }
+
     // Default to interrupted if this future is dropped; telemetry::CodeModeToolCallGuard::finish
     // overwrites this handler's captured span on explicit success or failure, including early errors.
     #[tracing::instrument(
@@ -94,8 +107,7 @@ impl CodeModeWaitHandler {
         } = invocation;
 
         let mut telemetry = CodeModeToolCallGuard::new(
-            session.services.analytics_events_client.clone(),
-            session.thread_id.to_string(),
+            &session,
             turn.sub_id.clone(),
             turn.turn_metadata_state.clone(),
             call_id.clone(),
@@ -118,16 +130,20 @@ impl CodeModeWaitHandler {
                     exec.session
                         .services
                         .code_mode_service
-                        .terminate(cell_id)
+                        .terminate(cell_id.clone())
                         .await
                 } else {
                     exec.session
                         .services
                         .code_mode_service
-                        .wait(codex_code_mode::WaitRequest {
-                            cell_id,
-                            yield_time_ms: args.yield_time_ms,
-                        })
+                        .wait(
+                            codex_code_mode::WaitRequest {
+                                cell_id: cell_id.clone(),
+                                yield_time_ms: args.yield_time_ms,
+                                max_output_tokens: None,
+                            },
+                            step_context.preempt.clone(),
+                        )
                         .await
                 }
                 .map_err(|error| {
@@ -136,9 +152,9 @@ impl CodeModeWaitHandler {
                 })?;
                 if let codex_code_mode::WaitOutcome::LiveCell(response) = &wait_response {
                     let runtime_cell_id = match response {
-                        codex_code_mode::RuntimeResponse::Yielded { cell_id, .. }
-                        | codex_code_mode::RuntimeResponse::Terminated { cell_id, .. }
-                        | codex_code_mode::RuntimeResponse::Result { cell_id, .. } => cell_id,
+                        RuntimeResponse::Yielded { cell_id, .. }
+                        | RuntimeResponse::Terminated { cell_id, .. }
+                        | RuntimeResponse::Result { cell_id, .. } => cell_id,
                     };
                     tracing::Span::current().record("cell.id", trace_id(runtime_cell_id.as_str()));
                     telemetry.cell_id = Some(runtime_cell_id.to_string());
@@ -146,7 +162,15 @@ impl CodeModeWaitHandler {
                         .services
                         .executed_tool_calls
                         .register_cell(runtime_cell_id, &call_id);
-                    if !matches!(response, codex_code_mode::RuntimeResponse::Yielded { .. }) {
+                    if !matches!(response, RuntimeResponse::Yielded { .. }) {
+                        telemetry.record_cell_timing(
+                            runtime_cell_id,
+                            CodeModeCellTiming::WaitFinished {
+                                result_buffered_for: wait_response
+                                    .result_buffered_for()
+                                    .unwrap_or_default(),
+                            },
+                        );
                         exec.session
                             .services
                             .rollout_thread_trace
@@ -170,6 +194,8 @@ impl CodeModeWaitHandler {
                                 },
                             );
                     }
+                } else {
+                    telemetry.record_cell_timing(&cell_id, CodeModeCellTiming::CellUnavailable);
                 }
                 if let Some(code_mode_host_duration) = wait_response.code_mode_host_duration() {
                     telemetry.record_code_mode_host_duration(code_mode_host_duration);

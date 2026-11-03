@@ -2,6 +2,7 @@
 //! Owner impersonation, directory pins, and registration-aware cleanup order are preserved.
 
 use std::io;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
@@ -24,6 +25,7 @@ pub(super) fn clean_up(
     prepared: &PreparedWindowsSandboxCleanup,
     runtime: Option<&InstallationRecord>,
     uninstalling: &AtomicBool,
+    preinstalled: bool,
 ) -> Result<()> {
     crate::service::log_information(
         crate::service::EVENT_CLEANUP_STARTED,
@@ -33,7 +35,10 @@ pub(super) fn clean_up(
     // Remove exact grants from the locked cleanup record before native account deletion.
     if let Some(record) = runtime {
         log_cleanup("removing registered runtime metadata");
-        crate::registered_runtime::remove_metadata(installation.user_token.0, record)?;
+        crate::registered_runtime::remove_metadata(
+            installation.user_token.as_raw_handle(),
+            record,
+        )?;
     }
     log_cleanup("removing native sandbox resources");
     let mut prune_codex_home = false;
@@ -55,7 +60,7 @@ pub(super) fn clean_up(
             return Ok(());
         };
         // The marker is user-writable. It must never authorize deletion as LocalSystem.
-        with_owner_impersonation(installation.user_token.0, || {
+        with_owner_impersonation(installation.user_token.as_raw_handle(), || {
             let mut errors = Vec::new();
             let mut record_result = |operation: &str, result: io::Result<()>| match result {
                 Ok(()) => log_cleanup(&format!("{operation}: completed")),
@@ -69,7 +74,9 @@ pub(super) fn clean_up(
                 }
             };
             if let Some(home) = &codex_home {
-                if desktop.created_codex_home {
+                if desktop.created_codex_home
+                    && crate::uninstall_policy::clean_uninstall_enabled(home, preinstalled)
+                {
                     // Release the home itself so it can be deleted; keep its ancestors pinned.
                     if installation.directory_guard.take().is_some() {
                         installation.directory_handles.pop();
@@ -80,8 +87,8 @@ pub(super) fn clean_up(
                     );
                 } else {
                     prune_codex_home = true;
-                    log_cleanup("skipping recursive codex home removal: existing CLI home");
-                    // Preserve CLI data without leaving inherited permissions for the deleted group.
+                    log_cleanup("preserving codex home");
+                    // Retained data must not keep permissions for the deleted sandbox group.
                     record_result(
                         "remove codex home sandbox permissions",
                         resolve_sid("CodexSandboxUsers")
@@ -133,13 +140,15 @@ pub(super) fn clean_up(
     if prune_codex_home && let Some(home) = &codex_home {
         // Keep the home pinned through native retries. Empty-root pruning is best effort
         // so a failure cannot restart native cleanup through an unpinned home.
-        if let Err(error) = with_owner_impersonation(installation.user_token.0, || {
-            if installation.directory_guard.take().is_some() {
-                installation.directory_handles.pop();
-            }
-            remove_empty_directory(home, "codex home");
-            Ok(())
-        }) {
+        if let Err(error) =
+            with_owner_impersonation(installation.user_token.as_raw_handle(), || {
+                if installation.directory_guard.take().is_some() {
+                    installation.directory_handles.pop();
+                }
+                remove_empty_directory(home, "codex home");
+                Ok(())
+            })
+        {
             log_error(
                 EVENT_CLEANUP_DETAIL,
                 &format!("remove empty codex home: failed, {error:#}"),

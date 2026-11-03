@@ -106,7 +106,7 @@ use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoal as AppThreadGoal;
 use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
 use codex_app_server_protocol::ThreadTokenUsage;
@@ -150,10 +150,6 @@ use codex_protocol::plan_tool::StepStatus as UpdatePlanItemStatus;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
-use codex_terminal_detection::Multiplexer;
-use codex_terminal_detection::TerminalInfo;
-use codex_terminal_detection::TerminalName;
-use codex_terminal_detection::terminal_info;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use crossterm::event::KeyCode;
@@ -162,7 +158,6 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
@@ -187,62 +182,6 @@ const AMBIENT_PET_WRAP_GAP_COLUMNS: u16 = 2;
 const TUI_STUB_MESSAGE: &str = "Not available in TUI yet.";
 const PARENT_OWNED_INPUT_MESSAGE: &str =
     "This sub-agent is controlled by its parent. Direct input is disabled.";
-
-/// Choose the keybinding used to edit the most-recently queued message.
-///
-/// Apple Terminal, Warp, and VSCode integrated terminals intercept or silently
-/// swallow Alt+Up, and tmux does not reliably pass that chord through. We fall
-/// back to Shift+Left for those environments while keeping the more discoverable
-/// Alt+Up everywhere else.
-///
-/// The match is exhaustive so that adding a new `TerminalName` variant forces
-/// an explicit decision about which binding that terminal should use.
-fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyBinding {
-    if matches!(
-        terminal_info.multiplexer.as_ref(),
-        Some(Multiplexer::Tmux { .. })
-    ) {
-        return key_hint::shift(KeyCode::Left);
-    }
-
-    match terminal_info.name {
-        TerminalName::AppleTerminal | TerminalName::WarpTerminal | TerminalName::VsCode => {
-            key_hint::shift(KeyCode::Left)
-        }
-        TerminalName::Ghostty
-        | TerminalName::Iterm2
-        | TerminalName::WezTerm
-        | TerminalName::Kitty
-        | TerminalName::Alacritty
-        | TerminalName::Konsole
-        | TerminalName::GnomeTerminal
-        | TerminalName::Vte
-        | TerminalName::WindowsTerminal
-        | TerminalName::Dumb
-        | TerminalName::Unknown => key_hint::alt(KeyCode::Up),
-    }
-}
-
-fn queued_message_edit_hint_binding(
-    keymap: &RuntimeKeymap,
-    terminal_info: TerminalInfo,
-) -> Option<crate::key_hint::ShortcutHint> {
-    let configured = keymap.primary_hint(crate::keymap::KeymapContext::Chat, "edit_queued_message");
-    if matches!(
-        configured,
-        Some(crate::key_hint::ShortcutHint::Chord { .. })
-    ) {
-        return configured;
-    }
-
-    let terminal_binding = queued_message_edit_binding_for_terminal(terminal_info);
-    keymap
-        .chat
-        .edit_queued_message
-        .contains(&terminal_binding)
-        .then_some(crate::key_hint::ShortcutHint::Single(terminal_binding))
-        .or(configured)
-}
 
 fn normalize_thread_name(name: &str) -> Option<String> {
     let trimmed = name.trim();
@@ -318,6 +257,7 @@ use crate::tui::FrameRequester;
 mod activity_groups;
 mod activity_presentation;
 mod command_lifecycle;
+mod config_panel;
 mod connector_mentions;
 mod connectors;
 mod constructor;
@@ -358,14 +298,18 @@ mod misalignment_policy;
 pub(crate) use misalignment_policy::MisalignmentReview;
 pub(crate) use misalignment_policy::MisalignmentTurnSource;
 mod pets;
+pub(crate) use self::pets::ConfiguredPetLoadGeneration;
 mod session_flow;
 mod session_header;
 use self::session_header::SessionHeader;
+mod clipboard;
 mod copy_picker;
 mod hook_lifecycle;
 mod hooks;
 mod interaction;
+pub(crate) use interaction::KeyEventAction;
 mod skills;
+mod slash_command_args;
 mod slash_dispatch;
 mod worktree_picker;
 use self::skills::collect_tool_mentions;
@@ -379,9 +323,11 @@ use self::plugins::PluginListFetchState;
 use self::plugins::PluginsCacheState;
 mod plan_implementation;
 use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
+mod model_command;
 mod model_popup_state;
 mod model_popups;
 mod notifications;
+pub(crate) mod quick_dials;
 mod session_model_selection;
 use self::notifications::Notification;
 pub(crate) use self::session_model_selection::AstraModelPickerAction;
@@ -395,6 +341,7 @@ mod backend_banners;
 mod compaction;
 mod luna_reserve_model;
 mod luna_reserve_return;
+mod security_setup;
 pub(crate) use backend_banners::AutomaticModelSwitchReason;
 mod protocol;
 mod protocol_requests;
@@ -415,6 +362,7 @@ mod realtime_settings;
 mod realtime_split_flap;
 pub(crate) use realtime::MAX_REPLAY_TRANSCRIPT_CELLS;
 pub(crate) use realtime::MAX_TRANSCRIPT_BYTES;
+pub(crate) use realtime::RealtimeFailureCause;
 pub(crate) use realtime::RealtimeTranscriptRecord;
 pub(crate) use realtime::is_private_realtime_agent_item;
 pub(crate) use realtime::realtime_delegation_display_text;
@@ -431,6 +379,7 @@ mod review;
 mod review_popups;
 use self::review::ReviewState;
 mod safety_buffering;
+mod safety_recourse;
 mod service_tiers;
 mod settings;
 mod settings_popups;
@@ -442,10 +391,11 @@ use self::status_state::StatusIndicatorState;
 use self::status_state::StatusState;
 use self::status_state::TerminalTitleStatusKind;
 mod status_controls;
+mod status_surface_commands;
 mod status_surfaces;
+use self::status_surface_commands::StatusSurfaceOverrides;
 mod streaming;
 use self::status_surfaces::CachedProjectRootName;
-mod thread_title_status;
 mod thread_usage;
 pub(crate) use self::thread_usage::ThreadUsageOutcome;
 mod tool_lifecycle;
@@ -461,6 +411,7 @@ use self::turn_lifecycle::TurnLifecycleState;
 mod usage;
 mod user_messages;
 mod working_directory;
+use self::user_messages::MessageDelivery;
 use self::user_messages::PendingSteer;
 #[cfg(test)]
 use self::user_messages::PendingSteerCompareKey;
@@ -515,7 +466,7 @@ const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it l
 const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
 const ASK_FOR_APPROVAL_LABEL: &str = "Ask for approval";
 const APPROVE_FOR_ME_LABEL: &str = "Approve for me";
-const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentially unsafe.";
+const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentially unsafe";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] = ["model-with-reasoning", "current-dir", "thread-name"];
 
@@ -572,13 +523,14 @@ pub(crate) enum ExternalEditorState {
 pub(crate) struct ChatWidget {
     pub(crate) empty_state_animation:
         std::cell::RefCell<crate::empty_state_animation::EmptyStateAnimation>,
-    pub(crate) cyber_policy_notice: crate::daybreak::NoticeCache,
+    pub(crate) daybreak_enabled: bool,
     app_event_tx: AppEventSender,
     codex_op_target: CodexOpTarget,
     bottom_pane: BottomPane,
     transcript: TranscriptState,
     config: Config,
     pub(crate) local_settings: crate::local_settings::LocalSettings,
+    pub(crate) config_panel_tui: codex_config::types::Tui,
     raw_output_mode: bool,
     /// Runtime value resolved by core. `config.service_tier` remains the explicit user choice.
     effective_service_tier: Option<String>,
@@ -593,7 +545,12 @@ pub(crate) struct ChatWidget {
     has_codex_backend_auth: bool,
     model_catalog: Arc<ModelCatalog>,
     model_popup_request_id: Option<uuid::Uuid>,
+    /// An app event has been queued to open the permissions picker, but no view exists yet.
+    pub(crate) permission_popup_pending: bool,
     permission_popup_request_id: Option<uuid::Uuid>,
+    permission_discovery: Option<crate::permission_discovery::PermissionDiscovery>,
+    inline_permission_profile_selection:
+        Option<permission_discovery::InlinePermissionProfileSelection>,
     worktree_popup_request_id: Option<uuid::Uuid>,
     permission_profiles_menu_opened: bool,
     model_popup_model_ids: Vec<String>,
@@ -629,13 +586,19 @@ pub(crate) struct ChatWidget {
     codex_rate_limit_reached_type: Option<RateLimitReachedType>,
     codex_spend_control_reached: Option<bool>,
     rate_limit_warnings: RateLimitWarningState,
+    clock_format: crate::clock_format::ClockFormat,
     usage_notice_state: usage_notice::UsageNoticeState,
     backend_banner_state: backend_banners::BackendBannerState,
+    pub(crate) security_setup_request_id: uuid::Uuid,
+    security_setup_presented: bool,
+    security_setup_identity: Option<crate::security_setup::Identity>,
+    security_setup_dismissed: bool,
     automatic_model_switch_state: backend_banners::AutomaticModelSwitchState,
     backend_banner_notice_model: Option<String>,
     // Remember the account's Reserve entry notice across chats and transient banner refreshes.
     luna_reserve_notice_account_id: Option<String>,
-    warning_display_state: WarningDisplayState,
+    pub(crate) warning_display_state: WarningDisplayState,
+    pub(crate) rendered_selection: std::cell::RefCell<crate::rendered_selection::RenderedSelection>,
     rate_limit_switch_prompt: RateLimitSwitchPromptState,
     add_credits_nudge_email_in_flight: Option<rate_limits::PendingCreditsNudge>,
     adaptive_chunking: AdaptiveChunkingPolicy,
@@ -644,18 +607,21 @@ pub(crate) struct ChatWidget {
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
     pending_stream_consolidations: usize,
-    /// Holds the platform clipboard lease so copied text remains available while supported.
-    clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
+    /// Copy feedback is discarded with its originating conversation.
+    pending_clipboard: Option<clipboard::PendingCopy>,
+    /// Legacy terminals report auto-repeat as new presses; suppress the burst after a slow paste.
+    suppress_image_paste_until: Instant,
     copy_last_response_binding: Vec<KeyBinding>,
     running_commands: HashMap<String, RunningCommand>,
     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     suppressed_exec_calls: HashSet<String>,
     skills_all: Vec<SkillMetadata>,
-    skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
+    skills_initial_state: Option<HashMap<PathUri, bool>>,
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     turn_lifecycle: TurnLifecycleState,
+    safety_recourse: Option<safety_recourse::PendingRecourse>,
     realtime_conversation: RealtimeConversationUiState,
     realtime_conversation_available_for_thread: bool,
     safety_buffering: SafetyBufferingState,
@@ -705,6 +671,7 @@ pub(crate) struct ChatWidget {
     pub(crate) pet_http_client: codex_http_client::RouteAwareClientPool,
     // Ambient companion rendered over the transcript area, never inside the footer rows.
     ambient_pet: Option<crate::pets::AmbientPet>,
+    configured_pet_load_generation: ConfiguredPetLoadGeneration,
     pet_picker_preview_state: crate::pets::PetPickerPreviewState,
     pet_picker_preview_pet: Option<crate::pets::AmbientPet>,
     pet_picker_preview_request_id: u64,
@@ -718,6 +685,8 @@ pub(crate) struct ChatWidget {
     active_side_conversation: bool,
     blocks_direct_input: bool,
     external_writer_view: bool,
+    /// Covers both queued and executing forks so repeated shortcuts cannot queue another one.
+    pub(crate) fork_in_progress: bool,
     misalignment_policy_violation: Option<misalignment_policy::MisalignmentViolation>,
     normal_placeholder_text: String,
     side_placeholder_text: String,
@@ -742,13 +711,13 @@ pub(crate) struct ChatWidget {
     safety_buffering_source: UserMessageSource,
     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
     chat_keymap: ChatKeymap,
+    /// Whether the preset submenu owns the next key.
+    quick_dial_menu: bool,
+    /// Ignore a held key after it dismisses the preset submenu.
+    quick_dial_menu_key_guard: Option<crate::activation_key_guard::ActivationKeyGuard>,
     permission_shortcut_pending: bool,
-    /// Keybinding to show for popping the most-recently queued message back
-    /// into the composer. This may differ from the first configured binding
-    /// when the default set includes a terminal-specific fallback.
-    queued_message_edit_hint_binding: Option<crate::key_hint::ShortcutHint>,
     // Pending notification to show when unfocused on next Draw
-    pending_notification: Option<Notification>,
+    pub(crate) pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
     /// must occur before `quit_shortcut_expires_at`.
     quit_shortcut_expires_at: Option<Instant>,
@@ -788,6 +757,8 @@ pub(crate) struct ChatWidget {
     // On cancel or persist-failure the inner value is restored to config;
     // on confirm the outer is set to `None` to end the session.
     terminal_title_setup_original_items: Option<Option<Vec<String>>>,
+    // Explicit per-thread layout choices made through `/title` and `/statusline`.
+    status_surface_overrides: StatusSurfaceOverrides,
     // Baseline instant used to animate spinner-prefixed title statuses.
     terminal_title_animation_origin: Instant,
     // The foreground loop refreshes the title at this deadline without drawing a frame.
@@ -829,6 +800,9 @@ pub(crate) struct ChatWidget {
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_rendered_user_message_client_id: Option<String>,
     last_non_retry_error: Option<(String, String)>,
+    // Keep fixture storage alive until all other widget fields have been dropped.
+    #[cfg(test)]
+    pub(crate) test_codex_home: Option<tempfile::TempDir>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1066,7 +1040,11 @@ impl ChatWidget {
             self.thread_id
                 .is_some_and(|thread_id| thread_id.to_string() == request_thread_id)
         }) && self.interrupts.remove_resolved_prompt(request);
+        let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
         let removed_visible = self.bottom_pane.dismiss_app_server_request(request);
+        if removed_visible && had_modal_or_popup && self.bottom_pane.no_modal_or_popup_active() {
+            self.on_modal_or_popup_closed();
+        }
         if removed_deferred || removed_visible {
             self.request_redraw();
         }
@@ -1115,7 +1093,8 @@ impl ChatWidget {
                 SelectionItem {
                     name: "Yes, enable".to_string(),
                     description: Some(
-                        "Save on the server for new threads. This thread is unchanged.".to_string(),
+                        "Save on the server for new threads without changing this thread"
+                            .to_string(),
                     ),
                     actions: vec![Box::new(move |tx| {
                         tx.send(AppEvent::EnableFeatureForNewThreads(feature));
@@ -1125,12 +1104,12 @@ impl ChatWidget {
                 },
                 SelectionItem {
                     name: "Not now".to_string(),
-                    description: Some(format!("Keep {name} disabled.")),
+                    description: Some(format!("Keep {name} disabled")),
                     dismiss_on_select: true,
                     ..Default::default()
                 },
             ],
-            ..SelectionViewParams::picker()
+            ..SelectionViewParams::confirmation()
         });
     }
 
@@ -1276,6 +1255,17 @@ impl ChatWidget {
         }
         self.refresh_status_line_if_workspace_headline_due();
         self.refresh_thread_usage_if_settlement_due();
+        self.refresh_terminal_program_status();
+    }
+
+    pub(crate) fn refresh_terminal_program_status(&self) {
+        let status = self.desired_program_status();
+        if let Err(err) = crate::terminal_program_status::set_terminal_program_status(
+            status,
+            self.iterm_session_detail(status),
+        ) {
+            tracing::debug!(error = %err, "failed to set terminal program status");
+        }
     }
 
     fn flush_active_cell(&mut self) {
@@ -1454,6 +1444,14 @@ impl ChatWidget {
         {
             self.on_user_message_display(display);
         }
+        if let Some(client_id) = client_id
+            && self.input_queue.queued_user_messages.iter().any(|message| {
+                matches!(&message.delivery, MessageDelivery::Unconfirmed(Some(id)) if id == client_id)
+            })
+        {
+            self.reconcile_recovered_messages(&[client_id.to_string()]);
+            self.maybe_send_next_queued_input();
+        }
     }
 
     fn on_user_message_display(&mut self, display: UserMessageDisplay) {
@@ -1465,12 +1463,15 @@ impl ChatWidget {
             || !display.local_images.is_empty()
             || !display.remote_image_urls.is_empty()
         {
-            self.add_to_history(history_cell::new_user_prompt(
-                display.message,
-                display.text_elements,
-                display.local_images,
-                display.remote_image_urls,
-            ));
+            self.add_to_history(
+                history_cell::new_user_prompt(
+                    display.message,
+                    display.text_elements,
+                    display.local_images,
+                    display.remote_image_urls,
+                )
+                .with_async_replies(display.replies, self.config.cwd.as_path()),
+            );
         }
     }
 
@@ -1585,13 +1586,10 @@ impl ChatWidget {
 
     /// Build a placeholder header cell while the session is configuring.
     fn placeholder_session_header_cell(config: &Config) -> Box<dyn HistoryCell> {
-        let placeholder_style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
         Box::new(
-            history_cell::SessionHeaderHistoryCell::new_with_style(
+            history_cell::SessionHeaderHistoryCell::new(
                 DEFAULT_MODEL_DISPLAY_NAME.to_string(),
-                placeholder_style,
                 /*reasoning_effort*/ None,
-                /*show_fast_status*/ false,
                 config.cwd.to_path_buf(),
                 CODEX_CLI_VERSION,
             )
@@ -1957,6 +1955,10 @@ impl ChatWidget {
         self.bottom_pane.composer_is_empty() && !self.bottom_pane.is_in_paste_burst()
     }
 
+    pub(crate) fn composer_is_vim_enabled(&self) -> bool {
+        self.bottom_pane.composer_is_vim_enabled()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_task_running_for_test(&self) -> bool {
         self.bottom_pane.is_task_running()
@@ -2167,6 +2169,10 @@ impl ChatWidget {
     /// The thread this one branched from, when it is a rewind fork.
     pub(crate) fn forked_from(&self) -> Option<ThreadId> {
         self.forked_from
+    }
+
+    pub(crate) fn last_turn_id(&self) -> Option<&str> {
+        self.turn_lifecycle.last_turn_id.as_deref()
     }
 
     pub(crate) fn thread_id(&self) -> Option<ThreadId> {

@@ -1,4 +1,4 @@
-//! Session-only model picker actions leave durable defaults untouched. Astra picker actions retain
+//! Session-only model selections leave durable defaults untouched. Explicit Astra selections retain
 //! their originating task and are checked against its effective model when the app applies them.
 
 use super::*;
@@ -10,11 +10,15 @@ use crate::model_catalog::LUNA_RESERVE_MODEL;
 #[derive(Debug)]
 pub(crate) enum AstraModelPickerAction {
     UpdateModel,
+    ApplyModelSelection {
+        effort: Option<ReasoningEffortConfig>,
+    },
     ApplyAdvancedReasoning {
         effort: ReasoningEffortConfig,
     },
     SelectSessionModel {
         effort: Option<ReasoningEffortConfig>,
+        service_tier: Option<String>,
     },
 }
 
@@ -33,10 +37,18 @@ impl AstraModelPickerAction {
     pub(crate) fn into_app_event(self, model: String) -> AppEvent {
         match self {
             Self::UpdateModel => AppEvent::UpdateModel(model),
+            Self::ApplyModelSelection { effort } => AppEvent::ApplyModelSelection { model, effort },
             Self::ApplyAdvancedReasoning { effort } => {
                 AppEvent::ApplyAdvancedReasoning { model, effort }
             }
-            Self::SelectSessionModel { effort } => AppEvent::SelectSessionModel { model, effort },
+            Self::SelectSessionModel {
+                effort,
+                service_tier,
+            } => AppEvent::SelectSessionModel {
+                model,
+                effort,
+                service_tier,
+            },
         }
     }
 }
@@ -77,6 +89,7 @@ impl ChatWidget {
                 tx.send(
                     AstraModelPickerAction::SelectSessionModel {
                         effort: effort.clone(),
+                        service_tier: None,
                     }
                     .into_picker_event(sparkle_thread, model.clone()),
                 );

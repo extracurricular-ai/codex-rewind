@@ -1,26 +1,23 @@
 ---
 source: tui/src/status/tests.rs
-assertion_line: 1825
 expression: "format!(\"before:\\n{before}\\n\\nafter:\\n{after}\")"
 ---
 before:
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
 /status
 
-╭──────────────────────────────────────────────────────────────────────────╮
-│  >_ OpenAI Codex (v0.0.0)                                                │
-│                                                                          │
-│ Visit https://chatgpt.com/codex/settings/usage for up-to-date            │
-│ information on rate limits and credits                                   │
-│                                                                          │
-│  Model:         gpt-5.1-codex-max (reasoning none, summaries auto)       │
-│  Directory: [[workspace]]                                                │
-│  Permissions:   Custom (workspace with network access, Ask for approval) │
-│  Agents.md:     <none>                                                   │
-│                                                                          │
-│  Token usage:   0 total  (0 input + 0 output)                            │
-│  Limits:        refresh requested; run /status again shortly.            │
-╰──────────────────────────────────────────────────────────────────────────╯
+  >_ OpenAI Codex (v0.0.0)
+
+  Visit https://chatgpt.com/settings/usage for up-to-date
+  information on rate limits and credits
+
+  Model:        gpt-5.1-codex-max (reasoning none, summaries auto)
+  Directory:    [[workspace]]
+  Permissions:  Custom (workspace with network access, Ask for approval)
+  Agents.md:    <none>
+
+  Token usage:  0 total  (0 input + 0 output)
+  Limits:       refresh requested; run /status again shortly.
 
 
 
@@ -30,7 +27,9 @@ before:
 
 
 
-Ctrl+Space select
+
+
+⌃space select
  ↑/↓ to scroll · pgup/pgdn to page · home/end to jump
  q close · f3 find · esc browse prompts
 
@@ -39,22 +38,20 @@ after:
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
 /status
 
-╭───────────────────────────────────────────────────────────────────────────╮
-│  >_ OpenAI Codex (v0.0.0)                                                 │
-│                                                                           │
-│ Visit https://chatgpt.com/codex/settings/usage for up-to-date             │
-│ information on rate limits and credits                                    │
-│                                                                           │
-│  Model:          gpt-5.1-codex-max (reasoning none, summaries auto)       │
-│  Directory: [[workspace]]                                                 │
-│  Permissions:    Custom (workspace with network access, Ask for approval) │
-│  Agents.md:      <none>                                                   │
-│                                                                           │
-│  Token usage:    0 total  (0 input + 0 output)                            │
-│  spark limit:                                                             │
-│  5h limit:       [███████████░░░░░░░░░] 55% left (resets soon)            │
-│  Weekly limit:   [██████████████░░░░░░] 70% left (resets later)           │
-╰───────────────────────────────────────────────────────────────────────────╯
+  >_ OpenAI Codex (v0.0.0)
+
+  Visit https://chatgpt.com/settings/usage for up-to-date
+  information on rate limits and credits
+
+  Model:         gpt-5.1-codex-max (reasoning none, summaries auto)
+  Directory:     [[workspace]]
+  Permissions:   Custom (workspace with network access, Ask for approval)
+  Agents.md:     <none>
+
+  Token usage:   0 total  (0 input + 0 output)
+  spark limit:
+  5h limit:      [███████████░░░░░░░░░] 55% left (resets soon)
+  Weekly limit:  [██████████████░░░░░░] 70% left (resets later)
 
 next message
 
@@ -62,6 +59,8 @@ next message
 
 
 
-Ctrl+Space select
+
+
+⌃space select
  ↑/↓ to scroll · pgup/pgdn to page · home/end to jump
  q close · f3 find · esc browse prompts

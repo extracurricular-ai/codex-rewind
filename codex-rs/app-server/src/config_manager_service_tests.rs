@@ -9,6 +9,7 @@ use codex_app_server_protocol::ConfigLayerSource as ApiConfigLayerSource;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
 use codex_config::test_support::CloudConfigBundleFixture;
+use codex_config::types::OtelExporterKind;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -737,6 +738,7 @@ async fn psp_feature_configures_first_party_routing() -> Result<()> {
         config.http_client_factory(),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
             .with_system_proxy_fallback()
+            .with_network_policy(config.application_network_policy.clone())
             .with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
     );
     assert_eq!(
@@ -1187,6 +1189,29 @@ async fn write_value_reports_override() {
 }
 
 #[tokio::test]
+async fn provider_setup_rejects_config_changed_after_preview() -> Result<()> {
+    let tmp = tempdir()?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let layers = service.load_config_layers(/*cwd*/ None).await?;
+    let (write, _) = service.prepare_provider_config(
+        &layers,
+        codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID,
+        [("aws.region", Some("us-west-2"))],
+    )?;
+
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    let newer_config = "model = 'newer'";
+    std::fs::write(&user_path, newer_config)?;
+    let error = service.commit_provider_config(write).await.unwrap_err();
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigVersionConflict)
+    );
+    assert_eq!(std::fs::read_to_string(user_path)?, newer_config);
+    Ok(())
+}
+
+#[tokio::test]
 async fn version_conflict_rejected() {
     let tmp = tempdir().expect("tempdir");
     let user_path = tmp.path().join(CONFIG_TOML_FILE);
@@ -1441,6 +1466,77 @@ url_prefix_from_env = "VENDOR_ENDPOINT"
 }
 
 #[tokio::test]
+async fn thread_refresh_resolves_preserved_layers_before_materialization() -> Result<()> {
+    use codex_core::config::ConfigOverrides;
+    use codex_features::Feature;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let tmp = tempdir()?;
+    let selected_path = tmp.path().join("work.config.toml");
+    std::fs::write(&selected_path, "log_dir = \"old-logs\"\n")?;
+    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(&selected_path)?);
+    loader_overrides.user_config_profile = Some("work".parse()?);
+    let service = ConfigManager::new(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        loader_overrides,
+        /*strict_config*/ true,
+        CloudConfigBundleLoader::default(),
+        Default::default(),
+        Arc::new(codex_config::NoopThreadConfigLoader),
+    );
+    let thread = service
+        .load_for_cwd(
+            Some(HashMap::from([(
+                "model_provider".to_string(),
+                serde_json::json!("openai"),
+            )])),
+            ConfigOverrides::default(),
+            Some(tmp.path().to_path_buf()),
+        )
+        .await?;
+    service
+        .extend_runtime_feature_enablement([
+            ("secret_auth_storage".to_string(), true),
+            ("mcp_oauth_refresh_coordination".to_string(), true),
+        ])
+        .expect("set runtime features");
+    std::fs::write(
+        &selected_path,
+        "model_provider = \"missing-provider\"\nlog_dir = \"new-logs\"\n\
+         [features]\nmcp_oauth_refresh_coordination = false\n",
+    )?;
+    // A throwaway host configuration is invalid; the actual thread's preserved
+    // provider is valid. Refresh must materialize only the final composed layers.
+    service
+        .load_latest_config(Some(tmp.path().to_path_buf()))
+        .await
+        .expect_err("host provider is unavailable");
+    let refreshed = service
+        .load_latest_config_with_session_layers(&thread.config_layer_stack, &thread.cwd)
+        .await?;
+    assert_eq!(refreshed.model_provider_id, "openai");
+    assert_eq!(refreshed.cwd, thread.cwd);
+    assert_eq!(refreshed.log_dir, tmp.path().join("new-logs"));
+    assert!(refreshed.features.enabled(Feature::SecretAuthStorage));
+    assert!(
+        !refreshed
+            .features
+            .enabled(Feature::McpOAuthRefreshCoordination)
+    );
+    std::fs::write(&selected_path, "approval_policy = false\n")?;
+    let error = service
+        .load_latest_config_with_session_layers(&thread.config_layer_stack, &thread.cwd)
+        .await
+        .expect_err("invalid final config is rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("work.config.toml"), "{error}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_user_value_rejected_even_if_overridden_by_managed() {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"user\"").unwrap();
@@ -1609,6 +1705,62 @@ async fn write_value_rejects_exact_managed_requirement() {
     );
 }
 
+#[tokio::test]
+async fn write_value_rejects_managed_otel_values_and_preserves_unmanaged_siblings() {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "").expect("write user config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"[otel]
+tool_result = { max_bytes = 1024 }
+log_user_prompt = false
+log_agent_responses = true
+log_guardian_assessments = false
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+span_attributes = { "service.name" = "managed-service" }
+tracestate = { managed = { tenant = "enterprise" }, empty = {} }"#,
+        ),
+    );
+    for (key_path, managed) in [
+        ("otel", true),
+        ("otel.log_user_prompt", true),
+        ("otel.log_agent_responses", true),
+        ("otel.log_guardian_assessments", true),
+        ("otel.exporter.otlp-http.endpoint", true),
+        ("otel.trace_exporter.otlp-grpc.endpoint", true),
+        ("otel.metrics_exporter.otlp-http.headers", true),
+        ("otel.span_attributes.\"service.name\"", true),
+        ("otel.tracestate.managed.tenant", true),
+        ("otel.environment", false),
+        ("otel.tool_result.max_bytes", true),
+        ("otel.span_attributes.\"service.version\"", false),
+        ("otel.tracestate.local.tenant", false),
+        ("otel.tracestate.managed.region", false),
+        ("otel.tracestate.empty.tenant", false),
+    ] {
+        let result = service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key_path.to_string(),
+                value: serde_json::json!("user"),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await;
+        assert_eq!(
+            result.err().and_then(|error| error.write_error_code()),
+            managed.then_some(ConfigWriteErrorCode::ConfigRequirementReadonly),
+            "OTEL path {key_path}"
+        );
+    }
+}
+
 fn toml_path(tmp: &Path, name: &str) -> String {
     tmp.join(name).to_string_lossy().replace('\\', "\\\\")
 }
@@ -1674,6 +1826,148 @@ enabled = false
         }
         assert!(response.origins.contains_key("model"));
     }
+}
+
+#[tokio::test]
+async fn read_projects_managed_otel_values_and_preserves_unmanaged_settings() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        r#"[otel]
+tool_result = { max_bytes = 1234 }
+log_user_prompt = true
+environment = "user"
+exporter = "statsig"
+span_attributes = { "service.name" = "user-service", "service.version" = "user-version" }
+tracestate = { managed = { tenant = "user-tenant", region = "us" }, local = { tenant = "preserved" }, empty = { tenant = "also-preserved" } }"#,
+    )
+    .expect("write user config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"[otel]
+log_user_prompt = false
+exporter = "none"
+span_attributes = { "service.name" = "managed-service" }
+tracestate = { managed = { tenant = "enterprise" }, empty = {} }"#,
+        ),
+    );
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+    let otel = response
+        .config
+        .additional
+        .get("otel")
+        .expect("effective OTEL config");
+    assert_eq!(
+        otel,
+        &serde_json::json!({
+            "tool_result": { "max_bytes": 1234 },
+            "log_user_prompt": false,
+            "log_agent_responses": null,
+            "log_guardian_assessments": null,
+            "environment": "user",
+            "exporter": "none",
+            "trace_exporter": null,
+            "metrics_exporter": null,
+            "span_attributes": {
+                "service.name": "managed-service",
+                "service.version": "user-version",
+            },
+            "tracestate": {
+                "managed": { "tenant": "enterprise", "region": "us" },
+                "local": { "tenant": "preserved" },
+                "empty": { "tenant": "also-preserved" },
+            },
+        }),
+    );
+    for (path, user_owned) in [
+        ("otel.log_user_prompt", false),
+        ("otel.exporter", false),
+        ("otel.span_attributes.service.name", false),
+        ("otel.tracestate.managed.tenant", false),
+        ("otel.tracestate.managed.region", true),
+        ("otel.environment", true),
+        ("otel.tool_result.max_bytes", true),
+        ("otel.span_attributes.service.version", true),
+        ("otel.tracestate.local.tenant", true),
+        ("otel.tracestate.empty.tenant", true),
+    ] {
+        assert_eq!(response.origins.contains_key(path), user_owned, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn read_projects_managed_otel_tool_result_and_omits_its_origin() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        r#"[otel]
+tool_result = { max_bytes = 1234 }"#,
+    )
+    .expect("write user config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"[otel]
+tool_result = { max_bytes = 4096 }"#,
+        ),
+    );
+
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+    assert_eq!(
+        response
+            .config
+            .additional
+            .get("otel")
+            .and_then(|otel| otel.get("tool_result")),
+        Some(&serde_json::json!({ "max_bytes": 4096 }))
+    );
+    assert!(!response.origins.contains_key("otel.tool_result.max_bytes"));
+}
+
+#[tokio::test]
+async fn read_keeps_omitted_otel_tool_result_unset() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        r#"[otel]
+environment = "user""#,
+    )
+    .expect("write user config");
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+
+    assert_eq!(
+        response
+            .config
+            .additional
+            .get("otel")
+            .and_then(|otel| otel.get("tool_result")),
+        Some(&serde_json::Value::Null)
+    );
 }
 
 #[tokio::test]
@@ -1831,6 +2125,178 @@ async fn write_value_reports_managed_override() {
         ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
     );
     assert_eq!(overridden.effective_value, serde_json::json!("never"));
+}
+
+#[tokio::test]
+async fn write_overrides_redact_managed_otel_exporter_headers() {
+    let tmp = tempdir().expect("tempdir");
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&user_path, "").expect("write user config");
+    let managed_path = tmp.path().join("managed_config.toml");
+    std::fs::write(
+        &managed_path,
+        r#"[otel]
+environment = "managed"
+exporter = { otlp-http = { endpoint = "https://collector.example", protocol = "json", headers = { Authorization = "admin-secret", "x.api.key" = "dotted-secret" } } }
+trace_exporter = { otlp-grpc = { endpoint = "https://trace.example", headers = { Authorization = "trace-secret" } } }
+metrics_exporter = { otlp-http = { endpoint = "https://metrics.example", protocol = "json", headers = { Authorization = "metrics-secret" } } }
+span_attributes = { "service.name" = "managed-service" }"#,
+    )
+    .expect("write managed config");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::with_managed_config_path_for_tests(managed_path),
+        CloudConfigBundleLoader::default(),
+    );
+    let exporter = serde_json::json!({
+        "otlp-http": {
+            "endpoint": "https://collector.example",
+            "headers": { "Authorization": "[redacted]", "x.api.key": "[redacted]" },
+            "protocol": "json"
+        }
+    });
+    let otel = serde_json::json!({
+        "environment": "managed",
+        "exporter": exporter.clone(),
+        "trace_exporter": {
+            "otlp-grpc": {
+                "endpoint": "https://trace.example",
+                "headers": { "Authorization": "[redacted]" }
+            }
+        },
+        "metrics_exporter": {
+            "otlp-http": {
+                "endpoint": "https://metrics.example",
+                "protocol": "json",
+                "headers": { "Authorization": "[redacted]" }
+            }
+        },
+        "span_attributes": { "service.name": "managed-service" }
+    });
+
+    for (key_path, expected) in [
+        ("otel", otel.clone()),
+        ("otel.exporter", exporter.clone()),
+        ("otel.exporter.otlp-http", exporter["otlp-http"].clone()),
+        (
+            "otel.exporter.otlp-http.headers",
+            exporter["otlp-http"]["headers"].clone(),
+        ),
+        (
+            "otel.exporter.otlp-http.headers.Authorization",
+            serde_json::json!("[redacted]"),
+        ),
+        (
+            "otel.exporter.otlp-http.headers.\"x.api.key\"",
+            serde_json::json!("[redacted]"),
+        ),
+        (
+            "otel.exporter.otlp-http.endpoint",
+            serde_json::json!("https://collector.example"),
+        ),
+        (
+            "otel.exporter.otlp-http.protocol",
+            serde_json::json!("json"),
+        ),
+        ("otel.trace_exporter", otel["trace_exporter"].clone()),
+        ("otel.metrics_exporter", otel["metrics_exporter"].clone()),
+        (
+            "otel.metrics_exporter.otlp-http.headers.Authorization",
+            serde_json::json!("[redacted]"),
+        ),
+        ("otel.environment", serde_json::json!("managed")),
+        (
+            "otel.span_attributes.\"service.name\"",
+            serde_json::json!("managed-service"),
+        ),
+    ] {
+        let response = service
+            .write_value(ConfigValueWriteParams {
+                file_path: None,
+                key_path: key_path.to_string(),
+                value: serde_json::Value::Null,
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await
+            .expect("no-op config clear should succeed");
+        assert_eq!(response.status, WriteStatus::OkOverridden, "{key_path}");
+        assert_eq!(
+            response
+                .overridden_metadata
+                .expect("managed override")
+                .effective_value,
+            expected,
+            "{key_path}"
+        );
+        assert_eq!(std::fs::read_to_string(&user_path).unwrap(), "");
+    }
+
+    let response = service
+        .batch_write(ConfigBatchWriteParams {
+            edits: vec![codex_app_server_protocol::ConfigEdit {
+                key_path: "otel.exporter.otlp-http.headers.Authorization".to_string(),
+                value: serde_json::Value::Null,
+                merge_strategy: MergeStrategy::Replace,
+            }],
+            file_path: None,
+            expected_version: None,
+            reload_user_config: false,
+        })
+        .await
+        .expect("no-op batch clear should succeed");
+    assert_eq!(response.status, WriteStatus::OkOverridden);
+    assert_eq!(
+        response
+            .overridden_metadata
+            .expect("managed batch override")
+            .effective_value,
+        serde_json::json!("[redacted]")
+    );
+    assert_eq!(std::fs::read_to_string(&user_path).unwrap(), "");
+
+    let read = service
+        .read(ConfigReadParams {
+            include_layers: true,
+            cwd: None,
+        })
+        .await
+        .expect("read public config");
+    let mut effective_exporter = exporter.clone();
+    effective_exporter["otlp-http"]["tls"] = serde_json::Value::Null;
+    assert_eq!(
+        read.config.additional["otel"]["exporter"],
+        effective_exporter
+    );
+    let managed_layer = read
+        .layers
+        .expect("config layers")
+        .into_iter()
+        .find(|layer| {
+            matches!(
+                layer.name,
+                ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { .. }
+            )
+        })
+        .expect("legacy managed layer");
+    assert_eq!(managed_layer.config["otel"]["exporter"], exporter);
+
+    let runtime = service
+        .load_latest_config(/*fallback_cwd*/ None)
+        .await
+        .expect("load runtime config");
+    let OtelExporterKind::OtlpHttp { headers, .. } = runtime.otel.exporter else {
+        panic!("unexpected runtime exporter");
+    };
+    assert_eq!(
+        headers.get("Authorization").map(|value| value.as_str()),
+        Some("admin-secret")
+    );
+    assert_eq!(
+        headers.get("x.api.key").map(|value| value.as_str()),
+        Some("dotted-secret")
+    );
 }
 
 /// Legacy managed feature toggles own their normalized enabled origin and override metadata.
@@ -2685,20 +3151,13 @@ async fn permission_config_reload_merges_session_layers() -> Result<()> {
     use codex_config::ConfigLayerSource;
     use codex_config::ConfigLayerStack;
     let tmp = tempdir()?;
-    let wrapper_dir = tmp.path().join("tmp/arg0/session");
-    std::fs::create_dir_all(&wrapper_dir)?;
-    let wrapper = wrapper_dir.join("codex-execve-wrapper");
-    std::fs::write(&wrapper, "")?;
     let service = ConfigManager::new(
         tmp.path().to_path_buf(),
         Vec::new(),
         LoaderOverrides::without_managed_config_for_tests(),
         /*strict_config*/ false,
         CloudConfigBundleLoader::default(),
-        codex_arg0::Arg0DispatchPaths {
-            main_execve_wrapper_exe: Some(wrapper),
-            ..Default::default()
-        },
+        codex_arg0::Arg0DispatchPaths::default(),
         std::sync::Arc::new(codex_config::NoopThreadConfigLoader),
     );
 
@@ -2743,16 +3202,70 @@ async fn permission_config_reload_merges_session_layers() -> Result<()> {
             .collect::<Vec<_>>(),
         vec!["first", "second"]
     );
-    let policy = loaded.permissions.file_system_sandbox_policy();
-    assert_eq!(
-        (
-            policy.can_read_local_path_with_cwd(&wrapper_dir, loaded.cwd.as_path()),
-            policy.can_read_local_path_with_cwd(
-                &tmp.path().join("tmp/arg0/other"),
-                loaded.cwd.as_path()
-            ),
-        ),
-        (true, false),
-    );
     Ok(())
+}
+
+/// Cloud storage requirements override user config and reject leaf or whole-table writes without touching the file.
+#[tokio::test]
+async fn cloud_desktop_storage_requirements_control_reads_and_writes() {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let original = "[desktop]\ndefaultProjectParent = 'user'\nprojectlessWorkspaceRoot = 'user'\nlocaleOverride = 'en-US'\n";
+    std::fs::write(&path, original).unwrap();
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(format!(
+            "[application.storage]\ndefault_project_parent = \"{}\"\nprojectless_workspace_root = \"{}\"",
+            toml_path(tmp.path(), "projects"),
+            toml_path(tmp.path(), "chats"),
+        )),
+    );
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(response.config.desktop).unwrap(),
+        serde_json::json!({
+            "defaultProjectParent": tmp.path().join("projects"),
+            "projectlessWorkspaceRoot": tmp.path().join("chats"),
+            "localeOverride": "en-US",
+        })
+    );
+    for key in [
+        "desktop.defaultProjectParent",
+        "desktop.projectlessWorkspaceRoot",
+        "desktop",
+    ] {
+        let error = service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key.into(),
+                value: serde_json::Value::Null,
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await
+            .expect_err("managed storage is read-only");
+        assert_eq!(
+            error.write_error_code(),
+            Some(ConfigWriteErrorCode::ConfigRequirementReadonly)
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "desktop.localeOverride".into(),
+            value: serde_json::json!("fr-FR"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect("unmanaged desktop settings stay writable");
 }

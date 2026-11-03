@@ -193,7 +193,7 @@ impl ThreadQueueRequestProcessor {
         let thread = loaded_thread
             .ok_or_else(|| invalid_request("resume the thread before starting a queued message"))?;
         self.config_manager
-            .check_thread_model_provider(thread.config().await.as_ref())
+            .check_thread_model_provider_for_input(thread.config().await.as_ref())
             .await
             .map_err(|error| config_load_error(&error))?;
         let submission = self
@@ -205,8 +205,11 @@ impl ThreadQueueRequestProcessor {
             )
             .await
             .map_err(queue_error)?;
-        let turn_id = match submission {
-            StartIfIdleSubmission::Started { turn_id } => turn_id,
+        let (turn_id, root_turn_id) = match submission {
+            StartIfIdleSubmission::Started {
+                turn_id,
+                root_turn_id,
+            } => (turn_id, root_turn_id),
             StartIfIdleSubmission::NotSubmitted {
                 reason: NotSubmittedReason::ServerDraining,
             } => return Err(crate::error_code::server_draining_error()),
@@ -229,6 +232,7 @@ impl ThreadQueueRequestProcessor {
         Ok(ThreadQueueStartResponse {
             turn: Turn {
                 id: turn_id,
+                root_turn_id: Some(root_turn_id),
                 items: vec![],
                 items_view: TurnItemsView::NotLoaded,
                 error: None,

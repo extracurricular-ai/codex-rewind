@@ -1,11 +1,13 @@
-//! Exercises the compression trigger through the public app-server API.
+//! Exercises compression and subsequent resume through the public app-server API.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use app_test_support::DEFAULT_CLIENT_NAME;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
 use app_test_support::create_fake_rollout;
+use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::rollout_path;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientRequest;
@@ -14,6 +16,10 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::RolloutCompressResponse;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -22,7 +28,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 20);
 
 #[tokio::test]
 async fn rollout_compress_runs_after_startup_with_compression_disabled() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .with_args(&["-c", "features.local_thread_store_compression=false"])
@@ -35,12 +43,21 @@ async fn rollout_compress_runs_after_startup_with_compression_disabled() -> Resu
         filename_ts,
         "2025-01-05T12:00:00Z",
         "Saved user message",
-        /*model_provider*/ None,
+        Some("mock_provider"),
         /*git_info*/ None,
     )?;
     let path = rollout_path(codex_home.path(), filename_ts, &thread_id);
     let original = std::fs::read_to_string(&path)?;
     let compressed_path = path.with_extension("jsonl.zst");
+    let before: ThreadReadResponse = app_server
+        .request(|request_id| ClientRequest::ThreadRead {
+            request_id,
+            params: ThreadReadParams {
+                thread_id: thread_id.clone(),
+                include_turns: true,
+            },
+        })
+        .await?;
 
     let response: RolloutCompressResponse = app_server
         .request(|request_id| ClientRequest::RolloutCompress {
@@ -61,7 +78,21 @@ async fn rollout_compress_runs_after_startup_with_compression_disabled() -> Resu
     while let Some(line) = reader.next_line().await? {
         lines.push(line);
     }
+    drop(reader);
     assert_eq!(lines.join("\n") + "\n", original);
+    let relative_path = path.strip_prefix(codex_home.path())?.to_path_buf();
+    let resumed: ThreadResumeResponse = app_server
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                path: Some(relative_path),
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(resumed.thread.id, thread_id);
+    assert_eq!(resumed.thread.turns, before.thread.turns);
     Ok(())
 }
 

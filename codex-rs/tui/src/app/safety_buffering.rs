@@ -10,6 +10,7 @@ use crate::chatwidget::ThreadInputState;
 use crate::chatwidget::ThreadInputStateRestoreMode;
 use crate::chatwidget::UserMessage;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::UserInput;
 
@@ -60,6 +61,8 @@ impl App {
             items,
             cwd,
             active_permission_profile,
+            approval_policy,
+            approvals_reviewer,
             model: turn_model,
             effort,
             collaboration_mode,
@@ -81,6 +84,19 @@ impl App {
         if let Err(err) = turn_permissions_overrides(permissions_override, cwd.as_path()) {
             self.chat_widget
                 .add_error_message(format!("Failed to retry with a faster model: {err}"));
+            return;
+        }
+        let daybreak_enabled = self.chat_widget.daybreak_enabled
+            && !self.chat_widget.side_conversation_active()
+            && !self.side_threads.contains_key(&thread_id);
+        let eligible_account = self.chat_widget.daybreak_account_eligible();
+        if let Err(message) = crate::daybreak::program_for_turn(
+            &self.chat_widget.model_catalog().models,
+            &model,
+            eligible_account,
+            daybreak_enabled,
+        ) {
+            self.chat_widget.add_error_message(message);
             return;
         }
         *turn_model = model.clone();
@@ -138,7 +154,7 @@ impl App {
                         .data
                         .into_iter()
                         .rev()
-                        .map(|entry| entry.item)
+                        .map(ThreadItem::from)
                         .collect();
                     turn.items_view = TurnItemsView::Full;
                 }
@@ -163,9 +179,9 @@ impl App {
                 .iter()
                 .find(|turn| turn.id == turn_id)
                 .into_iter()
-                .flat_map(|turn| &turn.items)
+                .flat_map(Turn::item_payloads)
                 .filter_map(|item| match item {
-                    ThreadItem::UserMessage { content, .. } => Some(content),
+                    ThreadItemPayload::UserMessage { content, .. } => Some(content),
                     _ => None,
                 })
                 .skip(/*n*/ 1)
@@ -180,7 +196,7 @@ impl App {
         let retry_display = ChatWidget::user_message_display_from_inputs(items);
 
         self.config = retry_config.clone();
-        let selected_profile = self.confirmed_server_profile(thread_id);
+        let selected_profile = self.selected_server_profile(thread_id);
         let started = app_server
             .fork_thread_at(
                 &self.local_settings,
@@ -203,8 +219,12 @@ impl App {
             }
         };
         let retry_thread_id = started.session.thread_id;
+        *approval_policy = started.session.approval_policy;
+        *approvals_reviewer = Some(started.session.approvals_reviewer);
+        *active_permission_profile = started.session.active_permission_profile.clone();
 
-        self.shutdown_current_thread(app_server).await;
+        self.detach_current_thread_for_navigation(app_server, Some(retry_thread_id))
+            .await;
         if let Err(err) = self
             .replace_chat_widget_with_app_server_thread(
                 tui,
@@ -218,6 +238,9 @@ impl App {
             return;
         }
 
+        if selected_profile.is_some() {
+            self.adopt_inherited_server_selection();
+        }
         let failure_input_state = input_state.clone();
         self.chat_widget.restore_thread_input_state(
             input_state,

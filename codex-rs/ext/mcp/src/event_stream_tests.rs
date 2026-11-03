@@ -155,13 +155,14 @@ impl Fixture {
         config.mcp_server_catalog = catalog.build();
         let config = Arc::new(config);
         let runtime_input = || McpRuntimeInput {
+            network_policy_metadata: None,
             startup_policy: McpStartupPolicy::Eager,
             config: Arc::clone(&config),
             plugins_available: false,
             ready_selected_capability_roots: Vec::new(),
             mcp_servers: HashMap::from([(
                 CODEX_APPS_MCP_SERVER_NAME.into(),
-                EffectiveMcpServer::configured(server_config.clone()),
+                EffectiveMcpServer::from_host_config(server_config.clone()),
             )]),
             submit_id: "test".into(),
             tx_event: None,

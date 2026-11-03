@@ -8,9 +8,11 @@ checksum and checked using object metadata before the run succeeds. The
 versioned prefix includes every release asset plus installer-facing
 ``release.json`` metadata derived from the verified downloads. Once those
 objects are verified, the same metadata advances ``codex/channels/latest`` when
-the release is marked latest and ``codex/channels/prerelease`` for prereleases.
-Stable releases also update the mutable ``codex/install.sh`` and
+the release is marked latest and ``codex/channels/prerelease`` for prereleases
+that are newer than its current version, or when that version is unreadable.
+Latest stable releases also update the mutable ``codex/install.sh`` and
 ``codex/install.ps1`` bootstrap aliases from their verified versioned assets.
+An older stable release cannot move these aliases or the latest channel back.
 """
 
 import argparse
@@ -26,18 +28,18 @@ from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 from urllib.parse import quote
 
+from releases import (
+    is_valid_release_version,
+    is_valid_stable_release_version,
+    should_update_version,
+)
+
 BUCKET = "releases"
 PREFIX = "codex"
 REPOSITORY = "openai/codex"
 RELEASE_METADATA_NAME = "release.json"
 INSTALLER_NAMES = ("install.sh", "install.ps1")
 MAX_UPLOAD_WORKERS = 8
-# Keep this pattern in sync with release-tag validation in
-# .github/workflows/rust-release.yml.
-VERSION_RE = re.compile(
-    r"^[0-9]+\.[0-9]+\.[0-9]+(?:-(?:alpha(?:\.[0-9]+){0,2}"
-    r"|beta(?:\.[0-9]+)?))?$"
-)
 CRC64_RE = re.compile(r"^[A-Za-z0-9+/]{11}=$")
 SHA256_RE = re.compile(r"^sha256:([0-9a-f]{64})$")
 MISSING_OBJECT_RE = re.compile(r"\((?:404|NoSuchKey|NotFound)\)")
@@ -265,6 +267,41 @@ def verify_remote(
         )
 
 
+def should_update_channel(endpoint: str, version: str, channel: str) -> bool:
+    # Read R2 directly: the public CDN may still serve an older version.
+    key = f"{PREFIX}/channels/{channel}"
+    url = f"s3://{BUCKET}/{key}"
+    try:
+        raw = run_command(["aws", "s3", "cp", url, "-", "--endpoint-url", endpoint])
+    except subprocess.CalledProcessError as error:
+        if MISSING_OBJECT_RE.search(error.stderr or ""):
+            return True
+        raise_s3("read", key, error, (error.stderr or "").strip())
+    except OSError as error:
+        raise_s3("read", key, error)
+
+    try:
+        metadata = json.loads(raw)
+    except json.JSONDecodeError as error:
+        if channel == "latest":
+            raise PublishError(f"invalid channel metadata for {key}") from error
+        return True
+    tag = metadata.get("tag_name") if isinstance(metadata, dict) else None
+    if not isinstance(tag, str) or not tag.startswith("rust-v"):
+        if channel == "latest":
+            raise PublishError(f"invalid channel metadata for {key}")
+        return True
+
+    current = tag.removeprefix("rust-v")
+    if channel == "latest":
+        if not is_valid_stable_release_version(current):
+            raise PublishError(f"invalid stable version in channel metadata for {key}")
+        # Reruns can repair installer writes interrupted before channel finalization.
+        if version == current:
+            return True
+    return should_update_version(version, current)
+
+
 def publish_installers(endpoint: str, tag: str, assets: list[ReleaseAsset]) -> None:
     installers = {asset.path.name: asset for asset in assets}
     missing = sorted(set(INSTALLER_NAMES) - installers.keys())
@@ -384,7 +421,7 @@ def main() -> int:
             raise PublishError("AWS_ENDPOINT_URL is required for the R2 S3 endpoint")
 
         version = args.tag.removeprefix("rust-v")
-        if args.tag == version or not VERSION_RE.fullmatch(version):
+        if args.tag == version or not is_valid_release_version(version):
             raise PublishError(f"invalid rust release tag: {args.tag}")
         with tempfile.TemporaryDirectory() as temp_dir:
             assets_directory = Path(temp_dir) / "assets"
@@ -414,7 +451,7 @@ def main() -> int:
                 asset for asset in assets if asset.path.name not in previously_published
             ]
             required_downloads = list(remaining)
-            if args.prerelease == "false":
+            if args.prerelease == "false" and args.make_latest == "true":
                 required_downloads.extend(
                     asset
                     for asset in assets
@@ -476,13 +513,17 @@ def main() -> int:
                 f"size={metadata_size} sha256={metadata_sha256}",
                 file=sys.stderr,
             )
-            if args.prerelease == "false":
-                publish_installers(endpoint, args.tag, assets)
             channels = []
-            if args.make_latest == "true":
+            if args.make_latest == "true" and should_update_channel(
+                endpoint, version, "latest"
+            ):
                 channels.append("latest")
-            if args.prerelease == "true":
+            if args.prerelease == "true" and should_update_channel(
+                endpoint, version, "prerelease"
+            ):
                 channels.append("prerelease")
+            if "latest" in channels and args.prerelease == "false":
+                publish_installers(endpoint, args.tag, assets)
             for channel in channels:
                 channel_key = f"{PREFIX}/channels/{channel}"
                 put_object(

@@ -1,5 +1,7 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::ContextualUserFragment;
 use crate::context::environment_context::FileSystemContext;
 use crate::context::environment_context::NetworkContext;
@@ -9,7 +11,9 @@ use crate::environment_selection::TurnEnvironmentState;
 use crate::session::turn_context::TurnContext;
 use crate::shell::ShellType;
 use codex_features::Feature;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
@@ -59,7 +63,10 @@ impl EnvironmentsState {
             environments: environment_states(environments),
             shell_version,
             current_date,
-            timezone: turn_context.timezone.clone(),
+            timezone: turn_context
+                .timezone
+                .clone()
+                .filter(|_| turn_context.config.include_environment_context_time),
             network: network_from_turn_context(turn_context),
             filesystem: environments.primary().map(|environment| {
                 FileSystemContext::from_permission_profile(
@@ -105,8 +112,11 @@ impl WorldStateSection for EnvironmentsState {
     const ID: &'static str = "environments";
     type Snapshot = EnvironmentsSnapshot;
 
-    fn snapshot(&self) -> Self::Snapshot {
-        EnvironmentsSnapshot {
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, Self::Snapshot>,
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = EnvironmentsSnapshot {
             environments: self
                 .environments
                 .iter()
@@ -129,14 +139,7 @@ impl WorldStateSection for EnvironmentsState {
             network: self.network.as_ref().map(NetworkContext::render),
             filesystem: self.filesystem.as_ref().map(FileSystemContext::render),
             subagents: self.subagents.clone(),
-        }
-    }
-
-    fn render_diff(
-        &self,
-        previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
-        let current = self.snapshot();
+        };
         let empty = EnvironmentsSnapshot::default();
         let previous = match previous {
             PreviousSectionState::Known(previous) => previous,
@@ -175,7 +178,7 @@ impl WorldStateSection for EnvironmentsState {
             && updates
                 .values()
                 .all(|update| matches!(update, EnvironmentUpdate::Current(_)));
-        (!updates.is_empty() || turn_context_values_changed).then(|| {
+        let fragment = (!updates.is_empty() || turn_context_values_changed).then(|| {
             Box::new(RenderedEnvironments {
                 updates,
                 legacy_single,
@@ -191,7 +194,11 @@ impl WorldStateSection for EnvironmentsState {
                 filesystem: self.filesystem.clone(),
                 subagents: self.subagents.clone(),
             }) as Box<dyn ContextualUserFragment>
-        })
+        });
+        (
+            Some(current),
+            WorldStateUpdate::optional_boxed_fragment(fragment),
+        )
     }
 }
 
@@ -212,7 +219,7 @@ impl ContextualUserFragment for EnvironmentsState {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         self.rendered_full().body()
     }
 }
@@ -253,7 +260,7 @@ impl ContextualUserFragment for RenderedEnvironments {
         environment_context_markers()
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let mut rendered = "\n".to_string();
         if self.legacy_single {
             if let Some(EnvironmentUpdate::Current(environment)) = self.updates.values().next() {
@@ -318,7 +325,7 @@ impl ContextualUserFragment for RenderedEnvironments {
             }
             rendered.push_str("  </subagents>\n");
         }
-        rendered
+        input_text(rendered)
     }
 }
 
@@ -492,7 +499,10 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
     const MAX_TOTAL_ERROR_BYTES: usize = 512;
     let mut remaining_error_bytes = MAX_TOTAL_ERROR_BYTES;
     for environment in &snapshot.environments {
-        if let TurnEnvironmentState::Failed { selection, error } = environment {
+        if let TurnEnvironmentState::Failed {
+            selection, error, ..
+        } = environment
+        {
             let detail = error
                 [..error.floor_char_boundary(remaining_error_bytes.min(MAX_ERROR_BYTES))]
                 .to_string();

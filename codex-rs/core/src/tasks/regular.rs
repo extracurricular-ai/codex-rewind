@@ -6,11 +6,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::TurnInput;
 use crate::session::session::Session;
+use crate::session::startup_prewarm::SessionStartupPrewarmResolution;
 use crate::session::turn::McpStartupRequirements;
 use crate::session::turn::run_hooks_and_record_inputs;
 use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
-use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::state::TaskKind;
 use codex_thread_store::PersistContext;
 use tracing::Instrument;
@@ -44,11 +44,23 @@ impl SessionTask for RegularTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        let run_turn_span = trace_span!("run_turn");
+        if ctx
+            .config
+            .features
+            .enabled(codex_features::Feature::CriticalPathTiming)
+            && !ctx.session_source.is_non_root_agent()
+        {
+            ctx.turn_timing_state.enable_critical_path();
+        }
+        let run_turn_span = trace_span!(
+            "run_turn",
+            conversation.id = %sess.thread_id,
+            turn.id = %ctx.sub_id,
+        );
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
         let prewarmed_client_session = async {
-            sess.emit_turn_started(&ctx).await;
+            sess.emit_turn_started(&ctx, TaskKind::Regular).await;
             // Regular-start contributors run once, after the task is visible and interruptible.
             let prepares_mcp = sess
                 .services
@@ -75,7 +87,6 @@ impl SessionTask for RegularTask {
             if preparation.is_err() {
                 return SessionStartupPrewarmResolution::Cancelled;
             }
-            sess.set_server_reasoning_included(/*included*/ false).await;
             sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
                 .await
         }

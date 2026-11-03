@@ -1,6 +1,8 @@
 use super::*;
 use crate::MAX_QUEUE_ITEMS;
 use crate::QueuedUserSubmissionRecord;
+use crate::sqlite::SqlitePoolWriteExt;
+use crate::sqlite::SqliteWriteQueryExt;
 use sqlx::Connection;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -99,7 +101,7 @@ impl SqliteQueueStore {
         .bind(now_ms)
         .bind(thread_id.to_string())
         .bind(i64::try_from(MAX_QUEUE_ITEMS)?)
-        .fetch_one(self.pool.as_ref())
+        .fetch_one_write(self.pool.as_ref())
         .await?;
         QueuedUserSubmissionRecord::try_from_row(&row)
     }
@@ -142,7 +144,7 @@ impl SqliteQueueStore {
         .bind(datetime_to_epoch_millis(Utc::now()))
         .bind(thread_id.to_string())
         .bind(item_id)
-        .fetch_optional(self.pool.as_ref())
+        .fetch_optional_write(self.pool.as_ref())
         .await?;
         row.as_ref()
             .map(QueuedUserSubmissionRecord::try_from_row)
@@ -154,7 +156,7 @@ impl SqliteQueueStore {
             sqlx::query("DELETE FROM queued_items WHERE thread_id = ? AND id = ?")
                 .bind(thread_id.to_string())
                 .bind(item_id)
-                .execute(self.pool.as_ref())
+                .execute_with_busy_retry(self.pool.as_ref())
                 .await?
                 .rows_affected()
                 > 0,
@@ -162,7 +164,7 @@ impl SqliteQueueStore {
     }
 
     pub async fn reorder(&self, thread_id: ThreadId, ordered_ids: &[String]) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT id, queue_order FROM queued_items
              WHERE thread_id = ? ORDER BY queue_order",
@@ -203,7 +205,7 @@ impl SqliteQueueStore {
     pub(crate) async fn delete_thread_queue(&self, thread_id: ThreadId) -> anyhow::Result<bool> {
         Ok(sqlx::query("DELETE FROM queued_items WHERE thread_id = ?")
             .bind(thread_id.to_string())
-            .execute(self.pool.as_ref())
+            .execute_with_busy_retry(self.pool.as_ref())
             .await?
             .rows_affected()
             > 0)

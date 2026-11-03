@@ -1,5 +1,6 @@
 //! Owns approval routing and the choice between cached evidence and a fresh assessment.
 //! Registration does not depend on the async scorer starting successfully.
+//! Tool-linked approvals never reuse a score from a later action.
 
 use super::authorization::ScoreAuthorization;
 use super::config::GuardianV2Config;
@@ -15,8 +16,10 @@ use codex_extension_api::ApprovalDecision;
 use codex_extension_api::ApprovalDecisionInput;
 use codex_extension_api::ApprovalReviewContributor;
 use codex_extension_api::ExtensionFuture;
+use codex_extension_api::ExtensionMetrics;
 use codex_protocol::approvals::GuardianReviewReason;
 use codex_protocol::config_types::ApprovalsReviewer;
+use codex_protocol::mcp::is_node_repl_backed_connector;
 use codex_protocol::openai_models::GuardianModelPolicy;
 use codex_protocol::openai_models::GuardianReviewMode;
 use codex_protocol::openai_models::GuardianScope;
@@ -97,12 +100,20 @@ impl GuardianApprovalReviewer {
         if mode == GuardianReviewMode::Disabled && !input.require_guardian {
             return ApprovalDecision::AskUser;
         }
-        let reason = if mode == GuardianReviewMode::Adaptive && !input.require_fresh_review {
+        let adaptive = mode == GuardianReviewMode::Adaptive && !input.require_fresh_review;
+        if adaptive && let Some(metrics) = input.metrics.as_deref() {
+            metrics.counter("codex.guardian_v2.adaptive_review", /*inc*/ 1, &[]);
+        }
+        let reason = if adaptive {
             match guardian_config.as_ref() {
-                Some(config) => match cached_evidence(thread, input, config, &policy).await {
-                    Ok(()) => return ApprovalDecision::Allow,
-                    Err(reason) => reason,
-                },
+                Some(config) => {
+                    match cached_evidence(thread, input, config, &policy, input.metrics.as_deref())
+                        .await
+                    {
+                        Ok(_) => return ApprovalDecision::Allow,
+                        Err(reason) => reason,
+                    }
+                }
                 None => {
                     record_fast_decision(input.metrics.as_deref(), "deferred", "scoring_failure");
                     GuardianReviewReason::ScoringFailure
@@ -118,22 +129,72 @@ impl GuardianApprovalReviewer {
             ?reason,
             "reviewing approval"
         );
-        match input.synchronous_reviewer.review(reason).await {
+        let async_approval = async {
+            if mode == GuardianReviewMode::Adaptive
+                && !input.require_fresh_review
+                && let Some(config) = guardian_config.as_ref()
+                && let Some(progress) = input.thread_store.get::<GuardianV2ScoreProgress>()
+            {
+                // Subscribe before checking so a concurrently published score is not lost.
+                let mut updates = progress.updates.subscribe();
+                loop {
+                    if let Ok(true) =
+                        cached_evidence(thread, input, config, &policy, /*metrics*/ None).await
+                    {
+                        return;
+                    }
+                    if updates.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            std::future::pending::<()>().await;
+        };
+        if let Some(metrics) = input.metrics.as_deref() {
+            metrics.counter(
+                "codex.guardian.review.route",
+                /*inc*/ 1,
+                &[
+                    (
+                        "route",
+                        if adaptive {
+                            "async_fallback"
+                        } else {
+                            "required_sync"
+                        },
+                    ),
+                    ("reason", reason.into()),
+                ],
+            );
+        }
+        match input
+            .synchronous_reviewer
+            .review(reason, Some(Box::pin(async_approval)))
+            .await
+        {
             Some(decision) => ApprovalDecision::Reviewed(decision),
             None => ApprovalDecision::AskUser,
         }
     }
 }
 
+/// Checks score reuse; the success value says whether it can also release a pending review.
 async fn cached_evidence(
     thread: &CodexThread,
     input: &ApprovalDecisionInput<'_>,
     config: &GuardianV2Config,
     policy: &GuardianModelPolicy,
-) -> Result<(), GuardianReviewReason> {
+    metrics: Option<&dyn ExtensionMetrics>,
+) -> Result<bool, GuardianReviewReason> {
     let store = input.thread_store;
-    let metrics = input.metrics.as_deref();
     let Some(progress) = store.get::<GuardianV2ScoreProgress>() else {
+        if let Some(metrics) = metrics {
+            metrics.counter(
+                "codex.guardian_v2.score_readiness",
+                /*inc*/ 1,
+                &[("ready", "false")],
+            );
+        }
         record_fast_decision(metrics, "deferred", "missing_score");
         return Err(GuardianReviewReason::MissingScore);
     };
@@ -144,12 +205,26 @@ async fn cached_evidence(
         .is_ok_and(|action| action.len().saturating_add(1) <= max_action_bytes);
     let history = thread.conversation_history_snapshot().await;
     let cached = progress.inspect(input.tool_call_id);
+    if let Some(metrics) = metrics {
+        metrics.counter(
+            "codex.guardian_v2.score_readiness",
+            /*inc*/ 1,
+            &[(
+                "ready",
+                if cached.action_risk.is_some() {
+                    "true"
+                } else {
+                    "false"
+                },
+            )],
+        );
+    }
     if !action_fits || cached.oversized {
         record_fast_decision(metrics, "deferred", "scoring_failure");
         return Err(GuardianReviewReason::ScoringFailure);
     }
     let context_mode = GuardianContextMode::from_history(history.as_ref());
-    if context_mode == GuardianContextMode::ThreadOwned {
+    if context_mode != GuardianContextMode::Legacy {
         let sampler = store
             .get::<LunaSampler>()
             .ok_or(GuardianReviewReason::MissingScore)?;
@@ -169,28 +244,50 @@ async fn cached_evidence(
     let action = input.action;
     if input.category == GuardianScope::ComputerUse
         && policy.allows_initial_cua_call()
-        && action.get("tool_name").and_then(serde_json::Value::as_str) == Some("js")
-        && action
-            .get("connector_id")
-            .and_then(serde_json::Value::as_str)
-            == Some("node_repl")
+        && matches!(
+            action.get("tool_name").and_then(serde_json::Value::as_str),
+            Some("js" | "browser_js")
+        )
+        && is_node_repl_backed_connector(
+            action
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            action
+                .get("connector_id")
+                .and_then(serde_json::Value::as_str),
+        )
         && cached.js_executions == 1
     {
         record_fast_decision(metrics, "approved", "initial_cua_call");
-        return Ok(());
+        return Ok(false);
     }
-    let current = ScoreAuthorization::current(thread).await;
+    let Some(permissions) = input.permissions else {
+        record_fast_decision(metrics, "deferred", "permission_resolution_error");
+        return Err(GuardianReviewReason::AuthorizationChanged);
+    };
+    let current = ScoreAuthorization::current(thread, permissions).await;
     // Classification may publish or fail while authorization is collected.
     let cached = progress.inspect(input.tool_call_id);
+    if let Some(metrics) = metrics
+        && let Some(sampled_at) = cached.sampled_at
+    {
+        // Age of the sampled input, including inference time; not time since publication.
+        let age = std::time::SystemTime::now()
+            .duration_since(sampled_at)
+            .unwrap_or_default();
+        metrics.histogram(
+            "codex.guardian_v2.score_age_ms",
+            i64::try_from(age.as_millis()).unwrap_or(i64::MAX),
+            &[],
+        );
+    }
     if cached.oversized {
         record_fast_decision(metrics, "deferred", "scoring_failure");
         return Err(GuardianReviewReason::ScoringFailure);
     }
-    if !current.local.retained_context_complete
-        || current
-            .root
-            .is_some_and(|root| !root.retained_context_complete)
-    {
+    // Root omissions remain visible to the classifier but do not veto a matching cached score.
+    if !current.local.retained_context_complete {
         record_fast_decision(metrics, "deferred", "incomplete_authorization");
         return Err(GuardianReviewReason::Policy);
     }
@@ -225,9 +322,13 @@ async fn cached_evidence(
                     GuardianReviewReason::AuthorizationChanged,
                     "authorization_changed",
                 )
+            } else if input.tool_call_id.is_some() && !cached.score_at_or_before_action {
+                // Apply action ordering to both initial and pending approvals. Intercepted
+                // actions without a tool-call ID retain their existing thread-level checks.
+                (GuardianReviewReason::MissingScore, "missing_score")
             } else {
                 record_fast_decision(metrics, "approved", "low_risk");
-                return Ok(());
+                return Ok(cached.score_at_or_before_action);
             }
         }
         Some(score) if score >= config.review_threshold => {

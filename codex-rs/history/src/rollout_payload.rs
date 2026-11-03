@@ -14,9 +14,18 @@ use super::SessionMetaLine;
 use super::TokenUsageRecord;
 use super::TurnContextItem;
 use super::WorldStateItem;
+use crate::RetainedContextEvent;
+use crate::RetainedUserMessage;
+use codex_protocol::ResponseItemId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+
+const CODE_MODE_DELIVERY_COMPLETE: &str = "codex:code-mode-delivery:v1:complete";
+const CODE_MODE_DELIVERY_INCOMPLETE: &str = "codex:code-mode-delivery:v1:incomplete:";
+const CODE_MODE_DELIVERY_UNAVAILABLE: &str = "The content of a confirmed assistant message is unavailable. Do not infer what was asked or authorized.";
 
 /// Persisted rollout item used by core history and rollout storage.
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -24,6 +33,9 @@ use serde::Serialize;
 pub(super) enum RolloutItemWire<'a> {
     SessionMeta {
         payload: Cow<'a, SessionMetaLine>,
+    },
+    DynamicToolsUpdated {
+        payload: DynamicToolsUpdatedPayload<'a>,
     },
     ResponseItem {
         payload: Cow<'a, ResponseItem>,
@@ -62,11 +74,23 @@ pub(super) enum RolloutItemWire<'a> {
     },
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub(super) struct DynamicToolsUpdatedPayload<'a> {
+    thread_id: codex_protocol::ThreadId,
+    tools: Cow<'a, [codex_protocol::dynamic_tools::DynamicToolSpec]>,
+}
+
 impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
     fn from(item: &'a RolloutItem) -> Self {
         match item {
             RolloutItem::SessionMeta(payload) => Self::SessionMeta {
                 payload: Cow::Borrowed(payload),
+            },
+            RolloutItem::DynamicToolsUpdated { thread_id, tools } => Self::DynamicToolsUpdated {
+                payload: DynamicToolsUpdatedPayload {
+                    thread_id: *thread_id,
+                    tools: Cow::Borrowed(tools),
+                },
             },
             RolloutItem::ResponseItem(envelope) => Self::ResponseItem {
                 payload: Cow::Borrowed(&envelope.item),
@@ -94,6 +118,50 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
             RolloutItem::WorldState(payload) => Self::WorldState {
                 payload: Cow::Borrowed(payload),
             },
+            RolloutItem::RetainedContext(RetainedContextEvent::DeliveredAssistantMessage {
+                message,
+                acceptance_order,
+            }) => {
+                // Earlier clients preserve this as genuine assistant context, including across compaction.
+                let text = if message.complete {
+                    message.text.clone()
+                } else {
+                    CODE_MODE_DELIVERY_UNAVAILABLE.to_owned()
+                };
+                let marker = if message.complete {
+                    CODE_MODE_DELIVERY_COMPLETE.to_owned()
+                } else {
+                    format!("{CODE_MODE_DELIVERY_INCOMPLETE}{}", message.text)
+                };
+                Self::ResponseItem {
+                    payload: Cow::Owned(ResponseItem::Message {
+                        status: None,
+                        encrypted_content: None,
+                        id: message.message_id.clone().map(ResponseItemId::from_server),
+                        role: "assistant".to_owned(),
+                        content: vec![ContentItem::OutputText {
+                            annotations: None,
+                            logprobs: None,
+                            text,
+                        }],
+                        // Older Guardian clients exclude commentary from root-to-worker
+                        // review. Keep the phase unspecified so they can review this
+                        // confirmed delivery without claiming it ended the turn.
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: Some(
+                            InternalChatMessageMetadataPassthrough {
+                                turn_id: Some(message.turn_id.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                    }),
+                    metadata: Some(Cow::Owned(CodexHarnessMetadata {
+                        delivered_assistant_message: Some(marker),
+                        user_input_order: Some(*acceptance_order),
+                        ..Default::default()
+                    })),
+                }
+            }
             RolloutItem::RetainedContext(payload) => Self::RetainedContext {
                 payload: Cow::Borrowed(payload),
             },
@@ -113,8 +181,51 @@ impl<'a> From<&'a RolloutItem> for RolloutItemWire<'a> {
 impl From<RolloutItemWire<'_>> for RolloutItem {
     fn from(item: RolloutItemWire<'_>) -> Self {
         match item {
-            RolloutItemWire::SessionMeta { payload } => Self::SessionMeta(payload.into_owned()),
+            RolloutItemWire::SessionMeta { payload } => {
+                Self::SessionMeta(Box::new(payload.into_owned()))
+            }
+            RolloutItemWire::DynamicToolsUpdated { payload } => Self::DynamicToolsUpdated {
+                thread_id: payload.thread_id,
+                tools: payload.tools.into_owned(),
+            },
             RolloutItemWire::ResponseItem { payload, metadata } => {
+                if let (
+                    ResponseItem::Message {
+                        id,
+                        role,
+                        content,
+                        internal_chat_message_metadata_passthrough: Some(passthrough),
+                        ..
+                    },
+                    Some(metadata),
+                ) = (payload.as_ref(), metadata.as_deref())
+                    && role == "assistant"
+                    && let [ContentItem::OutputText { text, .. }] = content.as_slice()
+                    && let Some(turn_id) = passthrough.turn_id.as_ref()
+                    && let Some(acceptance_order) = metadata.user_input_order
+                    && let Some(marker) = metadata.delivered_assistant_message.as_deref()
+                    && let Some((text, complete)) = if marker == CODE_MODE_DELIVERY_COMPLETE {
+                        Some((text.as_str(), true))
+                    } else {
+                        marker
+                            .strip_prefix(CODE_MODE_DELIVERY_INCOMPLETE)
+                            .map(|text| (text, false))
+                    }
+                {
+                    return Self::RetainedContext(
+                        RetainedContextEvent::DeliveredAssistantMessage {
+                            message: RetainedUserMessage {
+                                origin: crate::UserInputOrigin::User,
+                                turn_id: turn_id.clone(),
+                                message_id: id.as_ref().map(ToString::to_string),
+                                text: text.to_owned(),
+                                complete,
+                                phase: None,
+                            },
+                            acceptance_order,
+                        },
+                    );
+                }
                 Self::ResponseItem(ResponseItemEnvelope {
                     item: payload.into_owned(),
                     metadata: metadata.map(Cow::into_owned),
@@ -128,7 +239,9 @@ impl From<RolloutItemWire<'_>> for RolloutItem {
                     trigger_turn: payload.trigger_turn,
                 }
             }
-            RolloutItemWire::Compacted { payload } => Self::Compacted(payload.into_owned()),
+            RolloutItemWire::Compacted { payload } => {
+                Self::Compacted(Box::new(payload.into_owned()))
+            }
             RolloutItemWire::TurnContext { payload } => Self::TurnContext(payload.into_owned()),
             RolloutItemWire::TokenUsageRecord { payload } => {
                 Self::TokenUsageRecord(payload.into_owned())
@@ -177,6 +290,8 @@ pub(super) struct CompactedItemWire<'a> {
     compaction_response_id: Option<Cow<'a, str>>,
     #[serde(default)]
     latest_token_usage_record: Option<Cow<'a, TokenUsageRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_metadata: Option<Cow<'a, crate::CompactionResumeMetadata>>,
 }
 
 impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
@@ -216,6 +331,7 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
                 .map(|window_id| WindowIdWire::Id(Cow::Borrowed(window_id))),
             compaction_response_id: item.compaction_response_id.as_deref().map(Cow::Borrowed),
             latest_token_usage_record: item.latest_token_usage_record.as_ref().map(Cow::Borrowed),
+            resume_metadata: item.resume_metadata.as_ref().map(Cow::Borrowed),
         }
     }
 }
@@ -281,6 +397,7 @@ impl TryFrom<CompactedItemWire<'_>> for CompactedItem {
             window_id,
             compaction_response_id: item.compaction_response_id.map(Cow::into_owned),
             latest_token_usage_record: item.latest_token_usage_record.map(Cow::into_owned),
+            resume_metadata: item.resume_metadata.map(Cow::into_owned),
         })
     }
 }

@@ -2,7 +2,9 @@ use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AvailablePluginsInstructions;
@@ -27,7 +29,7 @@ impl ContextualUserFragment for AvailablePluginsInstructions {
         )
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let mut lines = vec![
             "## Plugins".to_string(),
             "A plugin is a local bundle of skills, MCP servers, and apps.".to_string(),
@@ -44,6 +46,6 @@ impl ContextualUserFragment for AvailablePluginsInstructions {
                 .to_string(),
         );
 
-        format!("\n{}\n", lines.join("\n"))
+        input_text(format!("\n{}\n", lines.join("\n")))
     }
 }

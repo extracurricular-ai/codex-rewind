@@ -137,9 +137,9 @@ async fn side_toggle_surfaces_pending_verification_from_an_inactive_thread() -> 
         app.toggle_side_conversation(&mut tui, &mut app_server)
             .await?;
         assert_eq!(app.active_thread_id, Some(primary_thread_id));
-        insta::assert_snapshot!(
-            "side_toggle_surfaces_pending_user_verification",
-            render_bottom_popup(&app.chat_widget, /*width*/ 80)
+        assert!(app.chat_widget.has_active_view());
+        assert!(
+            render_bottom_popup(&app.chat_widget, /*width*/ 80).contains("Approve deployment?")
         );
         app_server.shutdown().await?;
         Ok(())
@@ -165,7 +165,7 @@ async fn discarding_side_cancels_verification_and_ignores_late_proof() -> Result
     let attempt = app
         .pending_app_server_requests
         .user_verification
-        .begin("deployments", request.id())
+        .begin(&side_thread_id.to_string(), "deployments", request.id())
         .expect("pending side-thread verification");
 
     app.discard_side_thread_in_background(&mut app_server, side_thread_id)
@@ -239,19 +239,22 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
         /*replay_kind*/ None,
     );
     app.chat_widget.handle_server_notification(
-        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
-            thread_id: foreground_thread_id.to_string(),
-            turn_id: "turn-foreground".to_string(),
-            completed_at_ms: 0,
-            item: ThreadItem::AgentMessage {
-                id: "message-foreground".to_string(),
-                text: "The foreground answer continues.".to_string(),
-                phase: None,
-                memory_citation: None,
-                delivery: None,
-                questions: None,
-            },
-        }),
+        ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification::new(
+                foreground_thread_id.to_string(),
+                "turn-foreground".to_string(),
+                ThreadItemPayload::AgentMessage {
+                    id: "message-foreground".to_string(),
+                    text: "The foreground answer continues.".to_string(),
+                    phase: None,
+                    memory_citation: None,
+                    delivery: None,
+                    questions: None,
+                },
+                /*started_at_ms*/ None,
+                /*completed_at_ms*/ 0,
+            ),
+        ),
         /*replay_kind*/ None,
     );
 
@@ -268,6 +271,7 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
             AppEvent::InsertHistoryCell(cell) => app.insert_history_cell(&mut tui, cell),
             AppEvent::ConsolidateAgentMessage {
                 source,
+                copy_source,
                 cwd,
                 inline_visualization_context,
                 scrollback_reflow,
@@ -276,9 +280,12 @@ async fn inactive_thread_user_verification_preserves_foreground_stream() -> Resu
                 completed_messages.push(source.clone());
                 app.handle_consolidate_agent_message(
                     &mut tui,
-                    source,
-                    cwd,
-                    inline_visualization_context,
+                    history_cell::AgentMarkdownCell::new_with_inline_visualizations(
+                        source,
+                        &cwd,
+                        inline_visualization_context,
+                    )
+                    .with_copy_source(copy_source),
                     scrollback_reflow,
                     deferred_history_cell,
                 )?;

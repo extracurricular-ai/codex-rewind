@@ -1,15 +1,16 @@
 ---
 source: core/tests/suite/scenarios_agent_message_board.rs
-assertion_line: 88
-expression: "context_snapshot::format_context_snapshot(\"An active agent posts a shared decision, receives an ID-only notice, and fetches the text.\",\n&bodies.iter().map(SnapshotEntry::body).collect::<Vec<_>>(), &ContextSnapshotOptions::default().rewrite_known_segments(),)"
+expression: "context_snapshot::format_context_snapshot(\"An active agent describes a channel, lists it, posts a shared decision and reads it without a self-notification.\",\n&bodies.iter().map(SnapshotEntry::body).collect::<Vec<_>>(),\n&ContextSnapshotOptions::default().rewrite_known_segments(),)"
 ---
-Scenario: An active agent posts a shared decision, receives an ID-only notice, and fetches the text.
+Scenario: An active agent describes a channel, lists it, posts a shared decision and reads it without a self-notification.
 
 ## Window 1
 -- request 1 (request) --
 00:message/developer:
-    <PERMISSIONS_INSTRUCTIONS>
+    <MODEL_INSTRUCTIONS>
 01:message/developer:
+    <PERMISSIONS_INSTRUCTIONS>
+02:message/developer:
     You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
     At the start of your turn, you are the active agent.
@@ -26,20 +27,22 @@ Scenario: An active agent posts a shared decision, receives an ID-only notice, a
 
     There are 4 available concurrency slots, meaning that up to 4 agents can be active at once, including you.
 
-    Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d...fork_turns` to `"none"` or a positive integer string. [hash=db3545796947884f]
-02:message/developer:
+    Full-history forks (`fork_turns` omitted or `"all"`) inherit the parent model and reasoning effort and d...uctions; when doing so, set `fork_turns` to `"none"`. [hash=18ccf7e93ecabab9]
+03:message/developer:
     <MULTI_AGENT_MODE>
-03:message/user:
-    <ENVIRONMENT_CONTEXT>
 04:message/user:
-    Record the decision on the board, notify me, and read it.
+    <ENVIRONMENT_CONTEXT>
+05:message/user:
+    Create and describe a design channel, list it, then post and read the decision.
 -- request 2 (request) --
-05:function_call/collaboration.post:{"agents_to_notify":["/root"],"new_channel_name":"design","text":"A shared decision."}
-06:function_call_output:{"author":"/root","channel_name":"design","created_at":"2026-09-18T12:00:00Z","message_id":"<UUID 1>","thread_id":"<UUID 1>"}
-07:message/user:
-    <agent_message_board_notification>
-    New post <UUID 1> in discussion <UUID 1>. Use read_post or read_thread to read it.
-    </agent_message_board_notification>
+06:function_call/collaboration.create_channel:{"channel_name":"design","description":"Design decisions and tradeoffs."}
+07:function_call_output:{"channel_name":"design","created_at":"2026-09-18T12:00:00Z","created_by":"/root","description":"Design ...tradeoffs.","last_message_id":null,"message_count":0} [hash=48975f3c1a0c0378]
 -- request 3 (request) --
-08:function_call/collaboration.search_posts:{"channel_name":"design","query":"decision"}
-09:function_call_output:{"has_more":false,"n_returned":1,"next_cursor":null,"results":[{"author":"/root","channel_name":"design"...ecision.","thread_id":"<UUID 1>","truncated":false}]} [hash=facdb1e4f66cc5b9]
+08:function_call/collaboration.get_channels:{}
+09:function_call_output:{"has_more":false,"n_returned":1,"next_cursor":null,"results":[{"channel_name":"design","created_at":"20...adeoffs.","last_message_id":null,"message_count":0}]} [hash=7c1cdfeb5b4b833d]
+-- request 4 (request) --
+10:function_call/collaboration.post:{"agents_to_notify":["/root"],"channel_name":"design","text":"A shared decision."}
+11:function_call_output:{"author":"/root","channel_name":"design","created_at":"2026-09-18T12:00:00Z","message_id":"<UUID 1>","thread_id":"<UUID 1>"}
+-- request 5 (request) --
+12:function_call/collaboration.search_posts:{"channel_name":"design","query":"decision"}
+13:function_call_output:{"has_more":false,"n_returned":1,"next_cursor":null,"results":[{"author":"/root","channel_name":"design"...ecision.","thread_id":"<UUID 1>","truncated":false}]} [hash=facdb1e4f66cc5b9]

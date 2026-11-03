@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -36,23 +38,46 @@ def _snapshot_targets(root: Path) -> dict[str, dict[str, bytes] | bytes | None]:
     return {str(rel_path): _snapshot_target(root, rel_path) for rel_path in GENERATED_TARGETS}
 
 
-def test_generated_files_are_up_to_date():
-    """Regenerating from repository schemas should leave reviewed artifacts unchanged."""
+@pytest.mark.parametrize("format_output", [True, False])
+def test_generated_files_are_up_to_date(tmp_path, format_output):
+    """Both generation modes preserve the reviewed API, with optional formatting."""
     before = _snapshot_targets(ROOT)
+    sdk = tmp_path / "sdk" / "python"
+    sdk.mkdir(parents=True)
+    for directory in ("src", "scripts"):
+        shutil.copytree(
+            ROOT / directory, sdk / directory, ignore=shutil.ignore_patterns("__pycache__")
+        )
+    for name in ("pyproject.toml", "release_version.py"):
+        shutil.copyfile(ROOT / name, sdk / name)
 
     env = os.environ.copy()
     python_bin = str(Path(sys.executable).parent)
     env["PATH"] = f"{python_bin}{os.pathsep}{env.get('PATH', '')}"
 
+    command = [
+        sys.executable,
+        "scripts/update_sdk_artifacts.py",
+        "generate-types",
+        "--schema-dir",
+        str(ROOT.parents[1] / "codex-rs/app-server-protocol/schema/json"),
+    ]
+    if not format_output:
+        command.append("--no-format")
     subprocess.run(
-        [sys.executable, "scripts/update_sdk_artifacts.py", "generate-types"],
-        cwd=ROOT,
+        command,
+        cwd=sdk,
         check=True,
         env=env,
     )
 
-    after = _snapshot_targets(ROOT)
-    assert before == after, "Generated files drifted after regeneration"
+    after = _snapshot_targets(sdk)
+    if format_output:
+        assert before == after, "Generated files drifted after regeneration"
+    else:
+        assert [ast.dump(ast.parse((ROOT / path).read_bytes())) for path in GENERATED_TARGETS] == [
+            ast.dump(ast.parse((sdk / path).read_bytes())) for path in GENERATED_TARGETS
+        ]
 
 
 @pytest.mark.parametrize("mode", ["repository", "scratch", "experimental"])
@@ -94,3 +119,26 @@ def test_schema_generation_failure_does_not_update_python(monkeypatch):
     with pytest.raises(subprocess.CalledProcessError):
         runpy.run_path(str(script), run_name="__main__")
     assert calls == ["cargo"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "modelProviderNotConfigured", "modelProvider": "old-provider"},
+        {
+            "type": "modelProviderMismatch",
+            "modelProvider": "old-provider",
+            "currentModelProvider": "current-provider",
+        },
+        {
+            "type": "modelProviderPolicyConflict",
+            "modelProvider": "old-provider",
+            "requiredModelProvider": "required-provider",
+        },
+    ],
+)
+def test_model_provider_errors_round_trip_wire_names(payload):
+    from openai_codex.generated.v2_all import ModelProviderError
+
+    error = ModelProviderError.model_validate(payload)
+    assert error.model_dump(by_alias=True) == payload

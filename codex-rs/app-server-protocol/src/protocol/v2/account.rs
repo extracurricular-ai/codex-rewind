@@ -33,6 +33,8 @@ pub enum Account {
         )]
         email: Option<String>,
         plan_type: PlanType,
+        /// Display name of the selected ChatGPT workspace, when available.
+        workspace_name: Option<String>,
     },
 
     #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
@@ -41,18 +43,28 @@ pub enum Account {
         #[serde(default)]
         uses_codex_managed_credentials: bool,
     },
+
+    /// Google Cloud Vertex AI with externally managed credentials.
+    #[serde(rename = "gcp", rename_all = "camelCase")]
+    #[ts(rename = "gcp", rename_all = "camelCase")]
+    Gcp {},
 }
 
 impl From<ProviderAccount> for Account {
     fn from(account: ProviderAccount) -> Self {
         match account {
             ProviderAccount::ApiKey => Self::ApiKey {},
-            ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt { email, plan_type },
+            ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt {
+                email,
+                plan_type,
+                workspace_name: None,
+            },
             ProviderAccount::AmazonBedrock {
                 uses_codex_managed_credentials,
             } => Self::AmazonBedrock {
                 uses_codex_managed_credentials,
             },
+            ProviderAccount::Gcp => Self::Gcp {},
         }
     }
 }
@@ -215,8 +227,26 @@ pub struct AccountSessionsLogoutParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct AccountSessionsSwitchParams {
+    /// Opaque active-login identifier returned by accountSession/list.
     pub session_id: String,
+    /// Workspace to select within that login; this is not a user identifier.
     pub account_id: String,
+    /// Allow Core to start browser sign-in if this session needs SSO for the workspace.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional, as = "Option<bool>")]
+    pub allow_browser_login: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(untagged, rename_all_fields = "camelCase")]
+#[ts(untagged, rename_all_fields = "camelCase", export_to = "v2/")]
+pub enum AccountSessionsSwitchResponse {
+    Switched {
+        #[serde(flatten)]
+        sessions: AccountSessionsResponse,
+    },
+    /// Open the URL and await account/login/completed for this login ID.
+    BrowserLogin { login_id: String, auth_url: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -589,6 +619,62 @@ pub struct AccountUpdatedNotification {
     pub auth_mode: Option<AuthMode>,
     pub plan_type: Option<PlanType>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/", rename_all = "camelCase")]
+pub enum GatewayOAuthStatus {
+    NotReady,
+    Started,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthChangedNotification {
+    /// Authorization handoff, sent only to the connection that started login.
+    pub auth_url: Option<String>,
+    pub provider_id: String,
+    pub status: GatewayOAuthStatus,
+    pub error: Option<String>,
+}
+
+impl std::fmt::Debug for GatewayOAuthChangedNotification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayOAuthChangedNotification")
+            .field("auth_url", &self.auth_url.as_ref().map(|_| "[REDACTED]"))
+            .field("provider_id", &self.provider_id)
+            .field("status", &self.status)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+/// Current effective gateway policy and credential readiness; never contains credentials.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthReadResponse {
+    pub provider_id: String,
+    pub provider_name: String,
+    /// Whether the selected provider uses gateway OAuth, even when already signed in.
+    pub required: bool,
+    /// Null when the effective provider does not use gateway OAuth.
+    pub status: Option<GatewayOAuthStatus>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthLoginResponse {}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct GatewayOAuthCancelResponse {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

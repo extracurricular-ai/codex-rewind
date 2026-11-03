@@ -3,7 +3,7 @@ description: Run argument-comment-lint on codex-rs via Bazel.
 
 inputs:
   target:
-    description: Runner target passed to setup-bazel-ci.
+    description: Runner target passed to prepare-bazel-ci.
     required: true
   buildbuddy-api-key:
     description: BuildBuddy API key used by Bazel CI.
@@ -13,9 +13,10 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/setup-bazel-ci
+    - uses: ./.github/actions/prepare-bazel-ci
       with:
         target: ${{ inputs.target }}
+        cache-scope: bazel-argument-comment-lint
 
     - name: Install Linux sandbox build dependencies
       if: ${{ runner.os == 'Linux' }}
@@ -23,6 +24,15 @@ runs:
       run: |
         sudo DEBIAN_FRONTEND=noninteractive apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends pkg-config libcap-dev
+
+    - name: Resolve app-server/exec-server compatibility releases
+      if: ${{ runner.os == 'Linux' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |
+        releases="$(python3 .github/scripts/resolve_exec_server_releases.py)"
+        echo "CODEX_COMPAT_RELEASES=$releases" >> "$GITHUB_ENV"
 
     - name: Run argument comment lint on codex-rs via Bazel
       if: ${{ runner.os != 'Windows' }}

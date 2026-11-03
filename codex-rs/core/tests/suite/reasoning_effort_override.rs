@@ -17,6 +17,7 @@ use codex_login::CodexAuth;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::Op;
@@ -46,10 +47,6 @@ fn override_builder() -> TestCodexBuilder {
             model.supports_reasoning_effort_updates = true;
         })
         .with_config(|config| {
-            config
-                .features
-                .enable(Feature::ReasoningEffortOverride)
-                .expect("enable reasoning effort overrides");
             config.model_reasoning_effort = Some(ReasoningEffort::Medium);
         })
 }
@@ -75,6 +72,209 @@ fn message(role: &str, text: &str) -> Value {
         "role": role,
         "content": [{"type": "input_text", "text": text}],
     })
+}
+
+pub(super) async fn prediction_fork_requests() -> anyhow::Result<Vec<ResponsesRequest>> {
+    let server = responses::start_mock_server().await;
+    let mut mocks = Vec::new();
+    for id in ["parent-high", "parent-low", "child-medium", "parent-medium"] {
+        mocks.push(
+            responses::mount_sse_once(
+                &server,
+                responses::sse(vec![
+                    responses::ev_reasoning_item(
+                        &format!("reasoning-{id}"),
+                        &["Keep the existing context."],
+                        &["Continue from the previous response."],
+                    ),
+                    responses::ev_assistant_message(&format!("answer-{id}"), "Ready to continue."),
+                    responses::ev_completed(id),
+                ]),
+            )
+            .await,
+        );
+    }
+    let mut test = override_builder()
+        .with_config(|config| {
+            config.workspace_roots = vec![config.cwd.clone()];
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            // The child's first turn must preserve the pin even without startup prewarm.
+            config.model_provider.supports_websockets = false;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_text_turn("first parent turn").await?;
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            effort: Some(Some(ReasoningEffort::Low)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.submit_text_turn("second parent turn").await?;
+    let parent = Arc::clone(&test.codex);
+    parent.flush_rollout().await?;
+    let (mut options, settings) = test
+        .thread_manager
+        .fork_options_from_parent(test.session_configured.thread_id)
+        .await?;
+    options.config.ephemeral = true;
+    options.thread_source = Some(ThreadSource::Feature("composer_predictions".to_string()));
+    let child = test
+        .thread_manager
+        .fork_legacy_thread(
+            ForkSnapshot::Interrupted,
+            options,
+            parent.rollout_path().expect("parent rollout path"),
+        )
+        .await?;
+    child.thread.restore_thread_settings(settings).await?;
+    assert_eq!(
+        child.thread.config_snapshot().await.collaboration_mode,
+        parent.config_snapshot().await.collaboration_mode,
+    );
+    for thread in [child.thread, parent] {
+        test.codex = thread;
+        submit_thread_settings(
+            &test.codex,
+            ThreadSettingsOverrides {
+                effort: Some(Some(ReasoningEffort::Medium)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        test.submit_text_turn("continue identically").await?;
+    }
+    let requests = mocks
+        .iter()
+        .map(responses::ResponseMock::single_request)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.body_json()["reasoning"]["effort"].clone())
+            .collect::<Vec<_>>(),
+        vec![Value::from("high"); 4],
+    );
+    assert_eq!(
+        effort_updates(&requests[2]),
+        vec![
+            effort_update(ReasoningEffort::High),
+            effort_update(ReasoningEffort::Low),
+            effort_update(ReasoningEffort::Medium),
+        ],
+    );
+    let comparable = |index: usize| {
+        let mut body = requests[index].body_json();
+        body.as_object_mut()
+            .expect("request body")
+            .remove("client_metadata");
+        responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(body))
+    };
+    assert_eq!(comparable(2), comparable(3));
+    Ok(requests)
+}
+
+#[test_case(Some(ReasoningEffort::Low); "selected effort")]
+#[test_case(None; "model default")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prediction_fork_pins_effort_from_parent_with_overrides_disabled(
+    parent_effort: Option<ReasoningEffort>,
+) -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mock = responses::mount_sse_sequence(
+        &server,
+        ["parent-high", "parent-low", "child-medium"]
+            .into_iter()
+            .map(|id| responses::sse(vec![responses::ev_completed(id)]))
+            .collect(),
+    )
+    .await;
+    let mut test = test_codex()
+        .with_model_info_override("gpt-5.4", |model| {
+            model.use_responses_lite = true;
+            model.supports_reasoning_effort_updates = true;
+            model.default_reasoning_level = Some(ReasoningEffort::Low);
+        })
+        .with_config(|config| {
+            config
+                .features
+                .disable(Feature::ReasoningEffortOverride)
+                .expect("disable reasoning effort overrides");
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            config.model_provider.supports_websockets = false;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_text_turn("first parent turn").await?;
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            effort: Some(parent_effort),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.submit_text_turn("second parent turn").await?;
+    test.codex.flush_rollout().await?;
+    let (mut options, settings) = test
+        .thread_manager
+        .fork_options_from_parent(test.session_configured.thread_id)
+        .await?;
+    options.config.ephemeral = true;
+    options
+        .config
+        .features
+        .enable(Feature::ReasoningEffortOverride)?;
+    options.thread_source = Some(ThreadSource::Feature("composer_predictions".to_string()));
+    let child = test
+        .thread_manager
+        .fork_legacy_thread(
+            ForkSnapshot::Interrupted,
+            options,
+            test.codex.rollout_path().expect("parent rollout path"),
+        )
+        .await?;
+    child.thread.restore_thread_settings(settings).await?;
+    test.codex = child.thread;
+    submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            effort: Some(Some(ReasoningEffort::Medium)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.submit_text_turn("child turn").await?;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].body_json()["reasoning"]["effort"], "high");
+    assert_eq!(requests[1].body_json()["reasoning"]["effort"], "low");
+    assert!(effort_updates(&requests[1]).is_empty());
+    assert_eq!(
+        effort_updates(&requests[2]),
+        vec![effort_update(ReasoningEffort::Medium)],
+    );
+    let comparable = |index: usize| {
+        let mut body = requests[index].body_json();
+        body.as_object_mut()
+            .expect("request body")
+            .remove("client_metadata");
+        responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(body))
+    };
+    let parent = comparable(1);
+    let mut child = comparable(2);
+    let child_input = child["input"].as_array_mut().expect("child input");
+    assert_eq!(
+        child_input.pop(),
+        Some(effort_update(ReasoningEffort::Medium))
+    );
+    assert_eq!(child_input.pop(), Some(message("user", "child turn")));
+    assert_eq!(child, parent);
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,7 +343,7 @@ async fn worker_reasoning_overrides_follow_effective_client_policy(
     options.thread_source = Some(thread_source);
     let forked = test
         .thread_manager
-        .fork_thread(
+        .fork_legacy_thread(
             ForkSnapshot::Interrupted,
             options,
             parent.rollout_path().expect("parent rollout path"),
@@ -239,8 +439,12 @@ async fn worker_reasoning_overrides_follow_effective_client_policy(
     Ok(())
 }
 
+#[test_case(ReasoningEffort::High; "same effort")]
+#[test_case(ReasoningEffort::Medium; "changed effort")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_effort_override_recovery_reuses_trusted_tail_update() -> anyhow::Result<()> {
+async fn reasoning_effort_override_recovery_sends_latest_tail_update(
+    effort: ReasoningEffort,
+) -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     // Keep the turn active without allowing any model output after the update.
@@ -265,7 +469,7 @@ async fn reasoning_effort_override_recovery_reuses_trusted_tail_update() -> anyh
             text_elements: Vec::new(),
         }]))
         .await?;
-    let TurnInputSubmission::Started { turn_id } = submission else {
+    let TurnInputSubmission::Started { turn_id, .. } = submission else {
         panic!("expected a new turn");
     };
     wait_for_event(&test.codex, |event| {
@@ -309,28 +513,159 @@ async fn reasoning_effort_override_recovery_reuses_trusted_tail_update() -> anyh
             .codex
             .recover_turn_if_idle(RecoverTurnRequest {
                 turn_id: turn_id.clone(),
-                thread_settings: Default::default(),
+                thread_settings: ThreadSettingsOverrides {
+                    effort: Some(Some(effort.clone())),
+                    ..Default::default()
+                },
                 trace: None,
                 cyber_access_program: None,
             })
             .await?,
-        StartIfIdleSubmission::Started { turn_id },
+        StartIfIdleSubmission::Started {
+            root_turn_id: turn_id.clone(),
+            turn_id
+        },
     );
     wait_for_event(&resumed.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
 
+    let history_efforts = resumed
+        .codex
+        .conversation_history_snapshot()
+        .await
+        .items()
+        .filter_map(|item| match item {
+            ResponseItem::ConfigurationUpdate { reasoning } => Some(reasoning.effort.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut expected_history_efforts = vec![ReasoningEffort::High];
+    if effort != ReasoningEffort::High {
+        expected_history_efforts.push(effort.clone());
+    }
+    assert_eq!(history_efforts, expected_history_efforts);
+
     let request = mock.single_request();
     assert_eq!(
         effort_updates(&request),
-        vec![effort_update(ReasoningEffort::High)]
+        vec![effort_update(effort.clone())]
     );
+    assert_eq!(request.input().last(), Some(&effort_update(effort.clone())));
     assert_eq!(
-        request.input().last(),
-        Some(&effort_update(ReasoningEffort::High))
+        request.body_json()["reasoning"]["effort"],
+        serde_json::to_value(effort)?
     );
-    assert_eq!(request.body_json()["reasoning"]["effort"], "high");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_effort_override_capacity_retry_keeps_latest_adjacent_update()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let first = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("first")]),
+    )
+    .await;
+    let failed = responses::mount_response_once(
+        &server,
+        ResponseTemplate::new(503)
+            .set_body_json(serde_json::json!({"error": {"code": "server_is_overloaded"}})),
+    )
+    .await;
+    let retried = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![responses::ev_completed("retried")]),
+    )
+    .await;
+    let test = override_builder()
+        .with_config(|config| {
+            config.model_provider.supports_websockets = false;
+            config.model_provider.request_max_retries = Some(0);
+            config.model_provider.stream_max_retries = Some(0);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    test.submit_text_turn("establish medium").await?;
+    assert_eq!(
+        effort_updates(&first.single_request()),
+        [effort_update(ReasoningEffort::Medium)]
+    );
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "try high".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                effort: Some(Some(ReasoningEffort::High)),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let completed = wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let EventMsg::TurnComplete(completed) = completed else {
+        unreachable!("waited for turn completion");
+    };
+    assert_eq!(
+        completed.error.and_then(|error| error.codex_error_info),
+        Some(CodexErrorInfo::ServerOverloaded)
+    );
+
+    // The app's capacity Retry action uses current settings without adding a user message.
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(Vec::new()).with_thread_settings(
+                ThreadSettingsOverrides {
+                    effort: Some(Some(ReasoningEffort::Medium)),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let request = retried.single_request();
+    let mut expected = failed.single_request().input();
+    assert_eq!(expected.pop(), Some(effort_update(ReasoningEffort::High)));
+    expected.push(effort_update(ReasoningEffort::Medium));
+    assert_eq!(request.input(), expected);
+    assert_eq!(request.body_json()["reasoning"]["effort"], "medium");
+    assert_eq!(
+        effort_updates(&request),
+        vec![effort_update(ReasoningEffort::Medium); 2]
+    );
+    let saved_updates = test
+        .codex
+        .load_history(/*include_archived*/ false)
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItemEnvelope {
+                item: item @ ResponseItem::ConfigurationUpdate { .. },
+                ..
+            }) => Some(serde_json::to_value(item).expect("serialize saved update")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        saved_updates,
+        [
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Medium
+        ]
+        .map(effort_update)
+    );
     Ok(())
 }
 
@@ -619,7 +954,7 @@ async fn reasoning_effort_override_websocket_prewarm_preserves_baseline(
             configure_prewarm(&mut config);
             let forked = previous
                 .thread_manager
-                .fork_thread(
+                .fork_legacy_thread(
                     ForkSnapshot::Interrupted,
                     codex_core::StartThreadOptions::new(config.clone()),
                     previous.codex.rollout_path().expect("rollout path"),
@@ -697,6 +1032,14 @@ async fn reasoning_effort_override_websocket_appends_then_replays_after_reconnec
                 responses::ev_response_created("changed"),
                 responses::ev_completed("changed"),
             ],
+            vec![
+                responses::ev_response_created("coalesced"),
+                responses::ev_completed("coalesced"),
+            ],
+            vec![
+                responses::ev_response_created("continued"),
+                responses::ev_completed("continued"),
+            ],
         ],
         vec![vec![
             responses::ev_response_created("replayed"),
@@ -728,15 +1071,35 @@ async fn reasoning_effort_override_websocket_appends_then_replays_after_reconnec
     )
     .await?;
     test.submit_text_turn("changed effort").await?;
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(Vec::new()).with_thread_settings(
+                ThreadSettingsOverrides {
+                    effort: Some(Some(ReasoningEffort::Low)),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_text_turn("unchanged effort after coalescing")
+        .await?;
     test.submit_text_turn("unchanged effort after reconnect")
         .await?;
 
     let connections = websocket.connections();
-    assert_eq!(connections.iter().map(Vec::len).collect::<Vec<_>>(), [3, 1]);
+    assert_eq!(connections.iter().map(Vec::len).collect::<Vec<_>>(), [5, 1]);
     let first = connections[0][1].body_json();
     let changed = connections[0][2].body_json();
+    let coalesced = connections[0][3].body_json();
+    let continued = connections[0][4].body_json();
     let replayed = connections[1][0].body_json();
     assert_eq!(changed["previous_response_id"], "first");
+    assert_eq!(coalesced.get("previous_response_id"), None);
+    assert_eq!(continued["previous_response_id"], "coalesced");
     assert_eq!(replayed.get("previous_response_id"), None);
     assert_eq!(
         responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(
@@ -747,23 +1110,28 @@ async fn reasoning_effort_override_websocket_appends_then_replays_after_reconnec
             effort_update(ReasoningEffort::High),
         ])
     );
+    for full_request in [&coalesced, &replayed] {
+        assert_eq!(
+            full_request["input"]
+                .as_array()
+                .expect("full input")
+                .iter()
+                .filter(|item| item["type"] == "configuration_update")
+                .cloned()
+                .collect::<Vec<_>>(),
+            [effort_update(ReasoningEffort::Low)]
+        );
+    }
     assert_eq!(
-        replayed["input"]
-            .as_array()
-            .expect("replayed input")
-            .iter()
-            .filter(|item| item["type"] == "configuration_update")
-            .cloned()
-            .collect::<Vec<_>>(),
-        [effort_update(ReasoningEffort::High)]
+        responses::strip_response_item_ids_from_json(responses::strip_metadata_from_json(
+            continued["input"].clone()
+        )),
+        serde_json::json!([message("user", "unchanged effort after coalescing")]),
     );
     assert_eq!(
-        [&first, &changed, &replayed].map(|body| body["reasoning"]["effort"].clone()),
-        [
-            Value::from("medium"),
-            Value::from("medium"),
-            Value::from("medium")
-        ]
+        [&first, &changed, &coalesced, &continued, &replayed]
+            .map(|body| body["reasoning"]["effort"].clone()),
+        ["medium"; 5].map(Value::from),
     );
     websocket.shutdown().await;
     Ok(())

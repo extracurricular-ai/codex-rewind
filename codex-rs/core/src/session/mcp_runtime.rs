@@ -9,12 +9,15 @@ use super::*;
 use crate::mcp::McpRuntimeProjection;
 use codex_config::McpServerDisabledReason;
 use codex_config::McpServerTransportConfig;
+use codex_file_system::WindowsSandboxSelection;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpServerRegistration;
 use codex_mcp::McpServerSource;
 use codex_mcp::McpStartupPolicy;
 use codex_mcp::PreparedMcpCall;
+use codex_mcp::ToolInfo;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use std::collections::HashSet;
 
@@ -36,6 +39,7 @@ impl Session {
         next: &SessionConfiguration,
     ) -> bool {
         current.cwd() != next.cwd()
+            || current.runtime_workspace_roots != next.runtime_workspace_roots
             || current.step_settings.approval_policy.value()
                 != next.step_settings.approval_policy.value()
             || current.step_settings.approvals_reviewer != next.step_settings.approvals_reviewer
@@ -55,15 +59,13 @@ impl Session {
     /// Captures this session's current MCP client and catalog for one tool call.
     pub(crate) async fn prepare_mcp_call(
         self: &Arc<Self>,
-        server: &str,
-        tool: &str,
+        advertised_tool: &ToolInfo,
     ) -> Option<PreparedMcpCall> {
         self.refresh_mcp_if_dirty().await;
         self.services
             .mcp_runtime
-            .current_binding_for_call(server)
-            .await?
-            .prepare_call(server, tool)
+            .prepare_call(advertised_tool)
+            .await
     }
 
     pub(super) async fn latest_mcp_desired_state(
@@ -78,19 +80,9 @@ impl Session {
                 state.active_disabled_plugin_ids.clone(),
             )
         };
-        let cwd = environments
-            .primary()
-            .and_then(|environment| environment.cwd().to_abs_path().ok())
-            .unwrap_or_else(|| session_configuration.cwd().clone());
-        let config = self.build_per_turn_config(
-            &session_configuration,
-            cwd,
-            environments.primary_workspace_roots(),
-        );
-        let local_process_cwd = environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let config =
+            self.build_per_turn_config(&session_configuration, environments.local_selection());
+        let local_process_cwd = config.cwd.to_path_buf();
 
         McpDesiredState {
             config: Arc::new(config),
@@ -110,19 +102,12 @@ impl Session {
         auth: Option<CodexAuth>,
         mcp_projection: McpRuntimeProjection,
         resolved_environments: &TurnEnvironmentSnapshot,
-        mcp_runtime_cwd: PathBuf,
     ) -> anyhow::Result<()> {
-        let cwd = AbsolutePathBuf::from_absolute_path(mcp_runtime_cwd)
-            .unwrap_or_else(|_| session_configuration.cwd().clone());
         let config = self.build_per_turn_config(
             session_configuration,
-            cwd,
-            resolved_environments.primary_workspace_roots(),
+            resolved_environments.local_selection(),
         );
-        let local_process_cwd = resolved_environments
-            .local_environment_cwd()
-            .unwrap_or_else(|| session_configuration.cwd().clone())
-            .to_path_buf();
+        let local_process_cwd = config.cwd.to_path_buf();
         let desired = McpDesiredState {
             config: Arc::new(config),
             auth,
@@ -156,7 +141,13 @@ impl Session {
         mut projection: McpRuntimeProjection,
     ) -> BoxFuture<'a, McpRuntimeProjection> {
         Box::pin(async move {
-            if self.isolation == codex_extension_api::SessionIsolation::Isolated {
+            if self.isolation == codex_extension_api::SessionIsolation::Isolated
+                || self
+                    .services
+                    .mcp_thread_init
+                    .get::<crate::mcp::McpServersDisabled>()
+                    .is_some()
+            {
                 return projection;
             }
 
@@ -263,7 +254,7 @@ impl Session {
                     registered.insert(name.clone());
                     catalog
                         .get_or_insert_with(|| projection.config.mcp_server_catalog.to_builder())
-                        .register(McpServerRegistration::from_config(name, server));
+                        .register(McpServerRegistration::from_executor_config(name, server));
                 }
             }
 
@@ -301,7 +292,9 @@ impl Session {
             ready_selected_capability_roots,
             elicitation_reviewer,
         );
-        self.services.mcp_runtime.replace(input).await;
+        AuthStorageOriginator::from_client_name(&desired.originator)
+            .scope(self.services.mcp_runtime.replace(input))
+            .await;
         self.services.thread_extension_data.insert(selected_plugins);
     }
 
@@ -335,6 +328,25 @@ impl Session {
             .environment_cwds
             .entry(codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
             .or_insert_with(|| PathUri::from_abs_path(&desired.config.cwd));
+        config.environment_use_mxc = desired
+            .environments
+            .turn_environments()
+            .map(|environment| {
+                (
+                    environment.selection.environment_id.clone(),
+                    environment.windows_sandbox_selection_for_turn_metadata()
+                        == WindowsSandboxSelection::Mxc,
+                )
+            })
+            .collect();
+        config
+            .environment_use_mxc
+            .entry(codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string())
+            .or_insert(
+                cfg!(windows)
+                    && desired.config.effective_local_windows_sandbox_type()
+                        == SandboxType::WindowsMxc,
+            );
         let mcp_servers = effective_mcp_servers(&config, auth.as_ref());
         config.set_server_permission_profiles(
             &mcp_servers,
@@ -346,15 +358,10 @@ impl Session {
             }),
         );
         let mcp_config = Arc::new(config);
-        let runtime_context = McpRuntimeContext::new(
-            self.services.turn_environments.environment_manager(),
-            desired.local_process_cwd.clone(),
-        )
-        .with_selected_environments(
-            desired.environments.all_selections().into(),
-            desired.environments.ready_environment_handles(),
-        );
+        let runtime_context =
+            self.mcp_runtime_context(&desired.environments, &desired.local_process_cwd);
         McpRuntimeInput {
+            network_policy_metadata: None,
             startup_policy: if matches!(desired.session_source, SessionSource::SubAgent(_)) {
                 McpStartupPolicy::LazyWhenCached
             } else {

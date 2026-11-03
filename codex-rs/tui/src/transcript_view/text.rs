@@ -4,6 +4,7 @@
 //! lines introduce hard breaks. Display wrapping and synthetic controls never enter `text`.
 //! Layout offsets use `usize`; terminal coordinates are narrowed only for visible rows.
 //! Disclosure controls follow their activity's source text without changing its indentation.
+//! Selected hard breaks on nonempty rows highlight one trailing cell when space permits.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -40,13 +41,15 @@ use logical::logical_lines;
 use ratatui::text::Line;
 
 /// One cell's logical text and its width-dependent display rows.
-pub(super) struct TextLayout {
+pub(crate) struct TextLayout {
+    pub(super) image: Option<std::sync::Arc<crate::transcript_image::TranscriptImage>>,
     logical: Vec<LogicalLine>,
     text: String,
     rows: Vec<TextRow>,
     width: u16,
     pub(super) separated: bool,
     pub(super) disclosure: bool,
+    leading_blank_hidden: bool,
     disclosure_control: Option<DisclosureControl>,
 }
 
@@ -59,6 +62,8 @@ struct DisclosureControl {
 struct TextRow {
     line: HyperlinkLine,
     source: Range<usize>,
+    /// Source offset at the logical line end; absent on soft wraps and synthetic rows.
+    line_end: Option<usize>,
     content_width: u16,
     first_column: usize,
     prefix_columns: usize,
@@ -66,9 +71,89 @@ struct TextRow {
 }
 
 impl TextLayout {
-    pub(super) fn new(lines: Vec<HyperlinkLine>, width: u16) -> Self {
+    pub(super) fn copy_block_ranges(&self) -> Vec<(Range<usize>, &'static str, Option<String>)> {
+        let mut ranges = Vec::new();
+        for (label, code) in [("Code block", true), ("Blockquote", false)] {
+            let mut active: Option<(Range<usize>, Option<std::sync::Arc<str>>)> = None;
+            let mut offset = 0;
+            for line in &self.logical {
+                let end = offset + line.origin.range.len();
+                let metadata = line.origin.copy.as_deref();
+                let matches = metadata.is_some_and(|copy| {
+                    if code {
+                        copy.code || copy.code_source.is_some()
+                    } else {
+                        copy.prefix.contains('>')
+                    }
+                });
+                if matches {
+                    let source = metadata.and_then(|copy| {
+                        if code {
+                            copy.code_source.as_ref()
+                        } else {
+                            copy.quote_source.as_ref()
+                        }
+                    });
+                    // Shared source identity survives wrapping and separates adjacent blocks,
+                    // including equal payloads. A list marker can precede the first source row.
+                    if let Some(source) = source
+                        && active
+                            .as_ref()
+                            .and_then(|(_, retained)| retained.as_ref())
+                            .is_some_and(|retained| !std::sync::Arc::ptr_eq(retained, source))
+                        && let Some((range, retained)) = active.take()
+                    {
+                        ranges.push((range, label, retained.map(|source| source.to_string())));
+                    }
+                    let (range, retained) = active.get_or_insert((offset..end, None));
+                    range.end = end;
+                    if retained.is_none() {
+                        *retained = source.cloned();
+                    }
+                } else if let Some((range, source)) = active.take() {
+                    ranges.push((range, label, source.map(|source| source.to_string())));
+                }
+                offset = end + 1;
+            }
+            if let Some((range, source)) = active {
+                ranges.push((range, label, source.map(|source| source.to_string())));
+            }
+        }
+        ranges.retain(|(range, _, _)| {
+            self.text
+                .get(range.clone())
+                .is_some_and(|text| !text.trim().is_empty())
+        });
+        ranges
+    }
+
+    pub(crate) fn new(lines: Vec<HyperlinkLine>, width: u16) -> Self {
         let logical = logical_lines(&lines);
         Self::from_logical(logical, width)
+    }
+
+    /// Freeze the exact painted rows of a plain-text viewport, including tab stops.
+    /// Trim the selectable source so word and keyboard selection stay inside the viewport.
+    pub(crate) fn visible_plaintext(mut self, start: usize, height: u16) -> Self {
+        if start == 0 && self.rows.len() <= usize::from(height) {
+            return self;
+        }
+        self.rows.truncate(start + usize::from(height));
+        self.rows.drain(..start.min(self.rows.len()));
+        let from = self.rows.first().map_or(0, |row| row.source.start);
+        let to = self.rows.last().map_or(from, |row| row.source.end);
+        self.text = self.text[from..to].to_owned();
+        let lines = self
+            .text
+            .split('\n')
+            .map(|line| line.to_owned().into())
+            .collect::<Vec<_>>();
+        self.logical = logical_lines(&lines);
+        for row in &mut self.rows {
+            row.source = row.source.start - from..row.source.end - from;
+            row.line_end = row.line_end.map(|end| end.min(to) - from);
+        }
+        self
     }
 
     /// Reflow the same displayed content revision, retaining styles, links and disclosure label.
@@ -77,6 +162,10 @@ impl TextLayout {
         if let Some(control) = &self.disclosure_control {
             layout =
                 layout.with_disclosure_control_at(control.label.clone(), control.source_offset);
+        }
+        layout.image = self.image.clone();
+        if self.leading_blank_hidden {
+            layout = layout.without_leading_blank_row();
         }
         if self.separated {
             layout.with_leading_separator()
@@ -121,6 +210,7 @@ impl TextLayout {
             TextRow {
                 line: HyperlinkLine::from(line),
                 source: source_offset..source_offset,
+                line_end: None,
                 content_width: self.width,
                 first_column: indent,
                 prefix_columns: indent,
@@ -138,12 +228,38 @@ impl TextLayout {
 
     /// Add visual spacing between entries without changing any source position.
     pub(super) fn with_leading_separator(mut self) -> Self {
-        if !self.separated && !self.rows.is_empty() {
+        if !self.separated {
+            self = self.with_leading_spacer();
+            self.separated = !self.rows.is_empty();
+        }
+        self
+    }
+
+    /// Hide one leading blank row without changing selectable source offsets.
+    pub(super) fn without_leading_blank_row(mut self) -> Self {
+        if self
+            .rows
+            .first()
+            .is_some_and(|row| line_width(&row.line.line) == 0)
+        {
+            self.rows.remove(/*index*/ 0);
+            self.leading_blank_hidden = true;
+            if let Some(control) = &mut self.disclosure_control {
+                control.row = control.row.saturating_sub(/*rhs*/ 1);
+            }
+        }
+        self
+    }
+
+    /// Reserve one presentation-only row before existing spacing and source text.
+    pub(super) fn with_leading_spacer(mut self) -> Self {
+        if !self.rows.is_empty() {
             self.rows.insert(
                 /*index*/ 0,
                 TextRow {
                     line: HyperlinkLine::from(""),
                     source: 0..0,
+                    line_end: None,
                     content_width: self.width,
                     first_column: 0,
                     prefix_columns: 0,
@@ -153,7 +269,6 @@ impl TextLayout {
             if let Some(control) = &mut self.disclosure_control {
                 control.row += 1;
             }
-            self.separated = true;
         }
         self
     }
@@ -174,12 +289,54 @@ impl TextLayout {
         }
     }
 
+    pub(super) fn copy_lines(
+        &self,
+        range: Range<usize>,
+        separator: &str,
+        output: &mut Vec<crate::markdown_copy::SelectedLine>,
+    ) {
+        let mut offset = 0;
+        for (index, line) in self.logical.iter().enumerate() {
+            let end = offset + line.origin.range.len();
+            if range.start <= end && range.end >= offset {
+                let selected = line.origin.range.start + range.start.saturating_sub(offset)
+                    ..line.origin.range.start + range.end.min(end) - offset;
+                crate::markdown_copy::SelectedLine::append(
+                    output,
+                    line.origin.clone(),
+                    selected,
+                    if index == 0 { separator } else { "\n" },
+                );
+            }
+            offset = end + 1;
+        }
+    }
+
     pub(super) fn text(&self) -> &str {
         &self.text
     }
 
-    pub(super) fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
+        // Images occupy visual space, but have no searchable or selectable text rows.
+        self.text_row_count()
+            + self
+                .visible_image()
+                .map_or(0, |image| usize::from(image.rows))
+    }
+
+    pub(super) fn text_row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    pub(super) fn visible_image(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::transcript_image::TranscriptImage>> {
+        self.image.as_ref().filter(|image| {
+            image.columns + 2 <= self.width
+                && (image.protocol != crate::pets::ImageProtocol::Sixel
+                    || crate::transcript_image::terminal_cell_size()
+                        == Some((image.cell_width, image.cell_height)))
+        })
     }
 
     pub(super) fn disclosure_row(&self) -> Option<usize> {
@@ -194,7 +351,7 @@ impl TextLayout {
     }
 
     /// Paint visible rows, including inherited styles on empty rows and trailing columns.
-    pub(super) fn render(&self, area: Rect, buf: &mut Buffer, start_row: usize) {
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, start_row: usize) {
         for (screen_row, row) in self.visible_rows(area, start_row) {
             let mut row_area =
                 Rect::new(area.x, area.y + screen_row, area.width, /*height*/ 1);
@@ -222,8 +379,58 @@ impl TextLayout {
         row.source.end
     }
 
+    /// Resolve a keyboard caret to a grapheme start while leaving truly empty rows blank.
+    pub(super) fn cursor_position_at(&self, row: usize, column: u16) -> usize {
+        let offset = self.position_at(row, column);
+        let Some(row) = self.rows.get(row) else {
+            return offset;
+        };
+        if row.source.start == row.source.end || offset < row.source.end {
+            return offset;
+        }
+        self.text[row.source.clone()]
+            .grapheme_indices(/*is_extended*/ true)
+            .next_back()
+            .map_or(row.source.start, |(offset, _)| row.source.start + offset)
+    }
+
+    /// Return the first selectable source grapheme on a display row, excluding synthetic rows.
+    pub(super) fn first_cursor_position(&self, row: usize) -> Option<usize> {
+        let row = self.rows.get(row)?;
+        self.text[row.source.clone()]
+            .grapheme_indices(/*is_extended*/ true)
+            .next()
+            .map(|(offset, _)| row.source.start + offset)
+    }
+
+    /// Whether a source grapheme is actually painted on a display row.
+    pub(super) fn is_cursor_position(&self, offset: usize) -> bool {
+        self.rows.iter().any(|row| row.source.contains(&offset))
+    }
+
+    /// Advance one grapheme inside the caret's display row without crossing an empty row.
+    pub(super) fn after_cursor_grapheme(&self, row: usize, offset: usize) -> usize {
+        let Some(row) = self.rows.get(row) else {
+            return offset;
+        };
+        if row.source.start == row.source.end {
+            return offset;
+        }
+        let offset = self
+            .text
+            .floor_char_boundary(offset.clamp(row.source.start, row.source.end));
+        offset
+            + self.text[offset..row.source.end]
+                .graphemes(/*is_extended*/ true)
+                .next()
+                .map_or(/*default*/ 0, str::len)
+    }
+
     /// Find the display row containing a source position, including omitted wrapping whitespace.
     pub(super) fn row_for_offset(&self, offset: usize) -> usize {
+        if self.visible_image().is_some() && offset >= self.text.len() {
+            return self.row_count().saturating_sub(1);
+        }
         let before_control = if let Some(control_row) = self.disclosure_row() {
             let after_control = &self.rows[control_row + 1..];
             let matching_rows = after_control.partition_point(|row| row.source.start <= offset);
@@ -240,7 +447,12 @@ impl TextLayout {
     }
 
     pub(super) fn column_for_offset(&self, offset: usize) -> u16 {
-        let Some(row) = self.rows.get(self.row_for_offset(offset)) else {
+        self.column_for_offset_on_row(self.row_for_offset(offset), offset)
+    }
+
+    /// Resolve a source position within a specific display row when offsets are shared.
+    pub(super) fn column_for_offset_on_row(&self, row: usize, offset: usize) -> u16 {
+        let Some(row) = self.rows.get(row) else {
             return 0;
         };
         let offset = self
@@ -278,6 +490,36 @@ impl TextLayout {
                     }
                 }
                 column += width;
+            }
+        }
+    }
+
+    /// Mark selected hard breaks on nonempty rows, including a copied separator to `next`.
+    pub(super) fn highlight_selection(
+        &self,
+        range: Range<usize>,
+        next: Option<&Self>,
+        area: Rect,
+        buf: &mut Buffer,
+        start_row: usize,
+    ) {
+        self.highlight(range.clone(), area, buf, start_row);
+        for (screen_row, row) in self.visible_rows(area, start_row) {
+            if row.source.is_empty() {
+                continue;
+            }
+            let Some(end) = row.line_end else { continue };
+            let selected = range.contains(&end)
+                || (end == self.text.len()
+                    && next.is_some_and(|next| self.separator_after(next).contains('\n')));
+            let column = row.first_column
+                + row.tabs.column_for_offset(
+                    display_width(&self.text[row.source.clone()]),
+                    row.source.len(),
+                );
+            if selected && column < usize::from(self.width) {
+                buf[(area.x + column as u16, area.y + screen_row)]
+                    .set_style(Style::default().add_modifier(Modifier::REVERSED));
             }
         }
     }
@@ -321,14 +563,19 @@ impl TextLayout {
                     .map(|span| span.content.as_ref()),
             );
             rows.extend(layout_line(line, start, width));
+            if let Some(row) = rows.last_mut() {
+                row.line_end = Some(text.len());
+            }
         }
         Self {
+            image: None,
             logical,
             text,
             rows,
             width,
             separated: false,
             disclosure: false,
+            leading_blank_hidden: false,
             disclosure_control: None,
         }
     }
@@ -405,6 +652,7 @@ fn layout_line(logical: &LogicalLine, text_start: usize, width: u16) -> Vec<Text
             TextRow {
                 line: wrapped,
                 source: range,
+                line_end: None,
                 content_width,
                 first_column: first_column + prefix_columns,
                 prefix_columns,

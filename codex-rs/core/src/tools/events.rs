@@ -35,8 +35,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::format_exec_output_str;
-
 const REJECTION_MESSAGE_MAX_TOKENS: usize = 900;
 
 pub(super) fn truncate_rejection_message(message: &str) -> String {
@@ -45,6 +43,7 @@ pub(super) fn truncate_rejection_message(message: &str) -> String {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ToolEventCtx<'a> {
+    pub sandbox_type: Option<codex_protocol::sandbox::SandboxType>,
     pub model_context: Option<&'a ModelInvocationContext>,
     pub session: &'a Session,
     pub turn: &'a TurnContext,
@@ -64,6 +63,7 @@ impl<'a> ToolEventCtx<'a> {
     ) -> Self {
         Self {
             model_context: None,
+            sandbox_type: None,
             session,
             turn,
             model_info,
@@ -150,6 +150,7 @@ async fn emit_exec_command_begin(ctx: ToolEventCtx<'_>, exec_input: &ExecCommand
                     ctx.session.thread_id.to_string(),
                     ctx.turn.sub_id.clone(),
                     ctx.turn.originator.clone(),
+                    /*turn_metadata*/ None,
                 ),
                 ArtifactOperation {
                     item_id: ctx.call_id.to_string(),
@@ -173,6 +174,7 @@ async fn emit_exec_command_begin(ctx: ToolEventCtx<'_>, exec_input: &ExecCommand
             &TurnItem::CommandExecution(CommandExecutionItem {
                 id: ctx.call_id.to_string(),
                 model_context: ctx.model_context.cloned(),
+                sandbox_type: ctx.sandbox_type,
                 plugin_id,
                 script_path,
                 process_id: exec_input.process_id.map(str::to_owned),
@@ -182,12 +184,9 @@ async fn emit_exec_command_begin(ctx: ToolEventCtx<'_>, exec_input: &ExecCommand
                 source: exec_input.source,
                 interaction_input: exec_input.interaction_input.map(str::to_owned),
                 status: CommandExecutionStatus::InProgress,
-                stdout: None,
-                stderr: None,
                 aggregated_output: None,
                 exit_code: None,
                 duration: None,
-                formatted_output: None,
             }),
         )
         .await;
@@ -508,12 +507,9 @@ impl<'a> ExecCommandInput<'a> {
 }
 
 struct ExecCommandResult {
-    stdout: String,
-    stderr: String,
     aggregated_output: String,
     exit_code: i32,
     duration: Duration,
-    formatted_output: String,
     status: ExecCommandStatus,
 }
 
@@ -529,15 +525,9 @@ async fn emit_exec_stage(
         ToolEventStage::Success { output, .. }
         | ToolEventStage::Failure(ToolEventFailure::Output(output)) => {
             let exec_result = ExecCommandResult {
-                stdout: output.stdout.text.clone(),
-                stderr: output.stderr.text.clone(),
-                aggregated_output: output.aggregated_output.text.clone(),
+                aggregated_output: output.aggregated_output.text,
                 exit_code: output.exit_code,
                 duration: output.duration,
-                formatted_output: format_exec_output_str(
-                    &output,
-                    ctx.model_info.truncation_policy.into(),
-                ),
                 status: if output.exit_code == 0 {
                     ExecCommandStatus::Completed
                 } else {
@@ -549,12 +539,9 @@ async fn emit_exec_stage(
         ToolEventStage::Failure(ToolEventFailure::Message(message)) => {
             let text = message.to_string();
             let exec_result = ExecCommandResult {
-                stdout: String::new(),
-                stderr: text.clone(),
-                aggregated_output: text.clone(),
+                aggregated_output: text,
                 exit_code: -1,
                 duration: Duration::ZERO,
-                formatted_output: text,
                 status: ExecCommandStatus::Failed,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
@@ -562,12 +549,9 @@ async fn emit_exec_stage(
         ToolEventStage::Failure(ToolEventFailure::Rejected { message, .. }) => {
             let text = message.to_string();
             let exec_result = ExecCommandResult {
-                stdout: String::new(),
-                stderr: text.clone(),
-                aggregated_output: text.clone(),
+                aggregated_output: text,
                 exit_code: -1,
                 duration: Duration::ZERO,
-                formatted_output: text,
                 status: ExecCommandStatus::Declined,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
@@ -587,6 +571,7 @@ async fn emit_exec_end(
             TurnItem::CommandExecution(CommandExecutionItem {
                 id: ctx.call_id.to_string(),
                 model_context: ctx.model_context.cloned(),
+                sandbox_type: ctx.sandbox_type,
                 plugin_id,
                 script_path,
                 process_id: exec_input.process_id.map(str::to_owned),
@@ -594,14 +579,11 @@ async fn emit_exec_end(
                 cwd: exec_input.cwd.clone(),
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
                 source: exec_input.source,
-                interaction_input: exec_input.interaction_input.map(str::to_owned),
+                interaction_input: None,
                 status: exec_result.status.into(),
-                stdout: Some(exec_result.stdout),
-                stderr: Some(exec_result.stderr),
                 aggregated_output: Some(exec_result.aggregated_output),
                 exit_code: Some(exec_result.exit_code),
                 duration: Some(exec_result.duration),
-                formatted_output: Some(exec_result.formatted_output),
             }),
         )
         .await;

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::config::ManagedFeatures;
 use crate::context::ContextualUserFragment;
 use crate::context::ImageResizeNotice;
@@ -52,6 +54,8 @@ pub(crate) fn unified_image_budget_enabled(
 
 #[derive(Clone, Copy, Debug)]
 struct ImageOrigin<'a> {
+    thread_id: &'a str,
+    ephemeral: bool,
     message_role: Option<&'a str>,
     item_id: Option<&'a str>,
 }
@@ -105,6 +109,8 @@ pub(crate) enum ImagePreparationError {
 }
 
 impl ImagePreparationError {
+    pub(crate) const KIND: &str = "images.preparation_error";
+
     fn placeholder(&self) -> &'static str {
         match self {
             ImagePreparationError::RemoteUrlUnsupported => REMOTE_IMAGE_URL_PLACEHOLDER,
@@ -118,6 +124,8 @@ impl ImagePreparationError {
 }
 
 pub(crate) async fn prepare_response_items(
+    thread_id: &str,
+    ephemeral: bool,
     items: &mut Vec<ResponseItem>,
     mode: ImagePreparationMode,
     resize_notice_mode: ImageResizeNoticeMode,
@@ -135,6 +143,8 @@ pub(crate) async fn prepare_response_items(
                 let resized_images = prepare_message_content(
                     &mut content,
                     ImageOrigin {
+                        thread_id,
+                        ephemeral,
                         message_role: Some(role.as_str()),
                         item_id: None,
                     },
@@ -157,6 +167,8 @@ pub(crate) async fn prepare_response_items(
                 call_id, output, ..
             } => {
                 prepare_tool_output(
+                    thread_id,
+                    ephemeral,
                     output,
                     call_id.as_deref(),
                     resize_notice_mode,
@@ -170,6 +182,8 @@ pub(crate) async fn prepare_response_items(
                 call_id, output, ..
             } => {
                 prepare_tool_output(
+                    thread_id,
+                    ephemeral,
                     output,
                     Some(call_id.as_str()),
                     resize_notice_mode,
@@ -204,7 +218,10 @@ pub(crate) async fn prepare_response_items(
     metadata
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_tool_output(
+    thread_id: &str,
+    ephemeral: bool,
     output: &mut FunctionCallOutputPayload,
     item_id: Option<&str>,
     resize_notice_mode: ImageResizeNoticeMode,
@@ -216,6 +233,8 @@ async fn prepare_tool_output(
     let resized_images = prepare_tool_output_content(
         content,
         ImageOrigin {
+            thread_id,
+            ephemeral,
             message_role: None,
             item_id,
         },
@@ -268,9 +287,10 @@ async fn prepare_message_content(
                 Ok(_) => {}
                 Err(error) => {
                     warn!(%error, "failed to prepare message image");
-                    *item = AnnotatedContent::input_text(
+                    *item = AnnotatedContent::text(
                         error.placeholder(),
-                        ContentItemKind("images.preparation_error".to_string()),
+                        ContentItemKind(ImagePreparationError::KIND.to_string()),
+                        codex_protocol::models::ContentItemMetadata::harness(),
                     );
                 }
             }
@@ -349,7 +369,10 @@ async fn prepare_image(
     metadata.push(prepared.metadata(origin));
     let resize = prepared.resize;
     let request = UploadRequest {
+        thread_id: origin.thread_id.to_owned(),
+        ephemeral: origin.ephemeral,
         file_name: None,
+        tags: HashMap::new(),
         data: prepared.encoded.bytes.to_vec(),
     };
     *image = match image_store.upload(request).await {
@@ -417,4 +440,4 @@ pub(crate) fn resize_image(
 
 #[cfg(test)]
 #[path = "image_preparation_tests.rs"]
-mod tests;
+pub(crate) mod tests;

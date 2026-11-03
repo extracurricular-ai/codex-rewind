@@ -80,6 +80,7 @@ audio({{type:"audio",mimeType:"audio/wav",data:{payload:?}}});"#
                 code_mode_host_duration: None,
                 cell_id: cell_id("1"),
                 content_items: vec![expected; 3],
+                result_buffered_for: std::time::Duration::ZERO,
                 error_text: None,
             },
             "sample rate {sample_rate}, frames {frames}"
@@ -145,18 +146,24 @@ async fn audio_helper_bounds_wav_data_and_preserves_outputs_after_yield() {
     expected.push(FunctionCallOutputContentItem::InputText {
         text: "after".to_string(),
     });
-    assert_eq!(
-        service
-            .wait(WaitRequest {
+    let actual = service
+        .wait(
+            WaitRequest {
+                max_output_tokens: None,
                 cell_id: cell_id("1"),
                 yield_time_ms: 60_000,
-            })
-            .await
-            .unwrap(),
+            },
+            /*preempt*/ None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Result {
             code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: expected,
+            result_buffered_for: actual.result_buffered_for().unwrap(),
             error_text: None,
         })
     );

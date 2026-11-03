@@ -26,15 +26,19 @@ use windows_sys::Win32::Foundation::ERROR_NO_DATA;
 use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
 use windows_sys::Win32::Foundation::ERROR_SEM_TIMEOUT;
+use windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
+use windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+use windows_sys::Win32::Foundation::ERROR_SERVICE_MARKED_FOR_DELETE;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Security::SC_HANDLE;
 use windows_sys::Win32::Storage::FileSystem::SECURITY_IMPERSONATION;
 use windows_sys::Win32::Storage::FileSystem::SECURITY_SQOS_PRESENT;
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::Services;
+use windows_sys::Win32::System::Services::SC_HANDLE;
 
 const PROVISIONING_TIMEOUT: Duration = Duration::from_secs(120);
+const SERVICE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 mod group_change;
 mod refresh_retry;
@@ -186,6 +190,37 @@ fn service_unavailable() -> anyhow::Result<WindowsSandboxProvisioningOutcome> {
     Ok(WindowsSandboxProvisioningOutcome::Unavailable)
 }
 
+/// Starts a stopped service only for explicit setup. The normal connection path
+/// waits for startup and authenticates the pipe server; SCM authorizes the start.
+pub fn start_windows_sandbox_service_for_setup() -> anyhow::Result<()> {
+    query_service_status()
+        .and_then(|status| {
+            if status.dwCurrentState == Services::SERVICE_STOPPED {
+                let service = open_service(Services::SERVICE_START)
+                    .context("request permission to start sandbox service for setup")?;
+                if unsafe { Services::StartServiceW(service.0, 0, ptr::null()) } == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(ERROR_SERVICE_ALREADY_RUNNING as i32) {
+                        return Err(error).context("start sandbox service for setup");
+                    }
+                }
+            }
+            Ok(())
+        })
+        .or_else(|error| {
+            if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                matches!(error.raw_os_error(), Some(code)
+                if code == ERROR_SERVICE_DOES_NOT_EXIST as i32
+                    || code == ERROR_SERVICE_MARKED_FOR_DELETE as i32)
+            }) {
+                // The connection path preserves registered Core's no-fallback error.
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+}
+
 /// Records desktop uninstall ownership without creating or enabling a sandbox.
 pub fn register_desktop_installation(codex_home: &Path) -> anyhow::Result<()> {
     let request = crate::FramedProvisioningMessage {
@@ -256,6 +291,13 @@ fn exchange_request(
 ) -> anyhow::Result<crate::SandboxProvisioningResponse> {
     verify_server(pipe.as_raw_handle() as HANDLE)
         .context("authenticate provisioning pipe server")?;
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "sandbox provisioning deadline expired before sending request",
+        )
+        .into());
+    }
     crate::write_provisioning_frame(&mut *pipe, request)
         .context("send sandbox provisioning request")?;
     read_response(pipe, deadline)
@@ -286,6 +328,9 @@ fn read_response(
 }
 
 fn connect(deadline: Instant) -> anyhow::Result<Option<File>> {
+    // Startup should not hold up the desktop's readiness check for the full
+    // provisioning timeout. Keep the caller's original deadline for real work.
+    let startup_deadline = deadline.min(Instant::now() + SERVICE_STARTUP_TIMEOUT);
     let pipe_name = crate::windows_sandbox_service_pipe_name()?;
     let open_pipe = || {
         OpenOptions::new()
@@ -297,6 +342,31 @@ fn connect(deadline: Instant) -> anyhow::Result<Option<File>> {
 
     let pipe_name = crate::to_wide(&pipe_name);
     loop {
+        match query_service_status() {
+            Ok(status) if status.dwCurrentState == Services::SERVICE_START_PENDING => {
+                let remaining = startup_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(25)));
+                continue;
+            }
+            Ok(status) if status.dwCurrentState == Services::SERVICE_RUNNING => {}
+            Ok(_) => return Ok(None),
+            Err(error)
+                if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.raw_os_error(),
+                        Some(code)
+                            if code == ERROR_SERVICE_DOES_NOT_EXIST as i32
+                                || code == ERROR_SERVICE_MARKED_FOR_DELETE as i32
+                    )
+                }) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
         match open_pipe() {
             Ok(pipe) => return Ok(Some(pipe)),
             Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
@@ -312,12 +382,10 @@ fn connect(deadline: Instant) -> anyhow::Result<Option<File>> {
                     .max(1);
                 if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), wait_ms) } == 0 {
                     let error = io::Error::last_os_error();
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(code)
-                            if code == ERROR_FILE_NOT_FOUND as i32
-                                || code == ERROR_SEM_TIMEOUT as i32
-                    ) {
+                    if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
+                        continue;
+                    }
+                    if error.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32) {
                         return Ok(None);
                     }
                     return Err(error).context("wait for sandbox provisioning pipe");
@@ -349,26 +417,7 @@ fn verify_server(pipe: HANDLE) -> anyhow::Result<u32> {
 }
 
 fn query_service_status() -> anyhow::Result<Services::SERVICE_STATUS_PROCESS> {
-    let manager =
-        unsafe { Services::OpenSCManagerW(ptr::null(), ptr::null(), Services::SC_MANAGER_CONNECT) };
-    if manager == 0 {
-        return Err(io::Error::last_os_error()).context("open service control manager");
-    }
-    let manager = ServiceHandle(manager);
-
-    let service_name = crate::to_wide(crate::windows_sandbox_service_name()?);
-    let service = unsafe {
-        Services::OpenServiceW(
-            manager.0,
-            service_name.as_ptr(),
-            Services::SERVICE_QUERY_STATUS,
-        )
-    };
-    if service == 0 {
-        return Err(io::Error::last_os_error()).context("open sandbox provisioning service");
-    }
-    let service = ServiceHandle(service);
-
+    let service = open_service(Services::SERVICE_QUERY_STATUS)?;
     let mut status: Services::SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
     let mut bytes_needed = 0;
     if unsafe {
@@ -383,14 +432,33 @@ fn query_service_status() -> anyhow::Result<Services::SERVICE_STATUS_PROCESS> {
     {
         return Err(io::Error::last_os_error()).context("query sandbox provisioning service");
     }
+    if status.dwCurrentState == Services::SERVICE_STOPPED {
+        crate::service_diagnostics::record_stopped(&status, service.0);
+    }
     Ok(status)
+}
+
+fn open_service(access: u32) -> anyhow::Result<ServiceHandle> {
+    let manager =
+        unsafe { Services::OpenSCManagerW(ptr::null(), ptr::null(), Services::SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(io::Error::last_os_error()).context("open service control manager");
+    }
+    let manager = ServiceHandle(manager);
+
+    let service_name = crate::to_wide(crate::windows_sandbox_service_name()?);
+    let service = unsafe { Services::OpenServiceW(manager.0, service_name.as_ptr(), access) };
+    if service.is_null() {
+        return Err(io::Error::last_os_error()).context("open sandbox provisioning service");
+    }
+    Ok(ServiceHandle(service))
 }
 
 struct ServiceHandle(SC_HANDLE);
 
 impl Drop for ServiceHandle {
     fn drop(&mut self) {
-        if self.0 != 0 {
+        if !self.0.is_null() {
             unsafe { Services::CloseServiceHandle(self.0) };
         }
     }

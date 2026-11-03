@@ -92,8 +92,8 @@ impl<T: HttpTransport> ModelsClient<T> {
 
     /// Fetches a catalog using the provider's auth and retry policy without decoding it.
     ///
-    /// Callers accepting provider-controlled catalogs must set a response-body limit
-    /// and validate the native response without including raw values in diagnostics.
+    /// Callers accepting provider-controlled catalogs must validate the native response
+    /// without including raw values in diagnostics.
     pub async fn list_models_raw(
         &self,
         request_url: String,
@@ -184,7 +184,9 @@ mod tests {
     struct DummyAuth;
 
     impl AuthProvider for DummyAuth {
-        fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
+        fn add_auth_headers(&self, _headers: &mut HeaderMap) -> Result<(), crate::AuthError> {
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -193,8 +195,9 @@ mod tests {
     }
 
     impl AuthProvider for RetryAuth {
-        fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        fn add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
             headers.insert(http::header::AUTHORIZATION, "Bearer test".parse().unwrap());
+            Ok(())
         }
 
         fn apply_auth(&self, mut request: Request) -> AuthProviderFuture<'_> {
@@ -204,7 +207,7 @@ mod tests {
                 if limits.len() == 1 {
                     return Err(AuthError::Transient("retry authentication".to_string()));
                 }
-                self.add_auth_headers(&mut request.headers);
+                self.add_auth_headers(&mut request.headers)?;
                 Ok(request)
             })
         }

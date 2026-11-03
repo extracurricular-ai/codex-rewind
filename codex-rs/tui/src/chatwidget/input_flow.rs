@@ -28,8 +28,10 @@ impl ChatWidget {
             // Inline commands still follow so their output (including usage errors) is visible.
             InputResult::Command(
                 SlashCommand::Model
+                | SlashCommand::Presets
                 | SlashCommand::Keymap
                 | SlashCommand::Memories
+                | SlashCommand::Config
                 | SlashCommand::Title
                 | SlashCommand::Statusline
                 | SlashCommand::Theme,
@@ -60,7 +62,7 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::FollowTranscript);
                 let should_submit_now = self.is_session_configured()
                     && !self.is_plan_streaming_in_tui()
-                    && !self.input_queue.suppress_queue_autosend
+                    && !self.input_queue.submissions_paused()
                     && !self.input_queue.rate_limit_recovery_pending
                     && (!self.input_queue.user_turn_pending_start
                         || self.turn_lifecycle.agent_turn_running);
@@ -123,6 +125,12 @@ impl ChatWidget {
     }
 
     pub(super) fn on_modal_or_popup_closed(&mut self) {
+        if self.apply_pending_permission_profile() {
+            return;
+        }
+        if self.cancel_pending_permission_profile_selection() {
+            return;
+        }
         if self.input_queue.suppress_queue_autosend {
             self.app_event_tx.send(AppEvent::SettingsSelectionClosed);
         } else {
@@ -170,7 +178,7 @@ impl ChatWidget {
         }
         let should_run_now = self.is_session_configured()
             && !self.is_user_turn_pending_or_running()
-            && !self.input_queue.suppress_queue_autosend
+            && !self.input_queue.submissions_paused()
             && !self.input_queue.rate_limit_recovery_pending;
         if action != QueuedInputAction::ParseSlash {
             self.empty_state_animation.borrow_mut().dismiss();
@@ -205,7 +213,9 @@ impl ChatWidget {
                 .queued_user_messages
                 .push_back(QueuedUserMessage {
                     user_message,
+                    prepared_images: None,
                     action,
+                    delivery: MessageDelivery::Unsent,
                     pending_pastes,
                     source,
                 });
@@ -234,10 +244,12 @@ impl ChatWidget {
     /// If idle and there are queued inputs, submit exactly one to start the next turn.
     pub(crate) fn maybe_send_next_queued_input(&mut self) -> bool {
         if !self.is_session_configured()
+            || self.fork_in_progress
             || self.has_misalignment_policy_violation()
-            || self.input_queue.suppress_queue_autosend
+            || self.input_queue.submissions_paused()
             || self.input_queue.rate_limit_recovery_pending
             || self.input_queue.recovered_queue
+            || self.input_queue.has_unconfirmed_messages()
         {
             return false;
         }
@@ -268,6 +280,7 @@ impl ChatWidget {
                 QueuedInputAction::Literal => {
                     let QueuedUserMessage {
                         user_message,
+                        prepared_images,
                         pending_pastes,
                         source,
                         ..
@@ -296,11 +309,12 @@ impl ChatWidget {
                             );
                     }
                     submitted_follow_up = self
-                        .submit_user_message_with_history_and_shell_escape_policy(
+                        .submit_user_message_with_prepared_images(
                             user_message,
                             history_record,
                             ShellEscapePolicy::Disallow,
                             source,
+                            prepared_images,
                         )
                         .0;
                     if !submitted_follow_up {

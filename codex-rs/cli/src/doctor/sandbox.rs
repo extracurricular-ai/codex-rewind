@@ -100,11 +100,6 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
         "codex-linux-sandbox helper",
         arg0_paths.codex_linux_sandbox_exe.as_deref(),
     );
-    push_path_detail(
-        &mut details,
-        "execve wrapper helper",
-        arg0_paths.main_execve_wrapper_exe.as_deref(),
-    );
 
     let mut status = CheckStatus::Ok;
     let mut summary = "sandbox configuration is readable".to_string();
@@ -123,7 +118,7 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
     #[cfg(target_os = "windows")]
     {
         let configured_level = WindowsSandboxLevel::from_config(config);
-        let mxc = config.permissions.windows_sandbox_type
+        let mxc = config.effective_local_windows_sandbox_type()
             == codex_protocol::sandbox::SandboxType::WindowsMxc;
         let elevated = !mxc
             && configured_level != WindowsSandboxLevel::Disabled

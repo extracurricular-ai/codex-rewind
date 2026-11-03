@@ -6,6 +6,7 @@ use super::model::CommandOutput;
 use super::model::ExecCall;
 use super::model::ExecCell;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::history_cell::ActivityDisclosure;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::HistoryRenderMode;
 use crate::history_cell::plain_lines;
@@ -23,7 +24,7 @@ use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use crate::terminal_hyperlinks::remap_source_wrapped_line;
 use crate::terminal_hyperlinks::visible_lines;
 use crate::tool_output::tool_output_hyperlink_preview;
-use crate::ui_consts::TRANSCRIPT_HINT;
+use crate::ui_consts::transcript_hint;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line_with_source;
 use codex_ansi_escape::ansi_escape_line;
@@ -218,18 +219,19 @@ impl HistoryCell for ExecCell {
         }
     }
 
-    fn has_hidden_activity_details(&self, width: u16) -> bool {
+    fn activity_disclosure(&self, width: u16) -> Option<ActivityDisclosure> {
         if self.is_exploring_cell() {
-            return true;
+            return Some(ActivityDisclosure::Generic);
         }
         if self.group.calls.iter().any(ExecCall::is_user_shell_command) {
             // User-shell previews already retain wrapped commands and up to fifty output rows.
             // Reuse its actual truncation decision instead of comparing differently styled text.
             return self
                 .command_display_lines_with_hidden_details(width)
-                .hidden_details;
+                .hidden_details
+                .then_some(ActivityDisclosure::Generic);
         }
-        self.command_has_hidden_details(width)
+        self.command_disclosure(width)
     }
 
     fn compact_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -239,7 +241,7 @@ impl HistoryCell for ExecCell {
         if self.is_exploring_cell() {
             let mut lines = self.exploring_display_lines(width);
             lines.truncate(1 + crate::history_cell::activity_preview::DETAIL_PREVIEW_LINES);
-            let failures = self
+            let nonzero_exits = self
                 .group
                 .calls
                 .iter()
@@ -249,12 +251,17 @@ impl HistoryCell for ExecCell {
                         .is_some_and(|output| output.exit_code != 0)
                 })
                 .count();
-            if failures > 0
+            if nonzero_exits > 0
                 && let Some(header) = lines.first_mut()
             {
+                let exit_label = if nonzero_exits == 1 {
+                    "nonzero exit"
+                } else {
+                    "nonzero exits"
+                };
                 header
                     .line
-                    .push_span(format!(" · {failures} failed").red().bold());
+                    .push_span(format!(" · {nonzero_exits} {exit_label}").bold());
             }
             lines
                 .into_iter()
@@ -301,7 +308,7 @@ impl HistoryCell for ExecCell {
 impl ExecCell {
     fn output_ellipsis_text(omitted: usize) -> String {
         let noun = if omitted == 1 { "line" } else { "lines" };
-        format!("… +{omitted} {noun} ({TRANSCRIPT_HINT})")
+        format!("… +{omitted} {noun} ({})", transcript_hint())
     }
 
     fn output_ellipsis_line(omitted: usize) -> Line<'static> {
@@ -945,7 +952,7 @@ mod tests {
             .split_whitespace()
             .join(" ");
         assert!(
-            normalized.contains(TRANSCRIPT_HINT),
+            normalized.contains(&transcript_hint()),
             "expected truncated output to advertise transcript shortcut, got {normalized}"
         );
     }
@@ -977,7 +984,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.contains("… +6 lines (ctrl+t to view transcript)")),
+                .any(|line| line.contains("… +6 lines (⌃t to view transcript)")),
             "expected omitted hint to count hidden lines (not wrapped rows), got: {rendered:?}"
         );
     }
@@ -1005,7 +1012,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            vec!["1", "2", "… +3 lines (ctrl+t to view transcript)", "6", "7",]
+            vec!["1", "2", "… +3 lines (⌃t to view transcript)", "6", "7",]
         );
     }
 

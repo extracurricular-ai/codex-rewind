@@ -19,7 +19,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutItem;
-use codex_rollout::persisted_rollout_items;
+use codex_rollout::into_persisted_rollout_items;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::AppendThreadItemsParams;
@@ -128,10 +128,11 @@ mod tests {
 
         let items_err = store
             .list_items(ListItemsParams {
+                item_ids: None,
                 thread_id,
                 turn_id: None,
                 include_archived: true,
-                cursor: None,
+                position: None,
                 page_size: 10,
                 sort_direction: SortDirection::Asc,
                 sort_key: ItemSortKey::CreatedAtOrdinal,
@@ -165,6 +166,9 @@ mod tests {
         ] {
             store
                 .create_thread(CreateThreadParams {
+                    attached_thread: false,
+                    creator_user_id: None,
+                    creator_account_id: None,
                     session_id: thread_id.into(),
                     thread_id,
                     extra_config: None,
@@ -325,11 +329,15 @@ mod tests {
         let rollout_path = PathBuf::from("/tmp/paginated-thread.jsonl");
 
         store
-            .create_thread(create_thread_params(thread_id, ThreadHistoryMode::Legacy))
+            .create_thread(create_thread_params(
+                thread_id,
+                ThreadHistoryMode::Paginated,
+            ))
             .await
-            .expect("create legacy thread");
+            .expect("create paginated thread");
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(rollout_path.clone()),
                 history: None,
@@ -338,22 +346,6 @@ mod tests {
             })
             .await
             .expect("register rollout path");
-        {
-            let mut state = store.state.lock().await;
-            state
-                .created_threads
-                .get_mut(&thread_id)
-                .expect("created thread")
-                .history_mode = ThreadHistoryMode::Paginated;
-            let Some(RolloutItem::SessionMeta(meta_line)) = state
-                .histories
-                .get_mut(&thread_id)
-                .and_then(|history| history.first_mut())
-            else {
-                panic!("canonical session meta");
-            };
-            meta_line.meta.history_mode = ThreadHistoryMode::Paginated;
-        }
 
         let thread = store
             .read_thread(ReadThreadParams {
@@ -408,6 +400,7 @@ mod tests {
         );
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: None,
                 history: None,
@@ -416,15 +409,6 @@ mod tests {
             })
             .await
             .expect("resume should succeed");
-        assert_paginated_threads_unsupported(
-            store
-                .create_thread(create_thread_params(
-                    ThreadId::default(),
-                    ThreadHistoryMode::Paginated,
-                ))
-                .await
-                .expect_err("paginated create should fail"),
-        );
     }
 
     #[tokio::test]
@@ -459,6 +443,9 @@ mod tests {
         history_mode: ThreadHistoryMode,
     ) -> CreateThreadParams {
         CreateThreadParams {
+            attached_thread: false,
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: thread_id.into(),
             thread_id,
             extra_config: None,
@@ -542,6 +529,7 @@ pub struct InMemoryThreadStore {
 #[derive(Default)]
 struct InMemoryThreadStoreState {
     calls: InMemoryThreadStoreCalls,
+    repeated_list_threads_cursor: Option<String>,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
@@ -582,6 +570,11 @@ impl InMemoryThreadStore {
         self.state.lock().await.calls.clone()
     }
 
+    /// Makes every thread-list page return the same cursor for public API error-path tests.
+    pub async fn repeat_list_threads_cursor_for_testing(&self, cursor: impl Into<String>) {
+        self.state.lock().await.repeated_list_threads_cursor = Some(cursor.into());
+    }
+
     /// Makes metadata updates apply normally while returning no materialized thread.
     pub fn omit_metadata_update_result_for_testing(&self) {
         self.omit_metadata_update_result
@@ -589,10 +582,10 @@ impl InMemoryThreadStore {
     }
 
     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
-        reject_paginated_history_mode(params.history_mode)?;
         let mut state = self.state.lock().await;
         state.calls.create_thread += 1;
         let session_meta = SessionMeta {
+            attached_thread: params.attached_thread,
             session_id: params.session_id,
             id: params.thread_id,
             forked_from_id: params.forked_from_id,
@@ -606,6 +599,8 @@ impl InMemoryThreadStore {
             agent_role: params.source.get_agent_role(),
             agent_path: params.source.get_agent_path().map(Into::into),
             originator: params.originator.clone(),
+            creator_user_id: params.creator_user_id.clone(),
+            creator_account_id: params.creator_account_id.clone(),
             source: params.source.clone(),
             thread_source: params.thread_source.clone(),
             model_provider: Some(params.metadata.model_provider.clone()),
@@ -625,28 +620,41 @@ impl InMemoryThreadStore {
             .histories
             .entry(params.thread_id)
             .or_default()
-            .push(RolloutItem::SessionMeta(SessionMetaLine {
+            .push(RolloutItem::SessionMeta(Box::new(SessionMetaLine {
                 meta: session_meta,
                 git: None,
-            }));
+            })));
         state.created_threads.insert(params.thread_id, params);
         Ok(())
     }
 
-    async fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreResult<()> {
+    async fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
         let mut state = self.state.lock().await;
         state.calls.resume_thread += 1;
         if let Some(history) = params.history {
-            state
-                .histories
-                .insert(params.thread_id, Arc::unwrap_or_clone(history));
+            if matches!(
+                history.first(),
+                Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == params.thread_id
+            ) {
+                state
+                    .histories
+                    .entry(params.thread_id)
+                    .or_insert_with(|| Arc::unwrap_or_clone(history));
+            } else {
+                state
+                    .histories
+                    .insert(params.thread_id, Arc::unwrap_or_clone(history));
+            }
         } else {
             state.histories.entry(params.thread_id).or_default();
         }
         if let Some(rollout_path) = params.rollout_path {
             state.rollout_paths.insert(rollout_path, params.thread_id);
         }
-        Ok(())
+        Ok(Arc::new(state.histories[&params.thread_id].clone()))
     }
 
     async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()> {
@@ -655,7 +663,7 @@ impl InMemoryThreadStore {
         }
         let mut state = self.state.lock().await;
         let history_mode = history_mode_from_state(&state, params.thread_id);
-        let persisted_items = persisted_rollout_items(params.items.as_slice(), history_mode);
+        let persisted_items = into_persisted_rollout_items(params.items, history_mode);
         if persisted_items.is_empty() {
             return Ok(());
         }
@@ -684,6 +692,7 @@ impl InMemoryThreadStore {
         let history_mode = history_mode_from_state(&state, params.thread_id);
         reject_paginated_history_mode(history_mode)?;
         Ok(StoredThreadHistory {
+            revision: None,
             thread_id: params.thread_id,
             items: items.clone(),
         })
@@ -703,6 +712,7 @@ impl InMemoryThreadStore {
                     thread_id: params.thread_id,
                 })?;
         Ok(StoredModelContext {
+            revision: None,
             thread_id: params.thread_id,
             items: items.clone(),
         })
@@ -753,7 +763,7 @@ impl InMemoryThreadStore {
         items.sort_by_key(|item| item.thread_id.to_string());
         Ok(ThreadPage {
             items,
-            next_cursor: None,
+            next_cursor: state.repeated_list_threads_cursor.clone(),
         })
     }
 
@@ -917,7 +927,10 @@ impl ThreadStore for InMemoryThreadStore {
         Box::pin(InMemoryThreadStore::create_thread(self, params))
     }
 
-    fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
+    fn resume_thread(
+        &self,
+        params: ResumeThreadParams,
+    ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
         Box::pin(InMemoryThreadStore::resume_thread(self, params))
     }
 
@@ -991,6 +1004,11 @@ impl ThreadStore for InMemoryThreadStore {
                 Some(ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
                     page.items
                         .retain(|thread| thread.parent_thread_id == Some(parent_thread_id));
+                }
+                Some(ThreadRelationFilter::AttachedThreadsOf(_)) => {
+                    return Err(ThreadStoreError::Unsupported {
+                        operation: "attached threads",
+                    });
                 }
                 Some(ThreadRelationFilter::DescendantsOf(ancestor_thread_id)) => {
                     let mut subtree = HashSet::from([ancestor_thread_id]);
@@ -1083,6 +1101,7 @@ fn stored_thread_from_state(
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
     let history_items = state.histories.get(&thread_id).cloned().unwrap_or_default();
     let history = include_history.then(|| StoredThreadHistory {
+        revision: None,
         thread_id,
         items: history_items.clone(),
     });

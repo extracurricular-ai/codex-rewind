@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::LocalThreadStore;
 use super::test_support::test_config;
 use super::test_support::write_session_file;
+use crate::LoadThreadHistoryParams;
 use crate::ResumeThreadParams;
 use crate::ThreadMetadataPatch;
 use crate::ThreadPersistenceMetadata;
@@ -46,6 +47,7 @@ fn age(path: &Path) -> TestResult<()> {
 
 fn resume(thread_id: ThreadId, path: &Path, home: &Path) -> ResumeThreadParams {
     ResumeThreadParams {
+        history_revision: None,
         thread_id,
         rollout_path: Some(path.to_path_buf()),
         history: None,
@@ -183,9 +185,27 @@ async fn metadata_updates_share_ownership_and_resume_compressed_rollouts() -> Te
     expected.git = None;
     assert_eq!(
         json!(items.last()),
-        json!(Some(RolloutItem::SessionMeta(expected.clone())))
+        json!(Some(RolloutItem::SessionMeta(Box::new(expected.clone()))))
     );
 
+    age(&path)?;
+    compress(home.path()).await?;
+    let snapshot = competitor
+        .load_history(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        })
+        .await?;
+    let history = Arc::new(snapshot.items);
+    let resumed = competitor
+        .resume_thread(ResumeThreadParams {
+            history: Some(Arc::clone(&history)),
+            history_revision: snapshot.revision,
+            ..resume(thread_id, &path, home.path())
+        })
+        .await?;
+    assert!(Arc::ptr_eq(&history, &resumed));
+    competitor.shutdown_thread(thread_id).await?;
     age(&path)?;
     compress(home.path()).await?;
     patch.patch.memory_mode = Some(ThreadMemoryMode::Enabled);
@@ -194,7 +214,7 @@ async fn metadata_updates_share_ownership_and_resume_compressed_rollouts() -> Te
     let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
     assert_eq!(
         json!(items.last()),
-        json!(Some(RolloutItem::SessionMeta(expected)))
+        json!(Some(RolloutItem::SessionMeta(Box::new(expected))))
     );
     Ok(())
 }

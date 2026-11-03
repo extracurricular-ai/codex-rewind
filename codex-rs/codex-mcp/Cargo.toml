@@ -24,11 +24,14 @@ codex-diagnostics = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-login = { workspace = true }
 codex-model-provider = { workspace = true }
+codex-network-proxy = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-rmcp-client = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 codex-utils-plugins = { workspace = true }
+codex-utils-process = { workspace = true }
 futures = { workspace = true }
 lru = { workspace = true }
 regex-lite = { workspace = true }
@@ -46,6 +49,7 @@ url = { workspace = true }
 assert_matches = { workspace = true }
 codex-exec-server-test-support = { workspace = true }
 codex-plugin = { workspace = true }
+codex-utils-cargo-bin = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = ["base64", "macros", "schemars", "server"] }

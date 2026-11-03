@@ -1,10 +1,86 @@
 //! Replacement starts use server defaults and preserve the current task on failure.
 
 use super::*;
+use codex_app_server_protocol::SkillMetadata;
+use codex_app_server_protocol::SkillScope;
+use codex_app_server_protocol::SkillsListEntry;
+use codex_config::types::HistoryPersistence;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
+
+#[tokio::test]
+async fn new_sessions_preserve_yolo_launch_and_later_permission_choices() -> Result<()> {
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    app.harness_overrides.approval_policy = Some(AskForApproval::Never.to_core());
+    app.harness_overrides.sandbox_mode =
+        Some(codex_protocol::config_types::SandboxMode::DangerFullAccess);
+    let (mut server, requests, proxy) = start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    )
+    .await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut loaded_config = app.config.clone();
+    loaded_config
+        .permissions
+        .approval_policy
+        .set(AskForApproval::OnRequest.to_core())?;
+    loaded_config
+        .permissions
+        .set_permission_profile(PermissionProfile::read_only())?;
+    let loaded = server.start_thread(&loaded_config).await?;
+    app.select_agents_overview_thread(&mut tui, &mut server, loaded.session.thread_id)
+        .await?;
+    for picker_change in [false, true] {
+        if picker_change {
+            app.chat_widget
+                .set_approval_policy(AskForApproval::OnRequest);
+            app.chat_widget
+                .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
+                    PermissionProfile::read_only(),
+                    ActivePermissionProfile::new(":read-only"),
+                ))?;
+            app.adopt_server_permissions();
+        }
+        app.start_fresh_session(
+            &mut tui,
+            &mut server,
+            /*session_start_source*/ None,
+            /*initial_user_message*/ None,
+            /*new_thread_name*/ None,
+        )
+        .await;
+        let cached = app.primary_session_configured.as_ref().unwrap().clone();
+        let mut resumed = cached.clone();
+        resumed.approval_policy = AskForApproval::OnRequest;
+        resumed.permission_profile = PermissionProfile::read_only();
+        resumed.active_permission_profile = None;
+        app.restore_runtime_permissions(&mut resumed, &cached);
+        assert_eq!(resumed, cached);
+    }
+    let params = recorded_params(&requests, "thread/start");
+    assert_eq!(
+        params
+            .iter()
+            .skip(1)
+            .map(|params| serde_json::json!({
+                "approvalPolicy": params["approvalPolicy"],
+                "sandbox": params["sandbox"],
+                "permissions": params["permissions"],
+            }))
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!({"approvalPolicy": "never", "sandbox": "danger-full-access", "permissions": null}),
+            serde_json::json!({"approvalPolicy": "on-request", "sandbox": null, "permissions": ":read-only"}),
+        ]
+    );
+    server.shutdown().await?;
+    proxy.await??;
+    Ok(())
+}
 
 #[tokio::test]
 async fn new_session_preserves_vim_line_yank() -> Result<()> {
@@ -30,7 +106,7 @@ async fn new_session_preserves_vim_line_yank() -> Result<()> {
     )
     .await?;
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.start_fresh_session_with_summary_hint(
+    app.start_fresh_session(
         &mut tui,
         &mut server,
         /*session_start_source*/ None,
@@ -59,6 +135,69 @@ async fn new_session_preserves_vim_line_yank() -> Result<()> {
 }
 
 #[tokio::test]
+async fn widget_replacement_preserves_mention_usage_with_history_disabled() -> Result<()> {
+    let (mut app, _events, _ops) = make_test_app_with_channels().await;
+    app.local_settings.history.persistence = HistoryPersistence::None;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let skills = SkillsListResponse {
+        data: vec![SkillsListEntry {
+            cwd: app.config.cwd.to_path_buf(),
+            skills: ["statsig", "status"]
+                .into_iter()
+                .map(|name| SkillMetadata {
+                    name: name.to_owned(),
+                    description: String::new(),
+                    short_description: None,
+                    interface: None,
+                    dependencies: None,
+                    path: app
+                        .config
+                        .cwd
+                        .to_path_buf()
+                        .join(name)
+                        .join("SKILL.md")
+                        .abs()
+                        .into(),
+                    scope: SkillScope::User,
+                    enabled: true,
+                    plugin_id: None,
+                })
+                .collect(),
+            errors: Vec::new(),
+        }],
+    };
+    let init = app.chatwidget_init_for_forked_or_resumed_thread(
+        &mut tui,
+        app.config.clone(),
+        /*initial_user_message*/ None,
+    );
+    app.replace_chat_widget(ChatWidget::new_with_app_event(init));
+    app.chat_widget.set_skills_from_response(&skills);
+    app.chat_widget.insert_str("$status");
+    app.chat_widget.handle_key_event(KeyCode::Enter.into());
+
+    let init = app.chatwidget_init_for_forked_or_resumed_thread(
+        &mut tui,
+        app.config.clone(),
+        /*initial_user_message*/ None,
+    );
+    app.replace_chat_widget(ChatWidget::new_with_app_event(init));
+    app.chat_widget.set_skills_from_response(&skills);
+    app.chat_widget.insert_str("$stat");
+    insta::assert_snapshot!(normalize_snapshot_paths(render_bottom_popup(
+        &app.chat_widget,
+        /*width*/ 80
+    )));
+    assert!(
+        !app.local_settings
+            .codex_home
+            .join("mention_usage.json")
+            .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings() -> Result<()> {
     for (managed_effort, explicit, expected_model, expected_effort) in [
         (None, "saved", "server-model", "high"),
@@ -66,6 +205,9 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
         (Some("medium"), "effort", "server-model", "low"),
         (None, "profile_model", "profile-model", "high"),
         (None, "profile_effort", "server-model", "low"),
+        (None, "profile_summary", "server-model", "high"),
+        (None, "profile_summary_off", "server-model", "high"),
+        (None, "profile_summary_cli", "server-model", "high"),
         (Some("medium"), "profile_model", "profile-model", "high"),
         (Some("medium"), "profile_effort", "server-model", "low"),
         (Some(""), "profile", "profile-model", "low"),
@@ -77,7 +219,7 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
             "medium",
         ),
     ] {
-        let (mut app, _events, _ops) = make_test_app_with_channels().await;
+        let (mut app, mut events, _ops) = make_test_app_with_channels().await;
         let server_home = tempdir()?;
         let client_home = tempdir()?;
         std::fs::write(
@@ -86,7 +228,7 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
         )?;
         std::fs::write(
             client_home.path().join("config.toml"),
-            "model = \"stale-client-model\"\nmodel_reasoning_effort = \"low\"\n",
+            "model = \"stale-client-model\"\nmodel_reasoning_effort = \"low\"\nmodel_reasoning_summary = \"detailed\"\nfeatures.concurrent_reasoning_summaries = true\n",
         )?;
         if let Some(effort) = managed_effort {
             let effort = if effort.is_empty() {
@@ -107,7 +249,11 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
             HistoryCapabilities::Current,
             /*blocked_thread_list*/ None,
             /*failed_thread_name*/ None,
-            crate::app_server_session::ThreadParamsMode::Remote,
+            if explicit.starts_with("profile_summary") {
+                crate::app_server_session::ThreadParamsMode::Embedded
+            } else {
+                crate::app_server_session::ThreadParamsMode::Remote
+            },
             LoaderOverrides {
                 user_config_path: Some(server_home.path().join("work.config.toml").abs()),
                 user_config_profile: Some("work".parse()?),
@@ -131,7 +277,13 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
                 "model_reasoning_effort".to_string(),
                 TomlValue::String("low".to_string()),
             )),
-            profile @ ("profile" | "profile_model" | "profile_effort" | "profile_unrelated") => {
+            profile @ ("profile"
+            | "profile_model"
+            | "profile_effort"
+            | "profile_unrelated"
+            | "profile_summary"
+            | "profile_summary_off"
+            | "profile_summary_cli") => {
                 let path = client_home.path().join("work.config.toml");
                 std::fs::write(
                     &path,
@@ -139,6 +291,12 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
                         "profile_model" => "model = \"profile-model\"\n",
                         "profile_effort" => "model_reasoning_effort = \"low\"\n",
                         "profile_unrelated" => "model_verbosity = \"low\"\n",
+                        "profile_summary" => {
+                            "model_reasoning_summary = \"detailed\"\nfeatures.concurrent_reasoning_summaries = true\n"
+                        }
+                        "profile_summary_off" | "profile_summary_cli" => {
+                            "model_reasoning_summary = \"detailed\"\nfeatures.concurrent_reasoning_summaries = false\n"
+                        }
                         _ => "model = \"profile-model\"\nmodel_reasoning_effort = \"low\"\n",
                     },
                 )?;
@@ -147,8 +305,23 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
             }
             _ => {}
         }
+        if explicit == "profile_summary_cli" {
+            app.cli_kv_overrides.push((
+                "features.concurrent_reasoning_summaries".into(),
+                true.into(),
+            ));
+        }
+        if explicit.starts_with("profile_summary") {
+            app.app_server_target = AppServerTarget::LocalDaemon {
+                allow_embedded_fallback: true,
+                endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
+                    socket_path: client_home.path().join("daemon.sock").abs(),
+                },
+            };
+            app.open_agents_overview(&server);
+        }
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*session_start_source*/ None,
@@ -158,6 +331,21 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
         .await;
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), 1);
+        assert_eq!(
+            (
+                starts[0]["config"].get("model_reasoning_summary"),
+                starts[0]["config"]["features"].get("concurrent_reasoning_summaries"),
+            ),
+            (
+                explicit
+                    .starts_with("profile_summary")
+                    .then_some(&serde_json::json!("detailed")),
+                explicit
+                    .starts_with("profile_summary")
+                    .then_some(&serde_json::json!(explicit != "profile_summary_off")),
+            ),
+            "{explicit}",
+        );
         assert_eq!(
             (
                 &starts[0]["model"],
@@ -170,7 +358,13 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
         );
         assert_eq!(
             recorded_params(&requests, "config/read"),
-            vec![serde_json::json!({"cwd": server_config.cwd.display().to_string()})],
+            vec![
+                serde_json::json!({"cwd": if explicit.starts_with("profile_summary") {
+                    client_home.path().display().to_string()
+                } else {
+                    server_config.cwd.display().to_string()
+                }, "includeLayers": true})
+            ],
         );
         if explicit == "saved" {
             let rendered = render_bottom_popup(&app.chat_widget, /*width*/ 80)
@@ -180,6 +374,16 @@ async fn replacement_uses_server_defaults_and_preserves_explicit_launch_settings
 
               server-model high · <PROJECT>
             ");
+        }
+        if explicit.starts_with("profile_summary") {
+            // Opening the overview starts background RPCs. Let them finish before
+            // closing the client so the proxy is not writing to a closed socket.
+            loop {
+                let event = events.recv().await.expect("agents overview refresh");
+                if matches!(event, AppEvent::AgentsOverviewThreadsLoaded { .. }) {
+                    break;
+                }
+            }
         }
         server.shutdown().await?;
         proxy.await??;
@@ -215,7 +419,7 @@ async fn replacement_failure_keeps_current_task_and_restores_input() -> Result<(
             std::fs::write(home.path().join("config.toml"), "invalid = [")?;
         }
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*session_start_source*/ None,
@@ -272,6 +476,11 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
             home.path().join("config.toml"),
             "model = \"configured-model\"\n",
         )?;
+        app.enqueue_primary_thread_session(
+            test_thread_session(ThreadId::new(), app.config.cwd.to_path_buf()),
+            Vec::new(),
+        )
+        .await?;
         let (server, requests, proxy) = start_recording_app_server_with_history(
             &app.config,
             capabilities,
@@ -283,7 +492,7 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
         .await?;
         let mut server = server.with_remote_cwd_override(remote_cwd.clone());
         let mut tui = crate::tui::test_support::make_test_tui()?;
-        app.start_fresh_session_with_summary_hint(
+        app.start_fresh_session(
             &mut tui,
             &mut server,
             /*session_start_source*/ None,
@@ -293,7 +502,7 @@ async fn replacement_preserves_remote_launch_paths_and_older_servers() -> Result
         .await;
         assert_eq!(
             recorded_params(&requests, "config/read"),
-            vec![serde_json::json!({"cwd": "."}),]
+            vec![serde_json::json!({"cwd": ".", "includeLayers": true}),]
         );
         let starts = recorded_params(&requests, "thread/start");
         assert_eq!(starts.len(), 1);

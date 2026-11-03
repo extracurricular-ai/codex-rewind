@@ -4,6 +4,7 @@
 use crate::session::session::Session;
 use crate::tools::context::ToolInvocation;
 use crate::tools::registry::CoreToolRuntime;
+use codex_protocol::openai_models::GuardianScope;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -13,7 +14,6 @@ use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use futures::future::BoxFuture;
-use serde_json::Value;
 use std::sync::Arc;
 
 pub(crate) const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str =
@@ -26,18 +26,12 @@ pub(super) fn multi_agent_v2_handler(
     parameters_override: Option<&str>,
 ) -> Arc<dyn CoreToolRuntime> {
     let parameters_override = parameters_override.map(|parameters| -> Result<JsonSchema, &str> {
-        let parameters: Value =
-            serde_json::from_str(parameters).map_err(|_| "schema is not valid JSON")?;
-        if !parameters.is_object() || parameters["type"] != "object" {
-            return Err("schema must declare an object type");
-        }
-        let mut parameters: JsonSchema = serde_json::from_value(parameters)
-            .map_err(|_| "schema uses unsupported JSON Schema structures")?;
+        let mut parameters = codex_tools::parse_catalog_tool_parameters(parameters)?;
         if let ToolSpec::Function(tool) = handler.spec()
             && let Some(properties) = tool.parameters.properties
         {
             // Argument transport requires these markers even without server encryption config.
-            for (name, schema) in properties {
+            for (name, schema) in *properties {
                 if schema.encrypted == Some(true) {
                     let property = parameters
                         .properties
@@ -124,6 +118,16 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2ToolOverrides {
 }
 
 impl CoreToolRuntime for MultiAgentV2ToolOverrides {
+    fn requires_guardian_review(&self, invocation: &ToolInvocation) -> bool {
+        invocation
+            .turn
+            .config
+            .features
+            .enabled(codex_features::Feature::GuardianNativeMultiAgentHistory)
+            && GuardianScope::for_multi_agent_tool(&self.tool_name(), self.namespace.as_deref())
+                .is_some()
+    }
+
     fn wait_until_ready<'a>(&'a self, session: &'a Arc<Session>) -> Option<BoxFuture<'a, ()>> {
         self.handler.wait_until_ready(session)
     }

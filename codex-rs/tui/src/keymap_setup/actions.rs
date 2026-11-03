@@ -1,13 +1,13 @@
 //! Catalog and accessors for keymap actions shown by `/keymap`.
 //!
-//! The descriptor table is the single UI-facing inventory of configurable
-//! actions. Each descriptor ties together the config path segment, user-facing
-//! context label, stable action name, and short description used by the picker
-//! and action menu.
+//! The catalog declaration generates both the UI-facing descriptors and the
+//! matching root-config accessors. Each entry ties together the config path,
+//! user-facing context label, stable action name, short description, and
+//! optional feature gate used by the picker and action menu.
 //!
-//! Root-config accessors mirror the descriptor table, while runtime lookups
-//! reuse the inventory owned by [`crate::keymap`]. A catalog action must remain
-//! both writable in `TuiKeymap` and readable from the shared runtime inventory.
+//! Runtime lookups reuse the inventory owned by [`crate::keymap`]. A catalog
+//! action must remain both writable in `TuiKeymap` and readable from the shared
+//! runtime inventory.
 
 use std::collections::BTreeSet;
 
@@ -32,37 +32,6 @@ pub(super) struct KeymapActionDescriptor {
     required_feature: Option<KeymapActionFeature>,
 }
 
-const fn action(
-    context: &'static str,
-    context_label: &'static str,
-    action: &'static str,
-    description: &'static str,
-) -> KeymapActionDescriptor {
-    KeymapActionDescriptor {
-        context,
-        context_label,
-        action,
-        description,
-        required_feature: None,
-    }
-}
-
-const fn gated_action(
-    context: &'static str,
-    context_label: &'static str,
-    action: &'static str,
-    description: &'static str,
-    required_feature: KeymapActionFeature,
-) -> KeymapActionDescriptor {
-    KeymapActionDescriptor {
-        context,
-        context_label,
-        action,
-        description,
-        required_feature: Some(required_feature),
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 enum KeymapActionFeature {
     FastMode,
@@ -82,162 +51,246 @@ impl KeymapActionDescriptor {
     }
 }
 
-#[rustfmt::skip]
-pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
-    action("global", "Global", "open_agents", "Open the shared agent-session overview."),
-    action("global", "Global", "open_transcript", "Open the transcript overlay."),
-    action("global", "Global", "find_transcript", "Find text in the full transcript."),
-    // Keep the new warnings action out of shared-config writes until older strict readers
-    // accept it. Its built-in shortcuts remain available.
-    action("global", "Global", "focus_activity", "Focus transcript activity groups to expand or collapse their details."),
-    action("global", "Global", "open_external_editor", "Open the current draft in an external editor."),
-    action("global", "Global", "copy", "Copy the last agent response to the clipboard."),
-    action("global", "Global", "clear_terminal", "Clear the terminal UI."),
-    action("global", "Global", "toggle_vim_mode", "Turn Vim composer mode on or off."),
-    gated_action("global", "Global", "toggle_fast_mode", "Turn Fast mode on or off.", KeymapActionFeature::FastMode),
-    action("global", "Global", "toggle_raw_output", "Toggle raw scrollback mode."),
-    action("global", "Global", "toggle_side_conversation", "Switch between a side conversation and its parent."),
-    action("chat", "Chat", "interrupt_turn", "Interrupt the active turn."),
-    action("chat", "Chat", "decrease_reasoning_effort", "Decrease reasoning effort."),
-    action("chat", "Chat", "increase_reasoning_effort", "Increase reasoning effort."),
-    action("chat", "Chat", "previous_permission_mode", "Switch to the previous available permission mode."),
-    action("chat", "Chat", "next_permission_mode", "Switch to the next available permission mode."),
-    action("chat", "Chat", "edit_queued_message", "Move up through questions, then edit the last queued message."),
-    action("chat", "Chat", "prompt_stack_back", "Move back through questions toward the composer."),
-    action("chat", "Chat", "skip_question", "Skip the focused question."),
-    action("chat", "Chat", "toggle_voice", "Start or stop a voice conversation."),
-    action("chat", "Chat", "toggle_voice_mute", "Mute or unmute the voice microphone."),
-    action("composer", "Composer", "submit", "Submit the current composer draft."),
-    action("composer", "Composer", "queue", "Queue the draft while a task is running."),
-    action("composer", "Composer", "toggle_shortcuts", "Show or hide the composer shortcut overlay."),
-    action("composer", "Composer", "history_search_previous", "Open history search or move to the previous match."),
-    action("composer", "Composer", "history_search_next", "Move to the next history search match."),
-    action("editor", "Editor", "insert_newline", "Insert a newline in the editor."),
-    action("editor", "Editor", "move_left", "Move the cursor left."),
-    action("editor", "Editor", "move_right", "Move the cursor right."),
-    action("editor", "Editor", "move_up", "Move the cursor up."),
-    action("editor", "Editor", "move_down", "Move the cursor down."),
-    action("editor", "Editor", "move_word_left", "Move to the beginning of the previous word."),
-    action("editor", "Editor", "move_word_right", "Move to the end of the next word."),
-    action("editor", "Editor", "move_line_start", "Move to the beginning of the line."),
-    action("editor", "Editor", "move_line_end", "Move to the end of the line."),
-    action("editor", "Editor", "delete_backward", "Delete one grapheme to the left."),
-    action("editor", "Editor", "delete_forward", "Delete one grapheme to the right."),
-    action("editor", "Editor", "delete_backward_word", "Delete the previous word."),
-    action("editor", "Editor", "delete_forward_word", "Delete the next word."),
-    action("editor", "Editor", "kill_line_start", "Delete from cursor to line start."),
-    action("editor", "Editor", "kill_whole_line", "Delete the current line."),
-    action("editor", "Editor", "kill_line_end", "Delete from cursor to line end."),
-    action("editor", "Editor", "yank", "Paste the kill buffer."),
-    action("vim_normal", "Vim normal", "enter_insert", "Enter insert mode at the cursor."),
-    action("vim_normal", "Vim normal", "append_after_cursor", "Enter insert mode after the cursor."),
-    action("vim_normal", "Vim normal", "append_line_end", "Enter insert mode at end of line."),
-    action("vim_normal", "Vim normal", "insert_line_start", "Enter insert mode at the first non-blank character."),
-    action("vim_normal", "Vim normal", "open_line_below", "Open a new line below and enter insert mode."),
-    action("vim_normal", "Vim normal", "open_line_above", "Open a new line above and enter insert mode."),
-    action("vim_normal", "Vim normal", "enter_replace_mode", "Enter replace mode and overwrite characters."),
-    action("vim_normal", "Vim normal", "move_left", "Move left in Vim normal mode."),
-    action("vim_normal", "Vim normal", "move_right", "Move right in Vim normal mode."),
-    action("vim_normal", "Vim normal", "move_up", "Move up or recall older history in Vim normal mode."),
-    action("vim_normal", "Vim normal", "move_down", "Move down or recall newer history in Vim normal mode."),
-    action("vim_normal", "Vim normal", "move_word_forward", "Move to the start of the next word."),
-    action("vim_normal", "Vim normal", "move_word_backward", "Move to the start of the previous word."),
-    action("vim_normal", "Vim normal", "move_word_end", "Move to the end of the current or next word."),
-    action("vim_normal", "Vim normal", "move_line_start", "Move to the start of the line."),
-    action("vim_normal", "Vim normal", "move_line_end", "Move to the end of the line."),
-    action("vim_normal", "Vim normal", "find_forward", "Find the next character on the current line."),
-    action("vim_normal", "Vim normal", "find_backward", "Find the previous character on the current line."),
-    action("vim_normal", "Vim normal", "till_forward", "Stop before the next character on the current line."),
-    action("vim_normal", "Vim normal", "till_backward", "Stop after the previous character on the current line."),
-    action("vim_normal", "Vim normal", "jump_top", "Jump to the first buffer line."),
-    action("vim_normal", "Vim normal", "jump_bottom", "Jump to the last buffer line."),
-    action("vim_normal", "Vim normal", "delete_char", "Delete the character under the cursor."),
-    action("vim_normal", "Vim normal", "replace_char", "Replace the character under the cursor."),
-    action("vim_normal", "Vim normal", "repeat_last_change", "Repeat the last complete edit."),
-    action("vim_normal", "Vim normal", "substitute_char", "Delete the character under the cursor and enter insert mode."),
-    action("vim_normal", "Vim normal", "delete_to_line_end", "Delete from cursor to end of line."),
-    action("vim_normal", "Vim normal", "change_to_line_end", "Change from cursor to end of line and enter insert mode."),
-    action("vim_normal", "Vim normal", "yank_line", "Yank the entire line."),
-    action("vim_normal", "Vim normal", "paste_after", "Paste after the cursor."),
-    action("vim_normal", "Vim normal", "start_delete_operator", "Begin a delete operator and wait for a motion."),
-    action("vim_normal", "Vim normal", "start_yank_operator", "Begin a yank operator and wait for a motion."),
-    action("vim_normal", "Vim normal", "start_change_operator", "Begin a change operator and wait for a motion or text object."),
-    action("vim_normal", "Vim normal", "undo", "Undo the last complete edit."),
-    action("vim_normal", "Vim normal", "redo", "Redo the last undone edit."),
-    action("vim_normal", "Vim normal", "cancel_operator", "Cancel a pending Vim operator."),
-    action("vim_search", "Vim search", "forward", "Search forward in the active buffer."),
-    action("vim_search", "Vim search", "backward", "Search backward in the active buffer."),
-    action("vim_search", "Vim search", "next", "Repeat the accepted search."),
-    action("vim_search", "Vim search", "previous", "Repeat the search in the opposite direction."),
-    action("vim_operator", "Vim operator", "delete_line", "Repeat delete operator to delete the whole line."),
-    action("vim_operator", "Vim operator", "yank_line", "Repeat yank operator to yank the whole line."),
-    action("vim_operator", "Vim operator", "motion_left", "Operator motion left."),
-    action("vim_operator", "Vim operator", "motion_right", "Operator motion right."),
-    action("vim_operator", "Vim operator", "motion_up", "Operator motion up."),
-    action("vim_operator", "Vim operator", "motion_down", "Operator motion down."),
-    action("vim_operator", "Vim operator", "motion_word_forward", "Operator motion to start of next word."),
-    action("vim_operator", "Vim operator", "motion_word_backward", "Operator motion to start of previous word."),
-    action("vim_operator", "Vim operator", "motion_word_end", "Operator motion to end of word."),
-    action("vim_operator", "Vim operator", "motion_line_start", "Operator motion to line start."),
-    action("vim_operator", "Vim operator", "motion_line_end", "Operator motion to line end."),
-    action("vim_operator", "Vim operator", "motion_find_forward", "Operator motion to the next character on the current line."),
-    action("vim_operator", "Vim operator", "motion_find_backward", "Operator motion to the previous character on the current line."),
-    action("vim_operator", "Vim operator", "motion_till_forward", "Stop before the next character on the current line."),
-    action("vim_operator", "Vim operator", "motion_till_backward", "Stop after the previous character on the current line."),
-    action("vim_operator", "Vim operator", "motion_jump_top", "Operator motion to the first buffer line."),
-    action("vim_operator", "Vim operator", "motion_jump_bottom", "Operator motion to the last buffer line."),
-    action("vim_operator", "Vim operator", "select_inner_text_object", "Select an inner text object."),
-    action("vim_operator", "Vim operator", "select_around_text_object", "Select an around text object."),
-    action("vim_operator", "Vim operator", "cancel", "Cancel the pending operator."),
-    action("vim_text_object", "Vim text object", "word", "Target the current word."),
-    action("vim_text_object", "Vim text object", "big_word", "Target the current WORD."),
-    action("vim_text_object", "Vim text object", "parentheses", "Target enclosing parentheses."),
-    action("vim_text_object", "Vim text object", "brackets", "Target enclosing brackets."),
-    action("vim_text_object", "Vim text object", "braces", "Target enclosing braces."),
-    action("vim_text_object", "Vim text object", "double_quote", "Target enclosing double quotes."),
-    action("vim_text_object", "Vim text object", "single_quote", "Target enclosing single quotes."),
-    action("vim_text_object", "Vim text object", "backtick", "Target enclosing backticks."),
-    action("vim_text_object", "Vim text object", "cancel", "Cancel the pending text object."),
-    action("pager", "Pager", "scroll_up", "Scroll up by one row."),
-    action("pager", "Pager", "scroll_down", "Scroll down by one row."),
-    action("pager", "Pager", "page_up", "Scroll up by one page."),
-    action("pager", "Pager", "page_down", "Scroll down by one page."),
-    action("pager", "Pager", "half_page_up", "Scroll up by half a page."),
-    action("pager", "Pager", "half_page_down", "Scroll down by half a page."),
-    action("pager", "Pager", "jump_top", "Jump to the beginning."),
-    action("pager", "Pager", "jump_bottom", "Jump to the end."),
-    action("pager", "Pager", "close", "Close the pager overlay."),
-    action("pager", "Pager", "close_transcript", "Close the transcript overlay."),
-    action("pager", "Pager", "find", "Find text in a transcript pager."),
-    action("list", "List", "move_up", "Move list selection up."),
-    action("list", "List", "move_down", "Move list selection down."),
-    action("list", "List", "move_left", "Move horizontally left in list pickers."),
-    action("list", "List", "move_right", "Move horizontally right in list pickers."),
-    action("list", "List", "page_up", "Move list selection up by one page."),
-    action("list", "List", "page_down", "Move list selection down by one page."),
-    action("list", "List", "jump_top", "Jump to the first list item."),
-    action("list", "List", "jump_bottom", "Jump to the last list item."),
-    action("list", "List", "accept", "Accept the current list selection."),
-    action("list", "List", "cancel", "Cancel and close selection views."),
-    action("agents", "Agents", "resume", "Open the session resume picker."),
-    action("agents", "Agents", "search", "Search the available agent tasks."),
-    action("agents", "Agents", "new_task", "Open a new session in the selected checkout."),
-    action("agents", "Agents", "new_worktree", "Open a new session in a worktree from the project default branch."),
-    action("agents", "Agents", "rename", "Rename the selected task."),
-    action("agents", "Agents", "stop", "Stop the selected running task."),
-    action("agents", "Agents", "archive", "Archive the selected task and its child agents."),
-    action("agents", "Agents", "delete", "Permanently delete the selected task and its child agents."),
-    action("agents", "Agents", "hide", "Hide the selected task until explicitly resumed."),
-    action("agents", "Agents", "toggle_grouping", "Cycle task grouping by project, status, or model."),
-    action("approval", "Approval", "open_fullscreen", "Open approval details fullscreen."),
-    action("approval", "Approval", "open_thread", "Open the approval source thread when available."),
-    action("approval", "Approval", "approve", "Approve the primary option."),
-    action("approval", "Approval", "approve_for_session", "Approve for the session when available."),
-    action("approval", "Approval", "approve_for_prefix", "Approve with an exec-policy prefix when available."),
-    action("approval", "Approval", "deny", "Choose the explicit deny option when available."),
-    action("approval", "Approval", "decline", "Decline and provide corrective guidance."),
-    action("approval", "Approval", "cancel", "Cancel an elicitation request."),
-];
+macro_rules! required_feature {
+    () => {
+        None
+    };
+    ($feature:ident) => {
+        Some(KeymapActionFeature::$feature)
+    };
+}
+
+macro_rules! define_keymap_actions {
+    (
+        $(
+            $context:ident $context_label:literal {
+                $(
+                    $action:ident $( [$required_feature:ident] )? => $description:literal,
+                )*
+            }
+        )*
+    ) => {
+        pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
+            $(
+                $(
+                    KeymapActionDescriptor {
+                        context: stringify!($context),
+                        context_label: $context_label,
+                        action: stringify!($action),
+                        description: $description,
+                        required_feature: required_feature!($($required_feature)?),
+                    },
+                )*
+            )*
+        ];
+
+        /// Return the mutable root-config binding slot for one catalog action.
+        ///
+        /// The returned `Option<KeybindingsSpec>` distinguishes three states that the
+        /// editor must preserve: absent means use fallback/default resolution, `Some`
+        /// with one or more keys is a custom binding, and `Some(Many([]))` is an
+        /// explicit unbind.
+        pub(super) fn binding_slot<'a>(
+            keymap: &'a mut TuiKeymap,
+            context: &str,
+            action: &str,
+        ) -> Option<&'a mut Option<KeybindingsSpec>> {
+            match (context, action) {
+                $(
+                    $(
+                        (stringify!($context), stringify!($action)) => {
+                            Some(&mut keymap.$context.$action)
+                        }
+                    )*
+                )*
+                _ => None,
+            }
+        }
+    };
+}
+
+define_keymap_actions! {
+    global "Global" {
+        open_agents => "Open the shared agent-session overview.",
+        open_transcript => "Open the transcript overlay.",
+        find_transcript => "Find text in the full transcript.",
+        // Keep the new warnings action out of shared-config writes until older strict readers
+        // accept it. Its built-in shortcuts remain available.
+        focus_activity => "Focus transcript activity groups to expand or collapse their details.",
+        open_external_editor => "Open the current draft in an external editor.",
+        copy => "Copy the last agent response to the clipboard.",
+        clear_terminal => "Clear the terminal UI.",
+        toggle_vim_mode => "Turn Vim composer mode on or off.",
+        toggle_fast_mode [FastMode] => "Turn Fast mode on or off.",
+        toggle_raw_output => "Toggle raw scrollback mode.",
+        toggle_side_conversation => "Switch between a side conversation and its parent.",
+        leader => "Set the prefix used by shared leader shortcuts.",
+    }
+    chat "Chat" {
+        interrupt_turn => "Interrupt the active turn.",
+        decrease_reasoning_effort => "Decrease reasoning effort.",
+        increase_reasoning_effort => "Increase reasoning effort.",
+        previous_permission_mode => "Switch to the previous available permission mode.",
+        next_permission_mode => "Switch to the next available permission mode.",
+        edit_queued_message => "Move forward through questions, then edit the last queued message.",
+        prompt_stack_back => "Move back through questions toward the composer.",
+        skip_question => "Skip the focused question.",
+        toggle_voice => "Start or stop a voice conversation.",
+        open_presets => "Run or save reusable inputs.",
+        toggle_voice_mute => "Mute or unmute the voice microphone.",
+    }
+    composer "Composer" {
+        submit => "Submit the current composer draft.",
+        queue => "Queue the draft while a task is running.",
+        toggle_shortcuts => "Show or hide the composer shortcut overlay.",
+        history_search_previous => "Open history search or move to the previous match.",
+        history_search_next => "Move to the next history search match.",
+    }
+    editor "Editor" {
+        insert_newline => "Insert a newline in the editor.",
+        move_left => "Move the cursor left.",
+        move_right => "Move the cursor right.",
+        move_up => "Move the cursor up.",
+        move_down => "Move the cursor down.",
+        move_word_left => "Move to the beginning of the previous word.",
+        move_word_right => "Move to the end of the next word.",
+        move_line_start => "Move to the beginning of the line.",
+        move_line_end => "Move to the end of the line.",
+        delete_backward => "Delete one grapheme to the left.",
+        delete_forward => "Delete one grapheme to the right.",
+        delete_backward_word => "Delete the previous word.",
+        delete_forward_word => "Delete the next word.",
+        kill_line_start => "Delete from cursor to line start.",
+        kill_whole_line => "Delete the current line.",
+        kill_line_end => "Delete from cursor to line end.",
+        yank => "Paste the kill buffer.",
+    }
+    vim_normal "Vim normal" {
+        enter_insert => "Enter insert mode at the cursor.",
+        append_after_cursor => "Enter insert mode after the cursor.",
+        append_line_end => "Enter insert mode at end of line.",
+        insert_line_start => "Enter insert mode at the first non-blank character.",
+        open_line_below => "Open a new line below and enter insert mode.",
+        open_line_above => "Open a new line above and enter insert mode.",
+        enter_replace_mode => "Enter replace mode and overwrite characters.",
+        move_left => "Move left in Vim normal mode.",
+        move_right => "Move right in Vim normal mode.",
+        move_up => "Move up or recall older history in Vim normal mode.",
+        move_down => "Move down or recall newer history in Vim normal mode.",
+        move_word_forward => "Move to the start of the next word.",
+        move_word_backward => "Move to the start of the previous word.",
+        move_word_end => "Move to the end of the current or next word.",
+        move_line_start => "Move to the start of the line.",
+        move_line_end => "Move to the end of the line.",
+        find_forward => "Find the next character on the current line.",
+        find_backward => "Find the previous character on the current line.",
+        till_forward => "Stop before the next character on the current line.",
+        till_backward => "Stop after the previous character on the current line.",
+        jump_top => "Jump to the first buffer line.",
+        jump_bottom => "Jump to the last buffer line.",
+        delete_char => "Delete the character under the cursor.",
+        replace_char => "Replace the character under the cursor.",
+        repeat_last_change => "Repeat the last complete edit.",
+        substitute_char => "Delete the character under the cursor and enter insert mode.",
+        delete_to_line_end => "Delete from cursor to end of line.",
+        change_to_line_end => "Change from cursor to end of line and enter insert mode.",
+        yank_line => "Yank the entire line.",
+        paste_after => "Paste after the cursor.",
+        start_delete_operator => "Begin a delete operator and wait for a motion.",
+        start_yank_operator => "Begin a yank operator and wait for a motion.",
+        start_change_operator => "Begin a change operator and wait for a motion or text object.",
+        undo => "Undo the last complete edit.",
+        redo => "Redo the last undone edit.",
+        cancel_operator => "Cancel a pending Vim operator.",
+    }
+    vim_search "Vim search" {
+        forward => "Search forward in the active buffer.",
+        backward => "Search backward in the active buffer.",
+        next => "Repeat the accepted search.",
+        previous => "Repeat the search in the opposite direction.",
+    }
+    vim_operator "Vim operator" {
+        delete_line => "Repeat delete operator to delete the whole line.",
+        yank_line => "Repeat yank operator to yank the whole line.",
+        motion_left => "Operator motion left.",
+        motion_right => "Operator motion right.",
+        motion_up => "Operator motion up.",
+        motion_down => "Operator motion down.",
+        motion_word_forward => "Operator motion to start of next word.",
+        motion_word_backward => "Operator motion to start of previous word.",
+        motion_word_end => "Operator motion to end of word.",
+        motion_line_start => "Operator motion to line start.",
+        motion_line_end => "Operator motion to line end.",
+        motion_find_forward => "Operator motion to the next character on the current line.",
+        motion_find_backward => "Operator motion to the previous character on the current line.",
+        motion_till_forward => "Stop before the next character on the current line.",
+        motion_till_backward => "Stop after the previous character on the current line.",
+        motion_jump_top => "Operator motion to the first buffer line.",
+        motion_jump_bottom => "Operator motion to the last buffer line.",
+        select_inner_text_object => "Select an inner text object.",
+        select_around_text_object => "Select an around text object.",
+        cancel => "Cancel the pending operator.",
+    }
+    vim_text_object "Vim text object" {
+        word => "Target the current word.",
+        big_word => "Target the current WORD.",
+        parentheses => "Target enclosing parentheses.",
+        brackets => "Target enclosing brackets.",
+        braces => "Target enclosing braces.",
+        double_quote => "Target enclosing double quotes.",
+        single_quote => "Target enclosing single quotes.",
+        backtick => "Target enclosing backticks.",
+        cancel => "Cancel the pending text object.",
+    }
+    pager "Pager" {
+        scroll_up => "Scroll up by one row.",
+        scroll_down => "Scroll down by one row.",
+        page_up => "Scroll up by one page.",
+        page_down => "Scroll down by one page.",
+        half_page_up => "Scroll up by half a page.",
+        half_page_down => "Scroll down by half a page.",
+        jump_top => "Jump to the beginning.",
+        jump_bottom => "Jump to the end.",
+        close => "Close the pager overlay.",
+        close_transcript => "Close the transcript overlay.",
+        find => "Find text in a transcript pager.",
+    }
+    list "List" {
+        move_up => "Move list selection up.",
+        move_down => "Move list selection down.",
+        move_left => "Move horizontally left in list pickers.",
+        move_right => "Move horizontally right in list pickers.",
+        page_up => "Move list selection up by one page.",
+        page_down => "Move list selection down by one page.",
+        jump_top => "Jump to the first list item.",
+        jump_bottom => "Jump to the last list item.",
+        accept => "Accept the current list selection.",
+        cancel => "Cancel and close selection views.",
+    }
+    agents "Agents" {
+        resume => "Open the session resume picker.",
+        search => "Search the available agent tasks.",
+        new_task => "Open a new session in the selected checkout.",
+        new_worktree => "Open a new session in a worktree from the project default branch.",
+        fork => "Fork the selected conversation and open the new session.",
+        rename => "Rename the selected task.",
+        stop => "Stop the selected running task.",
+        archive => "Archive the selected task and its child agents.",
+        delete => "Permanently delete the selected task and its child agents.",
+        hide => "Hide the selected task until explicitly resumed.",
+        toggle_grouping => "Cycle task grouping by project, directory, status, or model.",
+    }
+    approval "Approval" {
+        open_fullscreen => "Open approval details fullscreen.",
+        open_thread => "Open the approval source thread when available.",
+        approve => "Approve the primary option.",
+        approve_for_session => "Approve for the session when available.",
+        approve_for_prefix => "Approve with an exec-policy prefix when available.",
+        deny => "Choose the explicit deny option when available.",
+        decline => "Decline and provide corrective guidance.",
+        cancel => "Cancel an elicitation request.",
+    }
+}
 
 /// Convert a stable action identifier into a display label.
 ///
@@ -256,174 +309,6 @@ pub(super) fn action_label(action: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-#[rustfmt::skip]
-/// Return the mutable root-config binding slot for one catalog action.
-///
-/// The returned `Option<KeybindingsSpec>` distinguishes three states that the
-/// editor must preserve: absent means use fallback/default resolution, `Some`
-/// with one or more keys is a custom binding, and `Some(Many([]))` is an
-/// explicit unbind.
-pub(super) fn binding_slot<'a>(
-    keymap: &'a mut TuiKeymap,
-    context: &str,
-    action: &str,
-) -> Option<&'a mut Option<KeybindingsSpec>> {
-    match (context, action) {
-        ("global", "open_agents") => Some(&mut keymap.global.open_agents),
-        ("global", "open_transcript") => Some(&mut keymap.global.open_transcript),
-        ("global", "find_transcript") => Some(&mut keymap.global.find_transcript),
-        ("global", "focus_activity") => Some(&mut keymap.global.focus_activity),
-        ("global", "open_external_editor") => Some(&mut keymap.global.open_external_editor),
-        ("global", "copy") => Some(&mut keymap.global.copy),
-        ("global", "clear_terminal") => Some(&mut keymap.global.clear_terminal),
-        ("global", "toggle_vim_mode") => Some(&mut keymap.global.toggle_vim_mode),
-        ("global", "toggle_fast_mode") => Some(&mut keymap.global.toggle_fast_mode),
-        ("global", "toggle_raw_output") => Some(&mut keymap.global.toggle_raw_output),
-        ("global", "toggle_side_conversation") => Some(&mut keymap.global.toggle_side_conversation),
-        ("chat", "interrupt_turn") => Some(&mut keymap.chat.interrupt_turn),
-        ("chat", "decrease_reasoning_effort") => Some(&mut keymap.chat.decrease_reasoning_effort),
-        ("chat", "increase_reasoning_effort") => Some(&mut keymap.chat.increase_reasoning_effort),
-        ("chat", "previous_permission_mode") => Some(&mut keymap.chat.previous_permission_mode),
-        ("chat", "next_permission_mode") => Some(&mut keymap.chat.next_permission_mode),
-        ("chat", "edit_queued_message") => Some(&mut keymap.chat.edit_queued_message),
-        ("chat", "prompt_stack_back") => Some(&mut keymap.chat.prompt_stack_back),
-        ("chat", "skip_question") => Some(&mut keymap.chat.skip_question),
-        ("chat", "toggle_voice") => Some(&mut keymap.chat.toggle_voice),
-        ("chat", "toggle_voice_mute") => Some(&mut keymap.chat.toggle_voice_mute),
-        ("composer", "submit") => Some(&mut keymap.composer.submit),
-        ("composer", "queue") => Some(&mut keymap.composer.queue),
-        ("composer", "toggle_shortcuts") => Some(&mut keymap.composer.toggle_shortcuts),
-        ("composer", "history_search_previous") => Some(&mut keymap.composer.history_search_previous),
-        ("composer", "history_search_next") => Some(&mut keymap.composer.history_search_next),
-        ("editor", "insert_newline") => Some(&mut keymap.editor.insert_newline),
-        ("editor", "move_left") => Some(&mut keymap.editor.move_left),
-        ("editor", "move_right") => Some(&mut keymap.editor.move_right),
-        ("editor", "move_up") => Some(&mut keymap.editor.move_up),
-        ("editor", "move_down") => Some(&mut keymap.editor.move_down),
-        ("editor", "move_word_left") => Some(&mut keymap.editor.move_word_left),
-        ("editor", "move_word_right") => Some(&mut keymap.editor.move_word_right),
-        ("editor", "move_line_start") => Some(&mut keymap.editor.move_line_start),
-        ("editor", "move_line_end") => Some(&mut keymap.editor.move_line_end),
-        ("editor", "delete_backward") => Some(&mut keymap.editor.delete_backward),
-        ("editor", "delete_forward") => Some(&mut keymap.editor.delete_forward),
-        ("editor", "delete_backward_word") => Some(&mut keymap.editor.delete_backward_word),
-        ("editor", "delete_forward_word") => Some(&mut keymap.editor.delete_forward_word),
-        ("editor", "kill_line_start") => Some(&mut keymap.editor.kill_line_start),
-        ("editor", "kill_whole_line") => Some(&mut keymap.editor.kill_whole_line),
-        ("editor", "kill_line_end") => Some(&mut keymap.editor.kill_line_end),
-        ("editor", "yank") => Some(&mut keymap.editor.yank),
-        ("vim_normal", "enter_insert") => Some(&mut keymap.vim_normal.enter_insert),
-        ("vim_normal", "append_after_cursor") => Some(&mut keymap.vim_normal.append_after_cursor),
-        ("vim_normal", "append_line_end") => Some(&mut keymap.vim_normal.append_line_end),
-        ("vim_normal", "insert_line_start") => Some(&mut keymap.vim_normal.insert_line_start),
-        ("vim_normal", "open_line_below") => Some(&mut keymap.vim_normal.open_line_below),
-        ("vim_normal", "open_line_above") => Some(&mut keymap.vim_normal.open_line_above),
-        ("vim_normal", "enter_replace_mode") => Some(&mut keymap.vim_normal.enter_replace_mode),
-        ("vim_normal", "move_left") => Some(&mut keymap.vim_normal.move_left),
-        ("vim_normal", "move_right") => Some(&mut keymap.vim_normal.move_right),
-        ("vim_normal", "move_up") => Some(&mut keymap.vim_normal.move_up),
-        ("vim_normal", "move_down") => Some(&mut keymap.vim_normal.move_down),
-        ("vim_normal", "move_word_forward") => Some(&mut keymap.vim_normal.move_word_forward),
-        ("vim_normal", "move_word_backward") => Some(&mut keymap.vim_normal.move_word_backward),
-        ("vim_normal", "move_word_end") => Some(&mut keymap.vim_normal.move_word_end),
-        ("vim_normal", "move_line_start") => Some(&mut keymap.vim_normal.move_line_start),
-        ("vim_normal", "move_line_end") => Some(&mut keymap.vim_normal.move_line_end),
-        ("vim_normal", "find_forward") => Some(&mut keymap.vim_normal.find_forward),
-        ("vim_normal", "find_backward") => Some(&mut keymap.vim_normal.find_backward),
-        ("vim_normal", "till_forward") => Some(&mut keymap.vim_normal.till_forward),
-        ("vim_normal", "till_backward") => Some(&mut keymap.vim_normal.till_backward),
-        ("vim_normal", "jump_top") => Some(&mut keymap.vim_normal.jump_top),
-        ("vim_normal", "jump_bottom") => Some(&mut keymap.vim_normal.jump_bottom),
-        ("vim_normal", "delete_char") => Some(&mut keymap.vim_normal.delete_char),
-        ("vim_normal", "replace_char") => Some(&mut keymap.vim_normal.replace_char),
-        ("vim_normal", "repeat_last_change") => Some(&mut keymap.vim_normal.repeat_last_change),
-        ("vim_normal", "substitute_char") => Some(&mut keymap.vim_normal.substitute_char),
-        ("vim_normal", "delete_to_line_end") => Some(&mut keymap.vim_normal.delete_to_line_end),
-        ("vim_normal", "change_to_line_end") => Some(&mut keymap.vim_normal.change_to_line_end),
-        ("vim_normal", "yank_line") => Some(&mut keymap.vim_normal.yank_line),
-        ("vim_normal", "paste_after") => Some(&mut keymap.vim_normal.paste_after),
-        ("vim_normal", "start_delete_operator") => Some(&mut keymap.vim_normal.start_delete_operator),
-        ("vim_normal", "start_yank_operator") => Some(&mut keymap.vim_normal.start_yank_operator),
-        ("vim_normal", "start_change_operator") => Some(&mut keymap.vim_normal.start_change_operator),
-        ("vim_normal", "undo") => Some(&mut keymap.vim_normal.undo),
-        ("vim_normal", "redo") => Some(&mut keymap.vim_normal.redo),
-        ("vim_normal", "cancel_operator") => Some(&mut keymap.vim_normal.cancel_operator),
-        ("vim_search", "forward") => Some(&mut keymap.vim_search.forward),
-        ("vim_search", "backward") => Some(&mut keymap.vim_search.backward),
-        ("vim_search", "next") => Some(&mut keymap.vim_search.next),
-        ("vim_search", "previous") => Some(&mut keymap.vim_search.previous),
-        ("vim_operator", "delete_line") => Some(&mut keymap.vim_operator.delete_line),
-        ("vim_operator", "yank_line") => Some(&mut keymap.vim_operator.yank_line),
-        ("vim_operator", "motion_left") => Some(&mut keymap.vim_operator.motion_left),
-        ("vim_operator", "motion_right") => Some(&mut keymap.vim_operator.motion_right),
-        ("vim_operator", "motion_up") => Some(&mut keymap.vim_operator.motion_up),
-        ("vim_operator", "motion_down") => Some(&mut keymap.vim_operator.motion_down),
-        ("vim_operator", "motion_word_forward") => Some(&mut keymap.vim_operator.motion_word_forward),
-        ("vim_operator", "motion_word_backward") => Some(&mut keymap.vim_operator.motion_word_backward),
-        ("vim_operator", "motion_word_end") => Some(&mut keymap.vim_operator.motion_word_end),
-        ("vim_operator", "motion_line_start") => Some(&mut keymap.vim_operator.motion_line_start),
-        ("vim_operator", "motion_line_end") => Some(&mut keymap.vim_operator.motion_line_end),
-        ("vim_operator", "motion_find_forward") => Some(&mut keymap.vim_operator.motion_find_forward),
-        ("vim_operator", "motion_find_backward") => Some(&mut keymap.vim_operator.motion_find_backward),
-        ("vim_operator", "motion_till_forward") => Some(&mut keymap.vim_operator.motion_till_forward),
-        ("vim_operator", "motion_till_backward") => Some(&mut keymap.vim_operator.motion_till_backward),
-        ("vim_operator", "motion_jump_top") => Some(&mut keymap.vim_operator.motion_jump_top),
-        ("vim_operator", "motion_jump_bottom") => Some(&mut keymap.vim_operator.motion_jump_bottom),
-        ("vim_operator", "select_inner_text_object") => Some(&mut keymap.vim_operator.select_inner_text_object),
-        ("vim_operator", "select_around_text_object") => Some(&mut keymap.vim_operator.select_around_text_object),
-        ("vim_operator", "cancel") => Some(&mut keymap.vim_operator.cancel),
-        ("vim_text_object", "word") => Some(&mut keymap.vim_text_object.word),
-        ("vim_text_object", "big_word") => Some(&mut keymap.vim_text_object.big_word),
-        ("vim_text_object", "parentheses") => Some(&mut keymap.vim_text_object.parentheses),
-        ("vim_text_object", "brackets") => Some(&mut keymap.vim_text_object.brackets),
-        ("vim_text_object", "braces") => Some(&mut keymap.vim_text_object.braces),
-        ("vim_text_object", "double_quote") => Some(&mut keymap.vim_text_object.double_quote),
-        ("vim_text_object", "single_quote") => Some(&mut keymap.vim_text_object.single_quote),
-        ("vim_text_object", "backtick") => Some(&mut keymap.vim_text_object.backtick),
-        ("vim_text_object", "cancel") => Some(&mut keymap.vim_text_object.cancel),
-        ("pager", "scroll_up") => Some(&mut keymap.pager.scroll_up),
-        ("pager", "scroll_down") => Some(&mut keymap.pager.scroll_down),
-        ("pager", "page_up") => Some(&mut keymap.pager.page_up),
-        ("pager", "page_down") => Some(&mut keymap.pager.page_down),
-        ("pager", "half_page_up") => Some(&mut keymap.pager.half_page_up),
-        ("pager", "half_page_down") => Some(&mut keymap.pager.half_page_down),
-        ("pager", "jump_top") => Some(&mut keymap.pager.jump_top),
-        ("pager", "jump_bottom") => Some(&mut keymap.pager.jump_bottom),
-        ("pager", "close") => Some(&mut keymap.pager.close),
-        ("pager", "close_transcript") => Some(&mut keymap.pager.close_transcript),
-        ("pager", "find") => Some(&mut keymap.pager.find),
-        ("list", "move_up") => Some(&mut keymap.list.move_up),
-        ("list", "move_down") => Some(&mut keymap.list.move_down),
-        ("list", "move_left") => Some(&mut keymap.list.move_left),
-        ("list", "move_right") => Some(&mut keymap.list.move_right),
-        ("list", "page_up") => Some(&mut keymap.list.page_up),
-        ("list", "page_down") => Some(&mut keymap.list.page_down),
-        ("list", "jump_top") => Some(&mut keymap.list.jump_top),
-        ("list", "jump_bottom") => Some(&mut keymap.list.jump_bottom),
-        ("list", "accept") => Some(&mut keymap.list.accept),
-        ("list", "cancel") => Some(&mut keymap.list.cancel),
-        ("agents", "resume") => Some(&mut keymap.agents.resume),
-        ("agents", "search") => Some(&mut keymap.agents.search),
-        ("agents", "new_task") => Some(&mut keymap.agents.new_task),
-        ("agents", "new_worktree") => Some(&mut keymap.agents.new_worktree),
-        ("agents", "rename") => Some(&mut keymap.agents.rename),
-        ("agents", "stop") => Some(&mut keymap.agents.stop),
-        ("agents", "archive") => Some(&mut keymap.agents.archive),
-        ("agents", "delete") => Some(&mut keymap.agents.delete),
-        ("agents", "hide") => Some(&mut keymap.agents.hide),
-        ("agents", "toggle_grouping") => Some(&mut keymap.agents.toggle_grouping),
-        ("approval", "open_fullscreen") => Some(&mut keymap.approval.open_fullscreen),
-        ("approval", "open_thread") => Some(&mut keymap.approval.open_thread),
-        ("approval", "approve") => Some(&mut keymap.approval.approve),
-        ("approval", "approve_for_session") => Some(&mut keymap.approval.approve_for_session),
-        ("approval", "approve_for_prefix") => Some(&mut keymap.approval.approve_for_prefix),
-        ("approval", "deny") => Some(&mut keymap.approval.deny),
-        ("approval", "decline") => Some(&mut keymap.approval.decline),
-        ("approval", "cancel") => Some(&mut keymap.approval.cancel),
-        _ => None,
-    }
 }
 
 /// Format an action's active single-key and chord alternatives in config order.
@@ -446,6 +331,23 @@ pub(super) fn format_action_binding_summary(
     let specs = specs
         .into_iter()
         .filter(|spec| seen.insert(spec.clone()))
+        .map(|spec| {
+            let Some(completion) = spec.strip_prefix("leader ") else {
+                return spec;
+            };
+            let resolved = runtime_keymap
+                .chords
+                .leader
+                .iter()
+                .filter_map(|prefix| super::binding_to_config_key_spec(*prefix).ok())
+                .map(|prefix| format!("{prefix} {completion}"))
+                .collect::<Vec<_>>();
+            if resolved.is_empty() {
+                format!("{spec} (inactive)")
+            } else {
+                format!("{spec} ({})", resolved.join(", "))
+            }
+        })
         .collect::<Vec<_>>();
     if specs.is_empty() {
         "unbound".to_string()

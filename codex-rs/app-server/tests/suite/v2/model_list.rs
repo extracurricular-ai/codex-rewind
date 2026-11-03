@@ -39,15 +39,16 @@ use wiremock::matchers::path;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 
-#[test_case(None, false, true; "default off")]
-#[test_case(None, true, true; "app rollout")]
-#[test_case(Some(false), true, true; "user opt out")]
-#[test_case(Some(true), false, true; "user opt in")]
-#[test_case(Some(true), false, false; "base URL without catalog opt in")]
+#[test_case(None, None, true; "default on")]
+#[test_case(None, Some(false), true; "app rollback")]
+#[test_case(None, Some(true), true; "app rollout")]
+#[test_case(Some(false), Some(true), true; "user opt out")]
+#[test_case(Some(true), Some(false), true; "user opt in")]
+#[test_case(Some(true), Some(false), false; "base URL without catalog opt in")]
 #[tokio::test]
 async fn api_key_model_discovery_startup_enablement_respects_user_config(
     user_enablement: Option<bool>,
-    app_enablement: bool,
+    app_enablement: Option<bool>,
     catalog_opt_in: bool,
 ) -> Result<()> {
     let server = MockServer::start().await;
@@ -101,6 +102,31 @@ requires_openai_auth = true
         .with_env_overrides(&[("OPENAI_API_KEY", None), ("CODEX_API_KEY", None)])
         .build_initialized()
         .await?;
+    // Exercise runtime toggles after login has replaced the startup catalog manager.
+    if let Some(enabled) = app_enablement {
+        let _: ExperimentalFeatureEnablementSetResponse = mcp
+            .request(
+                |request_id| ClientRequest::ExperimentalFeatureEnablementSet {
+                    request_id,
+                    params: ExperimentalFeatureEnablementSetParams {
+                        enablement: [("api_key_model_discovery".to_string(), !enabled)].into(),
+                    },
+                },
+            )
+            .await?;
+    }
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?
+        .replace("name = \"OpenAI\"", "name = \"After login\"");
+    std::fs::write(config_path, config)?;
+    let login = mcp.send_login_account_api_key_request("test-key").await?;
+    let _: codex_app_server_protocol::LoginAccountResponse = mcp.read_response(login).await?;
+    let _: ModelListResponse = mcp
+        .request(|request_id| ClientRequest::ModelList {
+            request_id,
+            params: ModelListParams::default(),
+        })
+        .await?;
     let mut bundled = codex_models_manager::bundled_models_response()?.models;
     bundled.sort_by_key(|model| model.priority);
     let mut bundled = ModelPreset::filter_by_auth(
@@ -115,7 +141,10 @@ requires_openai_auth = true
             |request_id| ClientRequest::ExperimentalFeatureEnablementSet {
                 request_id,
                 params: ExperimentalFeatureEnablementSetParams {
-                    enablement: [("api_key_model_discovery".to_string(), app_enablement)].into(),
+                    enablement: app_enablement
+                        .into_iter()
+                        .map(|enabled| ("api_key_model_discovery".to_string(), enabled))
+                        .collect(),
                 },
             },
         )
@@ -130,23 +159,25 @@ requires_openai_auth = true
             },
         })
         .await?;
-    let enabled = user_enablement.unwrap_or(app_enablement) && catalog_opt_in;
-    let expected = if enabled { &remote } else { &bundled };
+    let enabled = user_enablement.or(app_enablement).unwrap_or(true) && catalog_opt_in;
+    let expected: &[ModelPreset] = if enabled {
+        &remote
+    } else if catalog_opt_in {
+        // The rollout gate suppresses discovery, but an explicit catalog still
+        // prevents bundled models from being advertised for this provider.
+        &[]
+    } else {
+        &bundled
+    };
     assert_eq!(
         response,
         ModelListResponse {
-            data: expected
-                .iter()
-                .map(|preset| Model {
-                    // These catalogs retain personality metadata; the cache fixture does not.
-                    supports_personality: preset.supports_personality,
-                    ..model_from_preset(preset)
-                })
-                .collect(),
+            data: expected.iter().map(model_from_preset).collect(),
             next_cursor: None,
         }
     );
-    if !enabled {
+    // Only startup opt-outs prevent fetches before the app sends its enablement.
+    if user_enablement == Some(false) || !catalog_opt_in {
         assert!(
             server
                 .received_requests()
@@ -189,10 +220,6 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
             .collect(),
         default_reasoning_effort: preset.default_reasoning_effort.clone(),
         input_modalities: preset.input_modalities.clone(),
-        // `write_models_cache().await` round-trips through a simplified ModelInfo fixture that does not
-        // preserve personality placeholders in base instructions, so app-server list results from
-        // cache report `supports_personality = false`.
-        // todo(sayan): fix, maybe make roundtrip use ModelInfo only
         supports_personality: false,
         multi_agent_version: preset.multi_agent_version.map(Into::into),
         additional_speed_tiers: preset.additional_speed_tiers.clone(),

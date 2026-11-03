@@ -9,7 +9,7 @@
 - **Keyboard hints:** Use `key_hint` span helpers for compact, uniformly bold shortcut labels
   and readable secondary descriptions. Include `+`, `/`, and chord separators in the label's
   emphasis. The `?` shortcut reference uses readable accent-colored keys
-  without bold. Separate composer footer actions with ` · `.
+  without bold. Separate composer footer actions with `·`.
 
 # Foreground colors
 
@@ -34,3 +34,11 @@
 - Avoid ANSI `blue` and `yellow` because for now the style guide doesn't use them. Prefer a foreground color mentioned above.
 
 (There are some rules to try to catch this in `clippy.toml`.)
+
+# Menu descriptions
+
+- Prefer concise built-in option descriptions and disabled-option explanations without trailing
+  periods.
+- When a description needs multiple sentences, keep normal punctuation, including the final period.
+  Do not combine sentences at the expense of clarity.
+- Preserve externally supplied descriptions as written.

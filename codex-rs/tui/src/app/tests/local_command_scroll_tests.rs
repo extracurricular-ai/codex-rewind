@@ -233,6 +233,7 @@ async fn settings_confirmations_reveal_their_history_output() -> Result<()> {
             AppEvent::SelectSessionModel {
                 model: "gpt-5.5".into(),
                 effort: Some(ReasoningEffortConfig::High),
+                service_tier: None,
             },
             "Failed to update thread settings",
         ),
@@ -282,6 +283,88 @@ async fn settings_confirmations_reveal_their_history_output() -> Result<()> {
     }
     tui.set_owned_screen(/*owned*/ false)?;
     server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn keymap_daemon_validates_before_saving_or_applying_bindings() -> Result<()> {
+    use super::session_lifecycle_requests::HistoryCapabilities;
+    use super::session_lifecycle_requests::recorded_params;
+    use super::session_lifecycle_requests::start_recording_app_server_with_history;
+
+    for capabilities in [
+        HistoryCapabilities::Current,
+        HistoryCapabilities::SuperBindingsUnsupported,
+    ] {
+        let (mut app, mut events, _op_rx) = make_test_app_with_channels().await;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let path = app.local_settings.user_config_path.clone();
+        std::fs::write(&path, "# retained config\n")?;
+        let original_keymap = app.local_settings.tui.keymap.clone();
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            capabilities,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::without_managed_config_for_tests(),
+        )
+        .await?;
+        app.app_server_target = AppServerTarget::LocalDaemon {
+            endpoint: crate::resolve_remote_addr("ws://127.0.0.1:4500")?,
+            allow_embedded_fallback: false,
+        };
+        app.handle_event(
+            &mut tui,
+            &mut server,
+            AppEvent::KeymapCaptured {
+                context: "editor".into(),
+                action: "move_line_start".into(),
+                key: "f12".into(),
+                intent: crate::app_event::KeymapEditIntent::AddAlternate,
+            },
+        )
+        .await?;
+        while let Ok(event) = events.try_recv() {
+            app.handle_event(&mut tui, &mut server, event).await?;
+        }
+        assert_eq!(
+            recorded_params(&requests, "config/value/write"),
+            vec![serde_json::json!({
+                "keyPath": "tui.keymap.editor.move_line_start",
+                "value": ["home", "ctrl-a", "super-left", "f12"],
+                "mergeStrategy": "replace",
+                "filePath": path.display().to_string(),
+                "expectedVersion": null,
+            })],
+        );
+        if capabilities == HistoryCapabilities::Current {
+            let saved: codex_config::config_toml::ConfigToml =
+                toml::from_str(&std::fs::read_to_string(&path)?)?;
+            assert_eq!(saved.tui.unwrap().keymap, app.local_settings.tui.keymap);
+            assert_eq!(
+                crate::keymap_setup::active_binding_specs(&app.keymap, "editor", "move_line_start")
+                    .expect("editor bindings"),
+                vec!["home", "ctrl-a", "super-left", "f12"],
+            );
+        } else {
+            assert_eq!(std::fs::read_to_string(&path)?, "# retained config\n");
+            assert_eq!(app.local_settings.tui.keymap, original_keymap);
+            assert_eq!(
+                crate::keymap_setup::active_binding_specs(&app.keymap, "editor", "move_line_start")
+                    .expect("editor bindings"),
+                vec!["home", "ctrl-a", "super-left"],
+            );
+            let error = app.transcript_cells.last().expect("save error");
+            insta::assert_snapshot!(
+                "keymap_daemon_rejected_binding",
+                lines_to_single_string(&error.display_lines(/*width*/ 80)),
+            );
+        }
+        server.start_thread(&app.config).await?;
+        server.shutdown().await?;
+        proxy.await??;
+    }
     Ok(())
 }
 

@@ -5,7 +5,90 @@ expression: rendered
 [
     (
         "catppuccin-mocha",
+        "dark",
         [
+            Line::from_iter([
+                Span::from("# ").fg(Color::Rgb(243, 139, 168)).bold().underlined(),
+                Span::from("Heading").fg(Color::Rgb(243, 139, 168)).bold().underlined(),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("Bold").fg(Color::Rgb(243, 139, 168)).bold(),
+                Span::from(" "),
+                Span::from("Italic").fg(Color::Rgb(243, 139, 168)).italic(),
+                Span::from(" "),
+                Span::from("Link").fg(Color::Rgb(137, 180, 250)).underlined(),
+            ]),
+            Line::from_iter([
+                Span::from("("),
+                Span::from("https://example.com").fg(Color::Rgb(137, 180, 250)).underlined(),
+                Span::from(")"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("> "),
+                Span::from("Quote"),
+            ]).fg(Color::Rgb(245, 194, 231)),
+            Line::default(),
+            Line::from_iter([
+                Span::from("1. ").light_blue(),
+                Span::from("Ordered"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("• ").fg(Color::Rgb(148, 226, 213)),
+                Span::from("Unordered"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("Use "),
+                Span::from("src/main.rs").fg(Color::Rgb(166, 227, 161)),
+                Span::from(" and "),
+                Span::from("./").fg(Color::Rgb(166, 227, 161)),
+            ]),
+            Line::from_iter([
+                Span::from("src/lib.rs").fg(Color::Rgb(166, 227, 161)),
+                Span::from("."),
+            ]),
+        ],
+    ),
+    (
+        "catppuccin-mocha",
+        "light",
+        [
+            Line::from_iter([
+                Span::from("# ").fg(Color::Rgb(169, 97, 117)).bold().underlined(),
+                Span::from("Heading").fg(Color::Rgb(169, 97, 117)).bold().underlined(),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("Bold").fg(Color::Rgb(169, 97, 117)).bold(),
+                Span::from(" "),
+                Span::from("Italic").fg(Color::Rgb(169, 97, 117)).italic(),
+                Span::from(" "),
+                Span::from("Link").fg(Color::Rgb(91, 119, 166)).underlined(),
+            ]),
+            Line::from_iter([
+                Span::from("("),
+                Span::from("https://example.com").fg(Color::Rgb(91, 119, 166)).underlined(),
+                Span::from(")"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("> "),
+                Span::from("Quote"),
+            ]).fg(Color::Rgb(139, 110, 131)),
+            Line::default(),
+            Line::from_iter([
+                Span::from("1. ").light_blue(),
+                Span::from("Ordered"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("• ").fg(Color::Rgb(82, 126, 119)),
+                Span::from("Unordered"),
+            ]),
+            Line::default(),
             Line::from_iter([
                 Span::from("Use "),
                 Span::from("src/main.rs").fg(Color::Rgb(166, 227, 161)),
@@ -20,7 +103,41 @@ expression: rendered
     ),
     (
         "catppuccin-latte",
+        "light",
         [
+            Line::from_iter([
+                Span::from("# ").fg(Color::Rgb(210, 15, 57)).bold().underlined(),
+                Span::from("Heading").fg(Color::Rgb(210, 15, 57)).bold().underlined(),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("Bold").fg(Color::Rgb(210, 15, 57)).bold(),
+                Span::from(" "),
+                Span::from("Italic").fg(Color::Rgb(210, 15, 57)).italic(),
+                Span::from(" "),
+                Span::from("Link").fg(Color::Rgb(30, 102, 245)).underlined(),
+            ]),
+            Line::from_iter([
+                Span::from("("),
+                Span::from("https://example.com").fg(Color::Rgb(30, 102, 245)).underlined(),
+                Span::from(")"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("> "),
+                Span::from("Quote"),
+            ]).fg(Color::Rgb(174, 87, 151)),
+            Line::default(),
+            Line::from_iter([
+                Span::from("1. ").light_blue(),
+                Span::from("Ordered"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("• ").fg(Color::Rgb(20, 131, 138)),
+                Span::from("Unordered"),
+            ]),
+            Line::default(),
             Line::from_iter([
                 Span::from("Use "),
                 Span::from("src/main.rs").fg(Color::Rgb(64, 160, 43)),
@@ -34,8 +151,91 @@ expression: rendered
         ],
     ),
     (
-        "ansi",
+        "nord",
+        "dark",
         [
+            Line::from_iter([
+                Span::from("# ").fg(Color::Rgb(136, 192, 208)).bold().underlined(),
+                Span::from("Heading").fg(Color::Rgb(136, 192, 208)).bold().underlined(),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("Bold").bold(),
+                Span::from(" "),
+                Span::from("Italic").italic(),
+                Span::from(" "),
+                Span::from("Link").fg(Color::Rgb(99, 168, 248)).underlined(),
+            ]),
+            Line::from_iter([
+                Span::from("("),
+                Span::from("https://example.com").fg(Color::Rgb(99, 168, 248)).underlined(),
+                Span::from(")"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("> "),
+                Span::from("Quote"),
+            ]).fg(Color::Rgb(114, 126, 149)),
+            Line::default(),
+            Line::from_iter([
+                Span::from("1. ").fg(Color::Rgb(216, 222, 233)),
+                Span::from("Ordered"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("• ").fg(Color::Rgb(216, 222, 233)),
+                Span::from("Unordered"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("Use "),
+                Span::from("src/main.rs").fg(Color::Rgb(143, 188, 187)),
+                Span::from(" and "),
+                Span::from("./").fg(Color::Rgb(143, 188, 187)),
+            ]),
+            Line::from_iter([
+                Span::from("src/lib.rs").fg(Color::Rgb(143, 188, 187)),
+                Span::from("."),
+            ]),
+        ],
+    ),
+    (
+        "ansi",
+        "dark",
+        [
+            Line::from_iter([
+                Span::from("# ").blue().bold().underlined(),
+                Span::from("Heading").blue().bold().underlined(),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("Bold").yellow().bold(),
+                Span::from(" "),
+                Span::from("Italic").magenta().italic(),
+                Span::from(" "),
+                Span::from("Link").fg(Color::Rgb(99, 168, 248)).underlined(),
+            ]),
+            Line::from_iter([
+                Span::from("("),
+                Span::from("https://example.com").fg(Color::Rgb(99, 168, 248)).underlined(),
+                Span::from(")"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("> "),
+                Span::from("Quote"),
+            ]).yellow(),
+            Line::default(),
+            Line::from_iter([
+                Span::from("1. ").light_blue(),
+                Span::from("Ordered"),
+            ]),
+            Line::default(),
+            Line::from_iter([
+                Span::from("• "),
+                Span::from("Unordered"),
+            ]),
+            Line::default(),
             Line::from_iter([
                 Span::from("Use "),
                 Span::from("src/main.rs").green(),

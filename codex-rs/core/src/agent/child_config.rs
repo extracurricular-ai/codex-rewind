@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use codex_features::Feature;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::BaseInstructions;
@@ -131,6 +132,13 @@ pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, St
 fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, String> {
     let base_config = turn.config.clone();
     let mut config = (*base_config).clone();
+    if config
+        .features
+        .enabled(Feature::SubagentDefaultContextLimits)
+    {
+        config.model_context_window = None;
+        config.model_auto_compact_token_limit = None;
+    }
     // Preserve activation for history forks without freezing the parent's model-owned prompts.
     // Fresh child startup restores configured preferences from the retained snapshot.
     config.token_budget = turn.configured_token_budget.clone();
@@ -164,7 +172,7 @@ fn reject_full_fork_agent_type_override(agent_type: Option<&str>) -> Result<(), 
     Ok(())
 }
 
-/// Copies runtime-only turn state onto a child config before it is handed to `LocalAgentControl`.
+/// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale can
 /// make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
@@ -256,7 +264,7 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
     config: &mut Config,
 ) -> Result<(), String> {
-    let Some(service_tier) = session.services.agent_control.root_service_tier() else {
+    let Some(service_tier) = session.services.agent_control.service_tier() else {
         config.service_tier = None;
         return Ok(());
     };

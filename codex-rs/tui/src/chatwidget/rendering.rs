@@ -14,6 +14,7 @@ use std::cell::Cell;
 
 struct ExternalWriterNotice {
     command_center_available: bool,
+    agents_navigation_key_available: bool,
     transcript_hint: Option<crate::key_hint::ShortcutHint>,
 }
 
@@ -64,8 +65,8 @@ impl ExternalWriterNotice {
         ]
         .into();
         let retry: Line<'static> = vec![
-            Span::styled("R", crate::style::accent_style()),
-            " to Retry".into(),
+            Span::styled("r", crate::style::accent_style()),
+            " to retry".into(),
         ]
         .into();
         let mut lines = word_wrap_lines(&[title], usize::from(width));
@@ -88,14 +89,23 @@ impl ExternalWriterNotice {
     }
 
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut items = vec![("r".to_string(), "retry".to_string())];
+        let mut items = vec![
+            ("r".to_string(), "retry".to_string()),
+            ("f".to_string(), "fork".to_string()),
+        ];
         let escape = crate::key_hint::plain(KeyCode::Esc).display_label();
         let mut quit_keys = vec![
             crate::key_hint::ctrl(KeyCode::Char('c')).display_label(),
             crate::key_hint::plain(KeyCode::Char('q')).display_label(),
         ];
         if self.command_center_available {
-            items.push((escape, "command center".to_string()));
+            let key = if self.agents_navigation_key_available {
+                let left = crate::key_hint::plain(KeyCode::Left).display_label();
+                format!("{left}/{escape}")
+            } else {
+                escape
+            };
+            items.push((key, "command center".to_string()));
         } else {
             quit_keys.insert(/*index*/ 0, escape);
         }
@@ -117,15 +127,33 @@ impl ExternalWriterNotice {
 
 impl ChatWidget {
     pub(crate) fn as_renderable(&self) -> RenderableItem<'_> {
+        let backdrop = self.as_backdrop_renderable();
+        match self.centered_dialog() {
+            Some(dialog) => RenderableItem::Owned(Box::new(crate::bottom_pane::DialogOverlay {
+                backdrop,
+                dialog,
+            })),
+            None => backdrop,
+        }
+    }
+
+    pub(crate) fn centered_dialog(&self) -> Option<crate::bottom_pane::CenteredView<'_>> {
+        self.bottom_pane.centered_dialog()
+    }
+
+    fn as_backdrop_renderable(&self) -> RenderableItem<'_> {
         if self
             .bottom_pane
             .selected_index_for_active_view(crate::app::AGENTS_OVERVIEW_VIEW_ID)
             .is_some()
+            || (self.bottom_pane.has_centered_view()
+                && self
+                    .bottom_pane
+                    .selected_index_for_present_view(crate::app::AGENTS_OVERVIEW_VIEW_ID)
+                    .is_some())
         {
-            return self.bottom_pane_renderable(
-                /*footer*/ None,
-                crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-            );
+            return self
+                .bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default());
         }
 
         let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
@@ -186,13 +214,10 @@ impl ChatWidget {
         }
         flex.push(
             /*flex*/ 0,
-            self.bottom_pane_renderable(
-                /*footer*/ None,
-                crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-            )
-            .inset(Insets::tlbr(
-                /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
-            )),
+            self.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions::default())
+                .inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                )),
         );
         RenderableItem::Owned(Box::new(flex))
     }
@@ -200,15 +225,21 @@ impl ChatWidget {
     /// Returns the composer, footer, and active modal without the live transcript above it.
     ///
     /// Both transcript surfaces use this composition so read-only notices and cursor placement
-    /// remain consistent. The caller owns any spacing between the transcript and this surface.
+    /// remain consistent. Owned transcripts reserve their shared hint row above the composer.
     pub(crate) fn bottom_pane_renderable<'a>(
         &'a self,
-        footer: Option<&'a crate::bottom_pane::TranscriptFooter>,
-        command_popup_placement: crate::bottom_pane::CommandPopupPlacement,
+        mut options: crate::bottom_pane::ComposerRenderOptions<'a>,
     ) -> RenderableItem<'a> {
-        if self.external_writer_view && !self.bottom_pane.has_active_view() {
+        if self.fork_in_progress {
+            RenderableItem::Owned(Box::new(
+                Paragraph::new("Forking conversation…".dim()).inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 2, /*bottom*/ 1, /*right*/ 2,
+                )),
+            ))
+        } else if self.external_writer_view && !self.bottom_pane.has_active_view() {
             RenderableItem::Owned(Box::new(ExternalWriterNotice {
-                command_center_available: self.remote_connection.is_some(),
+                command_center_available: self.bottom_pane.command_center_enabled(),
+                agents_navigation_key_available: self.agents_navigation_key_available(),
                 transcript_hint: self.bottom_pane.transcript_shortcut_hint(),
             }))
         } else {
@@ -221,15 +252,25 @@ impl ChatWidget {
             } else {
                 self.ambient_pet_wrap_reserved_cols()
             };
-            self.bottom_pane
-                .as_renderable_with_options(crate::bottom_pane::ComposerRenderOptions {
-                    warning_count: self.warning_display_state.count,
-                    textarea_right_reserve: right_reserve,
-                    separate_status_line: command_popup_placement
-                        != crate::bottom_pane::CommandPopupPlacement::AboveComposer,
-                    command_popup_placement,
-                    footer,
-                })
+            options.rendered_selection = Some(&self.rendered_selection);
+            options.warning_count = self.warning_display_state.count;
+            options.textarea_right_reserve = right_reserve;
+            options.separate_status_line = options.command_popup_placement
+                != crate::bottom_pane::CommandPopupPlacement::AboveComposer;
+            let bottom_pane = self.bottom_pane.backdrop_with_options(options);
+            let above_composer = if self.quick_dial_menu {
+                RenderableItem::Owned(Box::new(self.quick_dial_hud()))
+            } else if let Some(pending) = &self.safety_recourse
+                && !self.bottom_pane.has_active_view()
+            {
+                RenderableItem::Borrowed(&pending.notice)
+            } else {
+                return bottom_pane;
+            };
+            let mut column = FlexRenderable::new();
+            column.push(/*flex*/ 1, above_composer);
+            column.push(/*flex*/ 0, bottom_pane);
+            RenderableItem::Owned(Box::new(column))
         }
     }
 

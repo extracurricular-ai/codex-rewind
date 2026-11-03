@@ -80,7 +80,7 @@ async fn memory_reset_clears_memory_files_and_rows_preserves_threads() -> Result
     Ok(())
 }
 
-async fn seed_stage1_output(
+pub(super) async fn seed_stage1_output(
     state_db: &Arc<StateRuntime>,
     codex_home: &Path,
     version: MemoryVersion,
@@ -134,7 +134,7 @@ async fn seed_stage1_output(
     Ok(thread_id)
 }
 
-async fn init_state_db(codex_home: &Path) -> Result<Arc<StateRuntime>> {
+pub(super) async fn init_state_db(codex_home: &Path) -> Result<Arc<StateRuntime>> {
     let state_db = StateRuntime::init(
         codex_state::SqliteConfig::new_for_testing(codex_home.abs()),
         "mock_provider".into(),
@@ -155,15 +155,34 @@ async fn memory_status_requires_successful_v2_consolidation_and_resets() -> Resu
         .enable_feature(Feature::Sqlite)
         .write(home.path())?;
     let db = init_state_db(home.path()).await?;
-    seed_stage1_output(&db, home.path(), MemoryVersion::V1).await?;
-    let source = seed_stage1_output(&db, home.path(), MemoryVersion::V2).await?;
-    seed_stage1_output(&db, home.path(), MemoryVersion::V2).await?;
     let mut server = TestAppServer::builder()
         .with_codex_home(home.path())
         .without_auto_env()
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
     let params = serde_json::json!({"minConsolidatedThreads": 2});
+    // Resetting a fresh profile must not create an unused V1 workspace.
+    let request = server
+        .send_raw_request("memory/reset", /*params*/ None)
+        .await?;
+    let _: MemoryResetResponse = server.read_response(request).await?;
+    assert!(!home.path().join("memories").exists());
+    let request = server
+        .send_raw_request("memory/status", Some(params.clone()))
+        .await?;
+    let status: MemoryStatusResponse = server.read_response(request).await?;
+    assert_eq!(
+        status,
+        MemoryStatusResponse {
+            v2_consolidated_threads: 0,
+            v2_ready: true
+        }
+    );
+    // Even an empty V1 workspace retains the existing readiness requirements.
+    tokio::fs::create_dir(home.path().join("memories")).await?;
+    seed_stage1_output(&db, home.path(), MemoryVersion::V1).await?;
+    let source = seed_stage1_output(&db, home.path(), MemoryVersion::V2).await?;
+    seed_stage1_output(&db, home.path(), MemoryVersion::V2).await?;
     let request = server
         .send_raw_request("memory/status", Some(params.clone()))
         .await?;

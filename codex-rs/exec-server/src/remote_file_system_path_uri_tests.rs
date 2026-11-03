@@ -402,7 +402,7 @@ async fn concurrent_remote_metadata_requests_share_only_in_flight_results() {
     };
     assert_eq!(first.expect("first metadata request"), expected);
     assert_eq!(second.expect("second metadata request"), expected);
-    assert!(file_system.metadata_requests.lock().await.is_empty());
+    assert!(file_system.lock_metadata_requests().is_empty());
 
     let initializing_file_system = std::sync::Arc::clone(&file_system);
     let initializing_path = path.clone();
@@ -424,9 +424,7 @@ async fn concurrent_remote_metadata_requests_share_only_in_flight_results() {
     assert!(futures::poll!(follower.as_mut()).is_pending());
     assert_eq!(
         file_system
-            .metadata_requests
-            .lock()
-            .await
+            .lock_metadata_requests()
             .get(&path)
             .map(std::sync::Arc::strong_count),
         Some(3)
@@ -448,7 +446,7 @@ async fn concurrent_remote_metadata_requests_share_only_in_flight_results() {
             .expect("waiting metadata request should retry the abandoned initializer"),
         refreshed
     );
-    assert!(file_system.metadata_requests.lock().await.is_empty());
+    assert!(file_system.lock_metadata_requests().is_empty());
     assert_eq!(
         captured_params.await.expect("captured metadata requests"),
         vec![

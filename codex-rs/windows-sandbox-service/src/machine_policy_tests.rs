@@ -2,6 +2,9 @@ use anyhow::Result;
 use codex_config::ConfigRequirementsToml;
 use codex_windows_sandbox::WindowsSandboxProvisioningSettings;
 use codex_windows_sandbox::WindowsSandboxProxyListeners;
+use pretty_assertions::assert_eq;
+
+use crate::ipc::ProvisioningRequest;
 
 fn validate_requirements(
     settings: &WindowsSandboxProvisioningSettings,
@@ -13,16 +16,29 @@ fn validate_requirements(
 }
 
 #[test]
-fn runtime_worker_impersonation_failure_rejects_provisioning() {
-    let error = super::validate_provisioning_settings(
-        &std::env::temp_dir(),
-        &WindowsSandboxProvisioningSettings::default(),
-        &WindowsSandboxProxyListeners::default(),
-        /*impersonation_token*/ 0,
-    )
-    .expect_err("runtime workers must not load configuration without impersonating the client");
-
-    assert!(error.to_string().contains("failed to impersonate"));
+fn only_registered_refresh_skips_configuration_loading() {
+    for (registered_core, refresh_only) in
+        [(true, true), (true, false), (false, false), (false, true)]
+    {
+        let request = ProvisioningRequest {
+            codex_home: std::env::temp_dir(),
+            registered_core,
+            refresh_only,
+            settings: WindowsSandboxProvisioningSettings::default(),
+            listeners: WindowsSandboxProxyListeners::default(),
+        };
+        // An invalid worker token makes any attempt to load config fail closed.
+        // Refresh must succeed without starting that runtime; setup must not.
+        let result = super::validate_provisioning_request(
+            &request.codex_home,
+            &request,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(result.is_ok(), registered_core && refresh_only);
+        if let Err(error) = result {
+            assert!(error.to_string().contains("failed to impersonate"));
+        }
+    }
 }
 
 #[test]
@@ -75,38 +91,44 @@ fn forbidden_local_binding_is_rejected() {
         proxy_ports: Vec::new(),
         allow_local_binding: true,
     };
-    assert!(
-        validate_requirements(
-            &settings,
-            WindowsSandboxProxyListeners::default(),
-            "[experimental_network]\nallow_local_binding = false"
-        )
-        .is_err()
-    );
+    for table in ["network_proxy", "experimental_network"] {
+        assert!(
+            validate_requirements(
+                &settings,
+                WindowsSandboxProxyListeners::default(),
+                &format!("[{table}]\nallow_local_binding = false")
+            )
+            .is_err(),
+            "{table}"
+        );
+    }
 }
 
 #[test]
 fn disabled_network_rejects_proxy_ports_and_local_binding() -> Result<()> {
-    let policy = "[experimental_network]\nenabled = false";
-    validate_requirements(
-        &WindowsSandboxProvisioningSettings::default(),
-        WindowsSandboxProxyListeners::default(),
-        policy,
-    )?;
-    for settings in [
-        WindowsSandboxProvisioningSettings {
-            proxy_ports: vec![3128],
-            allow_local_binding: false,
-        },
-        WindowsSandboxProvisioningSettings {
-            proxy_ports: Vec::new(),
-            allow_local_binding: true,
-        },
-    ] {
-        assert!(
-            validate_requirements(&settings, WindowsSandboxProxyListeners::default(), policy)
-                .is_err()
-        );
+    for table in ["network_proxy", "experimental_network"] {
+        let policy = format!("[{table}]\nenabled = false");
+        validate_requirements(
+            &WindowsSandboxProvisioningSettings::default(),
+            WindowsSandboxProxyListeners::default(),
+            &policy,
+        )?;
+        for settings in [
+            WindowsSandboxProvisioningSettings {
+                proxy_ports: vec![3128],
+                allow_local_binding: false,
+            },
+            WindowsSandboxProvisioningSettings {
+                proxy_ports: Vec::new(),
+                allow_local_binding: true,
+            },
+        ] {
+            assert!(
+                validate_requirements(&settings, WindowsSandboxProxyListeners::default(), &policy)
+                    .is_err(),
+                "{table}"
+            );
+        }
     }
     Ok(())
 }
@@ -137,42 +159,45 @@ fn disabled_local_binding_is_allowed_when_policy_permits_binding() -> Result<()>
 
 #[test]
 fn managed_proxy_ports_allow_only_configured_ports() -> Result<()> {
-    let policy = "[experimental_network]\nhttp_port = 3128\nsocks_port = 1080";
     let allowed = WindowsSandboxProvisioningSettings {
         proxy_ports: vec![1080, 3128],
         allow_local_binding: false,
     };
-    for listeners in [
-        WindowsSandboxProxyListeners {
-            http_ports: vec![3128],
-            socks_ports: vec![1080],
-        },
-        WindowsSandboxProxyListeners::default(),
-    ] {
-        validate_requirements(&allowed, listeners, policy)?;
-    }
     let prohibited = WindowsSandboxProvisioningSettings {
         proxy_ports: vec![1080, 3128, 8080],
         allow_local_binding: false,
     };
-    for listeners in [
-        WindowsSandboxProxyListeners {
-            http_ports: vec![3128, 8080],
-            socks_ports: vec![1080],
-        },
-        WindowsSandboxProxyListeners {
-            http_ports: vec![3128],
-            socks_ports: vec![1080],
-        },
-        WindowsSandboxProxyListeners::default(),
-    ] {
-        assert!(validate_requirements(&prohibited, listeners, policy).is_err());
+    for table in ["network_proxy", "experimental_network"] {
+        let policy = format!("[{table}]\nhttp_port = 3128\nsocks_port = 1080");
+        for listeners in [
+            WindowsSandboxProxyListeners {
+                http_ports: vec![3128],
+                socks_ports: vec![1080],
+            },
+            WindowsSandboxProxyListeners::default(),
+        ] {
+            validate_requirements(&allowed, listeners, &policy)?;
+        }
+        for listeners in [
+            WindowsSandboxProxyListeners {
+                http_ports: vec![3128, 8080],
+                socks_ports: vec![1080],
+            },
+            WindowsSandboxProxyListeners {
+                http_ports: vec![3128],
+                socks_ports: vec![1080],
+            },
+            WindowsSandboxProxyListeners::default(),
+        ] {
+            assert!(validate_requirements(&prohibited, listeners, &policy).is_err());
+        }
+        validate_requirements(
+            &WindowsSandboxProvisioningSettings::default(),
+            WindowsSandboxProxyListeners::default(),
+            &policy,
+        )?;
     }
-    validate_requirements(
-        &WindowsSandboxProvisioningSettings::default(),
-        WindowsSandboxProxyListeners::default(),
-        policy,
-    )
+    Ok(())
 }
 
 #[test]

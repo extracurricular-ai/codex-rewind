@@ -22,6 +22,7 @@ use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
+use codex_app_server_protocol::McpServerOauthLoginResponse;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::PluginInstallResponse;
@@ -43,6 +44,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
+use codex_utils_path_uri::PathUri;
 use strum_macros::IntoStaticStr;
 use uuid::Uuid;
 
@@ -52,6 +54,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::chatwidget::AstraModelPickerAction;
+use crate::chatwidget::ConfiguredPetLoadGeneration;
 use crate::chatwidget::ConnectorScopeGeneration;
 use crate::chatwidget::ThreadUsageOutcome;
 use crate::chatwidget::UserMessage;
@@ -66,6 +69,20 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_realtime_webrtc::StartedRealtimeWebrtcSession;
 
 use crate::history_cell::HistoryCell;
+
+#[derive(Debug)]
+pub(crate) struct RealtimeWebrtcStartupFailure {
+    pub message: String,
+    pub cause: codex_realtime_webrtc::ConnectionError,
+}
+
+/// Global voice controls always apply to the one call's owner.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VoiceControl {
+    Toggle,
+    Stop,
+    Mute,
+}
 
 /// Confirmed server lifecycle operations available from the agents dashboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,11 +247,12 @@ pub(crate) enum KeymapEditIntent {
     ReplaceOne { old_key: String },
 }
 
-/// Number of key strokes recorded by one `/keymap` capture.
+/// Kind of shortcut recorded by one `/keymap` capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeymapCaptureMode {
     SingleKey,
     Chord,
+    LeaderChord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,12 +282,32 @@ pub(crate) struct AgentsOverviewThreadRefresh {
     pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
     pub(crate) last_messages: std::collections::HashMap<ThreadId, String>,
     pub(crate) recent_seed_complete: bool,
+    pub(crate) discovery: Option<crate::app::agents_overview_discovery::AgentsOverviewDiscovery>,
+    pub(crate) pinned_thread_ids: Option<Option<Vec<ThreadId>>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AgentPickerThreadRefresh {
+    pub(crate) threads: Vec<Thread>,
+    pub(crate) archived_thread_ids: std::collections::HashSet<ThreadId>,
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
+    AccountEmailLoaded {
+        request_id: uuid::Uuid,
+        email: Option<String>,
+        workspace: Option<String>,
+    },
+    SecuritySetupLoaded {
+        request_id: uuid::Uuid,
+        identity: crate::security_setup::Identity,
+        notice: crate::security_setup::Notice,
+    },
     OpenDaemonMenu,
+    ConfirmDaemonRestart,
+    RunDaemonRestart,
     ConfirmDaemonUpdate(crate::update_action::DaemonUpdateSource),
     RunDaemonUpdate(crate::update_action::DaemonUpdateSource),
     ReviewMisalignment(Arc<crate::chatwidget::MisalignmentReview>),
@@ -277,6 +315,7 @@ pub(crate) enum AppEvent {
     CloseMisalignmentReview,
     /// Open the live command center for recent and locally retained root sessions.
     OpenAgentsOverview,
+    ShowMoreAgentsOverview,
     /// Create an empty thread from the command center.
     NewAgentsOverviewSession {
         cwd: Option<AbsolutePathBuf>,
@@ -295,10 +334,30 @@ pub(crate) enum AppEvent {
         cwd: Option<AbsolutePathBuf>,
     },
     AgentsOverviewWorktreeCreated(Result<crate::app::PendingWorktree, String>),
+    /// Fork the selected dashboard conversation and open the new session.
+    ForkAgentsOverviewThread {
+        thread_id: ThreadId,
+    },
+    /// Run the existing fork action after selection events have been processed.
+    ForkAgentsOverviewThreadReady {
+        thread_id: ThreadId,
+    },
     /// Rename a task directly from the shared dashboard.
     RenameAgentsOverviewThread {
         thread_id: ThreadId,
         name: String,
+    },
+    /// Move a task into or out of the shared pinned section.
+    ToggleAgentsOverviewPin {
+        thread_id: ThreadId,
+        pinned: bool,
+    },
+    /// Finish moving a task into or out of the shared pinned section.
+    AgentsOverviewPinToggled {
+        request_id: Uuid,
+        thread_id: ThreadId,
+        pinned: bool,
+        result: Result<(), String>,
     },
     /// Generate an editable title suggestion for the active rename prompt.
     SuggestThreadName {
@@ -354,7 +413,7 @@ pub(crate) enum AppEvent {
     AgentPickerThreadsLoaded {
         primary_thread_id: ThreadId,
         request_id: Uuid,
-        result: Result<Vec<Thread>, String>,
+        result: Result<AgentPickerThreadRefresh, String>,
     },
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
@@ -392,7 +451,10 @@ pub(crate) enum AppEvent {
         server_name: String,
         request_id: AppServerRequestId,
         attempt_id: Uuid,
-        result: Result<codex_app_server_protocol::UserVerificationProof, String>,
+        result: Result<
+            codex_app_server_protocol::UserVerificationProof,
+            crate::app_command::UserVerificationFailure,
+        >,
     },
 
     /// Interrupt, fork, and retry a safety-buffered turn with the server-selected model.
@@ -402,6 +464,13 @@ pub(crate) enum AppEvent {
         model: String,
         turn: AppCommand,
         prompt: UserMessage,
+    },
+
+    /// Fork before a blocked turn and send the selected safer follow-up.
+    ContinueSafetyRecourse {
+        thread_id: ThreadId,
+        turn_id: String,
+        prompt: String,
     },
 
     /// Deliver a synthetic history lookup response to a specific thread channel.
@@ -428,13 +497,27 @@ pub(crate) enum AppEvent {
     OpenWarnings,
     /// Copy a diagnostic and acknowledge in the footer, without appending history.
     CopyWarning(String),
+    /// Apply the user's decisions for the frozen warning details, in viewer-close order.
+    UpdateWarnings {
+        transcript: Arc<()>,
+        dismissed: Vec<crate::history_cell::WarningEntry>,
+        kept: Vec<crate::history_cell::WarningEntry>,
+    },
 
     /// Export all current-thread history to the selected destination.
     ExportTranscript {
         destination: TranscriptExportDestination,
     },
 
-    /// Copy a picker selection while retaining its clipboard lease in the chat widget.
+    /// Select a response or block directly in the owned transcript.
+    SelectTranscriptCopy {
+        guard: Arc<crate::copy_input_guard::CopyInputGuard>,
+    },
+
+    /// Retry queued input after the transcript copy owner is released.
+    TranscriptCopyClosed,
+
+    /// Copy text through the session clipboard worker.
     CopySelection {
         text: Arc<str>,
         label: String,
@@ -544,6 +627,8 @@ pub(crate) enum AppEvent {
 
     /// Clear history queued by the previous thread before the new thread's replay events.
     ResetTranscriptForThreadSwitch,
+    /// Reset queued history while keeping the startup draft visible until the next frame.
+    ResetTranscriptForThreadSwitchPreservingScreen,
 
     /// Re-render the transcript using the selected scrollback rendering mode.
     RawOutputModeChanged {
@@ -857,6 +942,7 @@ pub(crate) enum AppEvent {
 
     /// Result of restoring the configured ambient pet during startup.
     ConfiguredPetLoaded {
+        generation: ConfiguredPetLoadGeneration,
         pet_id: String,
         result: Result<Option<crate::pets::AmbientPet>, String>,
     },
@@ -883,9 +969,9 @@ pub(crate) enum AppEvent {
         cwd: PathBuf,
     },
 
-    /// Fetch lifecycle hook inventory for the provided working directory.
+    /// Fetch lifecycle hook inventory for the current thread or working directory.
     FetchHooksList {
-        cwd: PathBuf,
+        target: crate::hooks_rpc::HooksListTarget,
     },
 
     /// Result of fetching plugin marketplace state.
@@ -909,8 +995,8 @@ pub(crate) enum AppEvent {
 
     /// Result of fetching lifecycle hook inventory.
     HooksLoaded {
-        cwd: PathBuf,
-        result: Result<codex_app_server_protocol::HooksListResponse, String>,
+        target: crate::hooks_rpc::HooksListTarget,
+        result: Result<codex_app_server_protocol::HooksListEntry, String>,
     },
 
     /// Open the prompt for adding a marketplace source.
@@ -1074,6 +1160,16 @@ pub(crate) enum AppEvent {
         thread_id: Option<ThreadId>,
     },
 
+    StartMcpLogin {
+        name: String,
+        thread_id: ThreadId,
+    },
+
+    McpLoginStarted {
+        request_id: String,
+        result: Result<McpServerOauthLoginResponse, String>,
+    },
+
     /// Result of fetching MCP inventory via app-server RPCs.
     McpInventoryLoaded {
         result: Result<Vec<McpServerStatus>, String>,
@@ -1103,9 +1199,24 @@ pub(crate) enum AppEvent {
     FollowTranscript,
 
     InsertHistoryCell(Box<dyn HistoryCell>),
+    /// FIFO barrier after the completed turn's history insertions.
+    TurnTipReady {
+        thread_id: ThreadId,
+        turn_id: String,
+    },
 
     /// Move visible completed voice captions into history in one app event.
     CommitRealtimeTranscriptHistory,
+
+    VoiceControl {
+        thread_id: Option<ThreadId>,
+        control: VoiceControl,
+    },
+    RealtimeConversationStateChanged,
+    BackgroundVoiceError {
+        thread_id: ThreadId,
+        message: String,
+    },
 
     /// Finish buffering initial resume replay after all replay events have been queued.
     EndInitialHistoryReplayBuffer,
@@ -1124,6 +1235,7 @@ pub(crate) enum AppEvent {
     /// transcript without first writing its provisional render to scrollback.
     ConsolidateAgentMessage {
         source: String,
+        copy_source: Option<String>,
         cwd: PathBuf,
         inline_visualization_context: Option<InlineVisualizationContext>,
         scrollback_reflow: ConsolidationScrollbackReflow,
@@ -1152,7 +1264,13 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
-    /// Apply a final Astra picker action and offer the flourish only if it changed the model on
+    /// Apply a model-picker selection to the active conversation and saved local defaults.
+    ApplyModelSelection {
+        model: String,
+        effort: Option<ReasoningEffort>,
+    },
+
+    /// Apply an explicit Astra selection and offer the flourish only if it changed the model on
     /// its original task. Automatic model updates do not use this event.
     AstraSelectedFromModelPicker {
         thread_id: ThreadId,
@@ -1164,7 +1282,7 @@ pub(crate) enum AppEvent {
     RealtimeWebrtcOfferCreated {
         thread_id: ThreadId,
         attempt_id: u64,
-        result: Result<StartedRealtimeWebrtcSession, String>,
+        result: Result<StartedRealtimeWebrtcSession, RealtimeWebrtcStartupFailure>,
     },
 
     /// Result of establishing the WebRTC connection for an active voice attempt.
@@ -1190,10 +1308,29 @@ pub(crate) enum AppEvent {
         effort: Option<ReasoningEffort>,
     },
 
-    /// Apply a model and effort only to the active session, preserving saved defaults.
+    /// Apply a model, effort, and optional speed only to the active session, preserving saved defaults.
     SelectSessionModel {
         model: String,
         effort: Option<ReasoningEffort>,
+        service_tier: Option<String>,
+    },
+
+    OpenQuickDialEditor {
+        target: crate::chatwidget::quick_dials::QuickDialEditorTarget,
+        dial: Option<codex_config::types::QuickDial>,
+    },
+    OpenQuickDialSavePicker(codex_config::types::QuickDial),
+    ConfirmQuickDial {
+        slot: u8,
+        dial: Option<codex_config::types::QuickDial>,
+    },
+    SaveQuickDial {
+        slot: u8,
+        dial: Option<codex_config::types::QuickDial>,
+    },
+    RecallQuickDial {
+        slot: u8,
+        thread_id: Option<ThreadId>,
     },
 
     /// Show the cyber auto-review notice after the model selection confirmation.
@@ -1201,6 +1338,26 @@ pub(crate) enum AppEvent {
 
     /// Read the owning server preference before showing the voice picker.
     OpenRealtimeSettings,
+    OpenRealtimeSoundDevices,
+    OpenRealtimeVoices,
+    OpenRealtimeDevicePicker {
+        kind: codex_realtime_webrtc::AudioDeviceKind,
+    },
+    OpenRealtimeInputChannels {
+        device: codex_realtime_webrtc::AudioDevice,
+    },
+    RealtimeDevicesListed {
+        origin: Option<ThreadId>,
+        kind: codex_realtime_webrtc::AudioDeviceKind,
+        result: Result<Vec<codex_realtime_webrtc::AudioDevice>, String>,
+    },
+    PersistRealtimeDevice {
+        kind: codex_realtime_webrtc::AudioDeviceKind,
+        name: Option<String>,
+    },
+    PersistRealtimeInputChannel {
+        channel: Option<codex_config::config_toml::MicrophoneChannels>,
+    },
 
     /// Save the voice for subsequent conversations through the app server.
     PersistRealtimeVoiceSelection {
@@ -1212,11 +1369,22 @@ pub(crate) enum AppEvent {
         service_tier: Option<String>,
     },
 
+    /// Persist the current thread's Daybreak preference and the new-thread default.
+    PersistDaybreakSelection {
+        thread_id: ThreadId,
+        enabled: bool,
+    },
+
     /// Fetch the current catalog even when cached models produce no picker.
     FetchModels {
         request_id: uuid::Uuid,
     },
     ModelsLoaded {
+        request_id: uuid::Uuid,
+        result: Result<Vec<ModelPreset>, String>,
+    },
+    /// Finished the API-key compatibility check; do not check the same catalog again.
+    ApiKeyCompatModelsLoaded {
         request_id: uuid::Uuid,
         result: Result<Vec<ModelPreset>, String>,
     },
@@ -1386,7 +1554,7 @@ pub(crate) enum AppEvent {
 
     /// Enable or disable a skill by path.
     SetSkillEnabled {
-        path: AbsolutePathBuf,
+        path: PathUri,
         enabled: bool,
     },
 
@@ -1430,6 +1598,11 @@ pub(crate) enum AppEvent {
 
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
+
+    /// Resolve an inline permission profile after any app-owned platform preflight.
+    ResolvePermissionProfile {
+        profile_id: String,
+    },
 
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),
@@ -1517,6 +1690,23 @@ pub(crate) enum AppEvent {
     },
     /// Dismiss the terminal-title setup UI without changing config.
     TerminalTitleSetupCancelled,
+
+    /// Remember the Command Center grouping across launches.
+    PersistAgentsOverviewGrouping(codex_config::types::AgentsOverviewGrouping),
+
+    /// Open an existing editor above the configuration panel.
+    OpenConfigEditor(crate::config_panel::ConfigEditorHandoff),
+
+    /// Schedule a notification preview with time to switch away from the terminal.
+    TestConfigNotification,
+
+    /// Send the matching scheduled preview regardless of the configured focus condition.
+    SendConfigTestNotification {
+        generation: u64,
+    },
+
+    /// Requests saving a local `/config` preference and refreshing its effective value.
+    SaveConfigPreference(crate::config_panel::ConfigPreference),
 
     /// Save the transcript renderer preference for the next launch only.
     FullscreenTranscriptSelected {

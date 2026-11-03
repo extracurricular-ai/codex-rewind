@@ -1,10 +1,12 @@
-//! Public enterprise login exercises the real callback and keyring adapter in an isolated process.
+//! Enterprise login exercises the real callback and keyring adapter in an isolated process.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -19,7 +21,6 @@ use keyring::mock::MockCredential;
 use oauth2::TokenResponse;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use sha2::Digest;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tracing_test::traced_test;
@@ -32,6 +33,7 @@ use wiremock::matchers::path;
 use super::*;
 
 const SECRET: &str = "enterprise-secret-sentinel";
+const CLIENT_SECRET: &str = "client-secret-sentinel";
 const CREDENTIAL_NAME: &str = "ema-idp:enterprise-secret-sentinel";
 
 #[path = "enterprise_oauth_logout_tests.rs"]
@@ -59,8 +61,14 @@ async fn isolated_process(test_name: &str) -> Result<bool> {
     Ok(true)
 }
 
-async fn login(issuer: &str, callback_url: Option<&str>) -> Result<EnterpriseOAuthLoginHandle> {
+async fn login(
+    issuer: &str,
+    callback_url: Option<&str>,
+    auth_method: Option<McpEmaTokenEndpointAuthMethod>,
+) -> Result<EnterpriseOAuthLoginHandle> {
     perform_enterprise_oauth_login_return_url(EnterpriseOAuthLoginRequest {
+        client_secret: auth_method.map(|_| CLIENT_SECRET),
+        token_endpoint_auth_method: auth_method,
         credential_name: CREDENTIAL_NAME,
         issuer,
         client_id: "enterprise-client",
@@ -77,7 +85,10 @@ async fn login(issuer: &str, callback_url: Option<&str>) -> Result<EnterpriseOAu
 }
 
 async fn complete_login(issuer: &str) -> Result<EnterpriseOAuthCredentials> {
-    let handle = login(issuer, /*callback_url*/ None).await?;
+    let handle = login(
+        issuer, /*callback_url*/ None, /*auth_method*/ None,
+    )
+    .await?;
     callback(
         &handle.authorization_url(),
         issuer,
@@ -91,7 +102,7 @@ async fn metadata(server: &MockServer, issuer: &str) {
     Mock::given(method("GET")).and(path("/.well-known/oauth-authorization-server/idp"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "issuer": issuer, "authorization_endpoint": format!("{issuer}/authorize?prompt=none"),
-            "token_endpoint": format!("{issuer}/token"), "token_endpoint_auth_methods_supported": ["none"],
+            "token_endpoint": format!("{issuer}/token"), "token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
         }))).mount(server).await;
 }
 
@@ -131,8 +142,8 @@ async fn callback(authorization_url: &str, issuer: &str, provider_error: bool) -
     Ok(())
 }
 
-#[tokio::test]
 #[traced_test]
+#[tokio::test]
 async fn enterprise_callback_errors_and_sdk_logs_exclude_credentials() -> Result<()> {
     if isolated_process(
         "enterprise_oauth_login::tests::enterprise_callback_errors_and_sdk_logs_exclude_credentials",
@@ -141,6 +152,22 @@ async fn enterprise_callback_errors_and_sdk_logs_exclude_credentials() -> Result
     {
         return Ok(());
     }
+    let server = MockServer::start().await;
+    let issuer = format!("{}/idp", server.uri());
+    metadata(&server, &format!("https://{SECRET}.example/idp")).await;
+    let error = login(
+        &issuer, /*callback_url*/ None, /*auth_method*/ None,
+    )
+    .await
+    .err()
+    .expect("reject mismatched discovery issuer");
+    assert_eq!(
+        error.downcast_ref::<EmaErrorDetail>(),
+        Some(&EmaErrorDetail::new(
+            "failed to discover enterprise IdP authorization metadata"
+        ))
+    );
+    assert!(!format!("{error} {error:?} {error:#}").contains(SECRET));
     for (callback_error, token_success) in [(true, false), (false, false), (false, true)] {
         let server = MockServer::start().await;
         let issuer = format!("{}/idp", server.uri());
@@ -159,7 +186,10 @@ async fn enterprise_callback_errors_and_sdk_logs_exclude_credentials() -> Result
             .expect(u64::from(!callback_error))
             .mount(&server)
             .await;
-        let login = login(&issuer, /*callback_url*/ None).await?;
+        let login = login(
+            &issuer, /*callback_url*/ None, /*auth_method*/ None,
+        )
+        .await?;
         callback(&login.authorization_url(), &issuer, callback_error).await?;
         tracing::trace!(target: "rmcp::transport::auth", "SDK trace capture enabled");
         let error = login.wait().await.err().expect("reject provider response");
@@ -226,8 +256,8 @@ fn enterprise_callback_requires_loopback() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
 #[traced_test]
+#[tokio::test]
 async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
     if isolated_process("enterprise_oauth_login::tests::enterprise_public_api_storage_and_privacy")
         .await?
@@ -239,12 +269,6 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
     let server = MockServer::start().await;
     let issuer = format!("{}/idp", server.uri());
     metadata(&server, &issuer).await;
-    assert!(
-        login(&issuer, Some(&format!("{}/callback", server.uri())))
-            .await
-            .is_err(),
-        "an occupied registered callback port must not silently move"
-    );
     let assertion = format!(
         "{}.{}.signature",
         URL_SAFE_NO_PAD.encode(r#"{"alg":"ES256"}"#),
@@ -262,12 +286,20 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
         .await;
 
     // Callback, exchange and DefaultKeyringStore all run through public entrypoints.
-    for (login_index, callback_url) in ["http://localhost/callback", "http://127.0.0.1/callback"]
-        .into_iter()
-        .enumerate()
+    use McpEmaTokenEndpointAuthMethod::ClientSecretBasic;
+    use McpEmaTokenEndpointAuthMethod::ClientSecretPost;
+    for (login_index, (callback_url, auth_method)) in [
+        ("http://localhost/callback", None),
+        ("http://127.0.0.1/callback", None),
+        ("http://localhost/callback", Some(ClientSecretBasic)),
+        ("http://127.0.0.1/callback", Some(ClientSecretPost)),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        let login = login(&issuer, Some(callback_url)).await?;
+        let login = login(&issuer, Some(callback_url), auth_method).await?;
         let authorization_url = login.authorization_url();
+        assert!(!authorization_url.contains(CLIENT_SECRET));
         let authorization_query = Url::parse(&authorization_url)?
             .query_pairs()
             .into_owned()
@@ -284,31 +316,50 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
             })
             .collect::<Vec<_>>();
         assert_eq!(token_requests.len(), login_index + 1);
-        let token_form = url::form_urlencoded::parse(&token_requests[login_index].body)
+        let token_request = &token_requests[login_index];
+        let mut token_form = url::form_urlencoded::parse(&token_request.body)
             .into_owned()
             .collect::<HashMap<_, _>>();
-        assert_eq!(
-            token_form.get("grant_type").map(String::as_str),
-            Some("authorization_code")
-        );
-        assert!(!token_form.contains_key("resource"));
-        assert_eq!(
-            token_form.get("redirect_uri"),
-            Some(
-                authorization_query
-                    .get("redirect_uri")
-                    .expect("authorization redirect URI")
-            )
+        let authorization = token_request
+            .headers
+            .get("authorization")
+            .map(|value| value.to_str().unwrap());
+        let expected_basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("enterprise-client:{CLIENT_SECRET}"))
         );
         assert_eq!(
-            authorization_query
-                .get("code_challenge_method")
-                .map(String::as_str),
-            Some("S256")
+            authorization,
+            (auth_method == Some(ClientSecretBasic)).then_some(expected_basic.as_str())
         );
-        let verifier = token_form.get("code_verifier").expect("PKCE verifier");
-        let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
-        assert_eq!(authorization_query.get("code_challenge"), Some(&challenge));
+        assert_eq!(
+            token_form.remove("client_secret").as_deref(),
+            (auth_method == Some(ClientSecretPost)).then_some(CLIENT_SECRET)
+        );
+        assert_eq!(
+            token_form.remove("client_id").as_deref(),
+            (auth_method != Some(ClientSecretBasic)).then_some("enterprise-client")
+        );
+        let verifier = oauth2::PkceCodeVerifier::new(
+            token_form.remove("code_verifier").expect("PKCE verifier"),
+        );
+        assert_eq!(
+            oauth2::PkceCodeChallenge::from_code_verifier_sha256(&verifier).as_str(),
+            authorization_query["code_challenge"],
+        );
+        assert_eq!(authorization_query["code_challenge_method"], "S256");
+        assert_eq!(
+            token_form,
+            HashMap::from([
+                ("grant_type".to_string(), "authorization_code".to_string()),
+                ("code".to_string(), SECRET.to_string()),
+                (
+                    "redirect_uri".to_string(),
+                    authorization_query["redirect_uri"].clone()
+                ),
+            ])
+        );
         assert!(
             keyring
                 .values
@@ -341,6 +392,8 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
             },
         )?
         .expect("stored grant");
+        assert!(!serde_json::to_string(&stored)?.contains(CLIENT_SECRET));
+        assert!(!logs_contain(CLIENT_SECRET));
         assert_eq!(
             stored
                 .token_response
@@ -349,6 +402,67 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
                 .map(|token| token.secret().as_str()),
             Some(SECRET)
         );
+        // Exercise the production lease and keyring snapshot without installing another
+        // test backend. Use a non-sensitive name so routine keyring-read traces are safe.
+        let mut lease_tokens = stored.clone();
+        lease_tokens.server_name = "ema-idp:lease-snapshot".to_string();
+        crate::save_oauth_tokens(
+            &lease_tokens.server_name,
+            &lease_tokens,
+            OAuthCredentialsStoreMode::Keyring,
+            AuthKeyringBackendKind::Direct,
+        )
+        .await?;
+        let snapshot = crate::stored_oauth_credential_snapshot(
+            &lease_tokens.server_name,
+            &issuer,
+            OAuthCredentialsStoreMode::Keyring,
+            AuthKeyringBackendKind::Direct,
+        )?
+        .expect("keyring-backed snapshot");
+        let pinned = snapshot.clone().pin_ema_credentials().await?;
+        let accesses = keyring.accesses.load(Ordering::SeqCst);
+        keyring.fail.store(true, Ordering::SeqCst);
+        let leases = futures::future::try_join_all(
+            (0..32).map(|_| pinned.acquire_current_ema_credentials()),
+        )
+        .await?;
+        assert_eq!(keyring.accesses.load(Ordering::SeqCst), accesses);
+        drop(leases);
+        keyring.fail.store(false, Ordering::SeqCst);
+
+        // Even an identical replacement, or a failed write, revokes the old version.
+        for fail in [false, true] {
+            let pinned = snapshot.clone().pin_ema_credentials().await?;
+            keyring.fail.store(fail, Ordering::SeqCst);
+            let saved = crate::save_oauth_tokens(
+                &lease_tokens.server_name,
+                &lease_tokens,
+                OAuthCredentialsStoreMode::Keyring,
+                AuthKeyringBackendKind::Direct,
+            )
+            .await;
+            keyring.fail.store(false, Ordering::SeqCst);
+            assert_eq!(saved.is_err(), fail);
+            assert!(pinned.acquire_current_ema_credentials().await.is_err());
+        }
+        let pinned = snapshot.pin_ema_credentials().await?;
+        let first = pinned.acquire_current_ema_credentials().await?;
+        let second = pinned.acquire_current_ema_credentials().await?;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                delete_enterprise_oauth_tokens(
+                    &lease_tokens.server_name,
+                    &issuer,
+                    AuthKeyringBackendKind::Direct,
+                ),
+            )
+            .await??
+        );
+        drop(first);
+        drop(second);
+        assert!(pinned.acquire_current_ema_credentials().await.is_err());
         assert!(
             delete_enterprise_oauth_tokens(
                 CREDENTIAL_NAME,
@@ -381,13 +495,27 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
             .all(|value| value.get_secret().is_err())
     );
 
-    // Rejected old attempts neither write nor delete a newer grant.
+    // Failed replacement setup leaves the existing attempt valid.
+    let retained = complete_login(&issuer).await?;
+    assert!(
+        login(
+            &issuer,
+            Some(&format!("{}/callback", server.uri())),
+            /*auth_method*/ None
+        )
+        .await
+        .is_err(),
+        "an occupied registered callback port must not silently move"
+    );
+    retained.commit_if(|| async { Some(()) }).await?;
+
+    // A newer start fences a delayed callback even across Codex processes.
     let old = complete_login(&issuer).await?;
     complete_login(&issuer)
         .await?
         .commit_if(|| async { Some(()) })
         .await?;
-    assert!(old.commit_if(|| async { None::<()> }).await.is_err());
+    assert!(old.commit_if(|| async { Some(()) }).await.is_err());
     assert!(
         keyring
             .values
@@ -408,6 +536,13 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
         delete_enterprise_oauth_tokens(CREDENTIAL_NAME, &issuer, AuthKeyringBackendKind::Direct)
             .await
             .unwrap_err();
+    let save_error = save_error.context(EmaErrorDetail::new(
+        "enterprise sign-in credential commit failed",
+    ));
+    assert_eq!(
+        EmaErrorDetail::from_error(&save_error).to_string(),
+        "failed to store enterprise credentials"
+    );
     for error in [save_error, delete_error] {
         assert!(!format!("{error} {error:?} {error:#}").contains(SECRET));
     }
@@ -433,6 +568,7 @@ async fn enterprise_public_api_storage_and_privacy() -> Result<()> {
 struct TestKeyring {
     values: Arc<Mutex<HashMap<String, Arc<MockCredential>>>>,
     fail: Arc<AtomicBool>,
+    accesses: Arc<AtomicUsize>,
 }
 
 struct TestCredential(Arc<MockCredential>);
@@ -459,6 +595,7 @@ impl CredentialBuilderApi for TestKeyring {
         _service: &str,
         user: &str,
     ) -> keyring::Result<Box<Credential>> {
+        self.accesses.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
             return Err(keyring::Error::Invalid("account".into(), user.into()));
         }

@@ -69,6 +69,13 @@ impl WebLinkDisplay {
         {
             return Self::WithDestination;
         }
+        if terminal
+            .term_program
+            .as_deref()
+            .is_some_and(|program| program.eq_ignore_ascii_case("rex"))
+        {
+            return Self::LabelOnly;
+        }
         match terminal.name {
             TerminalName::Ghostty
             | TerminalName::Iterm2

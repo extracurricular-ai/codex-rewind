@@ -61,6 +61,7 @@ text(JSON.stringify([3, 1, 2].sort((a, b) => a - b)));
                 max_output_tokens: None,
             },
             Arc::new(NoopCodeModeSessionDelegate),
+            /*preempt*/ None,
         )
         .await
         .expect("start code-mode cell");
@@ -78,6 +79,7 @@ text(JSON.stringify([3, 1, 2].sort((a, b) => a - b)));
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "[1,2,3]".to_string(),
             }],
+            result_buffered_for: std::time::Duration::ZERO,
             error_text: None,
         }
     );

@@ -55,6 +55,7 @@ fn sample_turn_steer_request(
                 },
             ],
             responsesapi_client_metadata: None,
+            responsesapi_client_metadata_patch: None,
             additional_context: None,
         },
     }

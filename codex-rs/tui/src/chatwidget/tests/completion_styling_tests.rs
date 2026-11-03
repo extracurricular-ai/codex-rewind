@@ -4,6 +4,7 @@ use super::*;
 use crate::clock_format::ClockFormat;
 use chrono::Local;
 use chrono::TimeZone;
+use codex_app_server_protocol::ThreadItem;
 use pretty_assertions::assert_eq;
 
 const COMPLETED_AT: i64 = 1_700_000_000;
@@ -11,14 +12,16 @@ const COMPLETED_AT: i64 = 1_700_000_000;
 fn completed_turn(duration_ms: Option<i64>, completed_at: Option<i64>) -> AppServerTurn {
     AppServerTurn {
         completed_at,
-        items: vec![AppServerThreadItem::AgentMessage {
-            id: "answer-1".to_string(),
-            text: "The change is ready.".to_string(),
-            phase: Some(MessagePhase::FinalAnswer),
-            memory_citation: None,
-            delivery: None,
-            questions: None,
-        }],
+        items: vec![ThreadItem::untimed(
+            AppServerThreadItemPayload::AgentMessage {
+                id: "answer-1".to_string(),
+                text: "The change is ready.".to_string(),
+                phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+        )],
         ..app_server_turn(
             "turn-1",
             AppServerTurnStatus::Completed,
@@ -93,15 +96,15 @@ async fn completion_follows_plain_and_streamed_tool_answers() {
 }
 
 #[tokio::test]
-async fn completion_live_applies_duration_threshold_and_preserves_timestamp_fallback() {
+async fn completion_live_shows_known_durations_and_preserves_timestamp_fallback() {
     for (duration_ms, completed_at, prefix) in [
-        (598, Some(COMPLETED_AT), ""),
-        (1_000, Some(COMPLETED_AT), ""),
-        (60_000, Some(COMPLETED_AT), ""),
-        (60_999, Some(COMPLETED_AT), ""),
-        (61_000, Some(COMPLETED_AT), "Worked for 1m 1s · "),
-        (125_000, Some(COMPLETED_AT), "Worked for 2m 5s · "),
-        (1_000, None, ""),
+        (598, Some(COMPLETED_AT), "Worked for <1s • "),
+        (1_000, Some(COMPLETED_AT), "Worked for 1s • "),
+        (60_000, Some(COMPLETED_AT), "Worked for 1m 0s • "),
+        (60_999, Some(COMPLETED_AT), "Worked for 1m 0s • "),
+        (61_000, Some(COMPLETED_AT), "Worked for 1m 1s • "),
+        (125_000, Some(COMPLETED_AT), "Worked for 2m 5s • "),
+        (1_000, None, "Worked for 1s • "),
     ] {
         let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
         handle_turn_started(&mut chat, "turn-1");
@@ -131,17 +134,26 @@ async fn completion_replay_preserves_metadata_and_input_without_live_side_effect
         (
             Some(125_000),
             Some(COMPLETED_AT),
-            format!("Worked for 2m 5s · {done}"),
+            format!("Worked for 2m 5s • {done}"),
         ),
         (None, None, String::new()),
-        (Some(598), Some(COMPLETED_AT), done.clone()),
-        (Some(60_000), Some(COMPLETED_AT), done.clone()),
+        (None, Some(COMPLETED_AT), done.clone()),
+        (
+            Some(598),
+            Some(COMPLETED_AT),
+            format!("Worked for <1s • {done}"),
+        ),
+        (
+            Some(60_000),
+            Some(COMPLETED_AT),
+            format!("Worked for 1m 0s • {done}"),
+        ),
         (
             Some(61_000),
             Some(COMPLETED_AT),
-            format!("Worked for 1m 1s · {done}"),
+            format!("Worked for 1m 1s • {done}"),
         ),
-        (Some(60_000), None, String::new()),
+        (Some(60_000), None, "Worked for 1m 0s".to_string()),
         (Some(125_000), None, "Worked for 2m 5s".to_string()),
     ] {
         for replay_kind in [
@@ -190,7 +202,10 @@ async fn completion_replay_waits_for_older_turn_items_to_load() {
     let newer = completed_turn(Some(1_000), Some(COMPLETED_AT));
 
     chat.replay_thread_turns(vec![unloaded, newer], ReplayKind::ResumeInitialMessages);
-    assert_eq!(completion_labels(&mut rx), saved_completion_label());
+    assert_eq!(
+        completion_labels(&mut rx),
+        format!("Worked for 1s • {}", saved_completion_label())
+    );
 
     chat.replay_thread_turns(vec![older], ReplayKind::ThreadSnapshot);
     let older_time = Local
@@ -203,7 +218,7 @@ async fn completion_replay_waits_for_older_turn_items_to_load() {
         .to_string();
     assert_eq!(
         completion_labels(&mut rx),
-        format!("Worked for 2m 5s · {older_time}"),
+        format!("Worked for 2m 5s • {older_time}"),
     );
 }
 
@@ -265,7 +280,7 @@ fn completion_snapshot_normalization_preserves_clock_only_message_lines() {
                 &footer,
                 lines_to_single_string(&footer.display_lines(/*width*/ 80))
             ),
-            "  Worked for [duration] · [completion time]\n"
+            "  Worked for [duration] • [completion time]\n"
         );
     }
 }

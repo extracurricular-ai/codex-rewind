@@ -1,6 +1,7 @@
 //! Model catalog cache identity follows provider routing, effective auth, and gateway OAuth config.
 //! Only a digest is persisted; access tokens for ChatGPT are excluded so token
 //! rotation does not discard a catalog for the same account, user, and plan.
+//! Header auth with an account ID uses that identity instead of opaque auth headers.
 
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
@@ -9,12 +10,13 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::auth::resolve_provider_auth;
+use crate::provider::resolve_api_provider;
 
 pub(crate) fn identity(
     provider_info: &ModelProviderInfo,
     auth: Option<&CodexAuth>,
 ) -> CoreResult<String> {
-    let mut api_provider = provider_info.to_api_provider(auth.map(CodexAuth::auth_mode))?;
+    let mut api_provider = resolve_api_provider(provider_info, auth)?;
     let mut digest = Sha256::new();
     // Length-prefix every field to avoid ambiguity between adjacent values.
     let mut field = |value: &[u8]| {
@@ -57,18 +59,27 @@ pub(crate) fn identity(
         field(&[u8::from(auth.is_fedramp_account())]);
     }
     let has_stable_account = auth.is_some_and(|auth| {
-        matches!(
-            auth,
-            CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) | CodexAuth::AgentIdentity(_)
-        ) && auth.get_account_id().is_some()
-            && (auth.get_chatgpt_user_id().is_some() || auth.get_account_email().is_some())
+        auth.get_account_id().is_some()
+            && if matches!(auth, CodexAuth::Headers(_)) {
+                !provider_info.has_command_auth()
+            } else {
+                matches!(
+                    auth,
+                    CodexAuth::Chatgpt(_)
+                        | CodexAuth::ChatgptAuthTokens(_)
+                        | CodexAuth::AgentIdentity(_)
+                ) && (auth.get_chatgpt_user_id().is_some() || auth.get_account_email().is_some())
+            }
     });
     let explicit_bearer =
         provider_info.api_key()?.is_some() || provider_info.experimental_bearer_token.is_some();
     // Command auth also returns opaque API keys. A changed key may belong to a
-    // different account, so only credentials with stable owner metadata can be reused.
+    // different account, so reuse requires stable owner metadata. Explicit provider
+    // keys take precedence over the header auth's account identity.
     if !has_stable_account || explicit_bearer {
-        let headers = resolve_provider_auth(auth, provider_info)?.to_auth_headers();
+        let headers = resolve_provider_auth(auth, provider_info)?
+            .to_auth_headers()
+            .map_err(|error| codex_api::map_api_error(error.into()))?;
         api_provider.headers.extend(headers);
     }
     let mut headers: Vec<_> = api_provider.headers.iter().collect();

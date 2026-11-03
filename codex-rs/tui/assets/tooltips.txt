@@ -44,3 +44,4 @@ Press {key:global.find_transcript} to search this conversation.
 Press {key:global.open_external_editor} to edit your current draft in an external editor.
 Press {key:composer.history_search_previous} to search previously entered prompts.
 For models with adjustable reasoning, press {key:chat.increase_reasoning_effort} to increase reasoning effort or {key:chat.decrease_reasoning_effort} to decrease it.
+Use {key:chat.open_presets}, then 0–9 to run a preset; Enter browses, s saves, and d deletes.

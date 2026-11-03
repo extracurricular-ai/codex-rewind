@@ -13,6 +13,8 @@ use crate::model_catalog::LUNA_RESERVE_MODEL;
 use crate::status::format_credit_micros;
 use crate::status::format_estimated_usd_micros;
 use crate::status::format_tokens_compact;
+use crate::status::thread_cost_micros;
+use crate::terminal_program_status::ProgramStatus;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::ConfigLayerSource;
 use codex_config::os_host_name;
@@ -24,7 +26,7 @@ use codex_utils_sandbox_summary::summarize_permission_profile;
 use super::status_state::TerminalTitleStatusKind;
 
 /// Items shown in the terminal title when the user has not configured a
-/// custom selection. Unnamed threads omit the name until generation starts.
+/// custom selection. Unnamed threads omit the name until one is available.
 pub(super) const DEFAULT_TERMINAL_TITLE_ITEMS: [&str; 3] =
     ["activity", "thread-name", "project-name"];
 
@@ -250,6 +252,9 @@ impl ChatWidget {
     /// Animated titles record their next refresh for the foreground loop, independently
     /// of full TUI redraws.
     fn refresh_terminal_title_from_selections(&mut self, selections: &StatusSurfaceSelections) {
+        if self.app_event_tx.voice_only.load(Ordering::Relaxed) {
+            return;
+        }
         self.last_terminal_title_requires_action =
             self.terminal_title_shows_action_required_with_selections(selections);
         let now = Instant::now();
@@ -316,6 +321,42 @@ impl ChatWidget {
 
     fn terminal_title_requires_action(&self) -> bool {
         self.bottom_pane.terminal_title_requires_action()
+    }
+
+    /// Reports the displayed thread's actual state independently of terminal
+    /// title/notification settings. Replays never produce an unseen result.
+    pub(crate) fn desired_program_status(&self) -> ProgramStatus {
+        if let Some(kind) = self.bottom_pane.program_status_blocked_kind() {
+            ProgramStatus::Blocked(kind)
+        } else if self.bottom_pane.is_task_running()
+            || self.is_user_turn_pending_or_running()
+            || !self.unified_exec_processes.is_empty()
+            || (self.status_state.program_status_after_turn == ProgramStatus::Done
+                && self
+                    .current_goal_status
+                    .as_ref()
+                    .is_some_and(GoalStatusState::is_active))
+        {
+            ProgramStatus::Working
+        } else {
+            self.status_state.program_status_after_turn
+        }
+    }
+
+    pub(crate) fn acknowledge_program_status(&mut self) {
+        if matches!(
+            self.desired_program_status(),
+            ProgramStatus::Done | ProgramStatus::Error
+        ) {
+            self.status_state.program_status_after_turn = ProgramStatus::Idle;
+            self.request_redraw();
+        }
+    }
+
+    pub(super) fn iterm_session_detail(&self, status: ProgramStatus) -> Option<&str> {
+        (status == ProgramStatus::Working && self.bottom_pane.is_task_running())
+            .then_some(self.status_state.current_status.header.as_str())
+            .filter(|detail| *detail != "Working")
     }
 
     pub(super) fn terminal_title_shows_action_required(&self) -> bool {
@@ -395,27 +436,6 @@ impl ChatWidget {
         &self,
         selections: &StatusSurfaceSelections,
     ) -> Option<Duration> {
-        if self.local_settings.tui.animations
-            && self.local_settings.tui.effects.progress
-            && self.status_state.thread_title_generation_pending
-            && (selections.status_line_items.iter().any(|item| {
-                matches!(
-                    item,
-                    StatusLineItem::ThreadName
-                        | StatusLineItem::ThreadTitle
-                        | StatusLineItem::SessionId
-                )
-            }) || selections.terminal_title_items.iter().any(|item| {
-                matches!(
-                    item,
-                    TerminalTitleItem::ThreadName
-                        | TerminalTitleItem::Thread
-                        | TerminalTitleItem::SessionId
-                )
-            }))
-        {
-            return Some(TERMINAL_TITLE_SPINNER_INTERVAL);
-        }
         if self.local_settings.tui.animations
             && self.local_settings.tui.effects.title
             && self.terminal_title_shows_action_required_with_selections(selections)
@@ -706,11 +726,21 @@ impl ChatWidget {
     /// Returning `None` means "omit this item for now", not "configuration error". Callers rely on
     /// this to keep partially available status lines readable while waiting for session, token, or
     /// git metadata.
-    pub(super) fn status_line_value(&mut self, item: StatusLineItem) -> Option<String> {
+    pub(super) fn status_line_value_for_item(&mut self, item: StatusLineItem) -> Option<String> {
         match item {
             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_name()),
             StatusLineItem::Reasoning => Some(self.reasoning_display_name()),
+            StatusLineItem::Profile => {
+                let layer = self.config.config_layer_stack.get_active_user_layer()?;
+                let ConfigLayerSource::User { profile, .. } = &layer.name else {
+                    return None;
+                };
+                profile.as_ref().map(|name| format!("profile: {name}"))
+            }
+            StatusLineItem::Provider => self
+                .thread_id
+                .map(|_| format!("provider: {}", self.config.model_provider_id)),
             StatusLineItem::CurrentDir => {
                 Some(format_directory_display(
                     self.status_line_cwd(),
@@ -788,30 +818,26 @@ impl ChatWidget {
             }),
             StatusLineItem::ThreadCredits => self
                 .estimated_thread_usage()
+                .filter(|_| self.plan_type != Some(PlanType::Ent26))
                 .map(|usage| usage.estimated_usage_credits_micros)
                 .map(|credits| format!("{} credits", format_credit_micros(credits))),
             StatusLineItem::EstimatedThreadCost => self
                 .estimated_thread_usage()
-                .and_then(|usage| usage.estimated_usage_usd_micros)
+                .and_then(|usage| thread_cost_micros(usage, self.plan_type))
                 .and_then(format_estimated_usd_micros),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
-            StatusLineItem::FastMode => self
-                .model_catalog
-                .try_list_models()
-                .ok()
-                .and_then(|models| {
-                    models
-                        .into_iter()
-                        .find(|preset| preset.model == self.current_model())
-                })
-                .is_none_or(|preset| preset.supports_fast_mode())
-                .then(|| {
-                    if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
-                        "Fast on".to_string()
-                    } else {
-                        "Fast off".to_string()
-                    }
-                }),
+            StatusLineItem::FastMode => Some(
+                self.processing_tier_display_name()
+                    .unwrap_or("Standard")
+                    .to_string(),
+            ),
+            StatusLineItem::Daybreak => Some(
+                if self.daybreak_enabled && !self.side_conversation_active() {
+                    "Daybreak on".to_string()
+                } else {
+                    "Daybreak off".to_string()
+                },
+            ),
             StatusLineItem::RawOutput => self.raw_output_mode().then(|| "raw output".to_string()),
             StatusLineItem::ThreadName => {
                 self.thread_name.as_deref().and_then(normalize_thread_name)
@@ -865,11 +891,14 @@ impl ChatWidget {
             StatusSurfacePreviewItem::EstimatedThreadCost => StatusLineItem::EstimatedThreadCost,
             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
+            StatusSurfacePreviewItem::Daybreak => StatusLineItem::Daybreak,
             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
             StatusSurfacePreviewItem::WorkspaceHeadline => StatusLineItem::WorkspaceHeadline,
             StatusSurfacePreviewItem::Model => StatusLineItem::ModelName,
             StatusSurfacePreviewItem::ModelWithReasoning => StatusLineItem::ModelWithReasoning,
             StatusSurfacePreviewItem::Reasoning => StatusLineItem::Reasoning,
+            StatusSurfacePreviewItem::Profile => StatusLineItem::Profile,
+            StatusSurfacePreviewItem::Provider => StatusLineItem::Provider,
         };
         self.status_line_value_for_item(status_line_item)
     }
@@ -897,10 +926,8 @@ impl ChatWidget {
                 } else {
                     StatusLineItem::ThreadTitle
                 };
-                let value = self
-                    .status_line_value(item)
-                    .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 48));
-                self.with_thread_title_progress(value, now)
+                self.status_line_value_for_item(item)
+                    .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 48))
             }
             TerminalTitleItem::GitBranch => self.status_line_branch.as_ref().map(|branch| {
                 Self::truncate_terminal_title_part(branch.clone(), /*max_chars*/ 32)
@@ -935,15 +962,15 @@ impl ChatWidget {
             TerminalTitleItem::EstimatedThreadCost => self
                 .status_line_value_for_item(StatusLineItem::EstimatedThreadCost)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
-            TerminalTitleItem::SessionId => {
-                let value = self
-                    .status_line_value(StatusLineItem::SessionId)
-                    .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32));
-                self.with_thread_title_progress(value, now)
-            }
+            TerminalTitleItem::SessionId => self
+                .status_line_value_for_item(StatusLineItem::SessionId)
+                .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::FastMode => self
                 .status_line_value_for_item(StatusLineItem::FastMode)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
+            TerminalTitleItem::Daybreak => {
+                self.status_line_value_for_item(StatusLineItem::Daybreak)
+            }
             TerminalTitleItem::Model => Some(Self::truncate_terminal_title_part(
                 self.model_display_name().to_string(),
                 /*max_chars*/ 32,
@@ -968,17 +995,29 @@ impl ChatWidget {
     fn model_with_reasoning_display_name(&self) -> String {
         let label = self.reasoning_display_name();
         let service_tier_label = self
-            .current_service_tier()
-            .and_then(|service_tier| {
-                self.current_model_service_tier_commands()
-                    .into_iter()
-                    .find(|tier| tier.id == service_tier)
-                    .map(|tier| tier.name)
-            })
-            .filter(|_| self.has_chatgpt_account)
+            .processing_tier_display_name()
             .map(|tier| format!(" {tier}"))
             .unwrap_or_default();
         format!("{} {label}{service_tier_label}", self.model_display_name())
+    }
+
+    fn processing_tier_display_name(&self) -> Option<&str> {
+        let id = self.current_service_tier()?;
+        self.model_catalog
+            .models
+            .iter()
+            .find(|preset| preset.model == self.current_model())
+            .and_then(|preset| preset.service_tiers.iter().find(|tier| tier.id == id))
+            .map(|tier| tier.name.as_str())
+            .or_else(|| {
+                (id == ServiceTier::Flex.request_value()
+                    && self
+                        .config
+                        .model_providers
+                        .get(&self.config.model_provider_id)
+                        .is_some_and(|provider| !provider.is_amazon_bedrock()))
+                .then_some("Flex")
+            })
     }
 
     /// Computes the compact runtime status label used by word-based status items.

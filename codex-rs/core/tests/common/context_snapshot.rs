@@ -132,7 +132,7 @@ fn capture_request(number: usize, entry: &SnapshotEntry<'_>) -> CapturedRequest 
         }
         SnapshotSource::Items(items) => ("items".to_string(), Value::Array(items.to_vec()), None),
     };
-    // Responses Lite moves base instructions into an annotated developer content part. Keep its
+    // Base instructions live in an annotated developer content part. Keep its
     // location for rendering, while still excluding transport metadata from window comparison.
     let mut model_instruction_parts: Vec<_> = input
         .as_array()
@@ -150,21 +150,22 @@ fn capture_request(number: usize, entry: &SnapshotEntry<'_>) -> CapturedRequest 
                 .map(move |(part_index, _)| (item_index, part_index))
         })
         .collect();
-    // Providers can remove annotations. The Lite prefix still identifies the position, but an
+    // Providers can remove annotations. The prefix still identifies the position, but an
     // empty base prompt also leaves ordinary developer guidance there; require a complete catalog prompt.
+    let instructions_index = usize::from(input[0]["type"] == "additional_tools");
+    let instructions = &input[instructions_index];
     if model_instruction_parts.is_empty()
-        && input[0]["type"] == "additional_tools"
-        && input[0]["role"] == "developer"
-        && input[1]["type"] == "message"
-        && input[1]["role"] == "developer"
-        && input[1]["content"]
+        && instructions["type"] == "message"
+        && instructions["role"] == "developer"
+        && instructions["content"]
             .as_array()
             .is_some_and(|content| content.len() == 1)
-        && input[1]["internal_chat_message_metadata_passthrough"]["content_item_kinds"][0].is_null()
-        && let Some(text) = input[1]["content"][0]["text"].as_str()
+        && instructions["internal_chat_message_metadata_passthrough"]["content_item_kinds"][0]
+            .is_null()
+        && let Some(text) = instructions["content"][0]["text"].as_str()
         && is_bundled_model_instructions(text)
     {
-        model_instruction_parts.push((1, 0));
+        model_instruction_parts.push((instructions_index, 0));
     }
     let input = strip_metadata_from_json(strip_response_item_ids_from_json(input));
     CapturedRequest {
@@ -353,6 +354,26 @@ pub fn format_context_snapshot(
         }
     }
     result
+}
+
+/// Sort standalone JSON object lines embedded in rendered context. Cargo and Bazel can enable
+/// different serde_json map ordering features, but the model-visible values are the same.
+pub fn normalize_json_lines(snapshot: &str) -> String {
+    snapshot
+        .lines()
+        .map(|line| {
+            let json = line.trim_start();
+            if !json.starts_with('{') {
+                return line.to_owned();
+            }
+            let Ok(mut value) = serde_json::from_str::<Value>(json) else {
+                return line.to_owned();
+            };
+            value.sort_all_objects();
+            format!("{}{}", &line[..line.len() - json.len()], value)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_window_settings(
@@ -689,6 +710,10 @@ fn render_item(
                 .map(|text| render_text(&text, TextSource::Other, options, normalizer))
                 .unwrap_or_else(|| "<NO_COMMAND>".to_string());
             format!("{index:02}:local_shell_call:{command}")
+        }
+        "configuration_update" => {
+            let reasoning = normalizer.json(&item["reasoning"]);
+            format!("{index:02}:configuration_update:reasoning={reasoning}")
         }
         "reasoning" => {
             let summary = item

@@ -3,36 +3,30 @@
 //! This module keeps heavyweight `App` construction and config-inspection helpers available to
 //! focused sibling test modules without making `app/tests.rs` the only practical place to test
 //! app-owned behavior.
+//! Return the large fixture on the heap so async scenarios do not embed it in their stack frames.
 
 use super::*;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
+use crate::test_support::boxed_future;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 
-pub(super) fn select_catalog_tip(app: &mut App, width: u16, expected: &str) {
-    for seed in 0..1024 {
-        app.composer_tips = super::composer_hints::ComposerTips::new(seed);
-        if app
-            .composer_hint(width)
-            .is_some_and(|tip| tip.line.to_string().starts_with(expected))
-        {
-            return;
-        }
-    }
-    panic!("catalog tip was never selected: {expected}");
-}
-
-pub(crate) async fn make_test_app() -> App {
-    let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+pub(crate) async fn make_test_app() -> Box<App> {
+    let (mut chat_widget, app_event_tx, _rx, _op_rx) =
+        boxed_future!(make_chatwidget_manual_with_sender()).await;
+    let test_codex_home = chat_widget.test_codex_home.take();
     let config = chat_widget.config_ref().clone();
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
 
-    App {
+    Box::new(App {
         feature_write_lock: Arc::default(),
+        config_notification_test_generation: 0,
+        config_notification_test_pending: None,
         model_catalog: chat_widget.model_catalog(),
         session_telemetry,
+        terminal_size_tags: Vec::new(),
         app_event_tx,
         chat_widget,
         workspace_command_runner: None,
@@ -46,12 +40,13 @@ pub(crate) async fn make_test_app() -> App {
         loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
+        runtime_approvals_reviewer_override: None,
         runtime_permission_profile_override: None,
         pending_server_profiles: HashMap::new(),
         file_search,
         transcript_cells: Vec::new(),
-        composer_tips: super::composer_hints::ComposerTips::new(/*seed*/ 0),
         native_history: Default::default(),
+        turn_tips: Default::default(),
         transcript_view: Default::default(),
         last_rendered_history_tail: None,
         last_thread_usage_status_cell: None,
@@ -67,6 +62,7 @@ pub(crate) async fn make_test_app() -> App {
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
         key_chord_matcher: crate::keymap::KeyChordMatcher::default(),
+        routed_key_activation: None,
         commit_animation: None,
         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
@@ -77,15 +73,26 @@ pub(crate) async fn make_test_app() -> App {
         feedback_audience: FeedbackAudience::External,
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         app_server_target: crate::AppServerTarget::Embedded,
+        pending_right_click_paste: None,
+        right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+            primary: false,
+            platform_default: true,
+            ssh: false,
+            wsl: false,
+            vscode: crate::tui::VscodeDetection::Other,
+        },
         reconnect: Default::default(),
         daemon_cli_executable: None,
         pending_update_action: None,
+        daemon_restart: None,
         pending_shutdown_exit_thread_id: None,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
         pending_realtime_speech_replay: HashMap::new(),
         pending_realtime_transcript_replay: HashMap::new(),
         realtime_replay_order: VecDeque::new(),
+        background_voice: None,
+        background_voice_error: None,
         temporary_structured_requests: HashMap::new(),
         pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
@@ -113,12 +120,16 @@ pub(crate) async fn make_test_app() -> App {
         pending_managed_worktree_attach: None,
         startup_protected_input_boundary: false,
         startup_pending_protected_request: false,
+        account_email_request_id: None,
         rate_limit_hard_stop_generation: 0,
         rate_limit_refresh_state: Default::default(),
+        pending_mcp_login_start: None,
+        active_mcp_login_ids: HashMap::new(),
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
-    }
+        _test_codex_home: test_codex_home,
+    })
 }
 
 fn test_session_telemetry(config: &Config, model: &str) -> SessionTelemetry {

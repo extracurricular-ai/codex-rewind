@@ -137,6 +137,10 @@ osx.frameworks(names = [
     "UniformTypeIdentifiers",
     "VideoToolbox",
 ])
+osx.libraries(names = [
+    "libproc",
+    "libsandbox",
+])
 use_repo(osx, "macos_sdk")
 
 # Needed to disable xcode...
@@ -151,11 +155,12 @@ single_version_override(
     module_name = "rules_cc",
     patch_strip = 1,
     patches = [
-        "//patches:rules_cc_rusty_v8_custom_libcxx.patch",
+        "//patches:rules_cc_windows_native_llvm.patch",
     ],
 )
 
 bazel_dep(name = "rules_platform", version = "0.1.0")
+bazel_dep(name = "rules_pkg", version = "1.0.1")
 bazel_dep(name = "aws-lc", version = "5.1.0.bcr.1")
 bazel_dep(name = "rules_rs", version = "0.0.96")
 bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
@@ -170,12 +175,29 @@ single_version_override(
     version = "0.15.1",
 )
 
-bazel_dep(name = "rules_python", version = "1.7.0")
+bazel_dep(name = "rules_python", version = "2.4.2")
 
 voice_python = use_extension("@rules_python//python/extensions:python.bzl", "python")
 voice_python.defaults(python_version = "3.11")
 voice_python.toolchain(python_version = "3.12")
 use_repo(voice_python, "python_3_12")
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    download_only = True,
+    hub_name = "schema_python",
+    python_version = "3.12",
+    target_platforms = [
+        "linux_aarch64",
+        "linux_x86_64",
+        "osx_aarch64",
+        "osx_x86_64",
+        "windows_aarch64",
+        "windows_x86_64",
+    ],
+    uv_lock = "//sdk/python:uv.lock",
+)
+use_repo(pip, "schema_python")
 
 # Use the existing pinned Make build for foreign_cc consumers, including the
 # native voice pkg-config bootstrap, instead of a PATH-provided Make.
@@ -189,7 +211,9 @@ single_version_override(
     patch_strip = 1,
     patches = [
         "//patches:rules_rs_build_script_deps_annotation.patch",
+        "//patches:rules_rs_rust_debug_modes.patch",
         "//patches:rules_rs_windows_msvc_linker.patch",
+        "//patches:rules_rs_workspace_package_version.patch",
         "//patches:rules_rs_zlib_snapshot_urls.patch",
     ],
     version = "0.0.96",
@@ -201,15 +225,18 @@ rules_rust.patch(
         # Carry the OpenAI setup fix that makes build-script tools available
         # through their runfiles after the rules_rs upgrade.
         "//patches:rules_rust_build_script_tools_transition.patch",
+        # Opt-in release profile compatibility for native Cargo build scripts.
+        "//patches:rules_rust_release_build_script_profile.patch",
         # Prefer Rust's direct linker for Windows/MSVC and keep hermetic
         # LLVM's non-.lib runtime artifacts compatible with it.
         "//patches:rules_rust_windows_msvc_direct_link_args.patch",
         # Skip transient native-Windows linker outputs while consolidating
         # dependency search paths.
         "//patches:rules_rust_windows_process_wrapper_skip_temp_outputs.patch",
-        # Group build-script argument files to avoid Windows command-line limits.
-        "//patches:rules_rust_group_build_script_arg_files.patch",
+        # Spill wrapper arguments to a params file to avoid Windows command-line limits.
+        "//patches:rules_rust_process_wrapper_param_file.patch",
         "//patches:rules_rust_windows_execroot_separators.patch",
+        "//patches:rules_rust_compiler_thp.patch",
     ],
     strip = 1,
 )
@@ -225,7 +252,7 @@ nightly_rust = use_extension(
 nightly_rust.toolchain(
     dev_components = True,
     edition = "2024",
-    versions = ["nightly/2025-09-18"],
+    versions = ["nightly/2026-08-20"],
 )
 
 # Keep the reexported extension's default Windows set constrained to MSVC so
@@ -246,7 +273,7 @@ nightly_rust.repository_set(
         "@llvm//constraints/windows/abi:msvc",
     ],
     target_triple = "x86_64-pc-windows-msvc",
-    versions = ["nightly/2025-09-18"],
+    versions = ["nightly/2026-08-20"],
 )
 
 # Also let that MSVC-exec set target gnullvm for existing cross lanes.
@@ -281,13 +308,23 @@ nightly_rust.repository_set(
         "@llvm//constraints/windows/crt:msvcrt",
     ],
     target_triple = "x86_64-pc-windows-gnullvm",
-    versions = ["nightly/2025-09-18"],
+    versions = ["nightly/2026-08-20"],
 )
 use_repo(nightly_rust, "rust_toolchains")
+
+# Match Cargo's MSVC static CRT policy for target and host dependencies. V8's
+# allocator shim must not also import the dynamic UCRT. Selecting by target
+# triple applies to cross builds without affecting Windows GNU, Linux or macOS.
+MSVC_RUSTC_FLAGS = {
+    "aarch64-pc-windows-msvc": ["-Ctarget-feature=+crt-static"],
+    "x86_64-pc-windows-msvc": ["-Ctarget-feature=+crt-static"],
+}
 
 toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 toolchains.toolchain(
     edition = "2024",
+    extra_exec_rustc_flags = MSVC_RUSTC_FLAGS,
+    extra_rustc_flags = MSVC_RUSTC_FLAGS,
     version = "1.95.0",
 )
 use_repo(toolchains, "default_rust_toolchains")
@@ -349,11 +386,28 @@ crate.from_cargo(
 bazel_dep(name = "zstd", version = "1.5.7")
 
 crate.annotation(
+    # Keep Windows proxy authentication aligned with codex-rs/.cargo/config.toml.
+    build_script_env = {"CFLAGS": "-DCURL_ENABLE_NTLM"},
+    crate = "curl-sys",
+)
+crate.annotation(
+    # Daemon tests repeatedly hash large CLI binaries, even in fastbuild mode.
+    # Optimize the native backends as well as the Rust implementation.
+    build_script_env = {"OPT_LEVEL": "3"},
     # The Windows lint toolchain cannot reliably materialize blake3's native x86 assembly archives.
     crate = "blake3",
     crate_features_select = {
         "x86_64-pc-windows-gnullvm": ["pure"],
     },
+    rustc_flags = ["-Copt-level=3"],
+)
+
+# Match the CodeModeHost response-compression benchmark's zstd level.
+crate.annotation(
+    crate = "tonic",
+    patch_args = ["-p1"],
+    patches = ["//patches:tonic-zstd-level1.patch"],
+    version = "0.14.3",
 )
 crate.annotation(
     crate = "zstd-sys",
@@ -467,42 +521,37 @@ crate.annotation(
     workspace_cargo_toml = "rust/runfiles/Cargo.toml",
 )
 
-# MXC keeps its Rust workspace below the repository root.
-[
-    crate.annotation(
-        crate = name,
-        workspace_cargo_toml = "src/Cargo.toml",
-    )
-    for name in [
-        "appcontainer_common",
-        "learning_mode_core",
-        "learning_mode_windows",
-        "mxc_config_contract",
-        "mxc_telemetry",
-        "process_security_environment_spec",
-        "sandbox_spec",
-        "wxc_common",
-    ]
-]
+# MXC's resource compiler lookup needs an explicit path for Windows GNU targets.
+crate.annotation(
+    build_script_deps = [
+        "@crates//:cc-1.2.55",
+        "@crates//:winresource-0.1.34",
+    ],
+    build_script_env = {
+        "RC_PATH": "$(execpath @llvm//tools:llvm-rc)",
+    },
+    build_script_tools = [
+        "@llvm//tools:clang",
+        "@llvm//tools:llvm-rc",
+    ],
+    crate = "mxc-sdk",
+    patch_args = ["-p1"],
+    patches = ["//patches:mxc-sdk_utf8_resources.patch"],
+    workspace_cargo_toml = "src/Cargo.toml",
+)
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-codex_release_archive = use_extension(
-    "//bazel/extensions:codex_release_archive.bzl",
-    "codex_release_archive",
+codex_release_archive = use_repo_rule("//bazel/extensions:codex_release_archive.bzl", "codex_release_archive")
+
+codex_release_archive(
+    name = "codex_release_latest_stable",
+    release = "latest",
 )
-codex_release_archive.release(
-    sha256 = "0b7afd1de4ecf06a8633f1e4958ec5f8d57d4b7842773416d9cb9d8c816f2c84",
-    version = "0.153.1",
-)
-codex_release_archive.release(
-    sha256 = "71a28d362c96ac9829bf8203a2c71be451aeb726adb843167fdaf0eae8fe7dd9",
-    version = "0.145.0",
-)
-use_repo(
-    codex_release_archive,
-    "codex_release_0.145.0_linux_x86_64",
-    "codex_release_0.153.1_linux_x86_64",
+
+codex_release_archive(
+    name = "codex_release_historical_stable",
+    release = "historical",
 )
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
@@ -554,8 +603,7 @@ crate.annotation(
         "RUSTY_V8_SRC_BINDING_PATH": "$(execpath @v8_targets//:rusty_v8_binding_for_target)",
     },
     crate = "v8",
-    # Keep the Rust feature aligned with the source-built Bazel artifacts.
-    # Windows MSVC still consumes upstream non-sandboxed prebuilts.
+    # Keep the Rust feature aligned with the sandbox archive/binding pairs.
     crate_features_select = {
         "aarch64-apple-darwin": ["v8_enable_sandbox"],
         "aarch64-pc-windows-gnullvm": ["v8_enable_sandbox"],
@@ -580,6 +628,13 @@ inject_repo(crate, "v8_targets")
 llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")
 use_repo(llvm, "llvm-project")
 
+crate.annotation(
+    # Disable SQLite intrinsics that can crash at startup on older x64 Windows CPUs.
+    build_script_env_select = {
+        "x86_64-pc-windows-msvc": '{"LIBSQLITE3_FLAGS": "SQLITE_DISABLE_INTRINSIC"}',
+    },
+    crate = "libsqlite3-sys",
+)
 crate.annotation(
     # Provide the hermetic SDK path so the build script doesn't try to invoke an unhermetic `xcrun --show-sdk-path`.
     build_script_data = [
@@ -768,27 +823,66 @@ inject_repo(crate, "alsa_lib")
     ]
 ]
 
-bazel_dep(name = "v8", version = "15.0.245.2")
-archive_override(
-    module_name = "v8",
-    integrity = "sha256-Fk89PgqLTAKjhtOojRsRM9N+XCC+Ajn+zc3eQUpDQNU=",
+bazel_dep(name = "rules_license", version = "1.0.0")
+
+engine_repository = use_repo_rule("//third_party/v8:engine_repository.bzl", "engine_repository")
+
+engine_repository(
+    name = "v8",
+    integrity = "sha256-aNN5G427qQbP/5o+NXONgXR8ZvS6mjf6mfAI6jtxyzI=",
     patch_strip = 3,
     patches = [
-        "//patches:v8_module_deps.patch",
-        "//patches:v8_bazel_rules.patch",
         "//patches:v8_source_portability.patch",
+        "//patches:v8_array_sort_elements_kind.patch",
+        "//third_party/v8:v8_defs.patch",
     ],
-    strip_prefix = "v8-15.0.245.2",
-    urls = ["https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz"],
+    strip_prefix = "v8-15.2.124.1",
+    urls = ["https://github.com/v8/v8/archive/refs/tags/15.2.124.1.tar.gz"],
+)
+
+# All V8 inputs are owned here, including the pinned Python generator inputs.
+pip.parse(
+    extra_pip_args = ["--require-hashes"],
+    hub_name = "v8_python_deps",
+    python_version = "3.11",
+    requirements_lock = "@v8//:bazel/requirements.txt",
+    simpleapi_skip = [
+        "jinja2",
+        "markupsafe",
+    ],
+)
+use_repo(pip, "v8_python_deps")
+
+native_windows_llvm = use_repo_rule("//third_party/v8:native_windows.bzl", "native_windows_llvm")
+
+native_windows_llvm(name = "v8_native_windows_llvm")
+
+native_windows_cc = use_repo_rule("//third_party/v8:native_windows.bzl", "native_windows_cc")
+
+native_windows_cc(
+    name = "v8_native_windows_cc",
+    native_llvm = "@v8_native_windows_llvm//:BUILD.bazel",
+)
+
+v8_dependencies = use_extension("//third_party/v8:dependencies.bzl", "dependencies")
+use_repo(
+    v8_dependencies,
+    "v8_abseil",
+    "v8_dragonbox",
+    "v8_fast_float",
+    "v8_fp16",
+    "v8_highway",
+    "v8_icu",
+    "v8_simdutf",
 )
 
 http_archive(
-    name = "v8_crate_150_4_0",
+    name = "v8_crate_152_2_0",
     build_file = "//third_party/v8:v8_crate.BUILD.bazel",
-    sha256 = "42a978ff11f15b24e5c05a7123cf2b68f41e763546699781a924ef4e2cf43a49",
-    strip_prefix = "v8-150.4.0",
+    sha256 = "e2e7f9961af59dbb749a60ac0a3c34c9680f6b86dd04277f2715356b5a52feab",
+    strip_prefix = "rusty_v8-350c5a859a9b3c84ab8701b3ad51e3b7699b30c0",
     type = "tar.gz",
-    urls = ["https://static.crates.io/crates/v8/v8-150.4.0.crate"],
+    urls = ["https://github.com/seanh-oai/rusty_v8/archive/350c5a859a9b3c84ab8701b3ad51e3b7699b30c0.tar.gz"],
 )
 
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
@@ -796,7 +890,7 @@ git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "g
 git_repository(
     name = "rusty_v8_libcxx",
     build_file = "//third_party/v8:libcxx.BUILD.bazel",
-    commit = "5abc7f839700f0f17338434e1c1c6a8c87c00c11",
+    commit = "b16984ce99c702355a5b2b4c52574e82cec41fb9",
     remote = "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx.git",
 )
 
@@ -810,25 +904,151 @@ git_repository(
 git_repository(
     name = "rusty_v8_llvm_libc",
     build_file = "//third_party/v8:llvm_libc.BUILD.bazel",
-    commit = "9309c117ebae84dd2f9df1ef99de4782162527d5",
+    commit = "75ae50cd48c8a9d70f552ccff040029968778da9",
     remote = "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libc.git",
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_aarch64_pc_windows_msvc_archive",
-    downloaded_file_path = "rusty_v8_release_aarch64-pc-windows-msvc.lib.gz",
-    sha256 = "54722842af36b74248c403ff531254efac6ff65d281198bab0c6350fc1188ad4",
+    name = "rusty_v8_152_2_0_aarch64_apple_darwin_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz",
+    sha256 = "feab9ae0384bebaa99c1d000654462c9d42123d587185c7876aaeef7d76ff749",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/rusty_v8_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.lib.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_aarch64-apple-darwin.a.gz",
     ],
 )
 
 http_file(
-    name = "rusty_v8_150_4_0_x86_64_pc_windows_msvc_archive",
-    downloaded_file_path = "rusty_v8_release_x86_64-pc-windows-msvc.lib.gz",
-    sha256 = "732ec5da4243aa166799780c8519a5eea6f32f6e47657a323342794dc3c239d6",
+    name = "rusty_v8_152_2_0_aarch64_apple_darwin_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs",
+    sha256 = "b9d5652ebca515eb2bf4c2ee4a6551b2567117b5aa720f430d2032616dd7e3b5",
     urls = [
-        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-apple-darwin.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_pc_windows_msvc_archive",
+    downloaded_file_path = "rusty_v8_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.lib.gz",
+    sha256 = "daf327876f7753a94b3b05d6d64776258def3ae67503ac75db9c35c6deaa28a5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/rusty_v8_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.lib.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_pc_windows_msvc_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.rs",
+    sha256 = "572ed16ff09bb7944f4b35c659ff62dcd3faf43a0351e3f94f011e01b2f92a62",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_gnu_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.a.gz",
+    sha256 = "1054464a623006cdf5e25ae20877002bf3edb9a2c2f3e64f44a8714742b15e87",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.a.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_gnu_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.rs",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-gnu.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_musl_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.a.gz",
+    sha256 = "1a60f36a3dd8778802e6980668c4d65a3c7305d85a5d2debf466d9aa0daadd75",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.a.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_aarch64_unknown_linux_musl_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.rs",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_aarch64-unknown-linux-musl.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_apple_darwin_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_x86_64-apple-darwin.a.gz",
+    sha256 = "bfe19d9b633b61d99780ece89690427fef4b985c6b4196536eaf94571166fc24",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_x86_64-apple-darwin.a.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_apple_darwin_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-apple-darwin.rs",
+    sha256 = "b9d5652ebca515eb2bf4c2ee4a6551b2567117b5aa720f430d2032616dd7e3b5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-apple-darwin.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_pc_windows_msvc_archive",
+    downloaded_file_path = "rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz",
+    sha256 = "cd829415695b30ad61b306b23a381e11276f14bb0b46815ac5ed8b96711d002d",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_pc_windows_msvc_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs",
+    sha256 = "572ed16ff09bb7944f4b35c659ff62dcd3faf43a0351e3f94f011e01b2f92a62",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_gnu_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz",
+    sha256 = "b3b490f2aa809eda7f6ac727f851fb00ce8355be72827577cfaac28c7137dbcd",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.a.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_gnu_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-gnu.rs",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_musl_archive",
+    downloaded_file_path = "librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.a.gz",
+    sha256 = "2f2679773a12576dc6b89b0f7d70e8190e5aea8a57f8f6364efaffdd1497d0e7",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/librusty_v8_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.a.gz",
+    ],
+)
+
+http_file(
+    name = "rusty_v8_152_2_0_x86_64_unknown_linux_musl_binding",
+    downloaded_file_path = "src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.rs",
+    sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5",
+    urls = [
+        "https://github.com/openai/codex/releases/download/rusty-v8-v152.2.0/src_binding_ptrcomp_sandbox_release_x86_64-unknown-linux-musl.rs",
     ],
 )
 

@@ -1,9 +1,11 @@
 use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_attachment_store::AttachmentMetadata;
 use codex_attachment_store::AttachmentStore;
 use codex_attachment_store::AttachmentStoreError;
 use codex_attachment_store::AttachmentStoreErrorKind;
+use codex_attachment_store::IsResolvableFuture;
 use codex_attachment_store::ResolveFuture;
 use codex_attachment_store::ResolveRequest;
 use codex_attachment_store::UploadFuture;
@@ -43,7 +45,7 @@ use core_test_support::responses::strip_metadata;
 use core_test_support::responses::strip_response_item_id;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -53,6 +55,7 @@ use image::ImageBuffer;
 use image::Rgba;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -64,9 +67,28 @@ const UPLOADED_FILE_ID: &str = "file_uploaded_image";
 #[derive(Default)]
 pub(super) struct RecordingFileAttachmentStore {
     pub(super) uploads: Mutex<Vec<UploadRequest>>,
+    pub(super) resolve_errors: Mutex<HashMap<String, AttachmentStoreErrorKind>>,
+    pub(super) resolves: Mutex<HashMap<String, usize>>,
+    pub(super) resolve_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl AttachmentStore for RecordingFileAttachmentStore {
+    fn is_resolvable<'a>(&'a self, file_id: &'a str) -> IsResolvableFuture<'a> {
+        Box::pin(async move {
+            match self
+                .resolve(ResolveRequest {
+                    file_id,
+                    tags: HashMap::new(),
+                    download_url_ttl: None,
+                })
+                .await
+            {
+                Ok(_) => true,
+                Err(error) => error.kind() != AttachmentStoreErrorKind::NotFound,
+            }
+        })
+    }
+
     fn upload(&self, request: UploadRequest) -> UploadFuture<'_> {
         self.uploads.lock().expect("uploads lock").push(request);
         Box::pin(async {
@@ -77,12 +99,27 @@ impl AttachmentStore for RecordingFileAttachmentStore {
     }
 
     fn resolve<'a>(&'a self, request: ResolveRequest<'a>) -> ResolveFuture<'a> {
-        let file_id = request.file_id;
+        *self
+            .resolves
+            .lock()
+            .expect("resolves lock")
+            .entry(request.file_id.to_string())
+            .or_default() += 1;
+        let error_kind = self
+            .resolve_errors
+            .lock()
+            .expect("resolve errors lock")
+            .get(request.file_id)
+            .copied();
+        let barrier = self.resolve_barrier.clone();
         Box::pin(async move {
-            Err(AttachmentStoreError::new(
-                AttachmentStoreErrorKind::NotFound,
-                format!("attachment `{file_id}` was not found"),
-            ))
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+            match error_kind {
+                Some(kind) => Err(AttachmentStoreError::new(kind, "attachment unavailable")),
+                None => Ok(AttachmentMetadata::default()),
+            }
         })
     }
 }
@@ -188,7 +225,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
                 },
             ])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd.abs())),
+                environments: Some(local_requests(cwd.abs())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -216,6 +253,8 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
 
     let image_url = extract_image_url(&actual).expect("expected image url in rollout");
     let expected = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -286,7 +325,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
                 },
             ])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd.abs())),
+                environments: Some(local_requests(cwd.abs())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -314,6 +353,8 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()> 
 
     let image_url = extract_image_url(&actual).expect("expected image url in rollout");
     let expected = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![
@@ -390,6 +431,8 @@ async fn file_image_passes_through_request_and_rollout() -> anyhow::Result<()> {
     assert_eq!(
         strip_response_item_id(strip_metadata(actual)),
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -679,6 +722,10 @@ async fn resumed_history_only_emits_resize_notices_for_new_images() -> anyhow::R
         let [upload] = uploads.as_slice() else {
             panic!("only the new image should be uploaded");
         };
+        assert_eq!(
+            upload.thread_id,
+            resumed.session_configured.thread_id.to_string(),
+        );
         assert_eq!(
             image::load_from_memory(&upload.data)?.dimensions(),
             (2048, 768)

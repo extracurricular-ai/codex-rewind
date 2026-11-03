@@ -113,6 +113,7 @@ fn text_response(
         content_items: vec![FunctionCallOutputContentItem::InputText {
             text: value.to_string(),
         }],
+        result_buffered_for: Duration::ZERO,
         error_text: None,
     }
 }
@@ -124,7 +125,7 @@ async fn execute(
 ) -> Result<RuntimeResponse> {
     timeout(TEST_TIMEOUT, async {
         session
-            .execute(request, delegate.clone())
+            .execute(request, delegate.clone(), /*preempt*/ None)
             .await
             .map_err(anyhow::Error::msg)?
             .initial_response()
@@ -204,7 +205,7 @@ async fn completed_waits_drain_pending_notifications_before_returning() -> Resul
         .map_err(anyhow::Error::msg)?;
     let pending = request(r#"yield_control(); notify("notice"); text("done");"#);
     let cell = session
-        .execute(pending, delegate.clone())
+        .execute(pending, delegate.clone(), /*preempt*/ None)
         .await
         .map_err(anyhow::Error::msg)?;
     let actual = cell.initial_response().await.map_err(anyhow::Error::msg)?;
@@ -220,10 +221,14 @@ async fn completed_waits_drain_pending_notifications_before_returning() -> Resul
     let waiting = Arc::clone(&session);
     let completion = tokio::spawn(async move {
         waiting
-            .wait(WaitRequest {
-                cell_id: cell_id("1"),
-                yield_time_ms: 5_000,
-            })
+            .wait(
+                WaitRequest {
+                    cell_id: cell_id("1"),
+                    yield_time_ms: 5_000,
+                    max_output_tokens: None,
+                },
+                /*preempt*/ None,
+            )
             .await
             .map_err(anyhow::Error::msg)
     });
@@ -244,6 +249,7 @@ async fn completed_waits_drain_pending_notifications_before_returning() -> Resul
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
             }],
+            result_buffered_for: actual.result_buffered_for().unwrap(),
             error_text: None,
         })
     );
@@ -269,7 +275,7 @@ async fn termination_cancels_pending_notifications() -> Result<()> {
     let mut pending = request(r#"notify("notice"); await new Promise(() => {});"#);
     pending.yield_time_ms = Some(/*value*/ 1);
     let cell = session
-        .execute(pending, delegate.clone())
+        .execute(pending, delegate.clone(), /*preempt*/ None)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -287,7 +293,7 @@ async fn termination_cancels_pending_notifications() -> Result<()> {
         }
     );
     let actual = session
-        .terminate(cell_id("1"))
+        .terminate(cell_id("1").into())
         .await
         .map_err(anyhow::Error::msg)?;
     assert_eq!(

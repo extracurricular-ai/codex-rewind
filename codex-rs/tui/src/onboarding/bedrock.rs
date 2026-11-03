@@ -1,4 +1,4 @@
-//! Amazon Bedrock credential discovery and setup within the authentication step.
+//! Amazon Bedrock credential setup and the startup GovCloud guidance screen.
 
 use super::auth::AuthModeWidget;
 use super::auth::SignInState;
@@ -6,8 +6,11 @@ use super::auth::onboarding_request_id;
 use super::keys;
 use crate::key_hint::KeyBindingListExt;
 use crate::wrapping::word_wrap_lines;
+use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_protocol::AwsCredentialType;
 use codex_app_server_protocol::BedrockAwsProfile;
+use codex_app_server_protocol::BedrockCheckGovCloudRequirementsParams;
+use codex_app_server_protocol::BedrockCheckGovCloudRequirementsResponse;
 use codex_app_server_protocol::BedrockDiscoverParams;
 use codex_app_server_protocol::BedrockDiscoverResponse;
 use codex_app_server_protocol::BedrockEnvironmentCredential;
@@ -27,7 +30,13 @@ use ratatui::prelude::Widget;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
+use std::sync::Arc;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+const GOV_CLOUD_GUIDANCE_URL: &str =
+    "https://learn.chatgpt.com/docs/enterprise/govcloud-configuration";
 
 #[derive(Clone)]
 pub(super) struct BedrockState {
@@ -53,6 +62,8 @@ enum BedrockView {
     },
     EnvironmentInstructions,
     Configuring(RequestId),
+    // Render-clamped scroll offset shared with the auth widget's cloned state.
+    GovCloudWarning(Arc<AtomicUsize>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,6 +101,28 @@ enum BedrockAction {
 }
 
 impl BedrockState {
+    pub(super) fn guidance() -> Self {
+        Self {
+            view: BedrockView::GovCloudWarning(Arc::default()),
+            highlighted: 0,
+            profiles: Vec::new(),
+            environment_credentials: Vec::new(),
+        }
+    }
+
+    pub(super) fn handle_guidance_key_event(&mut self, key_event: &KeyEvent) -> bool {
+        let BedrockView::GovCloudWarning(scroll) = &self.view else {
+            return false;
+        };
+        let offset = scroll.load(Ordering::Relaxed);
+        if keys::MOVE_UP.is_pressed(*key_event) {
+            scroll.store(offset.saturating_sub(1), Ordering::Relaxed);
+        } else if keys::MOVE_DOWN.is_pressed(*key_event) {
+            scroll.store(offset.saturating_add(1), Ordering::Relaxed);
+        }
+        key_event.kind == KeyEventKind::Press && keys::CONFIRM.is_pressed(*key_event)
+    }
+
     fn discovering(request_id: RequestId) -> Self {
         Self {
             view: BedrockView::Discovering(request_id),
@@ -120,25 +153,18 @@ impl BedrockState {
             if !self.environment_credentials.is_empty() {
                 methods.push(BedrockMethod::Environment);
             }
-            methods.extend([BedrockMethod::OtherMethods, BedrockMethod::ApiKey]);
+            methods.push(BedrockMethod::OtherMethods);
             return methods;
         }
         if detected && !self.environment_credentials.is_empty() {
-            return vec![
-                BedrockMethod::Environment,
-                BedrockMethod::OtherMethods,
-                BedrockMethod::ApiKey,
-            ];
+            return vec![BedrockMethod::Environment, BedrockMethod::OtherMethods];
         }
-        let mut methods = vec![
+        vec![
             BedrockMethod::ManualProfile,
             BedrockMethod::AccessKeys,
             BedrockMethod::EnvironmentInstructions,
-        ];
-        if detected {
-            methods.push(BedrockMethod::ApiKey);
-        }
-        methods
+            BedrockMethod::ApiKey,
+        ]
     }
 
     pub(super) fn is_text_entry_active(&self) -> bool {
@@ -343,7 +369,20 @@ impl BedrockState {
             Line::from(vec!["> ".into(), "Set up Amazon Bedrock".bold()]),
             "".into(),
         ];
+        let mut footer = Vec::new();
         match &self.view {
+            BedrockView::GovCloudWarning(_) => {
+                lines = vec!["Using Codex with AWS GovCloud".bold().into(), "".into()];
+                lines.push(Line::from(vec![
+                    "You are using Codex with AWS GovCloud. Please ensure you or your administrator have read the ".into(),
+                    "application configuration and security guidance"
+                        .cyan()
+                        .underlined(),
+                    " before proceeding.".into(),
+                ]));
+                footer.push("".into());
+                footer.push("> Acknowledge".cyan().into());
+            }
             BedrockView::Discovering(_) => {
                 lines.push("  Checking for existing AWS credentials...".dim().into());
             }
@@ -450,7 +489,6 @@ impl BedrockState {
                 self.render_methods(&mut lines);
             }
         }
-        let mut footer = Vec::new();
         if !matches!(self.view, BedrockView::Discovering(_)) {
             footer.push("".into());
             if !matches!(self.view, BedrockView::Configuring(_)) {
@@ -460,24 +498,48 @@ impl BedrockState {
                     " to continue".dim(),
                 ]));
             }
-            footer.push(Line::from(vec![
-                "  Press ".dim(),
-                keys::CANCEL[0].into(),
-                " to go back".dim(),
-            ]));
+            if !matches!(self.view, BedrockView::GovCloudWarning(_)) {
+                footer.push(Line::from(vec![
+                    "  Press ".dim(),
+                    keys::CANCEL[0].into(),
+                    " to go back".dim(),
+                ]));
+            }
         }
         if let Some(error) = error {
             footer.push("".into());
             footer.push(error.red().into());
         }
         let mut lines = word_wrap_lines(lines, usize::from(area.width));
-        let footer = word_wrap_lines(footer, usize::from(area.width));
+        let mut footer = word_wrap_lines(footer, usize::from(area.width));
+        if matches!(self.view, BedrockView::GovCloudWarning(_))
+            && lines.len() + footer.len() > usize::from(area.height)
+        {
+            footer = vec!["> Acknowledge".cyan().into()];
+            if area.height > 2 {
+                footer.push(Line::from(vec![
+                    keys::MOVE_UP[0].into(),
+                    "/".dim(),
+                    keys::MOVE_DOWN[0].into(),
+                    " scroll · ".dim(),
+                    keys::CONFIRM[0].into(),
+                ]));
+            }
+            footer = word_wrap_lines(footer, usize::from(area.width));
+        }
         if lines.len() + footer.len() <= usize::from(area.height) || footer.is_empty() {
             lines.extend(footer);
             Paragraph::new(lines).render(area, buf);
+            if let BedrockView::GovCloudWarning(scroll) = &self.view {
+                scroll.store(0, Ordering::Relaxed);
+                crate::terminal_hyperlinks::mark_underlined_hyperlink(
+                    buf,
+                    area,
+                    GOV_CLOUD_GUIDANCE_URL,
+                );
+            }
             return;
         }
-
         let footer_height = u16::try_from(footer.len())
             .unwrap_or(u16::MAX)
             .min(area.height.saturating_sub(1));
@@ -493,10 +555,17 @@ impl BedrockState {
                     .then_some(index)
             })
             .unwrap_or_default();
-        let scroll = highlighted_row
-            .saturating_add(2)
-            .saturating_sub(usize::from(content_height))
-            .min(lines.len().saturating_sub(usize::from(content_height)));
+        let max_scroll = lines.len().saturating_sub(usize::from(content_height));
+        let scroll = if let BedrockView::GovCloudWarning(scroll) = &self.view {
+            let offset = scroll.load(Ordering::Relaxed).min(max_scroll);
+            scroll.store(offset, Ordering::Relaxed);
+            offset
+        } else {
+            highlighted_row
+                .saturating_add(2)
+                .saturating_sub(usize::from(content_height))
+                .min(max_scroll)
+        };
         let content_area = Rect {
             height: content_height,
             ..area
@@ -510,6 +579,13 @@ impl BedrockState {
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
             .render(content_area, buf);
         Paragraph::new(footer).render(footer_area, buf);
+        if matches!(self.view, BedrockView::GovCloudWarning(_)) {
+            crate::terminal_hyperlinks::mark_underlined_hyperlink(
+                buf,
+                content_area,
+                GOV_CLOUD_GUIDANCE_URL,
+            );
+        }
     }
 
     fn render_methods(&self, lines: &mut Vec<Line<'static>>) {
@@ -552,7 +628,7 @@ impl BedrockState {
                     if matches!(self.view, BedrockView::EnvironmentInstructions) {
                         ""
                     } else {
-                        "Use another profile, access keys, or environment variables"
+                        "Use another profile, access keys, environment variables, or a Bedrock API key"
                     }
                     .to_string(),
                 ),
@@ -566,7 +642,7 @@ impl BedrockState {
                 ),
                 BedrockMethod::EnvironmentInstructions => (
                     "Environment variables".to_string(),
-                    "Configure AWS credentials in your environment, then return here.".to_string(),
+                    "Configure AWS credentials in your environment, then return here".to_string(),
                 ),
                 BedrockMethod::ApiKey => (
                     "Bedrock API key".to_string(),
@@ -590,6 +666,23 @@ impl BedrockState {
             }
             lines.push("".into());
         }
+    }
+}
+
+pub(crate) async fn check_gov_cloud(request_handle: AppServerRequestHandle) -> bool {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 15),
+        request_handle.request_typed::<BedrockCheckGovCloudRequirementsResponse>(
+            ClientRequest::BedrockCheckGovCloudRequirements {
+                request_id: onboarding_request_id(),
+                params: BedrockCheckGovCloudRequirementsParams {},
+            },
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response.is_gov_cloud,
+        Ok(Err(_)) | Err(_) => false,
     }
 }
 
@@ -646,7 +739,7 @@ impl AuthModeWidget {
     }
 
     pub(super) fn handle_bedrock_key_event(&mut self, key_event: &KeyEvent) -> bool {
-        let (action, fallback) = {
+        {
             let mut guard = self
                 .sign_in_state
                 .write()
@@ -655,21 +748,17 @@ impl AuthModeWidget {
                 return false;
             };
             *self.error.write().unwrap_or_else(PoisonError::into_inner) = None;
-            let action = state.handle_key_event(key_event);
-            (action, state.clone())
-        };
-
-        match action {
-            Some(BedrockAction::BackToAuth) => {
-                *self
-                    .sign_in_state
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner) = SignInState::PickMode;
+            match state.handle_key_event(key_event) {
+                Some(BedrockAction::BackToAuth) => {
+                    *guard = SignInState::PickMode;
+                }
+                Some(BedrockAction::Configure(credential, region)) => {
+                    let fallback = state.clone();
+                    drop(guard);
+                    self.start_bedrock_setup(credential, region, fallback);
+                }
+                None => {}
             }
-            Some(BedrockAction::Configure(credential, region)) => {
-                self.start_bedrock_setup(credential, region, fallback);
-            }
-            None => {}
         }
         self.request_frame.schedule_frame();
         true
@@ -784,6 +873,7 @@ impl AuthModeWidget {
             match result {
                 Ok(()) => {
                     *error.write().unwrap_or_else(PoisonError::into_inner) = None;
+                    // Startup shows GovCloud guidance after the selected provider is reloaded.
                     *guard = SignInState::BedrockConfigured;
                 }
                 Err(err) => {

@@ -29,6 +29,7 @@ use tracing::Subscriber;
 use tracing::span::Attributes;
 use tracing::span::Record;
 use tracing::subscriber::Interest;
+use tracing_test::traced_test;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -53,6 +54,7 @@ use crate::oauth::compute_expires_at_millis;
 use crate::oauth::compute_store_key;
 use crate::oauth::delete_oauth_tokens;
 use crate::oauth::load_oauth_tokens_from_file;
+use crate::oauth::normalized_oauth_credentials;
 use crate::oauth::refresh_lock::RefreshCredentialLock;
 use crate::oauth::save_oauth_tokens;
 use crate::oauth::save_oauth_tokens_to_file;
@@ -179,8 +181,9 @@ async fn coordinated_401_refresh_rereads_and_persists_before_retry() -> Result<(
     let mut manager = authorization_manager_for(&initial).await?;
     manager.set_credential_store(OAuthCredentialStore::new(
         initial.clone(),
-        ResolvedOAuthCredentialStore::File,
+        ResolvedOAuthCredentialStore::file(),
         DefaultKeyringStore,
+        /*oauth_config*/ None,
     ));
     let client = AuthClient::new(
         StreamableHttpClientAdapter::new(
@@ -395,8 +398,9 @@ async fn resolved_keyring_read_error_preserves_in_memory_credentials() -> Result
         initial.server_name.clone(),
         initial.url.clone(),
         Arc::clone(&manager),
-        ResolvedOAuthCredentialStore::Keyring(AuthKeyringBackendKind::Direct),
+        ResolvedOAuthCredentialStore::keyring(AuthKeyringBackendKind::Direct),
         Some(initial.clone()),
+        /*oauth_config*/ None,
     );
 
     let error = persistor
@@ -459,6 +463,58 @@ async fn rejected_refresh_token_requires_reauthorization() -> Result<()> {
     let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
         .expect("rejected refresh must preserve the durable credentials");
     assert_tokens_match_without_expiry(&stored, &initial);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[traced_test]
+async fn rejection_callback_failure_keeps_reauthentication_and_redacts_diagnostics() -> Result<()> {
+    let (env, server, initial) = test_context().await?;
+    save_oauth_tokens_to_file(&initial)?;
+    let (auth_manager, store) = coordinated_manager_for(&initial).await?;
+    let credentials_path = env.path().join(".credentials.json");
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            // The provider rejects after the guarded reread. Make retirement fail with a
+            // deserialization error containing a sentinel credential value.
+            std::fs::write(
+                &credentials_path,
+                r#"{"invalid-entry":"credential-backend-secret"}"#,
+            )
+            .expect("corrupt the synthetic credential store");
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "invalid_grant"}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = OAuthRuntime::Coordinated {
+        auth_manager,
+        store: store.clone(),
+    }
+    .refresh_if_needed()
+    .await
+    .expect_err("rejected credentials must still require reauthentication");
+    assert!(is_authentication_required_error(&error));
+    let mut expected = initial.clone();
+    expected.token_response.0.set_refresh_token(None);
+    assert_eq!(
+        store.stored_credentials().await,
+        normalized_oauth_credentials(Some(&expected))
+    );
+    assert!(logs_contain(
+        "failed to persist rejected MCP OAuth refresh token retirement"
+    ));
+    assert!(logs_contain("Failed to handle rejected refresh token"));
+    assert!(!logs_contain("credential-backend-secret"));
+    // A failed durable retirement must not let this runtime reuse the same credential.
+    std::fs::remove_file(env.path().join(".credentials.json"))?;
+    save_oauth_tokens_to_file(&initial)?;
+    assert!(matches!(
+        store.acquire_transaction_guard().await,
+        Err(AuthError::AuthorizationRequired)
+    ));
     server.verify().await;
     Ok(())
 }
@@ -873,8 +929,9 @@ async fn coordinated_manager_for(
     let mut manager = authorization_manager_for(tokens).await?;
     let store = OAuthCredentialStore::new(
         tokens.clone(),
-        ResolvedOAuthCredentialStore::File,
+        ResolvedOAuthCredentialStore::file(),
         DefaultKeyringStore,
+        /*oauth_config*/ None,
     );
     manager.set_credential_store(store.clone());
     Ok((Arc::new(TokioMutex::new(manager)), store))
@@ -885,12 +942,13 @@ async fn persistor_for(tokens: &StoredOAuthTokens) -> Result<OAuthPersistor> {
         tokens.server_name.clone(),
         tokens.url.clone(),
         Arc::new(TokioMutex::new(authorization_manager_for(tokens).await?)),
-        ResolvedOAuthCredentialStore::File,
+        ResolvedOAuthCredentialStore::file(),
         Some(tokens.clone()),
+        /*oauth_config*/ None,
     ))
 }
 
-async fn test_context() -> Result<(TempCodexHome, MockServer, StoredOAuthTokens)> {
+pub(super) async fn test_context() -> Result<(TempCodexHome, MockServer, StoredOAuthTokens)> {
     let env = TempCodexHome::new();
     let server = MockServer::start().await;
     mount_oauth_metadata(&server).await;
@@ -898,7 +956,9 @@ async fn test_context() -> Result<(TempCodexHome, MockServer, StoredOAuthTokens)
     Ok((env, server, tokens))
 }
 
-async fn authorization_manager_for(tokens: &StoredOAuthTokens) -> Result<AuthorizationManager> {
+pub(super) async fn authorization_manager_for(
+    tokens: &StoredOAuthTokens,
+) -> Result<AuthorizationManager> {
     let oauth_http_client = Arc::new(OAuthHttpClientAdapter::new(
         Arc::new(RouteAwareHttpClient::new(HttpClientFactory::new(
             OutboundProxyPolicy::ReqwestDefault,

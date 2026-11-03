@@ -114,11 +114,12 @@ impl ExecRequest {
         }
     }
 
-    pub(crate) fn from_sandbox_exec_request(
+    pub(crate) async fn from_sandbox_exec_request(
         request: SandboxExecRequest,
         options: ExecOptions,
         windows_sandbox_workspace_roots: Vec<AbsolutePathBuf>,
     ) -> Result<Self, CodexErr> {
+        codex_exec_server::run_integrity_checks(&request).await;
         let SandboxExecRequest {
             command,
             cwd,
@@ -149,6 +150,7 @@ impl ExecRequest {
                     &permission_profile,
                     &sandbox_policy_cwd,
                     use_windows_elevated_backend,
+                    &env,
                 )
             } else {
                 resolve_windows_restricted_token_filesystem_overrides(

@@ -5,6 +5,8 @@ use anyhow::Result;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::types::ToolSuggestDiscoverable;
 use codex_config::types::ToolSuggestDiscoverableType;
+use codex_connectors::ConnectorDirectoryCacheContext;
+use codex_connectors::ConnectorDirectoryCacheKey;
 use codex_core::NewThread;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
@@ -34,6 +36,8 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::context_snapshot;
+use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -457,7 +461,7 @@ async fn mount_remote_calendar_installed_plugins(server: &wiremock::MockServer) 
 #[test_case(Feature::RecommendedPlugins, Some(Feature::RemotePlugin); "remote plugins disabled")]
 #[test_case(Feature::RecommendedPlugins, Some(Feature::RecommendedPlugins); "recommendations disabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn startup_recommendations(
+async fn startup_recommendations_use_developer_message(
     feature: Feature,
     disabled_feature: Option<Feature>,
 ) -> Result<()> {
@@ -546,16 +550,53 @@ async fn startup_recommendations(
 
     test.submit_turn("suggest a plugin").await?;
 
+    if feature == Feature::RecommendedPlugins && disabled_feature.is_none() {
+        insta::assert_snapshot!(
+            "startup_recommendations_developer_context",
+            context_snapshot::format_request_history_snapshot(
+                "Startup recommendations share the developer message with other context.",
+                &model_response.requests(),
+                &ContextSnapshotOptions::default().rewrite_known_segments(),
+            )
+        );
+    }
+
     let request = model_response.single_request();
-    let user_context = request.message_input_texts("user").join("\n");
+    let developer_context = request.message_input_texts("developer").join("\n");
     assert_eq!(
-        user_context.contains("<recommended_plugins>"),
+        developer_context.contains("<recommended_plugins>"),
         expect_recommendations,
     );
     assert_eq!(
-        user_context.contains("- GitHub (github@openai-curated-remote)"),
+        developer_context.contains("- GitHub (github@openai-curated-remote)"),
         expect_recommendations,
     );
+    if expect_recommendations {
+        let developer_messages = request.message_input_text_groups("developer");
+        let recommendation_message = developer_messages
+            .iter()
+            .find(|message| {
+                message
+                    .iter()
+                    .any(|text| text.starts_with("<recommended_plugins>"))
+            })
+            .expect("developer message with recommendations");
+        assert!(
+            recommendation_message
+                .iter()
+                .any(|text| text.starts_with("<permissions instructions>")),
+            "recommendations should share the developer message with other context"
+        );
+        assert_eq!(
+            recommendation_message.last().map(String::as_str),
+            Some(concat!(
+                "<recommended_plugins>\n",
+                "Here is a list of plugins that are available but not installed.\n\n",
+                "- GitHub (github@openai-curated-remote)\n",
+                "</recommended_plugins>",
+            ))
+        );
+    }
     let tools = tool_names(&request.body_json());
     assert_eq!(
         tools
@@ -622,7 +663,7 @@ async fn mcp_discovery_overlaps_endpoint_plugin_recommendations() -> Result<()> 
     let request = response.single_request();
     assert!(
         request
-            .message_input_texts("user")
+            .message_input_texts("developer")
             .join("\n")
             .contains("github@openai-curated-remote"),
         "the completed request should preserve endpoint recommendations"
@@ -720,7 +761,43 @@ async fn unavailable_recommendations_preserve_legacy_workflow(
         ],
     )
     .await;
-    let test = build_test(&server, &apps_server).await?;
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let mut builder = test_codex()
+        .with_auth(auth.clone())
+        .with_pre_build_hook(|home| {
+            std::fs::write(
+                home.join("config.toml"),
+                "[apps.calendar]\nenabled = false\n",
+            )
+            .expect("write disabled calendar app");
+        })
+        .with_config(move |config| {
+            configure_apps_without_search_tool(config, &apps_server.chatgpt_base_url);
+            config.tool_suggest.discoverables.extend(
+                [CALENDAR_CONNECTOR_ID, "connector_missing"].map(|id| ToolSuggestDiscoverable {
+                    kind: ToolSuggestDiscoverableType::Connector,
+                    id: id.to_string(),
+                }),
+            );
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let cache_key = ConnectorDirectoryCacheKey::new(
+        server.uri(),
+        auth.get_account_id(),
+        auth.get_chatgpt_user_id(),
+        auth.is_workspace_account(),
+    );
+    let client = codex_login::default_client::create_client();
+    codex_connectors::list_all_connectors_with_options(
+        ConnectorDirectoryCacheContext::new(test.home.path().to_path_buf(), cache_key),
+        auth.is_workspace_account(),
+        /*force_refetch*/ true,
+        |path| {
+            let request = client.get(format!("{}{path}", server.uri()));
+            async move { Ok(request.send().await?.json().await?) }
+        },
+    )
+    .await?;
     test.submit_turn_with_approval_and_permission_profile(
         "list tools",
         AskForApproval::Never,
@@ -733,7 +810,7 @@ async fn unavailable_recommendations_preserve_legacy_workflow(
     let request = &requests[0];
     assert!(
         !request
-            .message_input_texts("user")
+            .message_input_texts("developer")
             .join("\n")
             .contains("<recommended_plugins>")
     );
@@ -742,11 +819,29 @@ async fn unavailable_recommendations_preserve_legacy_workflow(
         .function_call_output_text(call_id)
         .expect("list tool output");
     let output: Value = serde_json::from_str(&output)?;
-    assert!(output["tools"].as_array().is_some_and(|tools| {
-        tools
-            .iter()
-            .any(|tool| tool["id"] == DISCOVERABLE_GMAIL_ID && tool["tool_type"] == "connector")
-    }));
+    assert_eq!(
+        output["tools"],
+        json!([
+            {
+                "id": DISCOVERABLE_GMAIL_ID,
+                "name": "Gmail",
+                "description": "Find and summarize email threads.",
+                "tool_type": "connector",
+                "has_skills": false,
+                "mcp_server_names": [],
+                "app_connector_ids": []
+            },
+            {
+                "id": "connector_missing",
+                "name": "connector_missing",
+                "description": null,
+                "tool_type": "connector",
+                "has_skills": false,
+                "mcp_server_names": [],
+                "app_connector_ids": []
+            }
+        ])
+    );
     Ok(())
 }
 
@@ -1028,10 +1123,23 @@ async fn endpoint_mode_injects_candidates_hides_list_and_rejects_invented_ids() 
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 2);
-    let contextual_user_message = requests[0].message_input_texts("user").join("\n");
-    assert!(contextual_user_message.contains("<recommended_plugins>"));
-    assert!(contextual_user_message.contains("github@openai-curated-remote"));
-    assert!(contextual_user_message.contains("google-calendar@openai-curated-remote"));
+    for request in &requests {
+        let recommendations = request
+            .message_input_texts("developer")
+            .into_iter()
+            .filter(|text| text.starts_with("<recommended_plugins>"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recommendations,
+            vec![concat!(
+                "<recommended_plugins>\n",
+                "Here is a list of plugins that are available but not installed.\n\n",
+                "- GitHub (github@openai-curated-remote)\n",
+                "- Google Calendar (google-calendar@openai-curated-remote)\n",
+                "</recommended_plugins>",
+            )]
+        );
+    }
     let body = requests[0].body_json();
     let tools = tool_names(&body);
     assert!(
@@ -1375,7 +1483,11 @@ async fn run_remote_plugin_install_refresh_case(refreshed_tools: RefreshedAppsTo
         "the refreshed installed-plugin cache should filter the cached recommendation"
     );
     drop(requests);
-    test.codex.refresh_runtime_config(test.config.clone()).await;
+    let current_config = test.codex.config().await;
+    let _ = test
+        .codex
+        .refresh_runtime_config(current_config, test.config.clone())
+        .await;
     test.submit_turn("check whether Calendar is still installed")
         .await?;
     let requests = mock.requests();
@@ -1435,7 +1547,7 @@ async fn endpoint_mode_with_no_eligible_candidates_exposes_no_suggestion_tools()
     let request = mock.single_request();
     assert!(
         !request
-            .message_input_texts("user")
+            .message_input_texts("developer")
             .join("\n")
             .contains("<recommended_plugins>")
     );

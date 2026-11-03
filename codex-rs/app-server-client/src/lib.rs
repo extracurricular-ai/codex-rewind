@@ -1,3 +1,7 @@
+// Release builds exceed rustc's default query depth when laying out the async
+// MessageProcessor::handle_initialized_client_request future.
+#![recursion_limit = "256"]
+
 //! Shared in-process app-server client facade for CLI surfaces.
 //!
 //! This crate wraps [`codex_app_server::in_process`] behind a single async API
@@ -16,8 +20,16 @@
 //! runtime remain bounded; the local consumer event queue is unbounded so
 //! unread notifications cannot prevent request responses from being delivered.
 
+mod cloud;
 mod path;
 mod remote;
+mod remote_websocket;
+pub use cloud::CloudClient;
+pub use cloud::CloudCommand;
+pub use cloud::CloudOperation;
+pub use cloud::CloudRequestHandle;
+mod server_request;
+pub use server_request::AppServerReplyHandle;
 
 use std::error::Error;
 use std::fmt;
@@ -29,10 +41,12 @@ use std::time::Duration;
 
 pub use codex_app_server::app_server_control_socket_path;
 pub use codex_app_server::in_process::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
+pub use codex_app_server::in_process::EmbeddedNetworkPolicy;
 pub use codex_app_server::in_process::InProcessServerEvent;
 use codex_app_server::in_process::InProcessStartArgs;
 use codex_app_server::in_process::LogDbLayer;
 pub use codex_app_server::in_process::StateDbHandle;
+pub use codex_app_server::verified_local_daemon_socket;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -51,7 +65,7 @@ use codex_config::NoopThreadConfigLoader;
 use codex_core::config::Config;
 pub use codex_core::otel_init::build_provider as build_otel_provider;
 pub use codex_exec_server::EnvironmentManager;
-pub use codex_exec_server::ExecServerRuntimePaths;
+pub use codex_exec_server::ExecServerRuntimeOptions;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -168,6 +182,29 @@ impl Error for TypedRequestError {
     }
 }
 
+// Await transport in a separate statement before calling this: dropping the
+// completed future must precede any caller-provided Deserialize implementation.
+fn decode_typed_response<T>(
+    method: &str,
+    response: IoResult<RequestResult>,
+) -> Result<T, TypedRequestError>
+where
+    T: DeserializeOwned,
+{
+    let response = response.map_err(|source| TypedRequestError::Transport {
+        method: method.to_string(),
+        source,
+    })?;
+    let result = response.map_err(|source| TypedRequestError::Server {
+        method: method.to_string(),
+        source,
+    })?;
+    serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
+        method: method.to_string(),
+        source,
+    })
+}
+
 #[derive(Clone)]
 pub struct InProcessClientStartArgs {
     /// Resolved argv0 dispatch paths used by command execution internals.
@@ -182,6 +219,8 @@ pub struct InProcessClientStartArgs {
     pub strict_config: bool,
     /// Preloaded cloud config bundle provider.
     pub cloud_config_bundle: CloudConfigBundleLoader,
+    /// Policy shared with transports created by the embedder before startup.
+    pub embedded_network_policy: EmbeddedNetworkPolicy,
     /// Feedback sink used by app-server/core telemetry and logs.
     pub feedback: CodexFeedback,
     /// SQLite tracing layer used to flush recently emitted logs before feedback upload.
@@ -214,6 +253,7 @@ impl InProcessClientStartArgs {
     /// Builds initialize params from caller-provided metadata.
     pub fn initialize_params(&self) -> InitializeParams {
         let capabilities = InitializeCapabilities {
+            explicit_gateway_oauth: false,
             experimental_api: self.experimental_api,
             request_attestation: false,
             extensions: None,
@@ -244,6 +284,7 @@ impl InProcessClientStartArgs {
             loader_overrides: self.loader_overrides,
             strict_config: self.strict_config,
             cloud_config_bundle: self.cloud_config_bundle,
+            embedded_network_policy: self.embedded_network_policy,
             thread_config_loader: Arc::new(NoopThreadConfigLoader),
             feedback: self.feedback,
             log_db: self.log_db,
@@ -310,11 +351,13 @@ pub struct InProcessAppServerRequestHandle {
 
 #[derive(Clone)]
 pub enum AppServerRequestHandle {
+    Cloud(CloudRequestHandle),
     InProcess(InProcessAppServerRequestHandle),
     Remote(crate::remote::RemoteAppServerRequestHandle),
 }
 
 pub enum AppServerClient {
+    Cloud(CloudClient),
     InProcess(InProcessAppServerClient),
     Remote(RemoteAppServerClient),
 }
@@ -481,21 +524,8 @@ impl InProcessAppServerClient {
         T: DeserializeOwned,
     {
         let method = request.method_name();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.to_string(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.to_string(),
-            source,
-        })?;
-        serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
-            method: method.to_string(),
-            source,
-        })
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 
     /// Sends a typed client notification.
@@ -530,26 +560,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         result: JsonRpcResult,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::ResolveServerRequest {
-                request_id,
-                result,
-                response_tx,
-            })
+        self.request_handle()
+            .resolve_server_request(request_id, result)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server resolve channel is closed",
-            )
-        })?
     }
 
     /// Rejects a pending server request with JSON-RPC error payload.
@@ -558,26 +571,9 @@ impl InProcessAppServerClient {
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> IoResult<()> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ClientCommand::RejectServerRequest {
-                request_id,
-                error,
-                response_tx,
-            })
+        self.request_handle()
+            .reject_server_request(request_id, error)
             .await
-            .map_err(|_| {
-                IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "in-process app-server worker channel is closed",
-                )
-            })?;
-        response_rx.await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server reject channel is closed",
-            )
-        })?
     }
 
     /// Returns the next in-process event, or `None` when worker exits.
@@ -624,6 +620,61 @@ impl InProcessAppServerClient {
 }
 
 impl InProcessAppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::ResolveServerRequest {
+                request_id,
+                result,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server resolve channel is closed",
+            )
+        })?
+    }
+
+    /// Rejects a pending server request with JSON-RPC error payload.
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ClientCommand::RejectServerRequest {
+                request_id,
+                error,
+                response_tx,
+            })
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "in-process app-server worker channel is closed",
+                )
+            })?;
+        response_rx.await.map_err(|_| {
+            IoError::new(
+                ErrorKind::BrokenPipe,
+                "in-process app-server reject channel is closed",
+            )
+        })?
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -651,29 +702,41 @@ impl InProcessAppServerRequestHandle {
         T: DeserializeOwned,
     {
         let method = request.method_name();
-        let response =
-            self.request(request)
-                .await
-                .map_err(|source| TypedRequestError::Transport {
-                    method: method.to_string(),
-                    source,
-                })?;
-        let result = response.map_err(|source| TypedRequestError::Server {
-            method: method.to_string(),
-            source,
-        })?;
-        serde_json::from_value(result).map_err(|source| TypedRequestError::Deserialize {
-            method: method.to_string(),
-            source,
-        })
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 }
 
 impl AppServerRequestHandle {
+    pub(crate) async fn resolve_server_request(
+        &self,
+        request_id: RequestId,
+        result: JsonRpcResult,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Remote(handle) => handle.resolve_server_request(request_id, result).await,
+            Self::Cloud(handle) => handle.resolve_server_request(request_id, result).await,
+        }
+    }
+
+    pub(crate) async fn reject_server_request(
+        &self,
+        request_id: RequestId,
+        error: JSONRPCErrorError,
+    ) -> IoResult<()> {
+        match self {
+            Self::InProcess(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Remote(handle) => handle.reject_server_request(request_id, error).await,
+            Self::Cloud(handle) => handle.reject_server_request(request_id, error).await,
+        }
+    }
+
     pub async fn request(&self, request: ClientRequest) -> IoResult<RequestResult> {
         match self {
             Self::InProcess(handle) => handle.request(request).await,
             Self::Remote(handle) => handle.request(request).await,
+            Self::Cloud(handle) => handle.request(request).await,
         }
     }
 
@@ -681,10 +744,9 @@ impl AppServerRequestHandle {
     where
         T: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(handle) => handle.request_typed(request).await,
-            Self::Remote(handle) => handle.request_typed(request).await,
-        }
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 }
 
@@ -695,6 +757,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(_) => Some(std::env::consts::FAMILY),
             Self::Remote(client) => client.platform_family(),
+            Self::Cloud(_) => None,
         }
     }
 
@@ -703,6 +766,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(_) => Some(std::env::consts::OS),
             Self::Remote(client) => client.platform_os(),
+            Self::Cloud(_) => None,
         }
     }
 
@@ -712,6 +776,7 @@ impl AppServerClient {
                 local_codex_home.display().to_string(),
             )),
             Self::Remote(client) => client.codex_home().map(AppServerPath::from_app_server),
+            Self::Cloud(_) => None,
         }
     }
 
@@ -719,6 +784,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.request(request).await,
             Self::Remote(client) => client.request(request).await,
+            Self::Cloud(client) => client.request(request).await,
         }
     }
 
@@ -726,16 +792,16 @@ impl AppServerClient {
     where
         T: DeserializeOwned,
     {
-        match self {
-            Self::InProcess(client) => client.request_typed(request).await,
-            Self::Remote(client) => client.request_typed(request).await,
-        }
+        let method = request.method_name();
+        let response = self.request(request).await;
+        decode_typed_response(method, response)
     }
 
     pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
         match self {
             Self::InProcess(client) => client.notify(notification).await,
             Self::Remote(client) => client.notify(notification).await,
+            Self::Cloud(client) => client.notify(notification).await,
         }
     }
 
@@ -747,6 +813,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.resolve_server_request(request_id, result).await,
             Self::Remote(client) => client.resolve_server_request(request_id, result).await,
+            Self::Cloud(client) => client.resolve_server_request(request_id, result).await,
         }
     }
 
@@ -758,6 +825,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.reject_server_request(request_id, error).await,
             Self::Remote(client) => client.reject_server_request(request_id, error).await,
+            Self::Cloud(client) => client.reject_server_request(request_id, error).await,
         }
     }
 
@@ -765,6 +833,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.next_event().await.map(Into::into),
             Self::Remote(client) => client.next_event().await,
+            Self::Cloud(client) => client.next_event().await,
         }
     }
 
@@ -772,6 +841,7 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => client.shutdown().await,
             Self::Remote(client) => client.shutdown().await,
+            Self::Cloud(client) => client.shutdown().await,
         }
     }
 
@@ -779,12 +849,15 @@ impl AppServerClient {
         match self {
             Self::InProcess(client) => AppServerRequestHandle::InProcess(client.request_handle()),
             Self::Remote(client) => AppServerRequestHandle::Remote(client.request_handle()),
+            Self::Cloud(client) => AppServerRequestHandle::Cloud(client.request_handle()),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[path = "reply_tests.rs"]
+    mod replies;
     use super::*;
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
@@ -807,6 +880,7 @@ mod tests {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use futures::SinkExt;
     use futures::StreamExt;
+    use futures::poll;
     use pretty_assertions::assert_eq;
     use std::ops::Deref;
     use std::path::Path;
@@ -881,6 +955,7 @@ mod tests {
             loader_overrides: LoaderOverrides::default(),
             strict_config: false,
             cloud_config_bundle: CloudConfigBundleLoader::default(),
+            embedded_network_policy: Default::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
             state_db: Some(state_db),
@@ -1060,19 +1135,22 @@ mod tests {
     }
 
     fn item_completed_notification(text: &str) -> ServerNotification {
-        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
-            thread_id: "thread".to_string(),
-            turn_id: "turn".to_string(),
-            completed_at_ms: 0,
-            item: codex_app_server_protocol::ThreadItem::AgentMessage {
-                id: "item".to_string(),
-                text: text.to_string(),
-                phase: None,
-                memory_citation: None,
-                delivery: None,
-                questions: None,
-            },
-        })
+        ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification::new(
+                "thread".to_string(),
+                "turn".to_string(),
+                codex_app_server_protocol::ThreadItemPayload::AgentMessage {
+                    id: "item".to_string(),
+                    text: text.to_string(),
+                    phase: None,
+                    memory_citation: None,
+                    delivery: None,
+                    questions: None,
+                },
+                /*started_at_ms*/ None,
+                /*completed_at_ms*/ 0,
+            ),
+        )
     }
 
     fn turn_completed_notification() -> ServerNotification {
@@ -1080,6 +1158,7 @@ mod tests {
             thread_id: "thread".to_string(),
             turn: codex_app_server_protocol::Turn {
                 id: "turn".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: codex_app_server_protocol::TurnStatus::Completed,
@@ -1117,6 +1196,42 @@ mod tests {
                 .expect("initialize capabilities")
                 .mcp_server_openai_form_elicitation
         );
+    }
+
+    #[tokio::test]
+    async fn typed_request_drop_cancels_waiting_send_and_reply() {
+        let (command_tx, mut commands) = mpsc::channel(/*buffer*/ 1);
+        let handle =
+            AppServerRequestHandle::InProcess(InProcessAppServerRequestHandle { command_tx });
+        let request = ClientRequest::ConfigRequirementsRead {
+            request_id: RequestId::String("typed-request".to_string()),
+            params: None,
+        };
+        let mut pending = Box::pin(handle.request_typed::<serde_json::Value>(request.clone()));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(poll!(&mut pending).is_pending());
+        let mut blocked = Box::pin(handle.request_typed::<serde_json::Value>(request.clone()));
+        assert!(poll!(&mut blocked).is_pending());
+        drop(blocked);
+
+        let ClientCommand::Request {
+            request: sent,
+            response_tx,
+        } = commands.try_recv().expect("first request should be queued")
+        else {
+            panic!("expected request command");
+        };
+        assert_eq!(*sent, request);
+        assert!(!response_tx.is_closed());
+        drop(pending);
+        assert!(response_tx.is_closed());
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -1371,6 +1486,7 @@ mod tests {
 
         assert_eq!(client.server_version(), Some("9.8.7-test"));
         assert_eq!(client.codex_home(), Some("/server/.codex"));
+        let client = AppServerClient::Remote(client);
         let response: GetAccountResponse = client
             .request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(1),
@@ -1655,24 +1771,25 @@ mod tests {
 
     #[tokio::test]
     async fn remote_notifications_arrive_over_websocket() {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
-            write_websocket_message(
-                &mut websocket,
-                JSONRPCMessage::Notification(
-                    serde_json::from_value(
-                        serde_json::to_value(ServerNotification::AccountUpdated(
-                            AccountUpdatedNotification {
-                                auth_mode: None,
-                                plan_type: None,
-                            },
-                        ))
-                        .expect("notification should serialize"),
-                    )
-                    .expect("notification should convert to JSON-RPC"),
-                ),
-            )
-            .await;
+            let notification = JSONRPCMessage::Notification(
+                serde_json::from_value(
+                    serde_json::to_value(ServerNotification::AccountUpdated(
+                        AccountUpdatedNotification {
+                            auth_mode: None,
+                            plan_type: None,
+                        },
+                    ))
+                    .expect("notification should serialize"),
+                )
+                .expect("notification should convert to JSON-RPC"),
+            );
+            // Only the first notification is consumed; the other can arrive during shutdown.
+            write_websocket_message(&mut websocket, notification.clone()).await;
+            write_websocket_message(&mut websocket, notification).await;
+            let _ = close_tx.send(websocket.next().await);
         })
         .await;
         let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
@@ -1687,6 +1804,14 @@ mod tests {
         ));
 
         client.shutdown().await.expect("shutdown should complete");
+        assert_eq!(
+            close_rx
+                .await
+                .expect("server should observe shutdown")
+                .expect("server should receive a frame")
+                .expect("websocket should close cleanly"),
+            Message::Close(None),
+        );
     }
 
     #[tokio::test]
@@ -1761,8 +1886,8 @@ mod tests {
                     }
                     ServerNotification::ItemCompleted(notification)
                         if matches!(
-                            &notification.item,
-                            codex_app_server_protocol::ThreadItem::AgentMessage { text, .. }
+                            &notification.item.payload,
+                            codex_app_server_protocol::ThreadItemPayload::AgentMessage { text, .. }
                                 if text == "hello"
                         ) =>
                     {
@@ -2010,7 +2135,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_event_surfaces_lagged_markers() {
-        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (command_tx, _) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let worker_handle = tokio::spawn(async {});
         event_tx
@@ -2042,7 +2167,7 @@ mod tests {
             EnvironmentManager::create_for_tests(
                 Some("ws://127.0.0.1:8765".to_string()),
                 Some(
-                    ExecServerRuntimePaths::new(
+                    ExecServerRuntimeOptions::new(
                         std::env::current_exe().expect("current exe"),
                         /*codex_linux_sandbox_exe*/ None,
                     )
@@ -2059,6 +2184,7 @@ mod tests {
             loader_overrides: LoaderOverrides::default(),
             strict_config: false,
             cloud_config_bundle: CloudConfigBundleLoader::default(),
+            embedded_network_policy: Default::default(),
             feedback: CodexFeedback::new(),
             log_db: None,
             state_db: None,

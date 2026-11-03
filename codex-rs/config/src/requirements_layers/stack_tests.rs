@@ -102,6 +102,7 @@ allowed_approval_policies = ["on-request"]
 allowed_sandbox_modes = ["workspace-write"]
 default_permissions = ":workspace"
 allow_remote_control = true
+unsafe_enforce_sqlite_journal_mode = false
 additional_developer_instructions = "Lower-priority instructions."
 
 [allowed_permission_profiles]
@@ -117,6 +118,7 @@ allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
 allow_remote_control = false
+unsafe_enforce_sqlite_journal_mode = true
 additional_developer_instructions = ""
 
 [allowed_permission_profiles]
@@ -136,6 +138,7 @@ allowed_approval_policies = ["never"]
 allowed_sandbox_modes = ["read-only"]
 default_permissions = ":read-only"
 allow_remote_control = false
+unsafe_enforce_sqlite_journal_mode = true
 additional_developer_instructions = ""
 
 [allowed_permission_profiles]
@@ -333,6 +336,109 @@ timeout_ms = 10000
 refresh_interval_ms = 12345
 "#,
             ))
+        );
+    }
+}
+
+#[test]
+fn otel_requirements_compose_exact_values_atomic_exporters_and_metadata() {
+    let low_dir = tempdir().expect("low-priority requirements directory");
+    let high_dir = tempdir().expect("high-priority requirements directory");
+    let low_base = AbsolutePathBuf::from_absolute_path(low_dir.path()).expect("absolute low base");
+    let high_base =
+        AbsolutePathBuf::from_absolute_path(high_dir.path()).expect("absolute high base");
+
+    let low = layer(
+        "req_low",
+        "Low",
+        r#"
+[otel]
+tool_result = { max_bytes = 1024 }
+log_user_prompt = true
+environment = "low"
+exporter = { otlp-http = { endpoint = "https://low.example", protocol = "json", headers = { stale = "low" }, tls = { ca-certificate = "low-ca.pem" } } }
+trace_exporter = { otlp-grpc = { endpoint = "https://low.example", tls = { client-certificate = "low-client.pem" } } }
+metrics_exporter = "statsig"
+span_attributes = { shared = "low", lower = "preserved" }
+tracestate = { shared = { tenant = "low", region = "us" }, lower = { tenant = "preserved" }, empty = {} }
+"#,
+    )
+    .with_base_dir(low_base);
+    let high = layer(
+        "req_high",
+        "High",
+        r#"
+[otel]
+tool_result = { max_bytes = 4096 }
+log_user_prompt = false
+environment = "high"
+exporter = { otlp-http = { endpoint = "https://high.example", protocol = "binary", tls = { ca-certificate = "high-ca.pem" } } }
+metrics_exporter = "none"
+span_attributes = { shared = "high", higher = "added" }
+tracestate = { shared = { tenant = "replacement" }, lower = {}, higher = { tenant = "added" } }
+"#,
+    )
+    .with_base_dir(high_base);
+    let expected_source = RequirementSource::composite([high.source.clone(), low.source.clone()]);
+    let composed = compose_requirements_for_hostname(
+        vec![
+            low,
+            high,
+            layer(
+                "empty",
+                "Empty",
+                "[otel]\nspan_attributes = {}\ntracestate = { lower = {} }",
+            ),
+        ],
+        /*hostname*/ None,
+    )
+    .expect("compose OTEL requirements")
+    .expect("requirements present")
+    .otel
+    .expect("OTEL requirements present");
+    assert_eq!(composed.source, expected_source);
+
+    let expected = r#"
+[otel]
+tool_result = { max_bytes = 4096 }
+log_user_prompt = false
+environment = "high"
+exporter = { otlp-http = { endpoint = "https://high.example", protocol = "binary", tls = { ca-certificate = '$HIGH_CA' } } }
+trace_exporter = { otlp-grpc = { endpoint = "https://low.example", tls = { client-certificate = '$LOW_CLIENT' } } }
+metrics_exporter = "none"
+span_attributes = { shared = "high", lower = "preserved", higher = "added" }
+tracestate = { shared = { tenant = "replacement", region = "us" }, lower = { tenant = "preserved" }, higher = { tenant = "added" } }
+"#
+    .replace(
+        "$HIGH_CA",
+        &high_dir.path().join("high-ca.pem").display().to_string(),
+    )
+    .replace(
+        "$LOW_CLIENT",
+        &low_dir.path().join("low-client.pem").display().to_string(),
+    );
+    assert_eq!(
+        composed.value,
+        *expected_requirements(expected).otel.unwrap()
+    );
+    assert_eq!(
+        compose(vec![layer(
+            "mixed",
+            "Mixed",
+            "[otel]\nexporter = 'none'\nspan_attributes = {}\ntracestate = { empty = {} }",
+        )]),
+        Ok(Some(expected_requirements("[otel]\nexporter = 'none'"))),
+    );
+
+    for empty in [
+        "[otel]",
+        "[otel.span_attributes]",
+        "[otel.tracestate.empty]",
+    ] {
+        assert_eq!(
+            compose(vec![layer("empty", "Empty", empty)]),
+            Ok(None),
+            "{empty}",
         );
     }
 }
@@ -720,6 +826,48 @@ fn network_maps_use_regular_toml_merge() {
 "#
         )
     );
+}
+
+#[test]
+fn network_aliases_merge_with_layer_precedence_and_sources() {
+    for (low_key, high_key) in [
+        ("network_proxy", "experimental_network"),
+        ("experimental_network", "network_proxy"),
+    ] {
+        let low = layer(
+            "req_low",
+            "Low",
+            &format!(
+                "[{low_key}]\nenabled = true\nallow_local_binding = false\n\
+                 [{low_key}.domains]\n'low.example.com' = 'allow'\n'shared.example.com' = 'allow'"
+            ),
+        );
+        let high = layer(
+            "req_high",
+            "High",
+            &format!(
+                "[{high_key}]\nenabled = false\nallow_upstream_proxy = true\n\
+                 [{high_key}.domains]\n'high.example.com' = 'allow'\n'shared.example.com' = 'deny'"
+            ),
+        );
+        let expected_source =
+            RequirementSource::composite([high.source.clone(), low.source.clone()]);
+        let composed = compose_requirements_for_hostname(vec![low, high], /*hostname*/ None)
+            .expect("compose network aliases")
+            .expect("requirements present");
+        assert_eq!(
+            composed.network,
+            Some(Sourced::new(
+                expected_requirements(
+                    "[network_proxy]\nenabled = false\nallow_local_binding = false\nallow_upstream_proxy = true\n\
+                     [network_proxy.domains]\n'low.example.com' = 'allow'\n'high.example.com' = 'allow'\n'shared.example.com' = 'deny'"
+                )
+                .network
+                .expect("network requirements"),
+                expected_source,
+            ))
+        );
+    }
 }
 
 #[test]
@@ -1586,5 +1734,87 @@ source = "local"
 path = "../plugins"
 "#,
         )
+    );
+}
+
+#[test]
+fn extension_headers_replace_lower_priority_lists_including_explicit_empty() {
+    for higher in [
+        r#"[browser_use.extension]
+request_headers = []"#,
+        r#"[browser_use.extension]
+request_headers = [{ name = "x-managed", value = "{{session_id}}" }]"#,
+    ] {
+        let composed = compose(vec![
+            layer(
+                "low",
+                "Lower priority",
+                r#"[browser_use.extension]
+request_headers = [{ name = "x-old", value = "old" }]"#,
+            ),
+            layer("high", "Higher priority", higher),
+        ])
+        .expect("compose requirements")
+        .expect("requirements present");
+        assert_eq!(composed, expected_requirements(higher));
+    }
+}
+
+#[test]
+fn higher_priority_config_server_replaces_previous_oauth_settings() {
+    let actual = crate::compose_requirements([
+        RequirementsLayerEntry::from_toml(
+            RequirementSource::SystemRequirementsToml {
+                file: AbsolutePathBuf::from_absolute_path(
+                    std::env::temp_dir().join("requirements.toml"),
+                )
+                .unwrap(),
+            },
+            r#"
+[config_server]
+base_url = "https://old.example/settings"
+[config_server.oauth]
+authorization_url = "https://login.old.example/authorize"
+token_url = "https://login.old.example/token"
+client_id = "old-client"
+scopes = ["policy.read"]
+"#,
+        ),
+        RequirementsLayerEntry::from_toml(
+            RequirementSource::LegacyManagedConfigTomlFromMdm,
+            "[config_server]\nbase_url = 'https://new.example/settings'",
+        ),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        actual,
+        ConfigRequirementsWithSources {
+            config_server: Some(Sourced::new(
+                crate::ConfigServer {
+                    base_url: "https://new.example/settings".into(),
+                    oauth: None,
+                },
+                RequirementSource::LegacyManagedConfigTomlFromMdm,
+            )),
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn fetched_policy_cannot_change_config_server() {
+    let result = crate::compose_requirements([RequirementsLayerEntry::from_toml(
+        RequirementSource::EnterpriseManaged {
+            id: "remote".into(),
+            name: "Remote policy".into(),
+        },
+        "[config_server]\nbase_url = 'https://replacement.example/settings'",
+    )]);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("only be configured in local managed requirements")
     );
 }

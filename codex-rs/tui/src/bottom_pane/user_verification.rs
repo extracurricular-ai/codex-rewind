@@ -218,6 +218,12 @@ impl BottomPaneView for UserVerificationView {
     fn terminal_title_requires_action(&self) -> bool {
         !self.is_complete()
     }
+
+    fn program_status_blocked_kind(
+        &self,
+    ) -> Option<crate::terminal_program_status::ProgramStatusKind> {
+        (!self.is_complete()).then_some(crate::terminal_program_status::ProgramStatusKind::Auth)
+    }
 }
 
 impl Renderable for UserVerificationView {
@@ -261,7 +267,9 @@ fn user_verification_options(keymap: &ApprovalKeymap) -> Vec<UserVerificationOpt
 
 pub(crate) fn prompt_header(request: &UserVerificationRequest) -> Box<dyn Renderable> {
     let mut header = ColumnRenderable::new();
-    header.push(Paragraph::new(request.title.clone().bold()).wrap(Wrap { trim: false }));
+    header.push(crate::terminal_hyperlinks::HyperlinkText::new(vec![
+        request.title.clone().bold().into(),
+    ]));
     header.push(Line::from(""));
     header.push(request_details(request));
     Box::new(header)
@@ -281,7 +289,7 @@ fn request_details(request: &UserVerificationRequest) -> Box<dyn Renderable> {
         Line::from(""),
         Line::from(request.description.clone()),
     ]);
-    Box::new(Paragraph::new(lines).wrap(Wrap { trim: false }))
+    Box::new(crate::terminal_hyperlinks::HyperlinkText::new(lines))
 }
 
 fn waiting_view(request: &UserVerificationRequest, keymap: &ListKeymap) -> Box<dyn Renderable> {

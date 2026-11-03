@@ -174,6 +174,7 @@ fn blocking_tool() -> ToolDefinition {
         description: String::new(),
         kind: CodeModeToolKind::Function,
         input_schema: None,
+        input_schema_max_bytes: None,
         output_schema: None,
     }
 }
@@ -196,7 +197,7 @@ async fn yielded_cells_retain_their_own_delegate_until_closed() {
         ..execute_request("await tools.block({}); await tools.block({});")
     };
     let a = service
-        .execute(request.clone(), delegate_a.clone())
+        .execute(request.clone(), delegate_a.clone(), /*preempt*/ None)
         .await
         .unwrap();
     assert_eq!(next_event(&mut events_a).await, DelegateEvent::ToolStarted);
@@ -205,7 +206,10 @@ async fn yielded_cells_retain_their_own_delegate_until_closed() {
         RuntimeResponse::Yielded { .. }
     ));
 
-    let b = service.execute(request, delegate_b.clone()).await.unwrap();
+    let b = service
+        .execute(request, delegate_b.clone(), /*preempt*/ None)
+        .await
+        .unwrap();
     assert_eq!(next_event(&mut events_b).await, DelegateEvent::ToolStarted);
     assert!(matches!(
         b.initial_response().await.unwrap(),
@@ -216,18 +220,24 @@ async fn yielded_cells_retain_their_own_delegate_until_closed() {
     delegate_a.release_tool();
     assert_eq!(next_event(&mut events_a).await, DelegateEvent::ToolStarted);
     delegate_a.release_tool();
-    assert_eq!(
-        service
-            .wait(WaitRequest {
+    let actual = service
+        .wait(
+            WaitRequest {
+                max_output_tokens: None,
                 cell_id: cell_id("1"),
-                yield_time_ms: 60_000
-            })
-            .await
-            .unwrap(),
+                yield_time_ms: 60_000,
+            },
+            /*preempt*/ None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Result {
             code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: Vec::new(),
+            result_buffered_for: actual.result_buffered_for().unwrap(),
             error_text: None
         })
     );
@@ -244,7 +254,7 @@ async fn yielded_cells_retain_their_own_delegate_until_closed() {
     );
     assert!(weak_a.upgrade().is_none());
 
-    service.terminate(cell_id("2")).await.unwrap();
+    service.terminate(cell_id("2").into()).await.unwrap();
     assert_eq!(
         next_event(&mut events_b).await,
         DelegateEvent::ToolCancelled
@@ -266,6 +276,7 @@ async fn yields_and_resumes() {
                 ..execute_request("")
             },
             Arc::new(NoopCodeModeSessionDelegate),
+            /*preempt*/ None,
         )
         .await
         .unwrap();
@@ -280,20 +291,26 @@ async fn yields_and_resumes() {
             }],
         }
     );
-    assert_eq!(
-        service
-            .wait(WaitRequest {
+    let actual = service
+        .wait(
+            WaitRequest {
+                max_output_tokens: None,
                 cell_id: cell_id("1"),
                 yield_time_ms: 60_000,
-            })
-            .await
-            .unwrap(),
+            },
+            /*preempt*/ None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Result {
             code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "after".to_string(),
             }],
+            result_buffered_for: actual.result_buffered_for().unwrap(),
             error_text: None,
         })
     );
@@ -345,6 +362,7 @@ text("after");
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "after".to_string(),
                 }],
+                result_buffered_for: Duration::ZERO,
                 error_text: None,
             }
         ))
@@ -358,6 +376,7 @@ async fn observed_natural_completion_wins_over_termination() {
         .execute(
             execute_request(r#"yield_control(); store("finished", true); text("done");"#),
             Arc::new(NoopCodeModeSessionDelegate),
+            /*preempt*/ None,
         )
         .await
         .unwrap();
@@ -379,6 +398,7 @@ async fn observed_natural_completion_wins_over_termination() {
                         ..execute_request(r#"text(String(load("finished")));"#)
                     },
                     Arc::new(NoopCodeModeSessionDelegate),
+                    /*preempt*/ None,
                 )
                 .await
                 .unwrap()
@@ -400,14 +420,18 @@ async fn observed_natural_completion_wins_over_termination() {
     })
     .await
     .unwrap();
+    let actual = service.terminate(cell_id("1").into()).await.unwrap();
+    let result_buffered_for = actual.result_buffered_for().unwrap();
+    assert!(!result_buffered_for.is_zero());
     assert_eq!(
-        service.terminate(cell_id("1")).await.unwrap(),
+        actual,
         WaitOutcome::LiveCell(RuntimeResponse::Result {
             code_mode_host_duration: None,
             cell_id: cell_id("1"),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
             }],
+            result_buffered_for,
             error_text: None,
         })
     );
@@ -421,6 +445,7 @@ async fn termination_cancels_pending_callbacks_before_responding() {
         .execute(
             execute_request(r#"notify("pending"); await new Promise(() => {});"#),
             delegate.clone(),
+            /*preempt*/ None,
         )
         .await
         .unwrap();
@@ -438,7 +463,7 @@ async fn termination_cancels_pending_callbacks_before_responding() {
         }
     );
     assert_eq!(
-        service.terminate(cell_id("1")).await.unwrap(),
+        service.terminate(cell_id("1").into()).await.unwrap(),
         WaitOutcome::LiveCell(RuntimeResponse::Terminated {
             code_mode_host_duration: None,
             cell_id: cell_id("1"),
@@ -461,7 +486,11 @@ async fn shutdown_cancels_notifications_while_natural_completion_is_draining() {
     let (delegate, mut events_rx) = HeldNotificationDelegate::new();
     let service = Arc::new(InProcessCodeModeSession::new());
     service
-        .execute(execute_request(r#"notify("pending");"#), delegate.clone())
+        .execute(
+            execute_request(r#"notify("pending");"#),
+            delegate.clone(),
+            /*preempt*/ None,
+        )
         .await
         .unwrap();
 
@@ -494,6 +523,7 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
         .execute(
             execute_request(r#"notify("pending"); await new Promise(() => {});"#),
             delegate.clone(),
+            /*preempt*/ None,
         )
         .await
         .unwrap();
@@ -513,13 +543,13 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
 
     let terminating_service = Arc::clone(&service);
     let first_termination =
-        tokio::spawn(async move { terminating_service.terminate(cell_id("1")).await });
+        tokio::spawn(async move { terminating_service.terminate(cell_id("1").into()).await });
     assert_eq!(
         next_event(&mut events_rx).await,
         DelegateEvent::NotificationCancelled
     );
 
-    let repeated_termination = service.terminate(cell_id("1")).await;
+    let repeated_termination = service.terminate(cell_id("1").into()).await;
     delegate.release_notification();
 
     assert_eq!(
@@ -547,6 +577,7 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
         .execute(
             execute_request("await new Promise(() => {});"),
             Arc::new(NoopCodeModeSessionDelegate),
+            /*preempt*/ None,
         )
         .await
         .unwrap();
@@ -561,17 +592,25 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
     );
 
     let first_observer = service
-        .begin_wait(WaitRequest {
-            cell_id: cell_id("1"),
-            yield_time_ms: 60_000,
-        })
+        .begin_wait(
+            WaitRequest {
+                cell_id: cell_id("1"),
+                yield_time_ms: 60_000,
+                max_output_tokens: None,
+            },
+            /*preempt*/ None,
+        )
         .await;
     assert_eq!(
         service
-            .wait(WaitRequest {
-                cell_id: cell_id("1"),
-                yield_time_ms: 60_000,
-            })
+            .wait(
+                WaitRequest {
+                    cell_id: cell_id("1"),
+                    yield_time_ms: 60_000,
+                    max_output_tokens: None,
+                },
+                /*preempt*/ None,
+            )
             .await
             .unwrap_err(),
         "exec cell 1 already has an active observer"
@@ -583,7 +622,7 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
         content_items: Vec::new(),
     };
     assert_eq!(
-        service.terminate(cell_id("1")).await.unwrap(),
+        service.terminate(cell_id("1").into()).await.unwrap(),
         WaitOutcome::LiveCell(terminated.clone())
     );
     assert_eq!(
@@ -605,6 +644,7 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
                 ..execute_request("")
             },
             delegate.clone(),
+            /*preempt*/ None,
         )
         .await
         .unwrap();
@@ -618,6 +658,7 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
             }],
+            result_buffered_for: Duration::ZERO,
             error_text: None,
         }
     );

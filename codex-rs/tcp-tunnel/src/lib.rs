@@ -36,11 +36,18 @@ use url::Host;
 use url::Url;
 
 mod control;
+mod diagnostics;
+
+use diagnostics::Code;
+use diagnostics::Diagnostics;
+use diagnostics::Phase;
 
 use control::read_auth_token;
 use control::read_connect_headers;
 
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// Bound decoded QPACK fields before h3 constructs its capacity-limited HeaderMap.
+const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -64,6 +71,9 @@ pub struct Args {
     /// Read a JSON list of extension-header name/value pairs before the first bearer.
     #[arg(long, requires = "auth_token_stdin")]
     connect_headers_stdin: bool,
+    /// Emit credential-safe JSON diagnostics on stderr instead of human-readable errors.
+    #[arg(long)]
+    diagnostics_json: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -156,68 +166,83 @@ fn parse_trusted_origins(origins: &str) -> Result<Vec<String>> {
 mod tests;
 
 pub async fn run(args: Args) -> Result<()> {
-    ensure!(args.auth_token_stdin, "--auth-token-stdin is required");
-    ensure!(
-        args.listen_addr.ip().is_loopback(),
-        "listener must be loopback"
-    );
-    let origins = std::fs::read_to_string(&args.proxy_origins_file)
-        .context("reading trusted proxy origins")?;
-    let trusted_origins = parse_trusted_origins(&origins)?;
-    let target = ProxyTarget::parse(&args.proxy_url, &trusted_origins, &args.target)?;
-    let (metadata, mut tokens) = control_input(
-        std::io::BufReader::new(std::io::stdin()),
-        args.connect_headers_stdin,
-    )?;
-    let connect = metadata.await.context("CONNECT metadata input closed")??;
-    let initial_auth = tokens
-        .recv()
-        .await
-        .context("MASQUE credential input closed")??
-        .context("empty MASQUE token")?;
-    let (updates, auth) = watch::channel(initial_auth);
-    let headers = TunnelHeaders { auth, connect };
-
-    let listener = TcpListener::bind(args.listen_addr)
-        .await
-        .context("binding loopback listener")?;
-    let native = rustls_native_certs::load_native_certs();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add_parsable_certificates(native.certs);
-    ensure!(
-        !roots.is_empty(),
-        "no native TLS roots: {:?}",
-        native.errors
-    );
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
-    let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    config.transport_config(Arc::new(transport));
-    let (ready, readiness) = oneshot::channel();
-    let tunnel = async move {
-        let connected = ProxyConnection::connect(&target, &config).await?;
-        // The line is the caller readiness contract, including the assigned port.
-        writeln!(std::io::stdout(), "LISTENING {}", listener.local_addr()?)?;
-        std::io::stdout().flush()?;
-        let _ = ready.send(());
-        serve(listener, target, config, headers, connected).await
-    };
-    if args.auth_token_updates_stdin {
-        tokio::select! {
-            result = tunnel => result,
-            result = update_auth_tokens(&mut tokens, updates, readiness, std::io::stdout()) => result,
-        }
+    let diagnostics = if args.diagnostics_json {
+        Diagnostics::Json
     } else {
-        tunnel.await
+        Diagnostics::Human
+    };
+    let mut phase = Phase::Startup;
+    let result = async {
+        ensure!(args.auth_token_stdin, "--auth-token-stdin is required");
+        ensure!(
+            args.listen_addr.ip().is_loopback(),
+            "listener must be loopback"
+        );
+        let origins = std::fs::read_to_string(&args.proxy_origins_file)
+            .context("reading trusted proxy origins")?;
+        let trusted_origins = parse_trusted_origins(&origins)?;
+        let target = ProxyTarget::parse(&args.proxy_url, &trusted_origins, &args.target)?;
+        phase = Phase::Control;
+        let (metadata, mut tokens) = control_input(
+            std::io::BufReader::new(std::io::stdin()),
+            args.connect_headers_stdin,
+        )?;
+        let connect = metadata.await.context("CONNECT metadata input closed")??;
+        let initial_auth = tokens
+            .recv()
+            .await
+            .context("MASQUE credential input closed")??
+            .context("empty MASQUE token")?;
+        phase = Phase::Startup;
+        let (updates, auth) = watch::channel(initial_auth);
+        let headers = TunnelHeaders { auth, connect };
+
+        let listener = TcpListener::bind(args.listen_addr)
+            .await
+            .context("binding loopback listener")?;
+        let native = rustls_native_certs::load_native_certs();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add_parsable_certificates(native.certs);
+        ensure!(
+            !roots.is_empty(),
+            "no native TLS roots: {:?}",
+            native.errors
+        );
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(Duration::from_secs(30).try_into()?));
+        transport.keep_alive_interval(Some(Duration::from_secs(10)));
+        config.transport_config(Arc::new(transport));
+        let (ready, readiness) = oneshot::channel();
+        let tunnel = async move {
+            let connected = ProxyConnection::connect(&target, &config).await?;
+            // The line is the caller readiness contract, including the assigned port.
+            writeln!(std::io::stdout(), "LISTENING {}", listener.local_addr()?)?;
+            std::io::stdout().flush()?;
+            let _ = ready.send(());
+            diagnostics.with_phase(
+                serve(listener, target, config, headers, connected, diagnostics).await,
+                Phase::Transport,
+            )
+        };
+        if args.auth_token_updates_stdin {
+            tokio::select! {
+                result = tunnel => result,
+                result = update_auth_tokens(&mut tokens, updates, readiness, std::io::stdout()) => diagnostics.with_phase(result, Phase::Control),
+            }
+        } else {
+            tunnel.await
+        }
     }
+    .await;
+    diagnostics.finish(result, phase, &mut std::io::stderr().lock())
 }
 
 type TokenStream = mpsc::Receiver<Result<Option<HeaderValue>>>;
@@ -278,7 +303,7 @@ fn control_input(
 impl ProxyConnection {
     async fn connect(target: &ProxyTarget, config: &quinn::ClientConfig) -> Result<Self> {
         tokio::time::timeout(PROXY_CONNECT_TIMEOUT, async {
-            let mut last_error = "MASQUE proxy resolved to no addresses".to_owned();
+            let mut last_error = anyhow!("MASQUE proxy resolved to no addresses");
             for peer in tokio::net::lookup_host((target.host.as_str(), target.port)).await? {
                 let bind = match peer.ip() {
                     IpAddr::V4(_) => "0.0.0.0:0",
@@ -287,7 +312,7 @@ impl ProxyConnection {
                 let mut endpoint = match quinn::Endpoint::client(bind.parse()?) {
                     Ok(endpoint) => endpoint,
                     Err(error) => {
-                        last_error = error.to_string();
+                        last_error = anyhow!(error.to_string());
                         continue;
                     }
                 };
@@ -295,29 +320,30 @@ impl ProxyConnection {
                 let connecting = match endpoint.connect(peer, &target.host) {
                     Ok(connecting) => connecting,
                     Err(error) => {
-                        last_error = error.to_string();
+                        last_error = anyhow!(error.to_string());
                         continue;
                     }
                 };
                 let quic = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
                     Ok(Ok(quic)) => quic,
                     Ok(Err(error)) => {
-                        last_error = error.to_string();
+                        last_error = anyhow!(error.to_string());
                         continue;
                     }
                     Err(_) => {
-                        last_error = "QUIC handshake timed out".to_owned();
+                        last_error = Code::HandshakeTimeout.into();
                         continue;
                     }
                 };
                 let (connection, sender) = match h3::client::builder()
+                    .max_field_section_size(MAX_FIELD_SECTION_SIZE)
                     .enable_extended_connect(true)
                     .build(h3_quinn::Connection::new(quic.clone()))
                     .await
                 {
                     Ok(connection) => connection,
                     Err(error) => {
-                        last_error = error.to_string();
+                        last_error = anyhow!(error.to_string());
                         continue;
                     }
                 };
@@ -328,10 +354,17 @@ impl ProxyConnection {
                     sender,
                 });
             }
-            bail!("QUIC handshake failed: {last_error}");
+            if matches!(
+                last_error.downcast_ref::<Code>(),
+                Some(Code::HandshakeTimeout)
+            ) {
+                Err(last_error)
+            } else {
+                bail!("QUIC handshake failed: {last_error}")
+            }
         })
         .await
-        .context("connecting to MASQUE proxy timed out")?
+        .context(Code::Timeout)?
     }
 }
 
@@ -341,6 +374,7 @@ async fn serve(
     config: quinn::ClientConfig,
     headers: TunnelHeaders,
     mut connected: ProxyConnection,
+    diagnostics: Diagnostics,
 ) -> Result<()> {
     loop {
         let ProxyConnection {
@@ -364,7 +398,11 @@ async fn serve(
                     request.headers_mut().insert(header::AUTHORIZATION, headers.auth.borrow().clone());
                     tokio::spawn(async move {
                         if let Err(error) = bridge(socket, &mut sender, request, draining).await {
-                            eprintln!("MASQUE TCP connection failed: {error:#}");
+                            diagnostics.report(
+                                Phase::Connect,
+                                &error,
+                                format_args!("MASQUE TCP connection failed: {error:#}"),
+                            );
                         }
                     });
                 }
@@ -379,7 +417,11 @@ async fn serve(
         drop(sender);
         match failure {
             ProxyClosure::Draining => {
-                eprintln!("MASQUE HTTP/3 proxy is draining; reconnecting");
+                diagnostics.report(
+                    Phase::Transport,
+                    &Code::Draining.into(),
+                    format_args!("MASQUE HTTP/3 proxy is draining; reconnecting"),
+                );
                 // A refused new CONNECT is not replayed. Accepted streams keep their old transport.
                 tokio::spawn(async move {
                     tokio::select! {
@@ -393,7 +435,11 @@ async fn serve(
                 driver.abort();
                 quic.close(/*error_code*/ 0_u8.into(), b"reconnecting");
                 drop(endpoint);
-                eprintln!("MASQUE proxy connection lost; reconnecting: {error:#}");
+                diagnostics.report(
+                    Phase::Transport,
+                    &Code::Closed.into(),
+                    format_args!("MASQUE proxy connection lost; reconnecting: {error:#}"),
+                );
             }
         }
 
@@ -422,7 +468,11 @@ async fn serve(
                     break;
                 }
                 Err(error) => {
-                    eprintln!("MASQUE proxy reconnect failed: {error:#}");
+                    diagnostics.report(
+                        Phase::Transport,
+                        &error,
+                        format_args!("MASQUE proxy reconnect failed: {error:#}"),
+                    );
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(15));
                 }
             }
@@ -451,7 +501,7 @@ async fn bridge(
         .context("receiving CONNECT response")?
         .status();
     if !status.is_success() {
-        bail!("MASQUE CONNECT rejected with status {}", status.as_u16());
+        return Err(Code::Rejected(status).into());
     }
     let (mut send, mut recv) = stream.split();
     let (mut local_read, mut local_write) = socket.split();

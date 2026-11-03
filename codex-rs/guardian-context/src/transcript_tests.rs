@@ -33,11 +33,116 @@ fn transcript_config() -> ConversationTranscriptConfig {
     }
 }
 
+#[test]
+fn heartbeat_references_preserve_positions_changes_and_human_messages() {
+    let make = |time: &str, instructions: &str, kind: &str| {
+        serde_json::from_value::<ResponseItem>(serde_json::json!({
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": format!("<heartbeat>\n  <automation_id>monitor</automation_id>\n  <current_time_iso>{time}</current_time_iso>\n  <instructions>\n{instructions}\n  </instructions>\n</heartbeat>\n")}],
+        "internal_chat_message_metadata_passthrough": {"content_item_kinds": [kind]}
+    })).unwrap()
+    };
+    let history = vec![
+        make("01:00Z", "Monitor only.", "user.heartbeat"),
+        make("01:30Z", "Monitor only.", "user.heartbeat"),
+        make("01:40Z", "Create a worktree.", "user.text"),
+        make("02:00Z", "Monitor only.", "user.heartbeat"),
+        make("02:30Z", "Never create a worktree.", "user.heartbeat"),
+        make("03:00Z", "Monitor only.", "user.heartbeat"),
+        make("03:10Z", "Monitor only.", "user.text"),
+    ];
+    let entries = collect_transcript(&history, &transcript_config());
+    assert_eq!(entries.len(), history.len());
+    for index in [0, 2, 4, 5, 6] {
+        let ResponseItem::Message { content, .. } = &history[index] else {
+            unreachable!()
+        };
+        let ContentItem::InputText { text } = &content[0] else {
+            unreachable!()
+        };
+        assert_eq!(
+            entries[index],
+            entry(ConversationTranscriptEntryKind::User, text)
+        );
+    }
+    for index in [1, 3] {
+        let crate::TranscriptContent::Text(text) = &entries[index].content else {
+            panic!("text entry")
+        };
+        assert!(text.contains("unchanged from transcript entry [1]"));
+        assert!(!text.contains("Monitor only."));
+    }
+    // Sync collection keeps originals. Preparation compresses before slicing, so
+    // full and delta requests retain exactly the existing reference text and numbering.
+    let raw = super::collect_transcript_for_target(
+        &history,
+        &transcript_config(),
+        crate::ContextTarget::Sync,
+    );
+    let collected = crate::CollectedContext {
+        sections: vec![ContextSection::ConversationTranscript { items: raw.clone() }],
+    };
+    let prepared = crate::ContextProfile::synchronous().prepare_transcript(
+        collected.transcript_entries(),
+        /*entry_number_offset*/ 0,
+    );
+    assert!(matches!(
+        collected.compose(
+            crate::ContextPresentation::SyncFull {
+                session_id: "heartbeat"
+            },
+            prepared,
+        ),
+        Err(crate::SectionError::UnsupportedDelivery {
+            section: "sync_preparation"
+        })
+    ));
+    for offset in [0, 1, 3] {
+        let [expected, actual] = [entries.clone(), raw.clone()].map(|items| {
+            let presentation = if offset == 0 {
+                crate::ContextPresentation::SyncFull {
+                    session_id: "heartbeat",
+                }
+            } else {
+                crate::ContextPresentation::SyncDelta {
+                    session_id: "heartbeat",
+                }
+            };
+            crate::prepare_sync_context(
+                crate::CollectedContext {
+                    sections: vec![crate::ContextSection::ConversationTranscript { items }],
+                },
+                &crate::ContextProfile::synchronous(),
+                offset,
+                presentation,
+            )
+            .unwrap()
+            .into_messages()
+        });
+        assert_eq!(actual, expected);
+    }
+    // A rebuilt window starts with a full body, never a dangling old reference.
+    let rebuilt = collect_transcript(&history[3..].to_vec(), &transcript_config());
+    assert!(
+        matches!(&rebuilt[0].content, crate::TranscriptContent::Text(text) if text.contains("Monitor only."))
+    );
+    let interrupted = vec![
+        history[0].clone(),
+        make("02:00Z", &"x".repeat(/*n*/ 3_600), "user.heartbeat"),
+        history[1].clone(),
+    ];
+    let interrupted = collect_transcript(&interrupted, &transcript_config());
+    assert!(
+        matches!(&interrupted[2].content, crate::TranscriptContent::Text(text) if text.contains("Monitor only."))
+    );
+}
+
 fn entry(kind: ConversationTranscriptEntryKind, text: &str) -> ConversationTranscriptEntry {
     ConversationTranscriptEntry {
         kind,
-        text: text.to_string(),
+        content: crate::TranscriptContent::Text(text.to_string()),
         original_bytes: text.len(),
+        retained_source: None,
     }
 }
 
@@ -48,7 +153,18 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
         "exact action ".repeat(/*n*/ 1_000)
     );
     let history = vec![
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Inspect the workspace."}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["compaction.summary"]
+            }
+        }))
+        .unwrap(),
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
@@ -58,6 +174,8 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -67,6 +185,8 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "developer".to_string(),
             content: vec![ContentItem::InputText {
@@ -76,15 +196,34 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
             id: None,
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
+                text: "The first result is ready.".to_string(),
+            }],
+            phase: Some(MessagePhase::PartialAnswer),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                annotations: None,
+                logprobs: None,
                 text: "Inspection complete.".to_string(),
             }],
             phase: Some(MessagePhase::FinalAnswer),
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "read_file".to_string(),
             namespace: Some("mcp__node_repl__".to_string()),
@@ -111,6 +250,7 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
             history: &history,
             transcript: &config,
             root_conversation: &[],
+            root_conversation_candidates: None,
             trusted_user_answers: &[],
             planned_action: None,
             permissions: None,
@@ -127,10 +267,18 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
         vec![ContextSection::ConversationTranscript {
             items: vec![
                 entry(
+                    ConversationTranscriptEntryKind::Assistant,
+                    "Inspect the workspace."
+                ),
+                entry(
                     ConversationTranscriptEntryKind::User,
                     "Inspect the workspace."
                 ),
                 entry(ConversationTranscriptEntryKind::Developer, &approved_action),
+                entry(
+                    ConversationTranscriptEntryKind::ProtectedAssistant,
+                    "The first result is ready."
+                ),
                 entry(
                     ConversationTranscriptEntryKind::ProtectedAssistant,
                     "Inspection complete."
@@ -160,6 +308,8 @@ fn registered_transcript_filters_roles_and_preserves_node_repl_tool_attribution(
 fn excluded_tool_calls_still_attribute_included_results() {
     let history = vec![
         ResponseItem::FunctionCall {
+            status: None,
+            encrypted_content: None,
             id: None,
             name: "read_file".to_string(),
             namespace: None,
@@ -190,6 +340,7 @@ fn excluded_tool_calls_still_attribute_included_results() {
             history: &history,
             transcript: &config,
             root_conversation: &[],
+            root_conversation_candidates: None,
             trusted_user_answers: &[],
             planned_action: None,
             permissions: None,
@@ -275,6 +426,7 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
         custom_output(/*name*/ None, "orphaned custom output"),
         custom_output(Some("notifications"), "named orphaned custom output"),
         ResponseItem::LocalShellCall {
+            encrypted_content: None,
             id: None,
             call_id: Some("shell-1".to_string()),
             status: LocalShellStatus::Completed,
@@ -303,6 +455,7 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
                     history: &history,
                     transcript: &config,
                     root_conversation: &[],
+                    root_conversation_candidates: None,
                     trusted_user_answers: &[],
                     planned_action: None,
                     permissions: None,
@@ -345,6 +498,8 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
 fn reused_registry_applies_current_history_sources_and_entry_limits() {
     let text = "é🙂".repeat(/*n*/ 10_000);
     let mut history = vec![ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText { text: text.clone() }],
@@ -361,6 +516,7 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
                 history: &history,
                 transcript: &config,
                 root_conversation: &[],
+                root_conversation_candidates: None,
                 trusted_user_answers: &[],
                 planned_action: None,
                 permissions: None,
@@ -375,13 +531,16 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
             transcript_items(&sections[0]),
             vec![ConversationTranscriptEntry {
                 kind: ConversationTranscriptEntryKind::User,
-                text: text.clone(),
+                content: crate::TranscriptContent::Text(text.clone()),
                 original_bytes: text.len(),
+                retained_source: None,
             }]
         );
     }
 
     history.push(ResponseItem::FunctionCall {
+        status: None,
+        encrypted_content: None,
         id: None,
         name: "exec_command".to_string(),
         namespace: None,
@@ -400,6 +559,7 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
                 history: &history,
                 transcript: &config,
                 root_conversation: &[],
+                root_conversation_candidates: None,
                 trusted_user_answers: &[],
                 planned_action: None,
                 permissions: None,
@@ -412,16 +572,20 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
             .expect("transcript collection should succeed");
         let mut expected = vec![ConversationTranscriptEntry {
             kind: ConversationTranscriptEntryKind::User,
-            text: text.clone(),
+            content: crate::TranscriptContent::Text(text.clone()),
             original_bytes: text.len(),
+            retained_source: None,
         }];
         if include_tool_calls {
             expected.push(ConversationTranscriptEntry {
                 kind: ConversationTranscriptEntryKind::ToolCall(
                     "tool exec_command call".to_string(),
                 ),
-                text: truncate_text(&text, /*max_tokens*/ 30),
+                content: crate::TranscriptContent::Text(truncate_text(
+                    &text, /*max_tokens*/ 30,
+                )),
                 original_bytes: text.len(),
+                retained_source: None,
             });
         }
         assert_eq!(transcript_items(&sections[0]), expected);
@@ -433,4 +597,169 @@ fn transcript_items(section: &ContextSection) -> &[ConversationTranscriptEntry] 
         panic!("expected transcript section");
     };
     items
+}
+
+#[test]
+fn encrypted_messages_preserve_order_and_budget_for_both_reviewers() {
+    use crate::ContextPresentation;
+    use crate::ContextProfile;
+    use crate::HistoryTruncation;
+    use crate::RequestBudget;
+    use codex_protocol::models::AgentMessageInputContent;
+    let message = ResponseItem::AgentMessage {
+        id: None,
+        author: "/root".into(),
+        recipient: "/root/worker".into(),
+        content: vec![AgentMessageInputContent::EncryptedContent {
+            encrypted_content: "opaque-parent-reply".repeat(/*n*/ 80),
+        }],
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let call: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type": "function_call", "call_id": "call", "namespace": "team", "name": "send_message",
+        "arguments": serde_json::json!({"target": "worker", "message": "opaque-parent-reply".repeat(80)}).to_string(),
+        "encrypted_function_args": ["message"],
+    })).unwrap();
+    let user = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "Update this page.".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    for mut profile in [
+        ContextProfile::synchronous(),
+        ContextProfile::asynchronous(),
+    ] {
+        let native_calls = profile.target == crate::ContextTarget::Sync;
+        profile.transcript.options.native_multi_agent_namespace =
+            native_calls.then(|| "team".to_owned());
+        if native_calls {
+            let mut limited = profile.clone();
+            // The call fits alone; its paired output must count toward retention too.
+            limited.retention.max_tool_transcript_tokens = crate::estimate_input_tokens(&call);
+            let entries = collect_transcript(&vec![call.clone()], &limited.transcript);
+            assert!(
+                limited
+                    .prepare_transcript(&entries, /*entry_number_offset*/ 0)
+                    .items
+                    .is_empty()
+            );
+        }
+        let mut history = vec![user.clone(), message.clone()];
+        if native_calls {
+            history.push(call.clone());
+        }
+        history.push(user.clone());
+        // Move the native call outside the five most recent tool entries, which stay required.
+        history.extend((0..5).map(|index| {
+            serde_json::from_value(serde_json::json!({
+                "type": "function_call", "call_id": format!("later-{index}"),
+                "name": "exec_command", "arguments": r#"{"cmd":"pwd"}"#,
+            }))
+            .unwrap()
+        }));
+        let entries = collect_transcript(&history, &profile.transcript);
+        let context = crate::CollectedContext {
+            sections: vec![ContextSection::ConversationTranscript {
+                items: entries.clone(),
+            }],
+        }
+        .compose(
+            ContextPresentation::SyncFull {
+                session_id: "worker",
+            },
+            profile.prepare_transcript(&entries, /*entry_number_offset*/ 0),
+        )
+        .unwrap();
+        assert_eq!(
+            context
+                .section_costs()
+                .filter(|(name, _)| *name == "conversation_transcript")
+                .count(),
+            1
+        );
+        let messages = context.clone().into_messages();
+        assert_eq!(messages[1], message);
+        let mut budget = context.estimated_tokens() - crate::estimate_input_tokens(&message) + 100;
+        if native_calls {
+            assert_eq!(messages.len(), 5);
+            assert_eq!(messages[2], call);
+            assert!(
+                matches!(&messages[3], ResponseItem::FunctionCallOutput { call_id: Some(id), .. } if id == "call")
+            );
+            budget -= crate::estimate_input_tokens(&call);
+        } else {
+            assert_eq!(messages.len(), 3);
+        }
+        // Native evidence and paired outputs must be evicted together.
+        let reduced = context
+            .enforce_budget(
+                RequestBudget {
+                    max_input_tokens: budget,
+                    existing_context_tokens: 0,
+                },
+                "Evidence omitted.".into(),
+                HistoryTruncation::Preserve,
+            )
+            .unwrap();
+        assert!(reduced.estimated_tokens() <= budget);
+        let reduced = serde_json::to_value(reduced.into_messages()).unwrap();
+        assert!(reduced.to_string().contains("Evidence omitted."));
+        assert!(!reduced.to_string().contains("opaque-parent-reply"));
+        assert!(
+            reduced
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "function_call_output")
+        );
+        let mut limited = profile.transcript.clone();
+        limited.entry_limits.message_tokens = 10;
+        limited.entry_limits.tool_tokens = 10;
+        let entries = collect_transcript(&history, &limited);
+        let native_end = if native_calls { 3 } else { 2 };
+        assert!(entries[1..native_end].iter().all(|entry| matches!(
+            &entry.content, crate::TranscriptContent::Text(text) if text.contains("omitted")
+        )));
+        if profile.target == ContextTarget::Sync {
+            let mut limited_profile = profile;
+            limited_profile.transcript = limited.clone();
+            let raw = super::collect_transcript_for_target(&history, &limited, ContextTarget::Sync);
+            let actual = {
+                let context = crate::CollectedContext {
+                    sections: vec![ContextSection::ConversationTranscript { items: raw }],
+                };
+                let profile = &limited_profile;
+                let transcript = profile.prepare_transcript(
+                    context.transcript_entries(),
+                    /*entry_number_offset*/ 0,
+                );
+                context.compose(
+                    ContextPresentation::SyncFull {
+                        session_id: "worker",
+                    },
+                    transcript,
+                )
+            }
+            .unwrap();
+            let expected = crate::CollectedContext {
+                sections: vec![ContextSection::ConversationTranscript {
+                    items: entries.clone(),
+                }],
+            }
+            .compose(
+                ContextPresentation::SyncFull {
+                    session_id: "worker",
+                },
+                limited_profile.prepare_transcript(&entries, /*entry_number_offset*/ 0),
+            )
+            .unwrap();
+            assert_eq!(actual.into_messages(), expected.into_messages());
+        }
+    }
 }

@@ -48,8 +48,24 @@ pub(crate) enum Overlay {
 }
 
 impl Overlay {
-    pub(crate) fn new_transcript(cells: Vec<Arc<dyn HistoryCell>>, keymap: PagerKeymap) -> Self {
-        Self::Transcript(TranscriptOverlay::new(cells, keymap))
+    pub(crate) fn new_transcript(
+        cells: Vec<Arc<dyn HistoryCell>>,
+        keymap: PagerKeymap,
+        copy_on_select: bool,
+        mouse_scroll_speed: f64,
+    ) -> Self {
+        let mut overlay = TranscriptOverlay::new(cells, keymap);
+        overlay.view.copy_on_select = copy_on_select;
+        overlay.view.mouse_scroll_speed = mouse_scroll_speed;
+        overlay.view.primary_selection = crate::clipboard_copy::primary::available();
+        Self::Transcript(overlay)
+    }
+
+    pub(crate) fn with_copy_on_select_clear_selection(mut self, enabled: bool) -> Self {
+        if let Self::Transcript(overlay) = &mut self {
+            overlay.view.copy_on_select_clear_selection = enabled;
+        }
+        self
     }
 
     pub(crate) fn new_static_with_lines(
@@ -69,19 +85,18 @@ impl Overlay {
     }
 
     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
-        let input = match self {
-            Overlay::Transcript(_) => tui::OverlayInput::Transcript,
-            Overlay::Static(_) => tui::OverlayInput::StaticPager,
-            Overlay::Analytics(_) => tui::OverlayInput::Usage,
+        let mouse_capture = match self {
+            Overlay::Transcript(_) | Overlay::Analytics(_) => tui::MouseCapture::Enabled,
+            Overlay::Static(_) => tui::MouseCapture::Disabled,
         };
-        tui.set_overlay_input(input)?;
+        tui.set_mouse_capture(mouse_capture)?;
         let result = match self {
-            Overlay::Transcript(o) => o.handle_event(tui, event),
+            Overlay::Transcript(o) => o.handle_event(tui, event).map(drop),
             Overlay::Static(o) => o.handle_event(tui, event),
             Overlay::Analytics(o) => o.handle_event(tui, event),
         };
         if result.is_err() || self.is_done() {
-            let restore = tui.set_overlay_input(tui::OverlayInput::Default);
+            let restore = tui.set_mouse_capture(tui::MouseCapture::Inherit);
             return result.and(restore);
         }
         result

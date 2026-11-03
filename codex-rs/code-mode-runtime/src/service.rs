@@ -15,6 +15,7 @@ use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
+use codex_code_mode_protocol::TerminateRequest;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::WaitToPendingOutcome;
@@ -66,13 +67,15 @@ impl InProcessCodeModeSession {
         &self,
         request: ExecuteRequest,
         delegate: Arc<dyn CodeModeSessionDelegate>,
+        preempt: Option<CancellationToken>,
     ) -> Result<StartedCell, String> {
         let yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
         let started = self
             .runtime
             .execute(
                 runtime_request(request),
-                runtime::ObserveMode::YieldAfter(self.resolve_yield_timeout(yield_time_ms)),
+                runtime::ObserveMode::YieldAfter(self.resolve_yield_timeout(yield_time_ms))
+                    .with_yield_signal(preempt.unwrap_or_default()),
                 Arc::new(ProtocolDelegate { delegate }),
             )
             .await
@@ -113,15 +116,21 @@ impl InProcessCodeModeSession {
         pending_outcome(&cell_id, event)
     }
 
-    pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
-        self.begin_wait(request).await.await
+    pub async fn wait(
+        &self,
+        request: WaitRequest,
+        preempt: Option<CancellationToken>,
+    ) -> Result<WaitOutcome, String> {
+        self.begin_wait(request, preempt).await.await
     }
 
     async fn begin_wait(
         &self,
         request: WaitRequest,
+        preempt: Option<CancellationToken>,
     ) -> CodeModeSessionResultFuture<'static, WaitOutcome> {
         let WaitRequest {
+            max_output_tokens: _,
             cell_id,
             yield_time_ms,
         } = request;
@@ -130,7 +139,8 @@ impl InProcessCodeModeSession {
             .runtime
             .begin_observe(
                 &runtime_cell_id,
-                runtime::ObserveMode::YieldAfter(self.resolve_yield_timeout(yield_time_ms)),
+                runtime::ObserveMode::YieldAfter(self.resolve_yield_timeout(yield_time_ms))
+                    .with_yield_signal(preempt.unwrap_or_default()),
             )
             .await
         {
@@ -150,7 +160,8 @@ impl InProcessCodeModeSession {
         }
     }
 
-    pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
+    pub async fn terminate(&self, request: TerminateRequest) -> Result<WaitOutcome, String> {
+        let cell_id = request.cell_id;
         match self.runtime.terminate(&runtime_cell_id(&cell_id)).await {
             Ok(event) => Ok(WaitOutcome::LiveCell(runtime_response(&cell_id, event)?)),
             Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)) => {
@@ -216,16 +227,26 @@ impl CodeModeSession for InProcessCodeModeSession {
         &'a self,
         request: ExecuteRequest,
         delegate: Arc<dyn CodeModeSessionDelegate>,
+        preempt: Option<CancellationToken>,
     ) -> CodeModeSessionResultFuture<'a, StartedCell> {
-        Box::pin(InProcessCodeModeSession::execute(self, request, delegate))
+        Box::pin(InProcessCodeModeSession::execute(
+            self, request, delegate, preempt,
+        ))
     }
 
-    fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(InProcessCodeModeSession::wait(self, request))
+    fn wait<'a>(
+        &'a self,
+        request: WaitRequest,
+        preempt: Option<CancellationToken>,
+    ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        Box::pin(InProcessCodeModeSession::wait(self, request, preempt))
     }
 
-    fn terminate<'a>(&'a self, cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(InProcessCodeModeSession::terminate(self, cell_id))
+    fn terminate<'a>(
+        &'a self,
+        request: TerminateRequest,
+    ) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        Box::pin(InProcessCodeModeSession::terminate(self, request))
     }
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
@@ -359,10 +380,12 @@ fn runtime_response(
         runtime::CellEvent::Completed {
             content_items,
             error_text,
+            result_buffered_for,
         } => Ok(RuntimeResponse::Result {
             cell_id: cell_id.clone(),
             content_items: content_items.into_iter().map(output_item).collect(),
             error_text,
+            result_buffered_for,
             code_mode_host_duration: None,
         }),
         runtime::CellEvent::Terminated { content_items } => Ok(RuntimeResponse::Terminated {
@@ -399,6 +422,7 @@ fn output_item(item: runtime::OutputItem) -> FunctionCallOutputContentItem {
 fn missing_cell_response(cell_id: CellId) -> RuntimeResponse {
     RuntimeResponse::Result {
         error_text: Some(format!("exec cell {cell_id} not found")),
+        result_buffered_for: Duration::ZERO,
         cell_id,
         content_items: Vec::new(),
         code_mode_host_duration: None,

@@ -49,7 +49,7 @@ async fn session_model_selection_accepts_final_choices_without_saving() {
         while rx.try_recv().is_ok() {}
         chat.handle_key_event(KeyEvent::from(KeyCode::Char('s')));
         let selected = rx.try_recv().expect("session-only selection");
-        assert_matches!(selected, AppEvent::SelectSessionModel { model, effort: selected_effort }
+        assert_matches!(selected, AppEvent::SelectSessionModel { model, effort: selected_effort, service_tier: None }
             if model == expected_model && selected_effort.as_ref() == Some(&effort));
         assert!(chat.bottom_pane.no_modal_or_popup_active(), "{picker}");
         assert!(
@@ -100,7 +100,7 @@ async fn session_model_selection_notifies_the_original_task_after_each_final_ast
         assert_matches!(events.try_recv(), Ok(AppEvent::AstraSelectedFromModelPicker {
             thread_id: selected_thread,
             model,
-            action: AstraModelPickerAction::SelectSessionModel { effort: selected_effort },
+            action: AstraModelPickerAction::SelectSessionModel { effort: selected_effort, service_tier: None },
         }) if selected_thread == thread_id && model == "gpt-6-astra" && selected_effort == Some(effort));
         assert!(
             std::iter::from_fn(|| events.try_recv().ok()).all(|event| matches!(
@@ -110,6 +110,33 @@ async fn session_model_selection_notifies_the_original_task_after_each_final_ast
         );
         assert!(chat.bottom_pane.no_modal_or_popup_active(), "{picker}");
     }
+}
+
+#[tokio::test]
+async fn model_settings_only_command_accepts_the_current_hidden_model() {
+    let (mut chat, mut events, _ops) =
+        make_chatwidget_manual(/*model_override*/ Some("gpt-5.5")).await;
+    chat.thread_id = Some(ThreadId::new());
+    let mut preset = get_available_model(&chat, "gpt-5.5");
+    preset.show_in_picker = false;
+    chat.model_catalog = std::sync::Arc::new(ModelCatalog::new(vec![preset]));
+
+    chat.handle_model_command_args("--reasoning high --speed standard");
+
+    assert_matches!(events.try_recv(), Ok(AppEvent::SelectSessionModel {
+        model,
+        effort: Some(ReasoningEffortConfig::High),
+        service_tier: Some(service_tier),
+    }) if model == "gpt-5.5" && service_tier == SERVICE_TIER_DEFAULT_REQUEST_VALUE);
+
+    while events.try_recv().is_ok() {}
+    chat.handle_model_command_args("gpt-5.5 --reasoning=high");
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok()).all(|event| !matches!(
+            event,
+            AppEvent::SelectSessionModel { .. } | AppEvent::AstraSelectedFromModelPicker { .. }
+        ))
+    );
 }
 
 #[tokio::test]
@@ -129,6 +156,6 @@ async fn session_model_selection_hides_conflicting_shortcut() {
     chat.handle_key_event(KeyEvent::from(KeyCode::Char('s')));
     assert!(
         std::iter::from_fn(|| rx.try_recv().ok())
-            .any(|event| matches!(event, AppEvent::PersistModelSelection { .. }))
+            .any(|event| matches!(event, AppEvent::ApplyModelSelection { .. }))
     );
 }

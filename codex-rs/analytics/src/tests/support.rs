@@ -31,7 +31,7 @@ use codex_app_server_protocol::SandboxPolicy as AppServerSandboxPolicy;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource as AppServerSessionSource;
 use codex_app_server_protocol::Thread;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSource as AppServerThreadSource;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -92,6 +92,7 @@ pub(super) fn test_tracking_context(thread_id: &str, turn_id: &str) -> TrackEven
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         product_client_id: TEST_PRODUCT_CLIENT_ID.to_string(),
+        turn_metadata: None,
     }
 }
 
@@ -264,6 +265,7 @@ pub(super) fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload
     ClientResponsePayload::TurnStart(codex_app_server_protocol::TurnStartResponse {
         turn: Turn {
             id: turn_id.to_string(),
+            root_turn_id: None,
             items_view: codex_app_server_protocol::TurnItemsView::Full,
             items: vec![],
             status: AppServerTurnStatus::InProgress,
@@ -283,6 +285,7 @@ pub(super) fn sample_turn_started_notification(
         thread_id: thread_id.to_string(),
         turn: Turn {
             id: turn_id.to_string(),
+            root_turn_id: None,
             items_view: codex_app_server_protocol::TurnItemsView::Full,
             items: vec![],
             status: AppServerTurnStatus::InProgress,
@@ -320,6 +323,7 @@ pub(super) fn sample_turn_completed_notification(
         thread_id: thread_id.to_string(),
         turn: Turn {
             id: turn_id.to_string(),
+            root_turn_id: None,
             items_view: codex_app_server_protocol::TurnItemsView::Full,
             items: vec![],
             status,
@@ -359,6 +363,7 @@ pub(super) fn sample_turn_resolved_config(
         approval_policy: AskForApproval::OnRequest,
         approvals_reviewer: ApprovalsReviewer::AutoReview,
         guardian_v2_enabled: false,
+        multi_agent_version: codex_protocol::protocol::MultiAgentVersion::Disabled,
         sandbox_network_access: true,
         collaboration_mode: ModeKind::Plan,
         personality: None,
@@ -369,6 +374,7 @@ pub(super) fn sample_turn_resolved_config(
 
 pub(super) fn sample_turn_profile() -> TurnProfile {
     TurnProfile {
+        critical_path: crate::TurnCriticalPath::Disabled,
         before_first_sampling_ms: 100,
         sampling_ms: 700,
         compaction_ms: 40,
@@ -377,6 +383,7 @@ pub(super) fn sample_turn_profile() -> TurnProfile {
         after_last_sampling_ms: 94,
         sampling_request_count: 2,
         sampling_retry_count: 1,
+        tools_change_count: 2,
     }
 }
 
@@ -539,17 +546,17 @@ pub(super) async fn ingest_completed_command_execution_item(
     reducer
         .ingest(
             AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
-                ItemStartedNotification {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-1".to_string(),
-                    started_at_ms: 1_000,
-                    item: sample_command_execution_item_with_id(
+                ItemStartedNotification::new(
+                    thread_id.to_string(),
+                    "turn-1".to_string(),
+                    sample_command_execution_item_with_id(
                         item_id,
                         CommandExecutionStatus::InProgress,
                         /*exit_code*/ None,
                         /*duration_ms*/ None,
                     ),
-                },
+                    /*started_at_ms*/ 1_000,
+                ),
             ))),
             events,
         )
@@ -557,17 +564,18 @@ pub(super) async fn ingest_completed_command_execution_item(
     reducer
         .ingest(
             AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
-                ItemCompletedNotification {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-1".to_string(),
-                    completed_at_ms: 1_042,
-                    item: sample_command_execution_item_with_id(
+                ItemCompletedNotification::new(
+                    thread_id.to_string(),
+                    "turn-1".to_string(),
+                    sample_command_execution_item_with_id(
                         item_id,
                         CommandExecutionStatus::Completed,
                         Some(0),
                         Some(42),
                     ),
-                },
+                    /*started_at_ms*/ None,
+                    /*completed_at_ms*/ 1_042,
+                ),
             ))),
             events,
         )
@@ -584,6 +592,7 @@ pub(super) fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
                 version: "1.0.0".to_string(),
             },
             capabilities: Some(InitializeCapabilities {
+                explicit_gateway_oauth: false,
                 experimental_api: false,
                 request_attestation: false,
                 opt_out_notification_methods: None,
@@ -633,7 +642,7 @@ pub(super) fn sample_command_execution_item(
     status: CommandExecutionStatus,
     exit_code: Option<i32>,
     duration_ms: Option<i64>,
-) -> ThreadItem {
+) -> ThreadItemPayload {
     sample_command_execution_item_with_id("item-1", status, exit_code, duration_ms)
 }
 
@@ -642,9 +651,10 @@ pub(super) fn sample_command_execution_item_with_id(
     status: CommandExecutionStatus,
     exit_code: Option<i32>,
     duration_ms: Option<i64>,
-) -> ThreadItem {
-    ThreadItem::CommandExecution {
+) -> ThreadItemPayload {
+    ThreadItemPayload::CommandExecution {
         model_context: None,
+        sandbox_type: None,
         id: id.to_string(),
         plugin_id: None,
         script_path: None,

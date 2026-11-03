@@ -1,13 +1,11 @@
 //! Local activity disclosure keyed by retained tool identities, independent of text selection.
-//! Controls follow the activity preview; copied text and full-transcript search remain source based.
+//! Controls appear only while activity is focused; copied text and full-transcript search remain source based.
 
 use crate::style::accent_color;
 use std::collections::HashSet;
 
 use crate::bottom_pane::TranscriptFooter;
 use crate::key_hint::KeyBindingListExt;
-use crate::key_hint::key_label_spans;
-use crate::keymap::KeymapContext;
 use crate::keymap::ListAction;
 use crate::keymap::RuntimeKeymap;
 use crossterm::event::KeyEvent;
@@ -169,7 +167,7 @@ impl TranscriptView {
         key: KeyEvent,
         cells: &[Arc<dyn HistoryCell>],
     ) -> Option<ViewAction> {
-        if self.detailed || self.mode != HistoryRenderMode::Rich || self.search.is_active() {
+        if self.detailed || self.mode != HistoryRenderMode::Rich || self.is_search_editing() {
             return None;
         }
         if self.disclosure.keymap.app.focus_activity.is_pressed(key) {
@@ -211,7 +209,9 @@ impl TranscriptView {
             ListAction::Accept => self.toggle_activity(cells, focused),
             ListAction::MoveLeft | ListAction::MoveRight => {
                 let ids = self.activity_ids(cells, focused);
-                if self.disclosure.is_expanded(&ids) != (action == ListAction::MoveRight) {
+                let expanded = self.disclosure.is_expanded(&ids)
+                    || self.is_search_expanded(self.entry_key(cells, focused));
+                if expanded != (action == ListAction::MoveRight) {
                     self.toggle_activity(cells, focused);
                 }
             }
@@ -317,6 +317,8 @@ impl TranscriptView {
         if ids.is_empty() {
             return;
         }
+        let key = self.entry_key(cells, index);
+        let matched = self.is_search_expanded(key);
         let previous_top = self.visible.first().map(|visible| {
             let offset = visible.layout.position_at(visible.row, /*column*/ 0);
             (
@@ -327,7 +329,13 @@ impl TranscriptView {
             )
         });
         self.end_selection(cells);
-        self.release_live_reading();
+        if self.search.has_active_query() && !matched {
+            if let Some(snapshot) = &mut self.held_reading {
+                snapshot.pinned.remove(&key);
+            }
+        } else {
+            self.release_live_reading();
+        }
         // Source offsets only survive an unchanged cell. Regrouped/retired live entries resolve
         // through their member IDs and anchor at their header, never a stale positional index.
         let anchor = previous_top
@@ -348,7 +356,7 @@ impl TranscriptView {
                 offset: 0,
                 row_bias: 0,
             });
-        if self.disclosure.is_expanded(&ids) {
+        if matched || self.disclosure.is_expanded(&ids) {
             self.disclosure.expanded.retain(|id| !ids.contains(id));
         } else {
             self.disclosure.expanded.extend(ids.iter().cloned());
@@ -358,78 +366,49 @@ impl TranscriptView {
         self.cache.clear();
         self.live_key = None;
         self.live_separated = None;
-        self.restart_search();
+        if matched {
+            self.invalidate_held_search();
+        }
     }
 
     pub(super) fn disclosure_footer(&self, width: u16) -> Option<TranscriptFooter> {
-        if self.detailed || self.mode != HistoryRenderMode::Rich {
+        if !self.is_activity_focused() {
             return None;
         }
         let keymap = &self.disclosure.keymap;
-        let text = if self.is_activity_focused() {
-            let hints: Vec<_> = [
-                (ListAction::MoveUp, "previous"),
-                (ListAction::MoveDown, "next"),
-                (ListAction::Accept, "details"),
-                (ListAction::Cancel, "back"),
-            ]
-            .into_iter()
-            .filter_map(|(action, label)| {
-                keymap.list.primary_hint(action).map(|key| {
-                    let mut spans = key.spans();
-                    spans.push(format!(" {label}").dim());
-                    Line::from(spans)
-                })
+        let hints: Vec<_> = [
+            (ListAction::MoveUp, "previous"),
+            (ListAction::MoveDown, "next"),
+            (ListAction::Accept, "details"),
+            (ListAction::Cancel, "back"),
+        ]
+        .into_iter()
+        .filter_map(|(action, label)| {
+            keymap.list.primary_hint(action).map(|key| {
+                let mut spans = key.spans();
+                spans.push(format!(" {label}").dim());
+                Line::from(spans)
             })
-            .collect();
-            // Drop navigation before the details/back controls, retaining whole remapped chords.
-            crate::footer_hint::first_fitting_line(
-                (0..hints.len()).map(|start| {
-                    let mut spans = Vec::new();
-                    for (index, hint) in hints[start..].iter().enumerate() {
-                        if index > 0 {
-                            spans.push(" · ".dim());
-                        }
-                        spans.extend(hint.spans.clone());
+        })
+        .collect();
+        // Drop navigation before the details/back controls, retaining whole remapped chords.
+        let text = crate::footer_hint::first_fitting_line(
+            (0..hints.len()).map(|start| {
+                let mut spans = Vec::new();
+                for (index, hint) in hints[start..].iter().enumerate() {
+                    if index > 0 {
+                        spans.push(" · ".dim());
                     }
-                    Line::from(spans)
-                }),
-                width,
-            )
-        } else {
-            if !self.visible.iter().any(|row| row.layout.disclosure) {
-                return None;
-            }
-            let key = keymap.primary_hint(KeymapContext::Global, "focus_activity")?;
-            let primary = key.display_label();
-            let alternatives = std::iter::once(primary.clone())
-                .chain(
-                    crate::keymap::user_bindings(&keymap.app.focus_activity)
-                        .iter()
-                        .map(crate::key_hint::KeyBinding::display_label)
-                        .filter(|label| *label != primary),
-                )
-                .take(/*n*/ 2)
-                .collect::<Vec<_>>()
-                .join("/");
-            crate::footer_hint::first_fitting_line(
-                [
-                    (alternatives.as_str(), " inspect activity"),
-                    (alternatives.as_str(), " activity"),
-                    (primary.as_str(), " activity"),
-                ]
-                .map(|(keys, action)| {
-                    let mut spans = key_label_spans(keys);
-                    spans.push(action.dim());
-                    Line::from(spans)
-                }),
-                width,
-            )
-        };
+                    spans.extend(hint.spans.clone());
+                }
+                Line::from(spans)
+            }),
+            width,
+        );
         Some(TranscriptFooter {
             text: text.into(),
             cursor_column: None,
-            is_interactive: self.is_activity_focused(),
+            is_interactive: true,
         })
     }
 }

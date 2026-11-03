@@ -33,6 +33,77 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use test_case::test_case;
 
+#[test_case(SessionSource::Exec, None, true, false; "root_without_capability")]
+#[test_case(SessionSource::Exec, Some("send_user_message_async"), true, true; "legacy_capability_enabled")]
+#[test_case(SessionSource::Exec, Some("send_user_message_async"), false, false; "legacy_capability_disabled")]
+#[test_case(SessionSource::Exec, Some("request_user_input_async"), true, true; "current_capability_enabled")]
+#[test_case(SessionSource::Exec, Some("request_user_input_async"), false, false; "current_capability_disabled")]
+#[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), Some("request_user_input_async"), true, false; "subagent")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_question_registration_respects_user_input_setting(
+    session_source: SessionSource,
+    catalog_tool: Option<&'static str>,
+    enabled: bool,
+    expect_question_tool: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.2", move |model| {
+            model.tool_mode = Some(ToolMode::CodeModeOnly);
+            model.experimental_supported_tools = catalog_tool
+                .into_iter()
+                .chain(["send_message_to_user_async"])
+                .map(str::to_string)
+                .collect();
+        })
+        .with_config(move |config| {
+            config.experimental_request_user_input_enabled = enabled;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let is_root = !session_source.is_non_root_agent();
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            session_source: Some(session_source),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?
+        .thread;
+    thread
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Report progress.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let body = responses.single_request().body_json();
+    let tools = body["tools"].as_array().expect("request tools");
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|tool| tool["name"] == "request_user_input_async")
+            .count(),
+        usize::from(expect_question_tool),
+    );
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|tool| tool["name"] == "send_message_to_user_async")
+            .count(),
+        usize::from(is_root),
+    );
+    Ok(())
+}
+
 #[test_case(SessionSource::Exec, false, false; "root_without_tool")]
 #[test_case(SessionSource::Exec, true, true; "root_with_tool")]
 #[test_case(SessionSource::SubAgent(SubAgentSource::Other("test".to_string())), true, false; "subagent")]
@@ -342,16 +413,41 @@ async fn freeform_async_message_emits_an_item_without_ending_the_turn(
     Ok(())
 }
 
-#[test_case(None, "send_user_message_async"; "fallback_description")]
-#[test_case(None, "request_user_input_async"; "current_catalog_name")]
-#[test_case(Some(ToolMessages::default()), "send_user_message_async"; "missing_tool")]
-#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage::default()), ..Default::default() }), "send_user_message_async"; "missing_description")]
-#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("Catalog async message description.".to_string()), ..Default::default() }), ..Default::default() }), "send_user_message_async"; "catalog_description")]
-#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some(String::new()), ..Default::default() }), ..Default::default() }), "send_user_message_async"; "empty_description")]
+const CATALOG_ASYNC_PARAMETERS: &str = r#"{
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "description": "Catalog questions for the user.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["title"]
+            }
+        }
+    },
+    "required": ["questions"],
+    "additionalProperties": false
+}"#;
+
+#[test_case(None, "send_user_message_async", None; "fallback_description")]
+#[test_case(None, "request_user_input_async", None; "current_catalog_name")]
+#[test_case(Some(ToolMessages::default()), "send_user_message_async", None; "missing_tool")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage::default()), ..Default::default() }), "send_user_message_async", None; "missing_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("Catalog async message description.".to_string()), ..Default::default() }), ..Default::default() }), "send_user_message_async", None; "catalog_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some(String::new()), ..Default::default() }), ..Default::default() }), "send_user_message_async", None; "empty_description")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { parameters: Some(CATALOG_ASYNC_PARAMETERS.to_string()), ..Default::default() }), ..Default::default() }), "send_user_message_async", Some(CATALOG_ASYNC_PARAMETERS); "catalog_parameters")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("Catalog async message description.".to_string()), parameters: Some(CATALOG_ASYNC_PARAMETERS.to_string()) }), ..Default::default() }), "request_user_input_async", Some(CATALOG_ASYNC_PARAMETERS); "catalog_description_and_parameters")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { parameters: Some(String::new()), ..Default::default() }), ..Default::default() }), "send_user_message_async", None; "empty_parameters_fallback")]
+#[test_case(Some(ToolMessages { send_user_message_async: Some(ToolMessage { description: Some("Catalog async message description.".to_string()), parameters: Some(r#"{"type":"object","properties":{"questions":{"type":"unsupported"}}}"#.to_string()) }), ..Default::default() }), "send_user_message_async", None; "invalid_parameters_preserve_description")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_user_input_async_emits_item_and_does_not_end_the_turn(
     tool_messages: Option<ToolMessages>,
     catalog_tool_name: &'static str,
+    expected_parameters: Option<&'static str>,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -490,17 +586,24 @@ async fn request_user_input_async_emits_item_and_does_not_end_the_turn(
             .expect("the async message tool should be directly visible to the model");
         assert_eq!(tool["description"], expected_description);
         assert_eq!(tool["strict"], false);
-        assert_eq!(tool["parameters"]["required"], json!(["questions"]));
-        assert_eq!(tool["parameters"]["additionalProperties"], false);
-        let schema = &tool["parameters"]["properties"]["questions"];
-        assert_eq!(schema["minItems"], 1);
-        assert_eq!(schema["items"]["required"], json!(["title"]));
-        assert_eq!(schema["items"]["additionalProperties"], false);
-        assert_eq!(schema["items"]["properties"]["options"]["minItems"], 1);
-        assert_eq!(
-            schema["items"]["properties"]["options"]["items"]["type"],
-            "string"
-        );
+        if let Some(expected_parameters) = expected_parameters {
+            assert_eq!(
+                tool["parameters"],
+                serde_json::from_str::<serde_json::Value>(expected_parameters)?
+            );
+        } else {
+            assert_eq!(tool["parameters"]["required"], json!(["questions"]));
+            assert_eq!(tool["parameters"]["additionalProperties"], false);
+            let schema = &tool["parameters"]["properties"]["questions"];
+            assert_eq!(schema["minItems"], 1);
+            assert_eq!(schema["items"]["required"], json!(["title"]));
+            assert_eq!(schema["items"]["additionalProperties"], false);
+            assert_eq!(schema["items"]["properties"]["options"]["minItems"], 1);
+            assert_eq!(
+                schema["items"]["properties"]["options"]["items"]["type"],
+                "string"
+            );
+        }
         assert!(
             tools
                 .iter()

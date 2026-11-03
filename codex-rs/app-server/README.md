@@ -1,3 +1,90 @@
+# Thread memory summary (experimental)
+
+`thread/memory/read` takes `{threadId}` for a loaded thread and returns
+`{summary}`. Start or resume the thread first. The summary uses that thread's
+resolved memory version, including thread-specific configuration overrides.
+It is `null` when memory use is disabled or the selected summary is missing,
+unreadable, or blank. It never falls back to the other memory version.
+
+# Thread list exclusions
+
+`thread/list` accepts `excludedThreadIds`, an optional array of up to 100
+thread ID strings. Omitted, null, or empty lists do not exclude anything.
+Invalid IDs or more than 100 entries return JSON-RPC error `-32602`;
+duplicates count toward that bound and no entries are silently truncated.
+
+Exclusions apply before the returned result limit, along with the existing
+source, provider, archive, project, section and cwd filters. Pages refill to
+the requested limit (at most 100) unless history is exhausted. Send the same
+exclusions and filters with each returned cursor. Clients that display a saved
+manual order can load those summaries separately, then exclude the entire saved
+ID set when listing the remainder. This field does not save or sort that order.
+
+DB-only requests (`useStateDbOnly: true`) return JSON-RPC error `-32603`
+when the local state DB cannot serve the query, even for an empty cwd filter.
+Listing also returns `-32603` if the store repeats a cursor while filling a page.
+These errors are not evidence that history is exhausted; callers can retry.
+A successful response with `nextCursor: null` still indicates exhaustion.
+Default scan-and-repair requests retain their filesystem fallback.
+
+# Shutdown admission errors
+
+When graceful shutdown rejects new work, app-server returns JSON-RPC error
+`-32600` with `data: {"reason":"serverShuttingDown"}`. Clients can use the
+reason to distinguish shutdown from other invalid requests.
+
+# Thread read state (experimental)
+
+Local durable ordinary user threads expose a `readState` on the
+`thread/read` response. `thread/list` returns `readStates`, a map from eligible
+thread IDs on the returned page to their receipts. Null (or absent on older servers)
+means durable read state is unavailable; a missing map entry means that row is
+ineligible. Ephemeral, not-yet-persisted, service and product-owned threads are
+ineligible. Shared `Thread` objects, including search and lifecycle responses,
+carry no receipts. After start, resume or fork, use `thread/read` to obtain the
+current receipt.
+Each local thread has one receipt, with the same storage ownership as the thread.
+
+A read state is `{firstUnread, revision}`. `firstUnread` is null when read,
+`{type:"threadStart"}` for an explicit unread mark (even for an empty thread),
+or `{type:"turn", turnId}` for the earliest eligible completed result.
+`revision` is an opaque string, scoped to this thread.
+
+Only newly delivered, durable, visible terminal results advance read state,
+before `turn/completed`. Every new result changes the revision, even when an
+older turn remains the first unread position. Reverting a paginated thread
+clears a removed position; explicit thread-start marks survive. Loading snapshots
+never acknowledges activity; empty threads start read and forked history does
+not publish inherited turns as new results.
+
+Enabling `initialize.capabilities.experimentalApi` permits updating read state and
+receiving its notifications.
+
+`thread/readState/update` takes `{threadId, expectedRevision, operation}`,
+where operation is `{type:"read"}` or `{type:"unread"}`.
+Use the revision of the row or transcript actually seen. An unread edit
+starts at `threadStart`; a read edit clears the position. Both require an
+exact revision match, and both conflicts return `-32600` with
+`{reason:"readStateConflict", readState:<current>}` as error data.
+Do not blindly retry: the original action may precede an unseen result or
+another window's mark. Unavailable threads fail; writes never change recency.
+
+Started, resumed or forked threads send `thread/readState/changed` alongside
+ordinary thread events; thread/unsubscribe or disconnect stops delivery.
+Clients can filter this method with the existing notification opt-out setting.
+Revisions are equality tokens, not clocks: never compare or merge them across
+threads or hosts. When concurrent responses disagree, refresh with `thread/read`.
+Offscreen threads converge on page refresh.
+
+# Guardian circuit-breaker errors
+
+Set `auto_review.circuit_break_action = "strict"` to include `TooManyDenials` in
+`TurnAborted.error` when Guardian reaches its denial limit. App-server exposes it
+as `turn.error.codexErrorInfo = "tooManyDenials"` in notifications and history.
+
+The default, `"default"`, leaves this error unset. Both modes preserve the warning,
+denial limit, and interrupted status; neither emits a separate `Error` event.
+
 # Model catalog provider requirements
 
 `model/list` and periodic model catalog refreshes check the startup provider against
@@ -10,8 +97,9 @@ and caching behavior remain in effect while the provider satisfies current requi
 # MCP App UI
 
 `mcpToolCall.mcpAppUi` records the invoked descriptor's `resourceUri`
-and `preferredModelDisplayMode` (`inline` or `fullscreen`). Descriptors with a widget
-URI default to `inline` when the preference is missing or unsupported. The
+and explicit `preferredModelDisplayMode` (`inline` or `fullscreen`). Missing or
+unsupported preferences leave `mcpAppUi` unset; `mcpAppResourceUri` retains the URI
+so clients can apply resource display defaults. The
 UI information is preserved in tool-call events and saved history so clients can
 render without waiting for the full MCP catalog.
 
@@ -29,6 +117,18 @@ An unused thread is not guaranteed to survive restart. Omitted or null leaves
 the choice unset. Ephemeral threads cannot save it.
 Use `thread/metadata/update` for later changes. This preference does not select
 `turn/start.cyberAccessProgram` or grant access to an access program.
+
+# Application network policy
+
+App-server loads application network policy at startup and existing explicit
+config/account reloads. Local requirements-file edits take effect on
+the next explicit reload or restart. Installing a new policy cancels requests
+that it no longer permits; a failed policy load blocks network traffic.
+
+Embedded app-server installs the same policy-aware requirements loader for clients
+it constructs. The embedding TUI and exec runtime install the same policy before
+creating their telemetry providers, background HTTP clients, and executor
+connections. TUI worktree cloud loaders retain that shared policy on reload.
 
 # User verification cancellation (experimental)
 
@@ -66,12 +166,26 @@ stdio servers. The existing `mcp_2026_07_28` flag still governs eligible other
 servers, regardless of whether their names or URLs resemble hosted Apps.
 App-server does not persist this selection.
 
+## Hosted resource reads
+
+`mcpServer/resource/read` accepts `target: {connectorId, linkId}` for direct hosted app reads without tool discovery. A string `linkId` selects that account; `null` explicitly requests no-auth access subject to backend policy. Do not infer no-auth access from unknown or synthetic links.
+
+`originCallId` with `threadId` takes precedence and retains the originating app/account scope. Requests without `target` retain discovery; `connectorId` continues to restrict reads to that connector. Direct targets require backend support for app/account resource reads.
+
 # Project trust
 
 `thread/start` does not persist project trust for a directory where configuration
 discovery finds no project-root marker, Git checkout, or project-local `.codex`
 directory. Starting a task there does not preapprove project configuration added
 later. Existing trust decisions and permission checks for projects are unchanged.
+
+# Review delivery
+
+`review/start` runs the review on the supplied thread and returns that same
+`reviewThreadId`. Clients can omit `delivery`, send `null`, or specify `"inline"`.
+Clients that used `"detached"` should call `thread/start` and pass the new thread id
+to `review/start`. To keep the original conversation history with custom review
+instructions, use `thread/fork` followed by `turn/start`.
 
 # Thread removal
 
@@ -82,6 +196,15 @@ after a client tries to archive or delete it.
 
 After the owner releases the worker, its saved conversation can be archived or
 deleted normally. Ordinary client-controlled threads keep their existing behavior.
+
+## Environment information (experimental)
+
+`environment/info` connects to a configured environment by `environmentId` and
+returns its detected `shell` plus its default `cwd` as a canonical
+environment-native `file:` URI. Connection failures are returned as request
+errors. After connecting, the live metadata request has a 30-second timeout. A
+timeout closes the probed connection and starts normal session recovery without
+retrying the failed request.
 
 ## User verification (experimental)
 
@@ -107,13 +230,13 @@ Local UI clients use five methods. They require the existing
 `unavailable/providerUnavailable` on unsupported platforms or without the required
 ChatGPT account identity.
 
-| Method | Params | Result |
-| --- | --- | --- |
-| `userVerification/status` | `{}` | `{credentialId, unavailableReason, unavailableMessage}` |
-| `userVerification/enroll` | `{}` | `{credentialId, algorithm?, publicKey?}` |
-| `userVerification/delete` | `{}` | `{}` |
-| `userVerification/verify` | `{challenge, title, description}` | `{proof: {credentialId, signature}}` |
-| `userVerification/cancel` | `{requestId}` | `{}` |
+| Method                    | Params                            | Result                                                  |
+| ------------------------- | --------------------------------- | ------------------------------------------------------- |
+| `userVerification/status` | `{}`                              | `{credentialId, unavailableReason, unavailableMessage}` |
+| `userVerification/enroll` | `{}`                              | `{credentialId, algorithm?, publicKey?}`                |
+| `userVerification/delete` | `{}`                              | `{}`                                                    |
+| `userVerification/verify` | `{challenge, title, description}` | `{proof: {credentialId, signature}}`                    |
+| `userVerification/cancel` | `{requestId}`                     | `{}`                                                    |
 
 Status reads local readiness without prompting or contacting a backend. A null
 `unavailableReason` means local checks passed, not that registration is valid.
@@ -172,14 +295,47 @@ any files were compressed; failures are reported through existing logs and metri
 There are no progress notifications or cancellation API. Clients sharing this
 Codex home must support compressed rollout files, including shared histories.
 
-## Managed model provider requirements
+## Model provider admission
+
+`configRequirements/read` reports `supportsIndependentSpeedModes: true` when
+`features.fast_mode` and `features.ultrafast_mode` independently control Fast and
+Ultra Fast. Older servers omit this field and use Fast mode as a shared speed
+gate. Missing individual feature requirements impose no additional restriction;
+the model catalog still determines which service tiers a model supports.
 
 Existing threads retain their provider configuration. Input RPCs reject requests when managed
 `model_provider` or `model_providers` requirements no longer match that configuration, or cannot
 be loaded. This covers turn start/steer, review, compaction, manual queue start, and active goal
 updates. Realtime connections use separate routing configuration and are not checked here.
-Interrupt, realtime stop, and goal pause/clear remain available. User and project
-configuration changes alone do not invalidate existing threads.
+Interrupt, realtime stop, and goal pause/clear remain available.
+
+Resume and input RPCs also reject a thread whose saved provider differs from the current
+configured provider, including profile and app-server launch overrides. The JSON-RPC error's
+`data` contains `ModelProviderError`: `modelProviderMismatch` has `modelProvider` and
+`currentModelProvider`, `modelProviderNotConfigured` identifies a missing provider, and
+`modelProviderPolicyConflict` identifies a mandatory-policy conflict. Clients can still use
+`thread/read` to display history and disable the composer with the error's explanation.
+Changing the resume request's provider does not bypass validation of the saved provider;
+switch the configured provider back to continue the chat. Input is also rejected when the
+current provider configuration cannot be loaded. Older clients retain their normal error
+fallback for unrecognized structured error variants.
+
+## Managed network requirements
+
+Use `[network_proxy]` in `requirements.toml` for shared managed network constraints.
+`[experimental_network]` remains a compatibility alias. A single requirements layer cannot
+contain both names; across layers, they merge with normal precedence. The
+`configRequirements/read.network` response exposes the resulting constraints.
+
+In `config.toml`, `[features.network_proxy]` configures the proxy, while
+`[permissions.<profile>.network]` configures a profile's network settings. Managed requirements
+remain separate and override conflicting profile settings. They can start the proxy without
+enabling the feature; feature settings apply only when the feature is enabled.
+
+Policy publishers must continue using `[experimental_network]` until every client and policy
+validation layer supports `[network_proxy]`. Older clients or intermediaries may ignore or strip
+the new spelling, or skip host-local validation. This reader change does not migrate or
+version-gate published policy bundles.
 
 # Amazon Bedrock authentication
 
@@ -188,12 +344,32 @@ Bedrock login return an error without changing configuration or saved credential
 exporter configuration before selecting another credential source. `aws.credential_export` and
 `aws.profile` cannot be configured together.
 
+Application network restrictions apply to each AWS credential and region HTTP request and to
+the Bedrock destination. Static access keys with an explicit region need no credential discovery.
+AWS profile `credential_process` commands are run by the AWS SDK; their network traffic is outside
+the application's HTTP policy. Configured credential exporters and AWS reauthentication commands
+require unrestricted application policy; policy revocation cancels their active work.
+
+After Bedrock login or setup, clients can call the experimental
+`account/bedrock/checkGovCloudRequirements` with `{}`. The server reloads configuration and
+requirements and returns `{ isGovCloud, shouldWarn }`. An explicitly configured official
+Bedrock endpoint hostname determines the region; with no URL or a custom proxy URL, the check
+resolves the AWS region using the current authentication state. It does not reload saved
+credentials or change login policy.
+For GovCloud, the advisory check requires API-only login and enabled managed application
+network restrictions with an explicit allow entry for the active Bedrock endpoint's domain.
+Non-Bedrock providers and commercial regions return both fields as `false`. Configuration or
+region resolution failures return an RPC error. This check does not block login or certify
+the entire network configuration.
+
 ## Stored thread attachments
 
 - `thread/attachment/add` — add a durable resource reference to a stored thread without loading it. Repeated writes with the same attachment type and identity key return the existing attachment.
 - `thread/attachment/list` — list attachments for one stored thread in a cursor-paginated request, including a thread that is not loaded.
+- `thread/attachmentOwner/list` — find stored threads with an exact attachment type and identity key, with cursor pagination and an optional archive filter.
 - `thread/attachment/remove` — remove an attachment by its thread, attachment type, and identity key; returns `{}`.
 - `thread/attachment/updated` — notification broadcast after an attachment is created or removed; contains the thread, attachment identity, attachment id, and operation.
+
 ### Example: Manage stored thread attachments
 
 Attachments record the resources currently associated with a thread, independently of conversation history. Clients can add, remove, and list attachments for one stored thread at a time without resuming those threads. Adding or removing an attachment does not create or delete the underlying resource or rewrite history. An attachment is idempotently identified by its thread, `attachmentType`, and `identityKey`. For pull requests, clients should reuse the canonical application identity `JSON.stringify([canonicalHostname, lowercaseOwner, lowercaseRepository, pullRequestNumber])` so addition and removal agree across surfaces.
@@ -249,11 +425,25 @@ Attachments record the resources currently associated with a thread, independent
 
 `thread/attachment/list` accepts one `threadId` and returns at most 100 attachments per page, ordered by creation time and attachment id. Continue with `nextCursor` and the same `threadId` until the cursor is `null`. Each thread can retain up to 100 attachments. Removing an attachment frees a slot for a new attachment.
 
+`thread/attachmentOwner/list` performs the reverse lookup: pass `attachmentType` and `identityKey` to get `data: [{threadId, archived}]` and `nextCursor`. Omit `archived` (or pass `null`) to include both active and archived threads; `false` selects active threads and `true` selects archived threads. Use the same identity and archive filter on subsequent cursor pages. The lookup covers only this app-server's configured thread store, not other hosts or stores. Results describe current membership and are not an atomic resource-cleanup check: attachments can change after a lookup.
+
 A non-ephemeral fork copies the source thread's current attachments, even when forking at an earlier turn. The copies have new attachment IDs and creation timestamps, but retain the same resource identities and payloads. Clients use `forkedFromId` on `thread/started` to detect forks and call `thread/attachment/list` with the new thread ID to load their attachments. Fork copying does not emit per-attachment updates; explicit add/remove operations still do. Copying is awaited before publishing the fork, but is best effort: a copy failure is logged and the conversation fork succeeds without attachments. Membership can then change independently on either thread; the referenced resources themselves are not copied. Resuming a fork does not repeat the copy.
 
 Attachment creation and deletion requests using the same thread ID are serialized across connections. The requesting client receives its response before the compact update is broadcast, and duplicate creates or absent deletes do not emit updates. Deleting the owning thread removes its attachments under the same lifecycle exclusion; queued attachment mutations then report that the thread was not found.
 
 # Thread plugin settings
+
+Plugin summaries returned by `plugin/list`, `plugin/installed`, `plugin/read`,
+and `plugin/share/list` report effective `enabled` state. When
+`plugins._default.enabled` is configured, an explicit
+`plugins."<plugin-name>@<marketplace-name>".enabled` overrides that default;
+a plugin disabled at its source remains disabled. Omitting the default preserves
+existing source and account enablement. Other plugin settings, including remembered
+tool approvals, inherit the activation default unless `enabled` is explicitly set.
+`plugin/search` retains its discovery behavior: results report `enabled: false`
+while preserving their installation state.
+Remote `plugin/install` still installs a policy-disabled package, but skips MCP and
+Apps authentication setup without writing an `enabled` override.
 
 `thread/settings/update` and `turn/start` accept `disabledPluginIds`, a list of
 `PluginSummary.id` values from `plugin/list`, in the
@@ -288,6 +478,17 @@ This is the server's advertised MCP capabilities object, including its `extensio
 map. It is null when the connection has not initialized successfully; capabilities
 are never inferred from tools or copied from a shared catalog cache.
 
+Pass `serverName` to discover only that server. With `threadId`, the request
+reuses the thread's current MCP connection and tool catalog after any pending
+runtime refresh; discovery then waits only for that server. Without `threadId`,
+discovery creates a connection for the selected server. An unknown name returns an empty page.
+Omitting `serverName` preserves full-inventory discovery.
+
+# MCP OAuth login
+
+`mcpServer/oauth/login` only returns HTTP(S) authorization URLs. Authorization
+endpoints with other schemes fail before client registration or URL return.
+
 # Thread rollback
 
 `thread/rollback` has been removed from the API, including its request and response
@@ -298,6 +499,23 @@ Existing rollouts may contain historical `ThreadRolledBack` events. Their replay
 and migration remain supported so resuming, reading, and forking those threads
 preserves the surviving history. This disk compatibility does not require restoring
 support for new `thread/rollback` requests.
+
+# MCP configuration reload
+
+`config/mcpServer/reload` returns an error when a loaded thread rejects the
+refreshed enterprise policy. The rejected thread retains its previous configuration
+layers with enterprise MCP disabled. Other planned thread refreshes are processed
+before the rejection is reported, so an error does not imply that no changes were
+applied. Correct the policy before retrying the reload.
+
+# Enterprise sign-in
+
+Call `mcpServer/oauth/login` with a directly configured server's `name` and its
+connected `threadId`. Open the returned `authorizationUrl` and match
+`mcpServer/oauthLogin/completed` by `loginId`. Starting another enterprise sign-in
+cancels the previous attempt and waits for its callback listener to close. Use
+`account/login/cancel` to cancel explicitly. Start a fresh session after success to
+use the saved grant.
 
 # Selected workspace routing
 
@@ -310,6 +528,7 @@ Routing compares origins by scheme, host, and effective port, ignoring API paths
 configured base URL.
 
 Responses HTTP (including compaction) and WebSockets wait for discovery and preserve API paths.
+Guardian v2 classifier HTTP and pooled WebSockets use the same routing.
 HTTP redirects are rejected. `us` and `us_cr` set `X-OpenAI-Account-Routing-Override`;
 `NO_CONSTRAINT` omits it.
 
@@ -329,3 +548,192 @@ compatibility but is not emitted. Non-Windows hosts report `notConfigured`.
 MXC uses the standard `command/exec` streaming and process-control path, including
 ConPTY when `tty` is enabled. The buffered legacy Windows sandbox restrictions on
 process control and custom output caps do not apply to MXC.
+
+### Gateway OAuth sign-in
+
+Providers configured with `gateway_oauth` require a secondary OAuth credential in
+addition to their primary authentication. Clients with a gateway sign-in UI set
+`initialize.capabilities.explicitGatewayOauth: true`, complete initialization, and
+successfully call `account/gatewayOAuth/read` before sending authenticated requests,
+including startup `model/list` and inference requests. Repeat this probe on each
+new connection. A successful `initialize` alone does not confirm support: older
+servers can ignore the unknown capability and retain automatic browser login.
+
+Support for `account/gatewayOAuth/read` and `explicitGatewayOauth` is introduced
+together, so a successful read confirms support even when `required` is `false`
+or `status` is `notReady`. The returned status determines whether sign-in is needed;
+it is separate from the capability check. If the probe fails because the method is
+unsupported, require a server upgrade. Other errors and timeouts also leave
+authenticated requests blocked until a probe succeeds; do not silently fall back
+to automatic login.
+
+With explicit login enabled, app-server refreshes existing credentials, but only the
+`account/gatewayOAuth/login` RPC starts browser authorization. Requests needing
+sign-in fail promptly so the client can offer that flow.
+
+Clients that omit the capability or set it to `false`, including the TUI, retain
+automatic browser authorization after initialization. Startup credential reads
+cannot open a browser before initialization. Explicit opt-in is shared by gateway
+managers using the same home and network configuration within the process and
+cannot be undone by a later connection that omits the capability.
+
+- `account/gatewayOAuth/read` returns the current effective `providerId`,
+  `providerName`, `required`, `status`, and `error`. `required` indicates that this
+  provider uses gateway OAuth, including when already signed in. This operation
+  does not refresh tokens or open a browser; `status` is null for other providers.
+  `notReady` means credentials are not ready. `succeeded` means saved credentials
+  are locally usable, not that a gateway request has been verified. Reads observe
+  usable replacement credentials saved by another process sharing the same home.
+- `account/gatewayOAuth/login` starts authorization and returns `{}` after
+  the credential has been saved. Providers requiring OpenAI authentication need a
+  primary account first. A second login request fails while a login is active.
+  The initiating connection receives a `started` notification with `authUrl`; the
+  client must open that URL in a browser that can reach the server callback port.
+  Other status notifications set `authUrl` to null. Login is rejected if the
+  initiating connection opted out of `account/gatewayOAuth/changed` notifications.
+- `account/gatewayOAuth/cancel` cancels the calling connection's login and returns
+  `{}` after the active login releases its slot, so the client can immediately
+  start another login. Closing that connection also cancels its login and releases
+  the callback listener. Cancellation makes the pending login request fail.
+- `account/gatewayOAuth/changed` reports `notReady`, `started`, `succeeded`, or
+  `failed`, with an optional `error`. Notifications apply to the current effective
+  gateway configuration. Clients can read readiness when connecting and after
+  changing configuration. Notifications follow the standard per-connection
+  `optOutNotificationMethods` setting.
+  These payloads never contain credentials.
+
+Read, login, and cancel take no params. Read and login use the app's current
+provider, reloading configuration and returning an error if it cannot be loaded.
+Status notifications include `providerId`. During browser sign-in, inference
+requests fail promptly and can be retried when sign-in succeeds.
+
+`model/list` also checks gateway authentication before returning cached models.
+If authentication fails after the provider configuration changes, it asks the client
+to restart Codex so the retained catalog and gateway sign-in use the same provider.
+
+## Application network policy
+
+Application policy uses the same managed TOML merge as agent-network requirements:
+higher-priority layers override conflicting values, including `enabled` and each
+domain permission, while non-conflicting domain entries are retained. Omitted
+values inherit from lower layers. After merging, a present network block defaults
+to `enabled = true` and an empty domain map, meaning no external destinations are
+allowed. An effective `enabled = false` disables application destination policy.
+Domain keys are exact ASCII names, normalized to lowercase without a trailing dot
+before merging; wildcards, URLs, ports, invalid permissions, and duplicate
+normalized names are rejected.
+App-server enforces these rules for its HTTP and WebSocket traffic before route
+resolution or connection work, including redirects and reused clients. An allow
+entry permits only HTTPS or WSS to that exact host. Agent-network requirements
+remain separate in `network`.
+
+App-server reloads effective requirements on explicit config or account reloads.
+Local changes or read failures discovered on reload revoke active requests;
+unchanged requirements preserve them. Failed policy loads block traffic until
+requirements load successfully. Invalid request or project configuration does not
+revoke unrelated traffic. Account changes revoke
+outstanding requests and clients retaining the previous account's authorization.
+Policy updates also stop active requests to newly denied destinations. Narrow
+authentication and requirements-discovery clients use local requirements and
+exact endpoint URLs while workspace policy is loading. API-key-only deployments
+do not discover ChatGPT workspace requirements.
+
+SDK transports without destination enforcement, including OTLP exporters and AWS
+credential discovery/signing, are disabled while restrictions apply. Supported
+HTTP, WebSocket, and code-mode gRPC requests use the shared destination checks.
+User-directed Git, SSH, shell, and other subprocess traffic retain their existing
+execution and sandbox policies.
+
+# Item history anchors
+
+Live notifications and turn history return the same `ThreadItem`. Each item has
+`startedAtMs` and `completedAtMs` beside `type` and `id`. Each timestamp is in
+Unix milliseconds, or `null` when the producer has not recorded it. Clients
+reading older servers may also encounter items that omit these fields.
+
+`thread/items/list` accepts an optional nullable `cursor`: either an opaque string
+from a previous response or an item anchor such as
+`{"type":"item","itemId":"item-123"}`. An item anchor resumes exclusively after
+that item in the requested pagination order: ascending (the default) returns newer
+items, and descending returns older items. It requires a non-empty `turnId`;
+otherwise the request returns invalid params (`-32602`) with
+`turnId is required when cursor is an item anchor`.
+The item must belong to that turn in the thread's visible history. Empty, unknown,
+and out-of-scope item IDs return invalid params (`-32602`) with
+`cursor.itemId does not identify an item in the requested history scope`.
+Omitted or null cursors preserve normal first-page behavior. Continue anchored
+pages with the returned opaque string `nextCursor`; response fields and
+`backwardsCursor` semantics are unchanged.
+
+## Workspace switching (experimental)
+
+For a managed ChatGPT login, `accountSession/list` returns an opaque
+`sessionId` for that login and its selected workspace. Set
+`refreshWorkspaceMetadata` to fetch the user's memberships.
+
+Call `accountSession/switch` with that `sessionId` and the target workspace's
+`accountId`. Core checks the membership, stops loaded threads, exchanges the
+session token and validates the new workspace's routing. Clients receive
+`thread/closed` for unloaded threads and `account/updated` after a successful
+switch. Selecting the current workspace leaves its threads running.
+
+The server remembers the selected workspace on refresh. If routing validation
+fails, Core attempts to restore the previous workspace while the same credentials
+are still current.
+
+Clients that can open a browser may pass `allowBrowserLogin: true`. If the
+workspace requires SSO, the response contains `loginId` and `authUrl`. Open
+that URL and wait for `account/login/completed`. The browser can reuse an
+existing SSO session. Core accepts the callback only for the requesting login
+and target workspace. Cancel through `account/login/cancel` to keep the current
+workspace. Government workspaces require a separate sign-in.
+
+# GCP provider account
+
+The experimental `account/gcp/setup` method configures the built-in Vertex AI provider.
+
+- `projectId` (required) — Google Cloud project ID.
+- `location` (optional) — Defaults to `global`.
+- `credentialFile` (optional) — Absolute path to a credential file on the app-server
+  host. Omit it or pass `null` to clear the saved path in the active user
+  configuration and use Application Default Credentials (ADC), including
+  `GOOGLE_APPLICATION_CREDENTIALS`.
+
+If the active profile inherits `model_providers.gcp.credential_file` from the base
+`config.toml`, clearing the profile’s own setting would expose the base path again.
+Setup returns an error without saving changes. To use ADC, remove the inherited
+setting from the file named in the error and retry.
+
+Setup rejects a GCP `base_url` override or higher-priority settings that conflict
+with the request. It fetches an access token before saving the settings and
+selecting GCP, then returns `{}`. The next `model/list` reloads the catalog.
+`account/read` reports `{ "account": { "type": "gcp" }, "requiresOpenaiAuth": false }`.
+Use a model request to verify Vertex model access.
+
+Credential failures include `error.data.reason`.
+
+- `gcloudNotInstalled` — The app-server could not find `gcloud` on its PATH.
+- `credentialFileInvalid` — The path is invalid or the file is unreadable. For
+  default `gcloud` auth, setup also checks for a JSON object with a nonempty string `type`.
+- `authCommandFailed` — The token command failed, including when ADC is missing
+  or a token refresh fails.
+
+For personal sign-in, users can run `gcloud auth application-default login` on
+the app-server host and retry setup.
+
+## Managed OpenTelemetry configuration
+
+`configRequirements/read` exposes managed `otel` settings. `config/read` applies
+those settings to the effective configuration and omits ordinary origins for
+managed fields. Configuration writes that overlap managed settings are rejected.
+
+Exporter header values are redacted in effective config, source layers, managed
+requirements, and write-override metadata. Runtime exporters retain the original values.
+
+Managed span attributes and tracestate metadata are included in effective config
+and requirements reads. Unmanaged metadata remains writable.
+
+Tracestate requirements merge individual fields within each member. For example,
+requiring `otel.tracestate.vendor.tenant` preserves an ordinary `vendor.region`.
+Only required fields and edits to their ancestors are protected; sibling fields
+retain their origins and remain writable.

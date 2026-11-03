@@ -9,6 +9,7 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use security_framework::access_control::ProtectionMode;
 use security_framework::access_control::SecAccessControl;
+use security_framework::key::SecKey;
 use security_framework_sys::access_control::kSecAccessControlBiometryAny;
 use security_framework_sys::access_control::kSecAccessControlPrivateKeyUsage;
 use security_framework_sys::item::kSecAttrKeyClass;
@@ -27,7 +28,11 @@ pub(super) fn access_control() -> Result<SecAccessControl, UserVerificationError
     .map_err(|err| error::classify("NSOSStatusErrorDomain", i64::from(err.code())))
 }
 
-pub(super) fn validate(attributes: &CFDictionary) -> Result<(), UserVerificationError> {
+pub(super) fn validate(key: &SecKey) -> Result<(), UserVerificationError> {
+    validate_attributes(&key.attributes())
+}
+
+fn validate_attributes(attributes: &CFDictionary) -> Result<(), UserVerificationError> {
     let size = CFNumber::from(/*value*/ 256);
     // Do not compare opaque SecAccessControl objects: macOS can change their persisted
     // representation. Biometric signing is enforced by the policy set at key creation.

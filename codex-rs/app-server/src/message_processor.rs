@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use crate::current_time::app_server_time_provider;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
+use crate::error_code::method_not_found;
 use crate::extensions::ThreadExtensionDependencies;
 use crate::extensions::app_server_extension_event_sink;
 use crate::extensions::thread_extensions;
@@ -48,11 +50,13 @@ use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::ThreadResumeTarget;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
+use crate::request_processors::account_processor::handle_gcp_setup;
 use crate::request_processors::read_server_diagnostics;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
+use crate::startup_warnings::StartupWarnings;
 use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
@@ -70,6 +74,7 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ThreadSampleCancelResponse;
 use codex_app_server_protocol::UserVerificationCancelResponse;
 use codex_app_server_protocol::experimental_required_message;
 use codex_arg0::Arg0DispatchPaths;
@@ -79,10 +84,12 @@ use codex_core::config::Config;
 use codex_core::config::ThreadStoreConfig;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::TurnStartAdmission;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_protocol::ThreadId;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::SessionSource;
@@ -95,6 +102,7 @@ use codex_thread_store::QueueStore;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::timeout;
@@ -141,6 +149,7 @@ pub(crate) struct MessageProcessor {
     pub(crate) turn_admission: TurnAdmission,
     user_verification: Arc<crate::user_verification::Service>,
     outgoing: Arc<OutgoingMessageSender>,
+    startup_warnings: StartupWarnings,
     models_refresh_worker: ModelsRefreshWorker,
     turn_cost_worker: Option<TurnCostWorker>,
     skills_watcher: Arc<SkillsWatcher>,
@@ -160,7 +169,7 @@ pub(crate) struct MessageProcessor {
     mcp_processor: McpRequestProcessor,
     plugin_processor: PluginRequestProcessor,
     project_processor: ProjectRequestProcessor,
-    remote_control_processor: RemoteControlRequestProcessor,
+    pub(super) remote_control_processor: RemoteControlRequestProcessor,
     search_processor: SearchRequestProcessor,
     thread_goal_processor: ThreadGoalRequestProcessor,
     thread_queue_processor: ThreadQueueRequestProcessor,
@@ -245,16 +254,20 @@ impl ConnectionSessionState {
 }
 
 pub(crate) struct MessageProcessorArgs {
+    pub(crate) cloud_skill_provider: Option<Arc<dyn codex_skills_extension::SkillProvider>>,
     pub(crate) outgoing: Arc<OutgoingMessageSender>,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) arg0_paths: Arg0DispatchPaths,
     pub(crate) config: Arc<Config>,
+    /// Original project context, retained even when startup falls back to defaults.
+    pub(crate) startup_cwd: Option<std::path::PathBuf>,
     pub(crate) config_manager: ConfigManager,
     pub(crate) environment_manager: Arc<EnvironmentManager>,
     pub(crate) feedback: CodexFeedback,
     pub(crate) log_db: Option<LogDbLayer>,
     pub(crate) state_db: Option<StateDbHandle>,
     pub(crate) config_warnings: Vec<ConfigWarningNotification>,
+    pub(crate) startup_warnings_tx: mpsc::UnboundedSender<String>,
     pub(crate) session_source: SessionSource,
     pub(crate) auth_manager: Arc<AuthManager>,
     pub(crate) user_verification: Arc<crate::user_verification::Service>,
@@ -271,16 +284,19 @@ impl MessageProcessor {
     /// `Sender` so handlers can enqueue messages to be written to stdout.
     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
         let MessageProcessorArgs {
+            cloud_skill_provider,
             outgoing,
             analytics_events_client,
             arg0_paths,
             config,
+            startup_cwd,
             config_manager,
             environment_manager,
             feedback,
             log_db,
             state_db,
             config_warnings,
+            startup_warnings_tx,
             session_source,
             auth_manager,
             user_verification,
@@ -290,6 +306,10 @@ impl MessageProcessor {
             remote_control_handle,
             plugin_startup_tasks,
         } = args;
+        // Startup credential reads must not open a browser before initialize selects the policy.
+        let gateway_login_control =
+            codex_login::GatewayLoginControl::for_runtime(&auth_manager.runtime_config());
+        gateway_login_control.require_explicit_login();
         let thread_state_manager = ThreadStateManager::new();
         outgoing.watch_user_verification_auth(Arc::clone(&auth_manager));
         // The thread store is intentionally process-scoped. Config reloads can
@@ -319,6 +339,7 @@ impl MessageProcessor {
         let extension_event_sink =
             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
         let mut queue_service = None;
+        let sample_responses = Arc::new(crate::thread_sample::SampleResponseRegistry::default());
         let thread_manager = Arc::new_cyclic(|thread_manager| {
             queue_service = queue_store.map(|queue| {
                 Arc::new(QueuedItemService::new(
@@ -334,20 +355,25 @@ impl MessageProcessor {
                 codex_core::CodexAppsToolsCache::default(),
                 session_source,
                 environment_manager,
-                thread_extensions(ThreadExtensionDependencies {
-                    event_sink: Arc::clone(&extension_event_sink),
-                    auth_manager: auth_manager.clone(),
-                    state_db: state_db.clone(),
-                    analytics_events_client: analytics_events_client.clone(),
-                    thread_manager: thread_manager.clone(),
-                    goal_service: Arc::clone(&goal_service),
-                    environment_manager: Arc::clone(&environment_manager_for_extensions),
-                    executor_skill_provider: Arc::clone(&executor_skill_provider),
-                    git_attribution_base_url: config.chatgpt_base_url.clone(),
-                    http_client_factory: config.http_client_factory(),
-                    queue_service: queue_service.clone(),
-                    turn_start_admission: Some(Arc::clone(&turn_start_admission)),
-                }),
+                thread_extensions(
+                    config.as_ref(),
+                    ThreadExtensionDependencies {
+                        sample_responses: Arc::clone(&sample_responses),
+                        event_sink: Arc::clone(&extension_event_sink),
+                        auth_manager: auth_manager.clone(),
+                        state_db: state_db.clone(),
+                        analytics_events_client: analytics_events_client.clone(),
+                        thread_manager: thread_manager.clone(),
+                        goal_service: Arc::clone(&goal_service),
+                        environment_manager: Arc::clone(&environment_manager_for_extensions),
+                        executor_skill_provider: Arc::clone(&executor_skill_provider),
+                        cloud_skill_provider: cloud_skill_provider.clone(),
+                        git_attribution_base_url: config.chatgpt_base_url.clone(),
+                        http_client_factory: config.http_client_factory(),
+                        queue_service: queue_service.clone(),
+                        turn_start_admission: Some(Arc::clone(&turn_start_admission)),
+                    },
+                ),
                 Arc::new(CodexHomeUserInstructionsProvider::new(
                     config.codex_home.clone(),
                 )),
@@ -360,10 +386,11 @@ impl MessageProcessor {
                     outgoing.clone(),
                     thread_state_manager.clone(),
                 )),
-                Some(app_server_time_provider(
-                    outgoing.clone(),
-                    thread_state_manager.clone(),
-                )),
+                {
+                    let time_provider =
+                        app_server_time_provider(outgoing.clone(), thread_state_manager.clone());
+                    Some(time_provider)
+                },
             );
             match code_mode_session_provider {
                 Some(provider) => manager.with_code_mode_session_provider(provider),
@@ -372,8 +399,10 @@ impl MessageProcessor {
         });
         let model_catalog = Arc::new(crate::model_catalog::ModelCatalog::new(
             config_manager.clone(),
+            startup_cwd,
             Arc::clone(&config),
             thread_manager.get_models_manager(),
+            Arc::clone(&auth_manager),
         ));
         let models_refresh_worker = crate::models_refresh_worker::spawn(&model_catalog);
         let turn_cost_worker =
@@ -387,7 +416,7 @@ impl MessageProcessor {
             outgoing.clone(),
         );
 
-        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let pending_thread_unloads = Arc::new(Mutex::new(HashMap::new()));
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
         let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
@@ -397,6 +426,7 @@ impl MessageProcessor {
             outgoing.clone(),
             config_manager.clone(),
             thread_manager.clone(),
+            Arc::clone(&model_catalog),
             analytics_events_client.clone(),
         );
         let on_effective_plugins_changed =
@@ -413,6 +443,7 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            Arc::clone(&model_catalog),
         );
         let apps_processor = AppsRequestProcessor::new(
             auth_manager.clone(),
@@ -449,25 +480,15 @@ impl MessageProcessor {
             state_db.clone(),
         );
         let git_processor = GitRequestProcessor::new();
-        let initialize_processor = InitializeRequestProcessor::new(
-            outgoing.clone(),
-            analytics_events_client.clone(),
-            Arc::clone(&config),
-            config_warnings.clone(),
-            rpc_transport,
-            Arc::clone(&user_verification),
-        );
-        let marketplace_processor = MarketplaceRequestProcessor::new(
-            Arc::clone(&config),
-            config_manager.clone(),
-            Arc::clone(&thread_manager),
-        );
+        let marketplace_processor =
+            MarketplaceRequestProcessor::new(config_manager.clone(), Arc::clone(&thread_manager));
         let mcp_processor = McpRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
             thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
+            account_processor.clone(),
         );
         let plugin_processor = PluginRequestProcessor::new(
             auth_manager.clone(),
@@ -517,7 +538,8 @@ impl MessageProcessor {
             log_db,
             Arc::clone(&skills_watcher),
             turn_cost_worker.as_ref().map(TurnCostWorker::handle),
-            config_warnings,
+            config_warnings.clone(),
+            sample_responses,
         );
         let turn_processor = TurnRequestProcessor::new(
             auth_manager,
@@ -548,10 +570,20 @@ impl MessageProcessor {
                 .plugins_manager()
                 .maybe_start_plugin_startup_tasks_for_config(
                     &config.plugins_config_input(),
+                    config.features.enabled(Feature::PluginDiscoveryPrefetch),
                     reload_config,
                     Some(on_effective_plugins_changed),
+                    startup_warnings_tx,
                 );
         }
+        let initialize_processor = InitializeRequestProcessor::new(
+            gateway_login_control,
+            outgoing.clone(),
+            analytics_events_client.clone(),
+            Arc::clone(&config),
+            rpc_transport,
+            Arc::clone(&user_verification),
+        );
         let external_agent_config_processor =
             ExternalAgentConfigRequestProcessor::new(ExternalAgentConfigRequestProcessorArgs {
                 outgoing: outgoing.clone(),
@@ -580,6 +612,9 @@ impl MessageProcessor {
             turn_admission,
             user_verification,
             outgoing,
+            startup_warnings: StartupWarnings {
+                config: config_warnings,
+            },
             models_refresh_worker,
             turn_cost_worker,
             skills_watcher,
@@ -798,8 +833,8 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
     ) {
-        self.initialize_processor
-            .send_initialize_notifications_to_connection(connection_id)
+        self.startup_warnings
+            .send_config_to_connections(&self.outgoing, &[connection_id])
             .await;
     }
 
@@ -821,8 +856,8 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn send_initialize_notifications(&self) {
-        self.initialize_processor
-            .send_initialize_notifications()
+        self.startup_warnings
+            .send_config_to_connections(&self.outgoing, &[])
             .await;
     }
 
@@ -831,8 +866,16 @@ impl MessageProcessor {
         thread_id: ThreadId,
         connection_ids: Vec<ConnectionId>,
     ) {
+        let Ok(thread) = self
+            .thread_processor
+            .thread_manager
+            .get_thread(thread_id)
+            .await
+        else {
+            return;
+        };
         self.thread_processor
-            .try_attach_thread_listener(thread_id, connection_ids)
+            .try_attach_thread_listener(thread_id, thread, connection_ids)
             .await;
     }
 
@@ -862,6 +905,8 @@ impl MessageProcessor {
         session_state: &ConnectionSessionState,
     ) {
         session_state.rpc_gate.close().await;
+        self.account_processor
+            .gateway_connection_closed(connection_id);
         self.request_serialization_queues.discard_closed().await;
         self.outgoing
             .disconnect_user_verification_connection(connection_id)
@@ -986,7 +1031,8 @@ impl MessageProcessor {
             | ClientRequest::TurnSettingsUpdate { .. }
             | ClientRequest::ThreadDelete { .. }
             | ClientRequest::ThreadArchive { .. } => (Some(self.turn_admission.admit()?), false),
-            ClientRequest::TurnStart { .. }
+            ClientRequest::ThreadSample { .. }
+            | ClientRequest::TurnStart { .. }
             | ClientRequest::TurnSteer { .. }
             | ClientRequest::ReviewStart { .. }
             | ClientRequest::ThreadCompactStart { .. }
@@ -1023,15 +1069,21 @@ impl MessageProcessor {
                     return;
                 }
                 let processor_for_request = Arc::clone(&processor);
+                let originator = AuthStorageOriginator::from_client_name(
+                    session.app_server_client_name().unwrap_or("none"),
+                );
                 // Keep queued requests small to avoid large stack temporaries during construction.
-                let result = Box::pin(processor_for_request.handle_initialized_client_request(
-                    connection_request_id,
-                    codex_request,
-                    request_context,
-                    session,
-                    event_stream_ready,
-                ))
-                .await;
+                let result = originator
+                    .scope(Box::pin(
+                        processor_for_request.handle_initialized_client_request(
+                            connection_request_id,
+                            codex_request,
+                            request_context,
+                            session,
+                            event_stream_ready,
+                        ),
+                    ))
+                    .await;
                 if let Err(error) = result {
                     processor.outgoing.send_error(error_request_id, error).await;
                 }
@@ -1320,6 +1372,20 @@ impl MessageProcessor {
                     .thread_undo_file_restore(request_id.clone(), params)
                     .await
             }
+            ClientRequest::ThreadSample { params, .. } => self
+                .thread_processor
+                .thread_sample(params, Arc::clone(&session.rpc_gate), request_context)
+                .await
+                .map(|response| Some(response.into())),
+            ClientRequest::ThreadSampleCancel { params, .. } => {
+                self.outgoing
+                    .cancel_thread_sample_request(&ConnectionRequestId {
+                        connection_id,
+                        request_id: params.request_id,
+                    })
+                    .await;
+                Ok(Some(ThreadSampleCancelResponse {}.into()))
+            }
             ClientRequest::ThreadArchive { params, .. } => {
                 self.thread_processor
                     .thread_archive(request_id.clone(), params)
@@ -1399,6 +1465,11 @@ impl MessageProcessor {
             ClientRequest::ThreadAttachmentList { params, .. } => {
                 self.thread_processor.thread_attachment_list(params).await
             }
+            ClientRequest::ThreadAttachmentOwnerList { params, .. } => {
+                self.thread_processor
+                    .thread_attachment_owner_list(params)
+                    .await
+            }
             ClientRequest::ThreadAttachmentRemove { params, .. } => {
                 self.thread_processor
                     .thread_attachment_remove(request_id.clone(), params)
@@ -1430,6 +1501,9 @@ impl MessageProcessor {
             ClientRequest::MemoryStatus { params, .. } => {
                 self.thread_processor.memory_status(params).await
             }
+            ClientRequest::ThreadMemoryRead { params, .. } => {
+                self.thread_processor.thread_memory_read(params).await
+            }
             ClientRequest::MemoryReset { .. } => self.thread_processor.memory_reset().await,
             ClientRequest::RolloutCompress { .. } => self.thread_processor.rollout_compress(),
             ClientRequest::ThreadUnarchive { params, .. } => {
@@ -1437,6 +1511,9 @@ impl MessageProcessor {
                     .thread_unarchive(request_id.clone(), params)
                     .await
             }
+            ClientRequest::ThreadPredictionRequest { .. } => Err(method_not_found(
+                "thread/prediction/request is not implemented yet",
+            )),
             ClientRequest::ThreadCompactStart { params, .. } => {
                 self.thread_processor
                     .thread_compact_start(&request_id, params)
@@ -1505,11 +1582,17 @@ impl MessageProcessor {
             ClientRequest::ThreadRead { params, .. } => {
                 self.thread_processor.thread_read(&request_id, params).await
             }
+            ClientRequest::ThreadReadStateUpdate { params, .. } => {
+                self.thread_processor.thread_read_state_update(params).await
+            }
             ClientRequest::ThreadTurnsList { params, .. } => {
                 self.thread_processor.thread_turns_list(params).await
             }
             ClientRequest::ThreadItemsList { params, .. } => {
                 self.thread_processor.thread_items_list(params).await
+            }
+            ClientRequest::ThreadItemsRead { params, .. } => {
+                self.thread_processor.thread_items_read(params).await
             }
             ClientRequest::ThreadShellCommand { params, .. } => {
                 self.thread_processor
@@ -1596,7 +1679,8 @@ impl MessageProcessor {
                 self.catalog_processor.skills_config_write(params).await
             }
             ClientRequest::PluginInstall { params, .. } => {
-                self.plugin_processor.plugin_install(params).await
+                // Keep installation and auth setup state off the shared request dispatcher stack.
+                Box::pin(self.plugin_processor.plugin_install(params)).await
             }
             ClientRequest::PluginUninstall { params, .. } => {
                 self.plugin_processor.plugin_uninstall(params).await
@@ -1649,8 +1733,9 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::ThreadRealtimeStart { params, .. } => {
+                let sideband_base_url = None;
                 self.turn_processor
-                    .thread_realtime_start(&request_id, params)
+                    .thread_realtime_start(&request_id, params, sideband_base_url)
                     .await
             }
             ClientRequest::ThreadRealtimeAppendAudio { params, .. } => {
@@ -1680,10 +1765,12 @@ impl MessageProcessor {
                 self.turn_processor.thread_realtime_list_voices().await
             }
             ClientRequest::ReviewStart { params, .. } => {
-                self.turn_processor.review_start(&request_id, params).await
+                // Keep review setup from inflating the shared request dispatcher's stack frame.
+                Box::pin(self.turn_processor.review_start(&request_id, params)).await
             }
             ClientRequest::McpServerOauthLogin { params, .. } => {
-                self.mcp_processor.mcp_server_oauth_login(params).await
+                // Keep MCP discovery's large future from inflating every request.
+                Box::pin(self.mcp_processor.mcp_server_oauth_login(params)).await
             }
             ClientRequest::McpServerRefresh { params, .. } => {
                 self.mcp_processor.mcp_server_refresh(params).await
@@ -1740,6 +1827,51 @@ impl MessageProcessor {
             ClientRequest::BedrockSetup { params, .. } => {
                 self.account_processor.bedrock_setup(params).await
             }
+            ClientRequest::GcpSetup { params, .. } => {
+                handle_gcp_setup(&self.account_processor, params).await
+            }
+            ClientRequest::BedrockCheckGovCloudRequirements { .. } => {
+                self.account_processor
+                    .bedrock_check_gov_cloud_requirements()
+                    .await
+            }
+            ClientRequest::GatewayOAuthRead { .. } => {
+                Box::pin(self.account_processor.gateway_oauth_read())
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::GatewayOAuthLogin { .. } => {
+                if session
+                    .opted_out_notification_methods()
+                    .contains("account/gatewayOAuth/changed")
+                {
+                    Err(invalid_request(
+                        "Gateway login requires account/gatewayOAuth/changed notifications",
+                    ))
+                } else {
+                    Box::pin(
+                        self.account_processor
+                            .gateway_oauth_login(connection_id, &session.rpc_gate),
+                    )
+                    .await
+                    .map(|response| Some(response.into()))
+                }
+            }
+            ClientRequest::GatewayOAuthCancel { .. } => {
+                Box::pin(self.account_processor.gateway_oauth_cancel(connection_id))
+                    .await
+                    .map(|response| Some(response.into()))
+            }
+            ClientRequest::AccountSessionsList { params, .. } => self
+                .account_processor
+                .list_account_sessions(params)
+                .await
+                .map(|response| Some(ClientResponsePayload::AccountSessionsList(response))),
+            ClientRequest::AccountSessionsSwitch { params, .. } => self
+                .account_processor
+                .switch_account_session(params, &self.thread_processor, &self.turn_admission)
+                .await
+                .map(|response| Some(ClientResponsePayload::AccountSessionsSwitch(response))),
             ClientRequest::LogoutAccount { .. } => {
                 self.account_processor
                     .logout_account(request_id.clone())
@@ -1839,6 +1971,9 @@ impl MessageProcessor {
             ClientRequest::FeedbackUpload { params, .. } => {
                 self.feedback_processor.feedback_upload(params).await
             }
+            ClientRequest::FeedbackSave { params, .. } => {
+                self.feedback_processor.feedback_save(params).await
+            }
         };
 
         match result {
@@ -1859,3 +1994,15 @@ impl MessageProcessor {
 #[cfg(test)]
 #[path = "message_processor_tracing_tests.rs"]
 mod message_processor_tracing_tests;
+
+#[cfg(test)]
+#[path = "message_processor_gateway_oauth_tests.rs"]
+mod gateway_oauth_tests;
+
+#[cfg(test)]
+#[path = "message_processor_thread_lifecycle_tests.rs"]
+mod thread_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "message_processor_workspace_routing_tests.rs"]
+mod workspace_routing_tests;

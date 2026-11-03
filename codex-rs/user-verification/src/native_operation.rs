@@ -1,4 +1,4 @@
-//! Keeps the authentication context on its owner thread while a native operation blocks.
+//! Drains asynchronous authentication before releasing its context and lifecycle lock.
 
 use crate::UserVerificationError;
 use crate::UserVerificationFailureReason;
@@ -6,46 +6,35 @@ use crate::UserVerificationRequestGuard;
 use std::sync::mpsc;
 use std::time::Duration;
 
-pub(crate) fn run_with_cancellation<T: Send>(
+pub(crate) fn wait_with_cancellation<T>(
     guard: &UserVerificationRequestGuard,
-    operation: impl FnOnce() -> Result<T, UserVerificationError> + Send,
+    completion: mpsc::Receiver<Result<T, UserVerificationError>>,
     cancel: impl FnOnce(),
 ) -> Result<T, UserVerificationError> {
-    guard.check()?;
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    std::thread::scope(|scope| {
-        let worker = std::thread::Builder::new()
-            .name("user-verification-sign".to_string())
-            .spawn_scoped(scope, move || {
-                let _ = done_tx.send(guard.check().and_then(|()| operation()));
-            })
-            .map_err(|error| {
-                tracing::warn!(%error, "could not start user-verification signer");
-                worker_error()
-            })?;
-        let result = loop {
-            match done_rx.recv_timeout(Duration::from_millis(/*millis*/ 50)) {
-                Ok(result) => break Some(result),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if !guard.is_active() {
-                        cancel();
-                        break None;
-                    }
+    let result = loop {
+        match completion.recv_timeout(Duration::from_millis(/*millis*/ 50)) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !guard.is_active() {
+                    cancel();
+                    // Invalidation is asynchronous. Keep the lifecycle lock until the
+                    // authentication callback completes, then reject any late success.
+                    break completion
+                        .recv()
+                        .unwrap_or_else(|_| Err(completion_error()));
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break Some(Err(worker_error())),
             }
-        };
-        // Join before returning so no signer outlives the context or its lifecycle lock.
-        worker.join().map_err(|_| worker_error())?;
-        guard.check()?;
-        result.unwrap_or_else(|| Err(worker_error()))
-    })
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Err(completion_error()),
+        }
+    };
+    guard.check()?;
+    result
 }
 
-fn worker_error() -> UserVerificationError {
+fn completion_error() -> UserVerificationError {
     UserVerificationError::Failed {
         reason: UserVerificationFailureReason::ProviderError,
-        message: "the user-verification signer could not complete".to_string(),
+        message: "the user-verification authorization could not complete".to_string(),
     }
 }
 

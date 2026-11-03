@@ -2,7 +2,9 @@ use super::*;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::edit::ConfigEditsBuilder;
 use codex_config::LoaderOverrides;
+use codex_config::types::RightClickPaste;
 use codex_config::types::SessionPickerViewMode;
+use codex_terminal_detection::Multiplexer;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -17,7 +19,15 @@ async fn launch_screen_mode_survives_configuration_reload() -> anyhow::Result<()
         .build()
         .await?;
     config.tui_fullscreen_transcript = true;
+    config.tui_copy_on_select = CopyOnSelect::Always;
+    config.tui_copy_on_select_clear_selection = true;
+    config.tui_right_click_paste = RightClickPaste::On;
     config.tui_alternate_screen = AltScreenMode::Auto;
+    config.animations = true;
+    config.tui_auto_recap = true;
+    config.tui_effects.starfield = true;
+    config.disable_paste_burst = false;
+    config.show_tooltips = true;
 
     for (alternate_screen, owned, expected_mode, expected_alt) in [
         (true, true, TranscriptMode::Owned, AltScreenMode::Auto),
@@ -35,13 +45,33 @@ async fn launch_screen_mode_survives_configuration_reload() -> anyhow::Result<()
 
         let mut reloaded_config = config.clone();
         reloaded_config.tui_fullscreen_transcript = false;
+        reloaded_config.tui_copy_on_select = CopyOnSelect::Never;
+        reloaded_config.tui_copy_on_select_clear_selection = false;
+        reloaded_config.tui_right_click_paste = RightClickPaste::Off;
         reloaded_config.tui_alternate_screen = AltScreenMode::Never;
         reloaded_config.tui_theme = Some("nord".into());
-        let mut expected = LocalSettings::from(&reloaded_config);
-        expected.transcript_mode = expected_mode;
-        expected.tui.alternate_screen = expected_alt;
-        assert_eq!(local.reloaded(&reloaded_config), expected);
-        assert_eq!(LocalSettings::for_tui(&reloaded_config, &tui), expected);
+        reloaded_config.animations = false;
+        reloaded_config.tui_auto_recap = false;
+        reloaded_config.tui_effects.starfield = false;
+        reloaded_config.disable_paste_burst = true;
+        reloaded_config.show_tooltips = false;
+        let mut expected_reload = LocalSettings::from(&reloaded_config);
+        expected_reload.transcript_mode = expected_mode;
+        expected_reload.tui.alternate_screen = expected_alt;
+        expected_reload.tui.animations = local.tui.animations;
+        expected_reload.tui.auto_recap = local.tui.auto_recap;
+        expected_reload.tui.effects.starfield = local.tui.effects.starfield;
+        expected_reload.tui.disable_paste_burst = local.tui.disable_paste_burst;
+        expected_reload.tui.show_tooltips = local.tui.show_tooltips;
+        assert_eq!(local.reloaded(&reloaded_config), expected_reload);
+
+        let mut expected_launch = LocalSettings::from(&reloaded_config);
+        expected_launch.transcript_mode = expected_mode;
+        expected_launch.tui.alternate_screen = expected_alt;
+        assert_eq!(
+            LocalSettings::for_tui(&reloaded_config, &tui),
+            expected_launch
+        );
         tui.set_owned_screen(/*owned*/ false)?;
     }
     Ok(())
@@ -94,11 +124,14 @@ async fn local_load_preserves_defaults_and_resolved_overrides() -> anyhow::Resul
         r#"
 [tui]
 animations = false
-whimsy = false # Retired: must not override effects or prevent strict loading.
 show_tooltips = false
 show_server_version_notice = false
 auto_recap = false
 fullscreen_transcript = true
+mouse_scroll_speed = 0.5
+copy_on_select = "never"
+copy_on_select_clear_selection = true
+right_click_paste = "off"
 vim_mode_default = true
 terminal_resize_reflow_max_rows = 0
 session_picker_view = "comfortable"
@@ -108,6 +141,7 @@ shimmer = false
 mermaid = false
 math = false
 tables = false
+lists = false
 [history]
 persistence = "none"
 max_bytes = 4096
@@ -117,6 +151,16 @@ fast_default_opt_out = true
     ] {
         let home = tempfile::tempdir()?;
         std::fs::write(home.path().join("config.toml"), config_text)?;
+        let cli_overrides = vec![
+            ("tui.disable_paste_burst".into(), true.into()),
+            ("tui.right_click_paste".into(), "on".into()),
+            ("tui.mouse_scroll_speed".into(), 1.5.into()),
+            // The removed flag must not override the TUI preference.
+            (
+                "features.transcript_v2".into(),
+                config_text.is_empty().into(),
+            ),
+        ];
         let config = ConfigBuilder::default()
             .codex_home(home.path().to_path_buf())
             .strict_config(true)
@@ -124,58 +168,136 @@ fast_default_opt_out = true
                 ignore_project_config: true,
                 ..LoaderOverrides::without_managed_config_for_tests()
             })
-            .cli_overrides(vec![
-                ("tui.disable_paste_burst".into(), true.into()),
-                // The deprecated flag must not override or migrate into the TUI preference.
-                (
-                    "features.transcript_v2".into(),
-                    config_text.is_empty().into(),
-                ),
-            ])
+            .cli_overrides(cli_overrides.clone())
             .build()
             .await?;
         assert_eq!(config.startup_warnings, Vec::<String>::new());
+        assert_eq!(config.tui_mouse_scroll_speed, Some(1.5));
+        assert!(config.tui_fullscreen_transcript);
+        let bootstrap = crate::legacy_core::config::load_config_toml_with_layer_stack(
+            home.path(),
+            /*cwd*/ None,
+            cli_overrides,
+            codex_config::ConfigLoadOptions {
+                loader_overrides: LoaderOverrides {
+                    ignore_project_config: true,
+                    ..LoaderOverrides::without_managed_config_for_tests()
+                },
+                strict_config: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            LocalSettings::from_bootstrap(&bootstrap, config.codex_home.clone())?,
+            LocalSettings::from(&config),
+        );
+        assert_eq!(config.features.legacy_feature_usages().count(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn copy_on_select_respects_terminal_defaults_and_config_overrides() -> anyhow::Result<()> {
+    for (configured, launch_override, expected) in [
+        (None, None, CopyOnSelect::Auto),
+        (Some("auto"), None, CopyOnSelect::Auto),
+        (Some("always"), None, CopyOnSelect::Always),
+        (Some("never"), None, CopyOnSelect::Never),
+        (Some("never"), Some("always"), CopyOnSelect::Always),
+        (Some("always"), Some("never"), CopyOnSelect::Never),
+        (Some("always"), Some("auto"), CopyOnSelect::Auto),
+        (Some("never"), Some("auto"), CopyOnSelect::Auto),
+    ] {
+        let home = tempfile::tempdir()?;
+        let config_path = home.path().join("config.toml");
+        let config_text = configured
+            .map(|mode| format!("[tui]\ncopy_on_select = \"{mode}\"\n"))
+            .unwrap_or_default();
+        std::fs::write(&config_path, &config_text)?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .strict_config(true)
+            .loader_overrides(LoaderOverrides {
+                ignore_project_config: true,
+                ..LoaderOverrides::without_managed_config_for_tests()
+            })
+            .cli_overrides(
+                launch_override
+                    .map(|mode| ("tui.copy_on_select".into(), mode.into()))
+                    .into_iter()
+                    .collect(),
+            )
+            .build()
+            .await?;
         let local = LocalSettings::from(&config);
-        let mut expected: Tui = toml::from_str("")?;
-        expected.disable_paste_burst = Some(true);
-        expected.session_picker_view = Some(SessionPickerViewMode::Dense);
-        if !config_text.is_empty() {
-            expected.animations = false;
-            expected.effects.shimmer = false;
-            expected.rendering = codex_config::types::TuiRendering {
-                mermaid: false,
-                math: false,
-                tables: false,
+        assert_eq!(
+            (config.tui_copy_on_select, local.tui.copy_on_select),
+            (expected, expected),
+        );
+        for (name, version, multiplexer, default_enabled) in [
+            (TerminalName::Iterm2, None, None, true),
+            (TerminalName::AppleTerminal, None, None, true),
+            (TerminalName::Ghostty, Some("1.2.0"), None, false),
+            (TerminalName::Ghostty, Some("1.3.0"), None, false),
+            (TerminalName::Ghostty, Some("1.1.3"), None, true),
+            (TerminalName::Ghostty, Some("1.2.0-dev"), None, true),
+            (TerminalName::Ghostty, Some("invalid"), None, true),
+            (TerminalName::Ghostty, None, None, true),
+            (TerminalName::Kitty, None, None, !cfg!(target_os = "macos")),
+            (TerminalName::WindowsTerminal, None, None, false),
+            (
+                TerminalName::VsCode,
+                None,
+                None,
+                !cfg!(target_os = "windows"),
+            ),
+            (TerminalName::Alacritty, None, None, true),
+            (TerminalName::GnomeTerminal, None, None, true),
+            (TerminalName::Konsole, None, None, true),
+            (TerminalName::Vte, None, None, true),
+            (TerminalName::WarpTerminal, None, None, true),
+            (TerminalName::WezTerm, None, None, true),
+            (TerminalName::Dumb, None, None, true),
+            (TerminalName::Unknown, None, None, true),
+            (
+                TerminalName::Ghostty,
+                Some("1.3.0"),
+                Some(Multiplexer::Tmux { version: None }),
+                true,
+            ),
+            (
+                TerminalName::Kitty,
+                None,
+                Some(Multiplexer::Zellij { version: None }),
+                true,
+            ),
+            (
+                TerminalName::WindowsTerminal,
+                None,
+                Some(Multiplexer::Tmux { version: None }),
+                true,
+            ),
+        ] {
+            let terminal = TerminalInfo {
+                backend: None,
+                name,
+                multiplexer,
+                term_program: None,
+                version: version.map(str::to_owned),
+                term: None,
             };
-            expected.show_tooltips = false;
-            expected.show_server_version_notice = false;
-            expected.auto_recap = false;
-            expected.fullscreen_transcript = true;
-            expected.vim_mode_default = true;
-            expected.terminal_resize_reflow_max_rows = Some(0);
-            expected.session_picker_view = Some(SessionPickerViewMode::Comfortable);
+            assert_eq!(
+                local.copy_on_select(&terminal),
+                match expected {
+                    CopyOnSelect::Auto => default_enabled,
+                    CopyOnSelect::Always => true,
+                    CopyOnSelect::Never => false,
+                },
+                "terminal={terminal:?}, override={expected:?}",
+            );
         }
-        assert_eq!(
-            local.transcript_mode.is_owned(),
-            expected.fullscreen_transcript
-        );
-        assert_eq!(local.tui, expected);
-        assert_eq!(
-            config
-                .features
-                .legacy_feature_usages()
-                .map(|usage| usage.alias.as_str())
-                .collect::<Vec<_>>(),
-            vec!["features.transcript_v2"],
-        );
-        assert_eq!(
-            local.terminal_resize_reflow(),
-            config.terminal_resize_reflow
-        );
-        assert_eq!(
-            (&local.history, &local.notices),
-            (&config.history, &config.notices)
-        );
+        assert_eq!(std::fs::read_to_string(config_path)?, config_text);
     }
     Ok(())
 }
@@ -183,6 +305,10 @@ fast_default_opt_out = true
 #[tokio::test]
 async fn local_writes_preserve_selected_user_file_and_home_destinations() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[tui]\nnotifications = [\"agent-turn-complete\"]\n",
+    )?;
     let selected = AbsolutePathBuf::from_absolute_path(home.path().join("work.config.toml"))?;
     std::fs::write(&selected, "[tui]\ntheme = \"dracula\"\n")?;
     let overrides = LoaderOverrides {
@@ -198,6 +324,7 @@ async fn local_writes_preserve_selected_user_file_and_home_destinations() -> any
         .await?;
     let local = LocalSettings::from(&config);
     assert_eq!(local.user_config_path, selected);
+    assert!(local.custom_notification_filters);
     ConfigEditsBuilder::for_config_path(local.user_config_path.as_path())
         .with_edits([crate::legacy_core::config::edit::syntax_theme_edit("nord")])
         .apply()

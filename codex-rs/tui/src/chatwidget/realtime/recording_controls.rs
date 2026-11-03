@@ -1,18 +1,27 @@
 //! Live voice capture controls, activity meters, and interruption presentation.
-//! Meter samples remain bounded and the current thread owns every shortcut.
+//! Meter samples remain bounded; App routes shortcuts to the voice owner.
 
 use super::*;
 
 impl ChatWidget {
-    pub(in crate::chatwidget) fn toggle_realtime_microphone(&mut self) {
+    pub(crate) fn toggle_realtime_microphone(&mut self) {
         let muted = !self.realtime_conversation.microphone_muted;
         if let Some(handle) = self.realtime_conversation.handle.as_ref() {
             if let Err(error) = handle.set_microphone_muted(muted) {
-                self.on_realtime_error(format!("Failed to update microphone: {error}"));
+                let (message, cause) = match handle.take_error() {
+                    Some((cause, error)) => {
+                        (format!("Voice conversation failed: {error}"), cause.into())
+                    }
+                    None => (
+                        format!("Failed to update microphone: {error}"),
+                        RealtimeFailureCause::AudioControls,
+                    ),
+                };
+                self.on_realtime_error(message, cause);
                 return;
             }
         } else if self.realtime_conversation.phase != RealtimeConversationPhase::Starting {
-            self.add_error_message("Start voice mode before muting the microphone.".to_string());
+            self.add_realtime_error("Start voice mode before muting the microphone.".to_string());
             return;
         }
 
@@ -37,17 +46,6 @@ impl ChatWidget {
             && self.realtime_conversation.thread_id.is_some()
             && self.realtime_conversation.thread_id == self.thread_id()
             && self.bottom_pane.no_modal_or_popup_active()
-    }
-
-    pub(crate) fn handle_realtime_microphone_shortcut(&mut self, key_event: KeyEvent) -> bool {
-        if key_event.kind != KeyEventKind::Press
-            || !self.chat_keymap.toggle_voice_mute.is_pressed(key_event)
-            || !self.realtime_microphone_shortcut_available()
-        {
-            return false;
-        }
-        self.toggle_realtime_microphone();
-        true
     }
 
     pub(in crate::chatwidget) fn realtime_microphone_is_listening(&self) -> bool {
@@ -137,7 +135,7 @@ impl ChatWidget {
         }
     }
 
-    pub(in crate::chatwidget) fn refresh_realtime_microphone_level(&mut self) {
+    pub(crate) fn refresh_realtime_microphone_level(&mut self) {
         if !matches!(
             self.realtime_conversation.phase,
             RealtimeConversationPhase::Starting | RealtimeConversationPhase::Active
@@ -147,8 +145,8 @@ impl ChatWidget {
         let Some(handle) = self.realtime_conversation.handle.as_ref() else {
             return;
         };
-        if let Some(error) = handle.take_error() {
-            self.on_realtime_error(format!("Voice conversation failed: {error}"));
+        if let Some((cause, error)) = handle.take_error() {
+            self.on_realtime_error(format!("Voice conversation failed: {error}"), cause.into());
             return;
         }
         if self.realtime_conversation.phase == RealtimeConversationPhase::Starting {

@@ -25,6 +25,7 @@ use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::DynamicToolCallStatus;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
@@ -33,11 +34,12 @@ use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SubAgentActivityKind;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadRealtimeStartedNotification;
 use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 use codex_app_server_protocol::WebSearchItem;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::UsageLimitReachedError;
 use codex_protocol::protocol::RealtimeConversationVersion;
 use codex_protocol::protocol::ThreadSource;
 use pretty_assertions::assert_eq;
@@ -100,6 +102,7 @@ fn turn_event_serializes_expected_shape() {
     let event = TrackEventRequest::TurnEvent(Box::new(CodexTurnEventRequest {
         event_type: "codex_turn_event",
         event_params: crate::events::CodexTurnEventParams {
+            critical_path: crate::TurnCriticalPath::Disabled.into(),
             thread_id: "thread-2".to_string(),
             session_id: "session-thread-2".to_string(),
             turn_id: "turn-2".to_string(),
@@ -128,6 +131,7 @@ fn turn_event_serializes_expected_shape() {
             approval_policy: "on-request".to_string(),
             approvals_reviewer: "auto_review".to_string(),
             guardian_v2_enabled: true,
+            multi_agent_version: codex_protocol::protocol::MultiAgentVersion::V2,
             sandbox_network_access: true,
             collaboration_mode: Some("plan"),
             personality: Some("pragmatic".to_string()),
@@ -148,6 +152,7 @@ fn turn_event_serializes_expected_shape() {
             turn_error: None,
             codex_error_kind: None,
             codex_error_http_status_code: None,
+            usage_limit_window_minutes: None,
             steer_count: Some(0),
             total_tool_call_count: None,
             shell_command_count: None,
@@ -171,6 +176,7 @@ fn turn_event_serializes_expected_shape() {
             after_last_sampling_ms: 94,
             sampling_request_count: 2,
             sampling_retry_count: 1,
+            tools_change_count: 2,
             duration_ms: Some(1234),
             started_at: Some(455),
             completed_at: Some(456),
@@ -182,6 +188,14 @@ fn turn_event_serializes_expected_shape() {
         r#"{
             "event_type": "codex_turn_event",
             "event_params": {
+                "critical_path_status": "disabled",
+                "critical_path_duration_ms": null,
+                "critical_path_inference_ms": null,
+                "critical_path_auto_review_ms": null,
+                "critical_path_user_wait_ms": null,
+                "critical_path_tools_ms": null,
+                "critical_path_overhead_ms": null,
+                "critical_path_unknown_ms": null,
                 "thread_id": "thread-2",
                 "session_id": "session-thread-2",
                 "turn_id": "turn-2",
@@ -218,6 +232,7 @@ fn turn_event_serializes_expected_shape() {
                 "approval_policy": "on-request",
                 "approvals_reviewer": "auto_review",
                 "guardian_v2_enabled": true,
+                "multi_agent_version": "v2",
                 "sandbox_network_access": true,
                 "collaboration_mode": "plan",
                 "personality": "pragmatic",
@@ -238,6 +253,7 @@ fn turn_event_serializes_expected_shape() {
                 "turn_error": null,
                 "codex_error_kind": null,
                 "codex_error_http_status_code": null,
+                "usage_limit_window_minutes": null,
                 "steer_count": 0,
                 "total_tool_call_count": null,
                 "shell_command_count": null,
@@ -261,6 +277,7 @@ fn turn_event_serializes_expected_shape() {
                 "after_last_sampling_ms": 94,
                 "sampling_request_count": 2,
                 "sampling_retry_count": 1,
+                "tools_change_count": 2,
                 "duration_ms": 1234,
                 "started_at": 455,
                 "completed_at": 456
@@ -466,7 +483,7 @@ async fn turn_event_counts_completed_tool_items() {
         )
         .await;
 
-    let mcp_tool_call_item = |status, duration_ms| ThreadItem::McpToolCall {
+    let mcp_tool_call_item = |status, duration_ms| ThreadItemPayload::McpToolCall {
         id: "mcp-1".to_string(),
         server: "server".to_string(),
         tool: "search".to_string(),
@@ -489,13 +506,13 @@ async fn turn_event_counts_completed_tool_items() {
     };
     let completed_tool_items = vec![
         sample_command_execution_item(CommandExecutionStatus::Completed, Some(0), Some(1)),
-        ThreadItem::FileChange {
+        ThreadItemPayload::FileChange {
             id: "file-change-1".to_string(),
             changes: Vec::new(),
             status: PatchApplyStatus::Completed,
         },
         mcp_tool_call_item(McpToolCallStatus::Completed, Some(2)),
-        ThreadItem::DynamicToolCall {
+        ThreadItemPayload::DynamicToolCall {
             id: "dynamic-1".to_string(),
             // A name collision with code-mode exec must not change the event boundary.
             namespace: Some("custom".to_string()),
@@ -506,7 +523,7 @@ async fn turn_event_counts_completed_tool_items() {
             success: Some(true),
             duration_ms: Some(3),
         },
-        ThreadItem::CollabAgentToolCall {
+        ThreadItemPayload::CollabAgentToolCall {
             id: "collab-1".to_string(),
             tool: CollabAgentTool::SpawnAgent,
             status: CollabAgentToolCallStatus::Completed,
@@ -517,32 +534,39 @@ async fn turn_event_counts_completed_tool_items() {
             reasoning_effort: None,
             agents_states: Default::default(),
         },
-        ThreadItem::SubAgentActivity {
+        ThreadItemPayload::SubAgentActivity {
+            model: None,
+            reasoning_effort: None,
             id: "sub-agent-activity-1".to_string(),
             kind: SubAgentActivityKind::Interacted,
             agent_thread_id: "thread-child".to_string(),
             agent_path: "/root/child".to_string(),
         },
-        ThreadItem::SubAgentActivity {
+        ThreadItemPayload::SubAgentActivity {
+            model: None,
+            reasoning_effort: None,
             id: "sub-agent-activity-completed".to_string(),
             kind: SubAgentActivityKind::Completed,
             agent_thread_id: "thread-child".to_string(),
             agent_path: "/root/child".to_string(),
         },
-        ThreadItem::WebSearch(WebSearchItem {
+        ThreadItemPayload::WebSearch(WebSearchItem {
             id: "web-1".to_string(),
             query: "codex".to_string(),
             action: None,
             results: None,
         }),
-        ThreadItem::ImageGeneration(ImageGenerationItem {
+        ThreadItemPayload::ImageGeneration(ImageGenerationItem {
             id: "image-1".to_string(),
             status: "completed".to_string(),
             revised_prompt: None,
-            result: "ok".to_string(),
+            image: GeneratedImageRef::Inline {
+                result: "ok".to_string(),
+            },
             transparent_background: None,
             failure: None,
             saved_path: None,
+            input_images: Vec::new(),
             imagegen_request_id: Some("req-imagegen-123".to_string()),
             generation_id: Some("gen-image-123".to_string()),
         }),
@@ -552,12 +576,12 @@ async fn turn_event_counts_completed_tool_items() {
         reducer
             .ingest(
                 AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
-                    ItemStartedNotification {
-                        thread_id: "thread-2".to_string(),
-                        turn_id: "turn-2".to_string(),
-                        started_at_ms: 998,
-                        item: item.clone(),
-                    },
+                    ItemStartedNotification::new(
+                        "thread-2".to_string(),
+                        "turn-2".to_string(),
+                        item.clone(),
+                        /*started_at_ms*/ 998,
+                    ),
                 ))),
                 &mut out,
             )
@@ -568,12 +592,13 @@ async fn turn_event_counts_completed_tool_items() {
         reducer
             .ingest(
                 AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
-                    ItemCompletedNotification {
-                        thread_id: "thread-2".to_string(),
-                        turn_id: "turn-2".to_string(),
-                        completed_at_ms: 1_000,
+                    ItemCompletedNotification::new(
+                        "thread-2".to_string(),
+                        "turn-2".to_string(),
                         item,
-                    },
+                        /*started_at_ms*/ None,
+                        /*completed_at_ms*/ 1_000,
+                    ),
                 ))),
                 &mut out,
             )
@@ -811,6 +836,97 @@ async fn turn_lifecycle_emits_failed_turn_event() {
         payload["event_params"]["codex_error_http_status_code"],
         json!(null)
     );
+    assert_eq!(
+        payload["event_params"]["usage_limit_window_minutes"],
+        json!(null)
+    );
+}
+
+#[tokio::test]
+async fn turn_event_reports_decisive_usage_limit_window() {
+    let usage_limit = |limit_window_minutes| {
+        CodexErr::UsageLimitReached(UsageLimitReachedError {
+            plan_type: None,
+            resets_at: None,
+            rate_limits: None,
+            promo_message: None,
+            rate_limit_reached_type: None,
+            limit_window_minutes,
+        })
+    };
+    let cases = [
+        (
+            usage_limit(Some(300)),
+            codex_app_server_protocol::CodexErrorInfo::UsageLimitExceeded,
+            json!(["usageLimitExceeded", "usage_limit_reached", 300]),
+        ),
+        (
+            usage_limit(Some(10_080)),
+            codex_app_server_protocol::CodexErrorInfo::UsageLimitExceeded,
+            json!(["usageLimitExceeded", "usage_limit_reached", 10080]),
+        ),
+        (
+            usage_limit(None),
+            codex_app_server_protocol::CodexErrorInfo::UsageLimitExceeded,
+            json!(["usageLimitExceeded", "usage_limit_reached", null]),
+        ),
+        (
+            CodexErr::InvalidRequest("invalid request".to_string()),
+            codex_app_server_protocol::CodexErrorInfo::BadRequest,
+            json!(["badRequest", "invalid_request", null]),
+        ),
+    ];
+
+    for (error, error_info, expected) in cases {
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        ingest_turn_prerequisites(
+            &mut reducer,
+            &mut out,
+            /*include_initialize*/ true,
+            /*include_resolved_config*/ true,
+            /*include_started*/ true,
+            /*include_token_usage*/ false,
+        )
+        .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Custom(CustomAnalyticsFact::TurnCodexError(Box::new(
+                    TurnCodexErrorFact::from_codex_err(
+                        "thread-2".to_string(),
+                        "turn-2".to_string(),
+                        &error,
+                    ),
+                ))),
+                &mut out,
+            )
+            .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                    "thread-2",
+                    "turn-2",
+                    AppServerTurnStatus::Failed,
+                    Some(error_info),
+                ))),
+                &mut out,
+            )
+            .await;
+
+        let [event] = out.as_slice() else {
+            panic!("expected one turn event");
+        };
+        let payload = serde_json::to_value(event).expect("serialize turn event");
+        let params = &payload["event_params"];
+        assert_eq!(
+            json!([
+                params["turn_error"],
+                params["codex_error_kind"],
+                params["usage_limit_window_minutes"],
+            ]),
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -850,4 +966,108 @@ async fn turn_completed_without_started_notification_emits_null_started_at() {
         json!(null)
     );
     assert_eq!(payload["event_params"]["total_tokens"], json!(null));
+}
+
+#[tokio::test]
+async fn critical_path_payload_preserves_capture_status_and_emits_once() {
+    use crate::TurnCriticalPath;
+    use crate::TurnCriticalPathDurations;
+    use crate::TurnProfileFact;
+    use crate::tests::support::sample_turn_profile;
+
+    for status in [
+        AppServerTurnStatus::Completed,
+        AppServerTurnStatus::Interrupted,
+    ] {
+        for (critical_path, expected) in [
+            (
+                TurnCriticalPath::Disabled,
+                json!(["disabled", null, null, null, null, null, null, null]),
+            ),
+            (
+                TurnCriticalPath::Incomplete,
+                json!(["incomplete", null, null, null, null, null, null, null]),
+            ),
+            (
+                TurnCriticalPath::Complete(TurnCriticalPathDurations {
+                    duration_ms: 1234,
+                    inference_ms: 700,
+                    auto_review_ms: 200,
+                    user_wait_ms: 100,
+                    tools_ms: 150,
+                    overhead_ms: 80,
+                    unknown_ms: 4,
+                }),
+                json!(["complete", 1234, 700, 200, 100, 150, 80, 4]),
+            ),
+            (
+                TurnCriticalPath::Complete(TurnCriticalPathDurations {
+                    duration_ms: 1234,
+                    inference_ms: 1234,
+                    auto_review_ms: 0,
+                    user_wait_ms: 0,
+                    tools_ms: 0,
+                    overhead_ms: 0,
+                    unknown_ms: 0,
+                }),
+                json!(["complete", 1234, 1234, 0, 0, 0, 0, 0]),
+            ),
+        ] {
+            let mut reducer = AnalyticsReducer::default();
+            let mut out = Vec::new();
+            ingest_turn_prerequisites(
+                &mut reducer,
+                &mut out,
+                /*include_initialize*/ true,
+                /*include_resolved_config*/ true,
+                /*include_started*/ true,
+                /*include_token_usage*/ true,
+            )
+            .await;
+            let mut profile = sample_turn_profile();
+            profile.critical_path = critical_path;
+            reducer
+                .ingest(
+                    AnalyticsFact::Custom(CustomAnalyticsFact::TurnProfile(Box::new(
+                        TurnProfileFact {
+                            turn_id: "turn-2".into(),
+                            profile,
+                        },
+                    ))),
+                    &mut out,
+                )
+                .await;
+            for _ in 0..2 {
+                reducer
+                    .ingest(
+                        AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                            "thread-2",
+                            "turn-2",
+                            status.clone(),
+                            /*codex_error_info*/ None,
+                        ))),
+                        &mut out,
+                    )
+                    .await;
+            }
+            assert_eq!(out.len(), 1);
+            let payload = serde_json::to_value(&out[0]).unwrap();
+            let params = &payload["event_params"];
+            assert_eq!(
+                json!([
+                    params["critical_path_status"],
+                    params["critical_path_duration_ms"],
+                    params["critical_path_inference_ms"],
+                    params["critical_path_auto_review_ms"],
+                    params["critical_path_user_wait_ms"],
+                    params["critical_path_tools_ms"],
+                    params["critical_path_overhead_ms"],
+                    params["critical_path_unknown_ms"],
+                ]),
+                expected
+            );
+            assert_eq!(params["tool_blocking_ms"], json!(250));
+            assert_eq!(params["duration_ms"], json!(1234));
+        }
+    }
 }

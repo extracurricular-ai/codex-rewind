@@ -8,6 +8,7 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 
+use crate::custom_terminal::ModifierDiff;
 use crate::render::line_utils::line_to_static;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::decorate_spans;
@@ -378,73 +379,6 @@ impl Command for ResetScrollRegion {
     fn is_ansi_code_supported(&self) -> bool {
         // TODO(nornagon): is this supported on Windows?
         true
-    }
-}
-
-struct ModifierDiff {
-    pub from: Modifier,
-    pub to: Modifier,
-}
-
-impl ModifierDiff {
-    fn queue<W>(self, mut w: W) -> io::Result<()>
-    where
-        W: io::Write,
-    {
-        use crossterm::style::Attribute as CAttribute;
-        let removed = self.from - self.to;
-        if removed.contains(Modifier::REVERSED) {
-            queue!(w, SetAttribute(CAttribute::NoReverse))?;
-        }
-        if removed.contains(Modifier::BOLD) {
-            queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
-            if self.to.contains(Modifier::DIM) {
-                queue!(w, SetAttribute(CAttribute::Dim))?;
-            }
-        }
-        if removed.contains(Modifier::ITALIC) {
-            queue!(w, SetAttribute(CAttribute::NoItalic))?;
-        }
-        if removed.contains(Modifier::UNDERLINED) {
-            queue!(w, SetAttribute(CAttribute::NoUnderline))?;
-        }
-        if removed.contains(Modifier::DIM) {
-            queue!(w, SetAttribute(CAttribute::NormalIntensity))?;
-        }
-        if removed.contains(Modifier::CROSSED_OUT) {
-            queue!(w, SetAttribute(CAttribute::NotCrossedOut))?;
-        }
-        if removed.contains(Modifier::SLOW_BLINK) || removed.contains(Modifier::RAPID_BLINK) {
-            queue!(w, SetAttribute(CAttribute::NoBlink))?;
-        }
-
-        let added = self.to - self.from;
-        if added.contains(Modifier::REVERSED) {
-            queue!(w, SetAttribute(CAttribute::Reverse))?;
-        }
-        if added.contains(Modifier::BOLD) {
-            queue!(w, SetAttribute(CAttribute::Bold))?;
-        }
-        if added.contains(Modifier::ITALIC) {
-            queue!(w, SetAttribute(CAttribute::Italic))?;
-        }
-        if added.contains(Modifier::UNDERLINED) {
-            queue!(w, SetAttribute(CAttribute::Underlined))?;
-        }
-        if added.contains(Modifier::DIM) {
-            queue!(w, SetAttribute(CAttribute::Dim))?;
-        }
-        if added.contains(Modifier::CROSSED_OUT) {
-            queue!(w, SetAttribute(CAttribute::CrossedOut))?;
-        }
-        if added.contains(Modifier::SLOW_BLINK) {
-            queue!(w, SetAttribute(CAttribute::SlowBlink))?;
-        }
-        if added.contains(Modifier::RAPID_BLINK) {
-            queue!(w, SetAttribute(CAttribute::RapidBlink))?;
-        }
-
-        Ok(())
     }
 }
 
@@ -883,6 +817,49 @@ mod tests {
     }
 
     #[test]
+    fn vt100_spoken_prompt_keeps_its_marker_color_without_a_terminal_palette() {
+        use crate::history_cell::HistoryCell;
+        use crate::history_cell::new_spoken_user_prompt;
+
+        crate::terminal_palette::with_test_default_colors(
+            /*colors*/ None::<crate::terminal_probe::DefaultColors>,
+            || {
+                let width = 30;
+                let lines = new_spoken_user_prompt("hello from voice".into())
+                    .display_hyperlink_lines(width);
+                let mut snapshots = Vec::new();
+                for policy in [
+                    HistoryLineWrapPolicy::PreWrap,
+                    HistoryLineWrapPolicy::Terminal,
+                ] {
+                    let mut backend = VT100Backend::new(width, /*height*/ 1);
+                    let (wrapped, _) =
+                        wrap_history_hyperlink_lines(&lines[1..2], usize::from(width), policy);
+                    write_history_line(&mut backend, &wrapped[0], usize::from(width))
+                        .expect("write spoken prompt");
+                    let screen = backend.vt100().screen();
+                    let marker = screen.cell(/*row*/ 0, /*col*/ 0).unwrap();
+                    let text = screen.cell(/*row*/ 0, /*col*/ 2).unwrap();
+                    let margin = screen.cell(/*row*/ 0, width - 1).unwrap();
+                    snapshots.push(format!(
+                        "{policy:?}: {}\nmarker: {:?}, text: {:?}, background: {:?}",
+                        screen.rows(/*start*/ 0, width).next().unwrap().trim_end(),
+                        marker.fgcolor(),
+                        text.fgcolor(),
+                        margin.bgcolor(),
+                    ));
+                }
+                insta::assert_snapshot!(snapshots.join("\n"), @"
+                PreWrap: › hello from voice
+                marker: Idx(1), text: Default, background: Idx(8)
+                Terminal: › hello from voice
+                marker: Idx(1), text: Default, background: Idx(8)
+                ");
+            },
+        );
+    }
+
+    #[test]
     fn vt100_user_message_url_wrap_preserves_gutter_and_background() {
         use crate::history_cell::HistoryCell;
         use crate::history_cell::UserHistoryCell;
@@ -900,7 +877,7 @@ mod tests {
 
         let url = "https://example.test/forwarded/threads/10930?page=1&queue=customer_support_unprocessed&forwardedScope=all";
         let cell = UserHistoryCell {
-            spoken: false,
+            presentation: Default::default(),
             message: url.to_string(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),

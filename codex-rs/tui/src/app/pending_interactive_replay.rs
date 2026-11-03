@@ -2,7 +2,7 @@ use crate::app_command::AppCommand;
 use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -255,15 +255,15 @@ impl PendingInteractiveReplayState {
 
     pub(super) fn note_server_notification(&mut self, notification: &ServerNotification) {
         match notification {
-            ServerNotification::ItemStarted(notification) => match &notification.item {
-                ThreadItem::CommandExecution { id, .. } => {
+            ServerNotification::ItemStarted(notification) => match &notification.item.payload {
+                ThreadItemPayload::CommandExecution { id, .. } => {
                     self.exec_approval_call_ids.remove(id);
                     Self::remove_call_id_from_turn_map(
                         &mut self.exec_approval_call_ids_by_turn_id,
                         id,
                     );
                 }
-                ThreadItem::FileChange { id, .. } => {
+                ThreadItemPayload::FileChange { id, .. } => {
                     self.patch_approval_call_ids.remove(id);
                     Self::remove_call_id_from_turn_map(
                         &mut self.patch_approval_call_ids_by_turn_id,
@@ -675,6 +675,7 @@ mod tests {
             thread_id: "thread-1".to_string(),
             turn: Turn {
                 id: turn_id.to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: TurnStatus::Completed,

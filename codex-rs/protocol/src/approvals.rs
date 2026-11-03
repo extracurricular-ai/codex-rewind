@@ -186,8 +186,20 @@ pub struct NetworkPolicyAmendment {
 }
 
 /// Why this approval needs a fresh Guardian assessment.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Deserialize,
+    Serialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    TS,
+    strum_macros::IntoStaticStr,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum GuardianReviewReason {
     Policy,
     FreshRequired,
@@ -445,6 +457,14 @@ pub enum ElicitationRequest {
         url: String,
         elicitation_id: String,
     },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct ElicitationAbandonedEvent {
+    pub server_name: String,
+    /// Original Core-generated response token of the unanswered request.
+    #[ts(type = "string | number")]
+    pub id: RequestId,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

@@ -94,6 +94,14 @@ pub(super) async fn update_thread_metadata(
         None
     };
     let paginated = matches!(history_mode, Some(ThreadHistoryMode::Paginated));
+    if paginated
+        && patch.name.is_some()
+        && live_writer::rollout_path(store, thread_id).await.is_ok()
+    {
+        // Naming saves a new thread even before its first turn. Persist its live recorder before
+        // updating SQLite so the named thread can be resumed immediately or after a restart.
+        live_writer::persist_thread(store, thread_id).await?;
+    }
     let needs_rollout_compat = requires_rollout_compat || patch.name.is_some();
     // Reject competing writers before committing any part of a legacy rollout patch to SQLite.
     let writer_lock = if !paginated
@@ -360,6 +368,22 @@ async fn apply_metadata_update(
                     .map_err(|err| ThreadStoreError::Internal {
                         message: format!("failed to read thread metadata for {thread_id}: {err}"),
                     })?;
+            // Existing timestamp-only observations must not rewrite metadata or its indexes.
+            // Missing rows and changed rollout paths still need the normal repair path.
+            if let Some(updated_at) = patch.updated_at
+                && patch.is_empty_except_updated_at()
+                && existing.as_ref().is_some_and(|metadata| {
+                    rollout_path.as_ref().is_none_or(|path| path == &metadata.rollout_path)
+                })
+                && state_db
+                    .touch_thread_updated_at(thread_id, updated_at)
+                    .await
+                    .map_err(|err| ThreadStoreError::Internal {
+                        message: format!("failed to update thread timestamp for {thread_id}: {err}"),
+                    })?
+            {
+                return Ok(());
+            }
             let project_id = if existing.is_none()
                 && let Some(Some(project_id)) = patch.project_id.as_ref()
                 && state_db
@@ -449,6 +473,8 @@ async fn apply_metadata_update(
                 metadata.source = enum_to_string(&source);
             }
             metadata.originator = metadata.originator.or(patch.originator);
+            metadata.creator_user_id = metadata.creator_user_id.or(patch.creator_user_id);
+            metadata.creator_account_id = metadata.creator_account_id.or(patch.creator_account_id);
             if let Some(thread_source) = patch.thread_source {
                 metadata.thread_source = thread_source;
             }
@@ -650,7 +676,9 @@ async fn metadata_for_missing_sqlite_row(
         patch.source.clone().unwrap_or(SessionSource::Unknown),
     );
     builder.model_provider = patch.model_provider.clone();
-    builder.history_mode = canonical_history_mode(store, thread_id, rollout_path).await?;
+    let (history_mode, attached_thread_parent_id) =
+        canonical_history_mode_and_attachment(store, thread_id, rollout_path).await?;
+    builder.history_mode = history_mode;
     builder.thread_source = patch.thread_source.clone().flatten();
     builder.agent_nickname = patch.agent_nickname.clone().flatten();
     builder.agent_role = patch.agent_role.clone().flatten();
@@ -658,17 +686,26 @@ async fn metadata_for_missing_sqlite_row(
     builder.cwd = patch.cwd.clone().map(normalize_cwd).unwrap_or_default();
     builder.cli_version = patch.cli_version.clone();
     let mut metadata = builder.build(store.config.default_model_provider_id.as_str());
+    metadata.attached_thread_parent_id = attached_thread_parent_id;
     if rollout_path_archived {
         metadata.archived_at = Some(metadata.updated_at);
     }
     Ok(metadata)
 }
 
-async fn canonical_history_mode(
+async fn canonical_history_mode_and_attachment(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     rollout_path: &Path,
-) -> ThreadStoreResult<ThreadHistoryMode> {
+) -> ThreadStoreResult<(ThreadHistoryMode, Option<ThreadId>)> {
+    if let Some((path, meta)) = live_writer::unpersisted_session_meta(store, thread_id).await
+        && path == rollout_path
+    {
+        return Ok((
+            meta.history_mode,
+            meta.forked_from_id.filter(|_| meta.attached_thread),
+        ));
+    }
     let session_meta = match read_session_meta_line(rollout_path).await {
         Ok(session_meta) => session_meta,
         Err(err) => {
@@ -684,7 +721,7 @@ async fn canonical_history_mode(
             {
                 // The live writer retains the canonical mode selected before its deferred
                 // SessionMeta reaches JSONL.
-                return Ok(history_mode);
+                return Ok((history_mode, None));
             }
             return Err(ThreadStoreError::Internal {
                 message: format!(
@@ -701,7 +738,13 @@ async fn canonical_history_mode(
             ),
         });
     }
-    Ok(session_meta.meta.history_mode)
+    Ok((
+        session_meta.meta.history_mode,
+        session_meta
+            .meta
+            .forked_from_id
+            .filter(|_| session_meta.meta.attached_thread),
+    ))
 }
 
 fn requires_rollout_compatibility_update(patch: &ThreadMetadataPatch) -> bool {
@@ -737,6 +780,8 @@ fn has_observed_metadata_facts(patch: &ThreadMetadataPatch) -> bool {
         || patch.created_at.is_some()
         || patch.source.is_some()
         || patch.originator.is_some()
+        || patch.creator_user_id.is_some()
+        || patch.creator_account_id.is_some()
         || patch.thread_source.is_some()
         || patch.agent_nickname.is_some()
         || patch.agent_role.is_some()
@@ -888,7 +933,7 @@ async fn update_rollout_metadata(
     };
     patch(&mut metadata);
     recorder
-        .record_canonical_items(&[RolloutItem::SessionMeta(metadata)])
+        .record_canonical_items(&[RolloutItem::SessionMeta(Box::new(metadata))])
         .await
         .map_err(io_error)?;
     recorder.flush().await.map_err(io_error)?;
@@ -1267,6 +1312,7 @@ mod tests {
         let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(path.clone()),
                 history: None,
@@ -1280,7 +1326,7 @@ mod tests {
         let (mut expected, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
         let mut metadata = read_session_meta_line(&path).await?;
         metadata.meta.memory_mode = Some("disabled".into());
-        expected.push(RolloutItem::SessionMeta(metadata));
+        expected.push(RolloutItem::SessionMeta(Box::new(metadata)));
 
         let mut shutdown = Box::pin(store.shutdown_thread(thread_id));
         update_rollout_metadata(&store, thread_id, &path, &writer_lock, |meta| {
@@ -1486,6 +1532,7 @@ mod tests {
 
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(path.clone()),
                 history: None,
@@ -2373,6 +2420,7 @@ mod tests {
         .await;
         store
             .resume_thread(ResumeThreadParams {
+                history_revision: None,
                 thread_id,
                 rollout_path: Some(archived_path.clone()),
                 history: None,

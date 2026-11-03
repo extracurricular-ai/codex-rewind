@@ -46,7 +46,8 @@ fn viewed_image_retains_original_path_in_details() {
         "/workspace/assets/example.png",
         r"C:\workspace\assets\example.png",
     ] {
-        let cell = new_view_image_tool_call(LegacyAppPathString::from_string(path));
+        let cell =
+            new_view_image_tool_call("view".to_string(), LegacyAppPathString::from_string(path));
         assert_eq!(
             cell.display_lines(/*width*/ 80)
                 .iter()
@@ -70,9 +71,10 @@ fn viewed_image_retains_original_path_in_details() {
 
 #[test]
 fn viewed_image_narrow_summary() {
-    let cell = new_view_image_tool_call(LegacyAppPathString::from_string(
-        "/workspace/very-long-screenshot-name.png",
-    ));
+    let cell = new_view_image_tool_call(
+        "view".to_string(),
+        LegacyAppPathString::from_string("/workspace/very-long-screenshot-name.png"),
+    );
     insta::assert_snapshot!(cell.display_lines(/*width*/ 32)[0].to_string());
 }
 

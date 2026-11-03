@@ -13,6 +13,7 @@ use super::SessionPickerLaunchContext;
 use super::SessionSelection;
 use super::SessionStatus;
 use super::SessionTarget;
+use crate::backend_id::BackendId;
 use crate::keymap::KeymapContext;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -70,9 +71,13 @@ impl PickerState {
             return;
         }
 
+        let backend_id = row.backend_id.unwrap_or(self.backend_id);
         self.archive_state = ArchiveState::Pending { thread_id };
         self.request_frame();
-        (self.picker_loader)(PickerLoadRequest::Archive { thread_id });
+        (self.picker_loader)(PickerLoadRequest::Archive {
+            backend_id,
+            thread_id,
+        });
     }
 
     pub(super) fn handle_archive_result(
@@ -83,6 +88,7 @@ impl PickerState {
         if self.archive_state != (ArchiveState::Pending { thread_id }) {
             return;
         }
+        self.chord_matcher.cancel();
         self.archive_state = ArchiveState::Idle;
 
         if let Err(error) = result {
@@ -136,14 +142,17 @@ impl PickerState {
         }
     }
 
-    pub(super) fn request_unarchive(&mut self, thread_id: ThreadId) {
+    pub(super) fn request_unarchive(&mut self, thread_id: ThreadId, backend_id: BackendId) {
         if !matches!(self.archive_state, ArchiveState::Idle) {
             return;
         }
 
         self.archive_state = ArchiveState::Restoring { thread_id };
         self.request_frame();
-        (self.picker_loader)(PickerLoadRequest::Unarchive { thread_id });
+        (self.picker_loader)(PickerLoadRequest::Unarchive {
+            backend_id,
+            thread_id,
+        });
     }
 
     pub(super) fn handle_unarchive_result(
@@ -154,6 +163,7 @@ impl PickerState {
         if self.archive_state != (ArchiveState::Restoring { thread_id }) {
             return None;
         }
+        self.chord_matcher.cancel();
         self.archive_state = ArchiveState::Idle;
 
         match result {

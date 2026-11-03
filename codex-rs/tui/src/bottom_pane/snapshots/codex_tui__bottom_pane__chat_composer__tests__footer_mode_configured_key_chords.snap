@@ -1,23 +1,18 @@
 ---
 source: tui/src/bottom_pane/chat_composer.rs
-assertion_line: 5620
 expression: terminal.backend()
 ---
 "  Keyboard shortcuts                                                                                "
 "                                                                                                    "
-"  Compose                             Session                                                       "
-"  /              Commands             tab     Send message                                          "
-"  @              Mention files        ⌥+,     Less reasoning                                        "
-"  !              Shell command        ⌥+.     More reasoning                                        "
-"  ctrl+x enter   New line             ctrl+c  Quit                                                  "
-"  ctrl+v         Paste image                                                                        "
-"  ctrl+g ctrl+g  External editor      Transcript (open first)                                       "
-"  ctrl+r         Search history       ctrl+t                 Open transcript                        "
-"  esc esc        Edit last message    f3                     Find text                              "
-"                                      pgup / pgdn            Scroll                                 "
-"                                      ctrl+space             Start selection                        "
-"                                      ctrl+home / ctrl+end   Top / latest                           "
-"                                      shift+⌥+, / shift+⌥+.  Top / latest                           "
+"  Compose                        Session                              Transcript (open first)       "
+"  /         Commands             tab      Send message                ⌃t            Open transcript "
+"  @         Mention files        ⌥,       Less reasoning              f3            Find text       "
+"  !         Shell command        ⌥.       More reasoning              pgup / pgdn   Scroll          "
+"  ⌃x enter  New line             ⌥← / ⌥→  Subagents (empty prompt)    ⌃space        Start selection "
+"  ⌃v        Paste image          f4       Inspect activity            ⌃home / ⌃end  Top / latest    "
+"  ⌃g ⌃g     External editor      ⌃c       Quit                        ⇧⌥, / ⇧⌥.     Top / latest    "
+"  ⌃r        Search history                                                                          "
+"  esc esc   Edit last message                                                                       "
 "                                                                                                    "
 "  /keymap customize                                                                                 "
 "                                                                                                    "

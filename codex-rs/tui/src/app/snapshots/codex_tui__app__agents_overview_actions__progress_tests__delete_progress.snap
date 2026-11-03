@@ -1,8 +1,28 @@
 ---
 source: tui/src/app/agents_overview_action_progress_tests.rs
-assertion_line: 62
-expression: terminal.backend()
+expression: "age.replace_all(&text, \" [age]\")"
 ---
-"Deleting task…                      "
-"Please wait. Task switching is      "
-"unavailable until this finishes.    "
+"  Agent command center  Group: Project  g                                       "
+"   All 2   Needs you 0   Working 0   Ready 0   Inactive 2                       "
+"  ────────────────────────────────────────────────────────────────────────────  "
+"      Tasks                                            Status         Updated   "
+"  /tmp/project  2                                                               "
+"    ○ Task 2                                           Inactive [age]   "
+"  › ○ Task 1                                           Inactive [age]   "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"  Deleting task…  You can still browse.                                         "

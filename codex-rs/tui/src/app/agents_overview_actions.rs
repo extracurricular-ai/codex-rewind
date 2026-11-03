@@ -1,8 +1,9 @@
 //! Server RPCs own lifecycle outcomes; successful actions invalidate dashboard group caches.
-//! A modal keeps rendering during RPCs while deferring navigation and task notifications.
+//! Keep the dashboard browsable during RPCs while deferring task notifications.
 //! Removing the current root leaves an unattached dashboard, even when it is empty.
 
 use super::App;
+use super::agents_overview::AGENTS_OVERVIEW_VIEW_ID;
 use crate::app_event::AgentsOverviewAction;
 use crate::app_event::AppEvent;
 use crate::app_server_session::AppServerSession;
@@ -12,10 +13,15 @@ use crate::chatwidget::ChatWidget;
 use crate::render::renderable::Renderable;
 use crate::tui;
 use crate::wrapping::word_wrap_lines;
+use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadSectionMoveParams;
+use codex_app_server_protocol::ThreadSectionMoveResponse;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SubAgentSource;
+use codex_state::PINNED_THREAD_SECTION_ID;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -25,6 +31,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 struct LifecycleHeader(Vec<Line<'static>>);
 
@@ -42,44 +49,14 @@ impl Renderable for LifecycleHeader {
     }
 }
 
-struct LifecycleProgress(AgentsOverviewAction);
-
-impl LifecycleProgress {
-    fn header(&self) -> LifecycleHeader {
-        let title = match self.0 {
-            AgentsOverviewAction::Archive => "Archiving task…",
-            AgentsOverviewAction::Delete => "Deleting task…",
-        };
-        LifecycleHeader(vec![
-            title.bold().into(),
-            "Please wait. Task switching is unavailable until this finishes."
-                .dim()
-                .into(),
-        ])
-    }
-}
-
-impl Renderable for LifecycleProgress {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.header().render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        self.header().desired_height(width)
-    }
-}
-
-/// Keep the terminal responsive without dispatching navigation or queued task events.
+/// Keep browsing responsive without queuing actions against a locked server.
 async fn run_lifecycle_modal<T>(
     tui: &mut tui::Tui,
-    action: AgentsOverviewAction,
+    app: &mut App,
     operation: impl Future<Output = T>,
     events: impl Stream<Item = tui::TuiEvent> + Unpin,
 ) -> color_eyre::Result<T> {
-    let progress = LifecycleProgress(action);
-    tui.draw(u16::MAX, |frame| {
-        progress.render(frame.area(), frame.buffer_mut());
-    })?;
+    app.render_chat_widget_frame(tui, tui.terminal.last_known_screen_size)?;
     let mut events = events.fuse();
     tokio::pin!(operation);
     let result = loop {
@@ -87,13 +64,28 @@ async fn run_lifecycle_modal<T>(
             biased;
             result = &mut operation => break result,
             Some(event) = events.next() => {
-                tui.screen_size_for_event(&event)?;
+                let screen_size = tui.screen_size_for_event(&event)?;
+                if matches!(&event, tui::TuiEvent::Paste(_) | tui::TuiEvent::FocusLost) {
+                    app.cancel_pending_key_chord();
+                }
+                let dashboard_active = app.chat_widget
+                    .selected_index_for_active_view(AGENTS_OVERVIEW_VIEW_ID)
+                    .is_some();
                 match event {
+                    tui::TuiEvent::Key(key) if dashboard_active => {
+                        if let Some(key) = app.route_key_chord_event(tui, key) {
+                            app.chat_widget.handle_key_event_with_activation_key(key, app.routed_key_activation);
+                        }
+                        tui.frame_requester().schedule_frame();
+                    }
+                    tui::TuiEvent::Paste(text) if dashboard_active => {
+                        app.chat_widget.handle_paste(text);
+                        tui.frame_requester().schedule_frame();
+                    }
                     tui::TuiEvent::Key(_) | tui::TuiEvent::Paste(_) | tui::TuiEvent::FocusLost | tui::TuiEvent::Mouse(_) => {}
                     tui::TuiEvent::Draw | tui::TuiEvent::Resize(_) | tui::TuiEvent::Resume | tui::TuiEvent::FocusGained => {
-                        tui.draw(u16::MAX, |frame| {
-                            progress.render(frame.area(), frame.buffer_mut());
-                        })?;
+                        app.expire_pending_key_chord();
+                        app.render_chat_widget_frame(tui, screen_size)?;
                     }
                 }
             }
@@ -104,6 +96,90 @@ async fn run_lifecycle_modal<T>(
 }
 
 impl App {
+    pub(super) fn toggle_agents_overview_pin(
+        &mut self,
+        app_server: &AppServerSession,
+        thread_id: ThreadId,
+        pinned: bool,
+    ) {
+        if self.agents_overview.pending_pin_change.is_some() {
+            return;
+        }
+        let request_id = Uuid::new_v4();
+        self.agents_overview.pending_pin_change = Some(request_id);
+        let request_handle = app_server.request_handle();
+        let app_event_tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let result = request_handle
+                .request_typed::<ThreadSectionMoveResponse>(ClientRequest::ThreadSectionMove {
+                    request_id: RequestId::String(Uuid::new_v4().to_string()),
+                    params: ThreadSectionMoveParams {
+                        thread_id: thread_id.to_string(),
+                        section_id: pinned.then(|| PINNED_THREAD_SECTION_ID.to_string()),
+                        before_thread_id: None,
+                    },
+                })
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            app_event_tx.send(AppEvent::AgentsOverviewPinToggled {
+                request_id,
+                thread_id,
+                pinned,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn complete_agents_overview_pin(
+        &mut self,
+        app_server: &AppServerSession,
+        request_id: Uuid,
+        thread_id: ThreadId,
+        pinned: bool,
+        result: Result<(), String>,
+    ) {
+        if self.agents_overview.pending_pin_change != Some(request_id) {
+            return;
+        }
+        self.agents_overview.pending_pin_change = None;
+        match result {
+            Ok(()) => {
+                if let Some(pinned_thread_ids) = self.agents_overview.pinned_thread_ids.as_mut() {
+                    if pinned {
+                        if !pinned_thread_ids.contains(&thread_id) {
+                            pinned_thread_ids.push(thread_id);
+                        }
+                    } else {
+                        pinned_thread_ids.retain(|id| *id != thread_id);
+                    }
+                }
+            }
+            Err(error) => {
+                self.add_agents_overview_error(format!(
+                    "Failed to {} task: {error}",
+                    if pinned { "pin" } else { "unpin" }
+                ));
+            }
+        }
+        let restore_show_more = self.agents_overview.refresh_show_more;
+        if let Some(refresh) = self.agents_overview.refresh_task.take() {
+            refresh.abort();
+        }
+        self.agents_overview.request_id = None;
+        self.agents_overview.refresh_show_more = false;
+        self.agents_overview.refresh_notifications.clear();
+        let refresh_thread_ids =
+            std::mem::take(&mut self.agents_overview.active_refresh_thread_ids);
+        self.agents_overview
+            .refresh_thread_ids
+            .extend(refresh_thread_ids);
+        self.agents_overview.refresh_pending = false;
+        self.agents_overview.show_more_requested |= restore_show_more;
+        self.refresh_agents_overview_threads(app_server);
+        self.repaint_agents_overview();
+    }
+
     pub(super) fn confirm_agents_overview_action(
         &mut self,
         thread_id: ThreadId,
@@ -157,7 +233,7 @@ impl App {
                     ..Default::default()
                 },
             ],
-            ..SelectionViewParams::picker()
+            ..SelectionViewParams::confirmation()
         });
     }
 
@@ -176,8 +252,25 @@ impl App {
         let mut attempted = false;
         let primary_thread_id = self.primary_thread_id;
         let events = tui.event_stream();
+        self.prepare_agents_overview_removal(&HashSet::from([thread_id]));
+        let hidden = self.agents_overview.hidden_threads.insert(thread_id);
+        {
+            let mut state = self
+                .agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.removal = Some(action);
+            // Confirmation may have been opened from the rename editor.
+            state.rename_target = None;
+        }
+        self.repaint_agents_overview();
+        let voice_result = self
+            .stop_voice_for_removed_thread(app_server, thread_id)
+            .await;
         let operation = async {
             let result = async {
+                voice_result?;
                 if let Some(primary) = primary_thread_id
                     && primary != thread_id
                 {
@@ -218,13 +311,29 @@ impl App {
             }
             (result, detach_primary)
         };
-        let (result, detach_primary) = run_lifecycle_modal(tui, action, operation, events).await?;
+        let outcome = run_lifecycle_modal(tui, self, operation, events).await;
+        if hidden {
+            self.agents_overview.hidden_threads.remove(&thread_id);
+        }
+        self.agents_overview
+            .view_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .removal = None;
+        let (result, detach_primary) = outcome?;
         if attempted {
             // A read started before the RPC can contain stale task and approval state.
             if let Some(refresh) = self.agents_overview.refresh_task.take() {
                 refresh.abort();
             }
             self.agents_overview.request_id = None;
+            self.agents_overview.refresh_show_more = false;
+            self.agents_overview.active_refresh_thread_ids.clear();
+            self.agents_overview
+                .view_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .loading = false;
             self.agents_overview.refresh_pending = false;
             self.agents_overview.refresh_notifications.clear();
         }
@@ -261,8 +370,9 @@ impl App {
             {
                 removed.insert(primary);
             }
+            self.prepare_agents_overview_removal(&removed);
             for removed_id in removed {
-                self.agents_overview.threads.remove(&removed_id);
+                self.remove_agents_overview_thread(removed_id);
                 self.agents_overview.activity.remove(&removed_id);
                 self.agents_overview.last_messages.remove(&removed_id);
                 self.agents_overview.usage.remove(&removed_id);
@@ -272,11 +382,21 @@ impl App {
             }
         }
         if detach_primary {
+            self.agents_overview.selection_after_removal =
+                self.agents_overview.selection_after_removal.or_else(|| {
+                    self.chat_widget
+                        .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
+                        .and_then(|index| {
+                            self.agents_overview.visible_thread_ids.get(index).copied()
+                        })
+                });
             self.reset_for_thread_switch(tui)?;
             self.pending_thread_switch_resets += 1;
             self.app_event_tx
                 .send(AppEvent::ResetTranscriptForThreadSwitch);
-            self.reset_thread_event_state();
+            self.detach_current_thread_for_navigation(app_server, /*destination*/ None)
+                .await;
+            self.reset_thread_event_state().await;
             let init = self.chatwidget_init_for_forked_or_resumed_thread(
                 tui,
                 self.config.clone(),

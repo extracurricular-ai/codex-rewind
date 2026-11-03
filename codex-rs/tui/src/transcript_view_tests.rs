@@ -1,6 +1,7 @@
 //! Viewport behavior and cache lifetime across scrolling, selection, and redraws.
 
 use super::*;
+use crate::history_cell::new_user_prompt;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -38,6 +39,15 @@ pub(super) fn cell(text: impl Into<String>) -> Arc<dyn HistoryCell> {
     })
 }
 
+fn prompt(text: impl Into<String>) -> Arc<dyn HistoryCell> {
+    Arc::new(new_user_prompt(
+        text.into(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
+}
+
 pub(super) fn render(
     view: &mut TranscriptView,
     cells: &[Arc<dyn HistoryCell>],
@@ -61,6 +71,376 @@ pub(super) fn text(buffer: &Buffer) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn consecutive_user_prompts_share_one_background_block() {
+    use crate::history_cell::AgentMessageCell;
+    use crate::history_cell::new_spoken_user_prompt;
+    use codex_protocol::user_input::TextElement;
+
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        prompt("First steering message"),
+        prompt("Second steering message"),
+        Arc::new(AgentMessageCell::new(
+            vec!["Assistant response".into()],
+            /*is_first_line*/ true,
+        )),
+        Arc::new(new_spoken_user_prompt(String::new())),
+        Arc::new(new_user_prompt(
+            "   ".into(),
+            vec![TextElement::new((0..3).into(), Some("   ".into()))],
+            Vec::new(),
+            Vec::new(),
+        )),
+        prompt("Later user message"),
+    ];
+    crate::terminal_palette::with_test_default_colors(
+        crate::terminal_probe::DefaultColors {
+            fg: (235, 235, 235),
+            bg: (18, 20, 30),
+        },
+        || {
+            let mut view = TranscriptView::default();
+            let buffer = render(&mut view, &cells, /*width*/ 32, /*height*/ 12);
+            insta::assert_snapshot!(
+                "consecutive_user_prompts_share_one_background_block",
+                format!("{buffer:?}")
+            );
+        },
+    );
+}
+
+#[test]
+fn prompt_adjacency_uses_cached_retained_presentations() {
+    let renders = Arc::new(AtomicUsize::new(0));
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(TestCell {
+            text: "response".into(),
+            renders: Arc::clone(&renders),
+        }),
+        prompt("steering"),
+    ];
+    let mut view = TranscriptView::default();
+
+    view.current_layout(&cells, /*index*/ 1);
+    view.current_layout(&cells, /*index*/ 1);
+
+    assert_eq!(renders.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn joined_prompt_preserves_source_offsets_across_rewrap() {
+    let cells = vec![prompt("older"), prompt("one\n\ntwo")];
+    let mut view = TranscriptView::default();
+    let unjoined = [Arc::clone(&cells[1])];
+    let source = view
+        .current_layout(&unjoined, /*index*/ 0)
+        .unwrap()
+        .text()
+        .to_owned();
+    let joined = view.current_layout(&cells, /*index*/ 1).unwrap();
+
+    assert_eq!(
+        (joined.text(), joined.rewrap(/*width*/ 8).text()),
+        (source.as_str(), source.as_str())
+    );
+}
+
+#[test]
+fn detailed_only_reasoning_separates_user_prompts() {
+    use crate::history_cell::ReasoningSummaryCell;
+    use std::path::Path;
+
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![
+        prompt("first"),
+        Arc::new(ReasoningSummaryCell::new(
+            "Reasoning".into(),
+            "visible detail".into(),
+            Path::new("."),
+            /*transcript_only*/ true,
+        )),
+        prompt("second"),
+    ];
+    let mut detailed = TranscriptView {
+        detailed: true,
+        ..TranscriptView::default()
+    };
+    assert!(
+        detailed
+            .current_layout(&cells, /*index*/ 2)
+            .unwrap()
+            .separated
+    );
+
+    let mut compact = TranscriptView::default();
+    assert!(
+        !compact
+            .entry_layout(&cells, /*index*/ 2, /*full_content*/ true)
+            .unwrap()
+            .separated
+    );
+}
+
+#[test]
+fn page_keys_follow_pager_scroll_bindings() {
+    let cells = [cell(
+        (1..=30)
+            .map(|row| format!("row {row}\n"))
+            .collect::<String>(),
+    )];
+    let mut frames = Vec::new();
+    for (label, pager, rows) in [
+        ("default", serde_json::json!({}), 7),
+        (
+            "half page",
+            serde_json::json!({
+                "page_up": [], "page_down": [],
+                "half_page_up": "page-up", "half_page_down": "page-down"
+            }),
+            4,
+        ),
+        (
+            "single row",
+            serde_json::json!({
+                "page_up": [], "page_down": [],
+                "scroll_up": "page-up", "scroll_down": "page-down"
+            }),
+            1,
+        ),
+        (
+            "unbound",
+            serde_json::json!({"page_up": [], "page_down": []}),
+            0,
+        ),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({"pager": pager})).unwrap();
+        let keymap = crate::keymap::RuntimeKeymap::from_config(&config).unwrap();
+        let mut view = TranscriptView::default();
+        view.set_keymap_bindings(&keymap);
+        let pre_scroll = render(&mut view, &cells, /*width*/ 20, /*height*/ 8);
+        assert_eq!(
+            view.handle_key(KeyCode::PageUp.into(), &cells).is_some(),
+            rows != 0
+        );
+        let scrolled = render(&mut view, &cells, /*width*/ 20, /*height*/ 8);
+        let mut expected = TranscriptView::default();
+        render(&mut expected, &cells, /*width*/ 20, /*height*/ 8);
+        expected.scroll(&cells, -rows);
+        assert_eq!(
+            scrolled,
+            render(&mut expected, &cells, /*width*/ 20, /*height*/ 8)
+        );
+        frames.push(format!("{label}\n{}", text(&scrolled)));
+        assert_eq!(
+            view.handle_key(KeyCode::PageDown.into(), &cells).is_some(),
+            rows != 0
+        );
+        assert_eq!(
+            render(&mut view, &cells, /*width*/ 20, /*height*/ 8),
+            pre_scroll
+        );
+        for key in [
+            KeyCode::Char('j').into(),
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        ] {
+            assert!(view.handle_key(key, &cells).is_none());
+        }
+    }
+    insta::assert_snapshot!(
+        "page_keys_follow_pager_scroll_bindings",
+        frames.join("\n\n")
+    );
+}
+
+#[test]
+fn terminal_output_disclosure_follows_live_history_and_keymap() {
+    use crate::exec_cell::CommandOutput;
+    use crate::exec_cell::new_active_exec_command;
+    use crate::keymap::RuntimeKeymap;
+    use codex_app_server_protocol::CommandExecutionSource;
+
+    let mut cell = new_active_exec_command(
+        "output-test".into(),
+        vec!["echo".into()],
+        Vec::new(),
+        CommandExecutionSource::Agent,
+        /*interaction_input*/ None,
+        /*animations_enabled*/ false,
+    );
+    cell.complete_call(
+        "output-test",
+        CommandOutput::new(/*exit_code*/ 0, "1\n2\n3\n4\n5\n6\n7\n8\n".into()),
+        std::time::Duration::ZERO,
+    );
+    let cell: Arc<dyn HistoryCell> = Arc::new(cell);
+    let mut view = TranscriptView::default();
+    view.sync_live_activity(&[], cell.activity_ids());
+    view.sync_live_activity_tail(
+        /*width*/ 72,
+        /*key*/ None,
+        /*expanded*/ false,
+        |width| {
+            Some(ActivityTranscriptLines {
+                activity: cell.compact_hyperlink_lines(width),
+                auxiliary: Vec::new(),
+                disclosure: cell.activity_disclosure(width),
+            })
+        },
+    );
+    let live = text(&render(
+        &mut view,
+        &[],
+        /*width*/ 72,
+        /*height*/ 6,
+    ));
+    let cells = [cell];
+    view.sync_live_activity(&cells, Vec::new());
+    view.sync_live_tail(/*width*/ 72, /*key*/ None, |_| None);
+    let committed = text(&render(
+        &mut view, &cells, /*width*/ 72, /*height*/ 6,
+    ));
+    assert_eq!(live, committed);
+    let hint = " (⌃t to expand)";
+    assert!(live.contains(&format!("+ 5 lines{hint}")));
+    // Check where the hint is visible, so the copy/search exclusion cannot pass vacuously.
+    assert!(
+        !view
+            .layout(&cells, /*index*/ 0)
+            .unwrap()
+            .text()
+            .contains(hint)
+    );
+    // Warm layouts must follow config changes, including chords and disabling the action.
+    for (configured, expected) in [
+        (serde_json::json!("f12"), " (f12 to expand)"),
+        (serde_json::json!("ctrl-x t"), " (⌃x t to expand)"),
+        (serde_json::json!([]), ""),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({
+            "global": {"open_transcript": configured}
+        }))
+        .unwrap();
+        let keymap = RuntimeKeymap::from_config(&config).unwrap();
+        view.set_keymap_bindings(&keymap);
+        assert_eq!(
+            text(&render(
+                &mut view, &cells, /*width*/ 72, /*height*/ 6,
+            )),
+            live.replace(hint, expected),
+        );
+    }
+}
+
+#[test]
+fn terminal_output_disclosure_counts_only_revealable_lines() {
+    use crate::exec_cell::CommandOutput;
+    use crate::exec_cell::new_active_exec_command;
+    use codex_app_server_protocol::CommandExecutionSource;
+
+    let mut frames = Vec::new();
+    for (name, command, output, width, streamed) in [
+        ("three visible", "echo", "a\nb\nc\n".to_owned(), 64, false),
+        ("one hidden", "echo", "a\nb\nc\nd\n".to_owned(), 64, false),
+        (
+            "clipped line",
+            "echo",
+            "abcdefghijklmnopqrstuvwxyz\n".to_owned(),
+            20,
+            false,
+        ),
+        ("command only", "echo a\necho b", String::new(), 64, false),
+        (
+            "storage truncated",
+            "echo",
+            "x\n".repeat(/*n*/ 530_000),
+            64,
+            true,
+        ),
+    ] {
+        let mut cell = new_active_exec_command(
+            "output-test".into(),
+            vec!["sh".into(), "-c".into(), command.into()],
+            Vec::new(),
+            CommandExecutionSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        if streamed {
+            cell.append_output("output-test", &output);
+        } else {
+            cell.complete_call(
+                "output-test",
+                CommandOutput::new(/*exit_code*/ 0, output),
+                std::time::Duration::from_secs(/*secs*/ 1),
+            );
+        }
+        let cells: [Arc<dyn HistoryCell>; 1] = [Arc::new(cell)];
+        frames.push(format!(
+            "{name}\n{}",
+            text(&render(
+                &mut TranscriptView::default(),
+                &cells,
+                width,
+                /*height*/ 6,
+            ))
+            .trim_end()
+        ));
+    }
+    insta::assert_snapshot!(frames.join("\n\n"));
+}
+
+#[test]
+fn startup_warning_keeps_first_visible_header_in_place() {
+    let header: Arc<dyn HistoryCell> =
+        Arc::new(crate::history_cell::SessionHeaderHistoryCell::new(
+            "gpt-test".into(),
+            /*reasoning_effort*/ None,
+            crate::test_support::test_path_buf("/project"),
+            "test",
+        ));
+    let mut view = TranscriptView::default();
+    view.sync_live_tail(/*width*/ 80, /*key*/ None, |width| {
+        Some(header.compact_hyperlink_lines(width))
+    });
+    let mut cells = Vec::new();
+    let before = render(&mut view, &cells, /*width*/ 80, /*height*/ 24);
+    cells.push(Arc::new(crate::history_cell::StartupWarningsCell::new(vec![
+        "Skill manifest is invalid.".into(),
+    ])) as Arc<dyn HistoryCell>);
+    assert_eq!(
+        render(&mut view, &cells, /*width*/ 80, /*height*/ 24),
+        before
+    );
+    view.sync_live_tail(/*width*/ 80, /*key*/ None, |_| None);
+    cells.insert(/*index*/ 0, header);
+    assert_eq!(
+        render(&mut view, &cells, /*width*/ 80, /*height*/ 24),
+        before
+    );
+    assert_eq!(crate::history_cell::warning_count(&cells), 1);
+}
+
+#[test]
+fn hidden_initial_entries_do_not_add_a_separator_but_visible_entries_do() {
+    let cells = vec![cell(""), cell(""), cell("First"), cell(""), cell("Second")];
+    let mut view = TranscriptView::default();
+    view.sync_live_tail(
+        /*width*/ 20,
+        /*key*/ None,
+        |_| Some(vec![HyperlinkLine::from("Live")]),
+    );
+    let frame = render(&mut view, &cells, /*width*/ 20, /*height*/ 5);
+    insta::assert_snapshot!(text(&frame), @"
+    First
+
+    Second
+
+    Live
+    ");
+    // Scrolling past the first visible entry must stop at its content, not its separator.
+    view.scroll(&cells, /*rows*/ -100);
+    assert_eq!(render(&mut view, &cells, /*width*/ 20, /*height*/ 5), frame);
 }
 
 #[test]
@@ -340,7 +720,7 @@ fn single_row_scrolling_crosses_an_entry_separator_in_both_directions() {
 }
 
 #[test]
-fn clicking_an_edge_does_not_start_selection_autoscroll() {
+fn selecting_within_an_edge_row_does_not_start_selection_autoscroll() {
     let cells = vec![cell(
         (0..40)
             .map(|row| format!("row {row:02}\n"))
@@ -367,6 +747,63 @@ fn clicking_an_edge_does_not_start_selection_autoscroll() {
                 before
             );
         }
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 3,
+                row: edge,
+                modifiers: KeyModifiers::NONE,
+            },
+            &cells,
+        );
+        let selected = render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
+        assert_eq!(text(&selected), text(&before));
+        assert_eq!(view.selected_text(&cells).as_deref(), Some("row"));
+        for _ in 0..10 {
+            assert!(!view.tick_selection(&cells));
+            assert_eq!(
+                render(&mut view, &cells, /*width*/ 20, /*height*/ 6),
+                selected
+            );
+            assert_eq!(view.selected_text(&cells).as_deref(), Some("row"));
+        }
+        if edge == 0 {
+            insta::assert_snapshot!("horizontal_selection_at_edge_0", text(&selected));
+        }
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 3,
+            row: edge,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.handle_mouse(
+            MouseEvent {
+                kind: if edge == 0 {
+                    MouseEventKind::ScrollUp
+                } else {
+                    MouseEventKind::ScrollDown
+                },
+                ..drag
+            },
+            &cells,
+        );
+        render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
+        view.handle_mouse(drag, &cells);
+        assert!(!view.tick_selection(&cells));
+        // A deliberate vertical drag can return to its starting edge and still autoscroll.
+        for row in [2, edge] {
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: 3,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &cells,
+            );
+            render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
+        }
+        assert!(view.tick_selection(&cells));
     }
 }
 
@@ -393,6 +830,10 @@ fn wheel_scrolling_pauses_selection_autoscroll_until_the_next_drag() {
             row: edge,
             modifiers: KeyModifiers::NONE,
         };
+        // Wheel input before the first drag must not lose the original physical row.
+        view.handle_mouse(MouseEvent { kind, ..drag }, &cells);
+        assert!(!view.tick_selection(&cells));
+        render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
         view.handle_mouse(drag, &cells);
         assert!(view.tick_selection(&cells));
         render(&mut view, &cells, /*width*/ 20, /*height*/ 6);
@@ -579,7 +1020,10 @@ fn mutable_history_formats_once_per_frame_and_refreshes_the_next_frame() {
         )),
         matched
     );
-    view.handle_key(KeyCode::Enter.into(), &cells);
+    view.handle_key(
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        &cells,
+    );
     assert!(!view.advance_search(&cells));
     assert!(
         text(&render(
@@ -839,4 +1283,81 @@ fn history_prefetch_counts_rows_in_preceding_entries() {
         view.jump_to_entry(&cells, /*index*/ 0);
         assert!(view.near_start(&cells));
     }
+}
+
+#[test]
+fn user_prompt_has_a_background_without_a_terminal_palette() {
+    use crate::history_cell::new_user_prompt;
+    use codex_protocol::user_input::TextElement;
+    use std::path::PathBuf;
+
+    let message = "First steering message";
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(new_user_prompt(
+        message.into(),
+        vec![TextElement::new((0..5).into(), Some("First".into()))],
+        vec![PathBuf::from("screenshot.png")],
+        Vec::new(),
+    ))];
+    crate::terminal_palette::with_test_default_colors(
+        /*colors*/ None::<crate::terminal_probe::DefaultColors>,
+        || {
+            let mut view = TranscriptView::default();
+            let buffer = render(&mut view, &cells, /*width*/ 32, /*height*/ 8);
+            insta::assert_snapshot!(
+                "user_prompt_has_a_background_without_a_terminal_palette",
+                format!("{buffer:?}")
+            );
+        },
+    );
+}
+
+#[test]
+fn spoken_prompt_selection_keeps_its_fallback_contrast() {
+    use crate::history_cell::new_spoken_user_prompt;
+    use ratatui::style::Color;
+    use ratatui::style::Modifier;
+
+    crate::terminal_palette::with_test_default_colors(
+        /*colors*/ None::<crate::terminal_probe::DefaultColors>,
+        || {
+            let cells: Vec<Arc<dyn HistoryCell>> =
+                vec![Arc::new(new_spoken_user_prompt("one\nnext".into()))];
+            for detailed in [false, true] {
+                let mut view = TranscriptView {
+                    detailed,
+                    ..TranscriptView::default()
+                };
+                let before = render(&mut view, &cells, /*width*/ 20, /*height*/ 5);
+                let rendered = text(&before);
+                let first = rendered
+                    .lines()
+                    .position(|row| row.contains("› one"))
+                    .unwrap() as u16;
+                let second = rendered
+                    .lines()
+                    .position(|row| row.contains("next"))
+                    .unwrap() as u16;
+                view.begin_selection(&cells, /*column*/ 2, first, /*clicks*/ 1);
+                view.extend_selection(/*column*/ 2, second);
+                let selected = render(&mut view, &cells, /*width*/ 20, /*height*/ 5);
+                let newline = &selected[(5, first)];
+                assert_eq!(
+                    (
+                        view.selected_text(&cells).as_deref(),
+                        selected[(0, first)].fg,
+                        newline.fg,
+                        newline.bg,
+                        newline.modifier.contains(Modifier::REVERSED),
+                    ),
+                    (
+                        Some("one\n"),
+                        Color::Red,
+                        Color::Reset,
+                        Color::DarkGray,
+                        true
+                    )
+                );
+            }
+        },
+    );
 }

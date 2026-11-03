@@ -8,12 +8,45 @@ use codex_protocol::models::ImageReference;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn request_token_ranges_keep_boundary_values_in_the_lower_bucket() {
+    let tokens = [
+        0,
+        19_999,
+        20_000,
+        20_001,
+        40_000,
+        40_001,
+        240_000,
+        240_001,
+        256_000,
+        256_001,
+        usize::MAX,
+    ];
+    assert_eq!(
+        tokens.map(request_token_bucket),
+        [
+            "01_0-20k",
+            "01_0-20k",
+            "01_0-20k",
+            "02_20k-40k",
+            "02_20k-40k",
+            "03_40k-60k",
+            "12_220k-240k",
+            "13_240k-256k",
+            "13_240k-256k",
+            "14_256k-max",
+            "14_256k-max"
+        ]
+    );
+}
+
+#[test]
 fn section_costs_keep_multimodal_payloads_separate() {
     let context = ComposedContext {
         sections: vec![
             SectionOutput {
                 id: "transcript",
-                delivery: SectionDelivery::UserContent(vec![
+                delivery: SectionDelivery::user_content(vec![
                     Budgeted::required(ContentItem::InputText {
                         text: "évidence".to_owned(),
                     }),
@@ -33,11 +66,12 @@ fn section_costs_keep_multimodal_payloads_separate() {
             },
             SectionOutput {
                 id: "trusted",
-                delivery: SectionDelivery::Message(Box::new(message(vec![
-                    ContentItem::InputText {
+                delivery: SectionDelivery::Message(crate::Budgeted::required(Box::new(
+                    message(vec![ContentItem::InputText {
                         text: "verified".to_owned(),
-                    },
-                ]))),
+                    }])
+                    .into(),
+                ))),
             },
         ],
         truncations: Vec::new(),
@@ -89,26 +123,55 @@ fn request_estimate_reserves_images_independently_of_encoded_size() {
 
 #[test]
 fn section_estimate_bounds_the_delivered_message() {
-    // Individually rounded costs do not always leave room for JSON separators.
-    for text in ["x", "quoted \"text\"", "évidence"] {
-        for count in 1..=40 {
-            let context = ComposedContext {
-                sections: vec![SectionOutput {
-                    id: "transcript",
-                    delivery: SectionDelivery::UserContent(vec![
-                        Budgeted::required(
-                            ContentItem::InputText {
-                                text: text.to_owned(),
-                            }
-                        );
-                        count
-                    ]),
-                }],
-                truncations: Vec::new(),
+    // Account for both JSON escaping layers and UTF-8-safe chunk boundaries.
+    for format in [crate::TranscriptFormat::Line, crate::TranscriptFormat::Json] {
+        for (text, max_count) in [
+            ("x".to_owned(), 40),
+            ("quoted \"text\"".to_owned(), 40),
+            ("é🙂\n\0\\".repeat(20_000), 1),
+        ] {
+            let mut record = crate::TranscriptRecord::new(
+                &crate::ConversationTranscriptEntryKind::Assistant,
+                /*index*/ 7,
+                text,
+                /*retained_source_order*/ None,
+                format,
+                /*suffix*/ "",
+            );
+            // Composition changes framing after preparation has populated the cache.
+            record.frame_for_sync("\n");
+            let expected = ContentItem::InputText {
+                text: record.to_string(),
             };
-            let estimate = context.estimated_tokens();
-            let delivered = context.into_messages();
-            assert!(estimate >= estimate_input_tokens(&delivered[0]));
+            assert_eq!(record.rendered().tokens, content_tokens(&expected));
+            assert_eq!(record.clone().into_content_item(), expected);
+            // Individually rounded costs must still leave room for separators.
+            for count in 1..=max_count {
+                let context = ComposedContext {
+                    sections: vec![SectionOutput {
+                        id: "transcript",
+                        delivery: SectionDelivery::UserContent(vec![
+                            Budgeted::required(
+                                record.clone().into()
+                            );
+                            count
+                        ]),
+                    }],
+                    truncations: Vec::new(),
+                };
+                assert_eq!(
+                    context.section_costs().collect::<Vec<_>>(),
+                    vec![(
+                        "transcript",
+                        SectionCost {
+                            text_bytes: record.to_string().len() * count,
+                            ..SectionCost::default()
+                        }
+                    )]
+                );
+                let estimate = context.estimated_tokens();
+                assert!(estimate >= estimate_input_tokens(&context.into_messages()[0]));
+            }
         }
     }
 }

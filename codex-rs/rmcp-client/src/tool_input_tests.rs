@@ -1,12 +1,12 @@
 //! Exercises pending MRTR input cleanup over a real duplex transport.
 
 use super::ElicitationClientService;
+use crate::request_input::call_tool;
 use crate::rmcp_client::ElicitationPauseState;
-use crate::tool_input::call_tool;
 use codex_protocol::mcp::OPENAI_ELICITATION_EXTENSION_ID;
 use rmcp::RoleServer;
 use rmcp::model::CallToolRequestParams;
-use rmcp::model::ClientInfo;
+use rmcp::model::ClientConfig;
 use rmcp::model::ClientJsonRpcMessage;
 use rmcp::model::CustomResult;
 use rmcp::model::ServerJsonRpcMessage;
@@ -28,7 +28,7 @@ async fn connection_closure_releases_pending_inputs_and_timeout_pause() -> anyho
             let pause_state = ElicitationPauseState::new();
             let mut paused = pause_state.subscribe();
             let (route_tx, mut route_rx) = mpsc::unbounded_channel();
-            let mut info = ClientInfo::default();
+            let mut info = ClientConfig::default();
             info.capabilities.extensions = Some(
                 [(
                     OPENAI_ELICITATION_EXTENSION_ID.into(),
@@ -53,7 +53,11 @@ async fn connection_closure_releases_pending_inputs_and_timeout_pause() -> anyho
                 tokio::io::duplex(/*max_buf_size*/ 4096);
             let client = serve_directly(service, client_transport, /*peer_info*/ None);
             let mut server = IntoTransport::<RoleServer, _, _>::into_transport(server_transport);
-            let call = call_tool(&client, CallToolRequestParams::new("test"));
+            let call = call_tool(
+                &client,
+                client.service(),
+                CallToolRequestParams::new("test"),
+            );
             tokio::pin!(call);
             let request = tokio::select! {
                 result = &mut call => panic!("tool completed before input: {result:?}"),

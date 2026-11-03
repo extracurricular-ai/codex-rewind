@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use codex_diagnostics::Gauge;
+use codex_exec_server::ExecutorCapabilityDiscoveryV2Cache;
 use codex_extension_api::ThreadIdleCause;
 use futures::future::BoxFuture;
 use tokio::select;
@@ -46,7 +47,9 @@ use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_otel::TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC;
+use codex_otel::auth_storage::AuthStorageOriginator;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::TokenUsage;
@@ -280,7 +283,7 @@ impl Session {
 
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "record the started turn atomically with its active reservation"
+        reason = "record the started turn atomically with task registration"
     )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
@@ -288,6 +291,18 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        // Replace the cache; in-flight acquisitions retain their previous Arc.
+        self.services
+            .thread_extension_data
+            .insert(ExecutorCapabilityDiscoveryV2Cache::default());
+        if turn_context
+            .config
+            .features
+            .enabled(Feature::ExecutorCapabilityDiscoveryV2)
+        {
+            // MCP contributors must project the new inventory even if their other inputs match.
+            self.request_mcp_runtime_reprojection();
+        }
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -313,9 +328,9 @@ impl Session {
         let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
-            self.record_started_turn(&turn_context.sub_id).await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
             debug_assert!(turn.task.is_none());
+            turn.finishing = None;
             Arc::clone(&turn.turn_state)
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
@@ -332,7 +347,13 @@ impl Session {
         let mut active = self.active_turn.lock().await;
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
-        let agent_execution_guard = self.services.agent_control.execution_guard(
+        // Record lineage only when the task starts: settings changes can invalidate a reservation.
+        self.record_started_turn(
+            &turn_context.sub_id,
+            (task_kind == TaskKind::Regular).then(|| turn_context.attribution()),
+        )
+        .await;
+        let agent_execution_guard = self.services.agent_control.admit_turn(
             turn_context.multi_agent_version,
             &turn_context.session_source,
         );
@@ -360,46 +381,46 @@ impl Session {
             codex.turn.token_usage.reasoning_output_tokens = field::Empty,
             codex.turn.token_usage.total_tokens = field::Empty,
         );
-        let handle = tokio::spawn(
-            async move {
-                let ctx_for_finish = Arc::clone(&ctx);
-                let task_result = task_for_run
-                    .run(
-                        Arc::clone(&session),
-                        ctx,
-                        task_input,
-                        task_cancellation_token.child_token(),
-                    )
-                    .instrument(trace_span!("session_task.run"))
-                    .await;
-                let sess = Arc::clone(&session);
-                // Private reviewers save their transcript together with the terminal event.
-                // Errors and cancellation retain their existing save path.
-                if (!sess.is_private_guardian_reviewer().await
-                    || task_cancellation_token.is_cancelled()
-                    || task_result.is_err())
-                    && let Err(err) = sess.flush_rollout().await
-                {
-                    warn!("failed to flush rollout before completing turn: {err}");
-                    sess.send_event(
-                        ctx_for_finish.as_ref(),
-                        EventMsg::Warning(WarningEvent {
-                            message: format!(
-                                "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
-                            ),
-                        }),
-                    )
-                    .await;
-                }
-                if !task_cancellation_token.is_cancelled() {
-                    // Finish uniformly from the spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
-                        .await;
-                }
-                done_clone.notify_waiters();
+        let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
+        let task_future = async move {
+            let ctx_for_finish = Arc::clone(&ctx);
+            let task_result = task_for_run
+                .run(
+                    Arc::clone(&session),
+                    ctx,
+                    task_input,
+                    task_cancellation_token.child_token(),
+                )
+                .instrument(trace_span!("session_task.run"))
+                .await;
+            let sess = Arc::clone(&session);
+            // Private reviewers save their transcript together with the terminal event.
+            // Errors and cancellation retain their existing save path.
+            if (!sess.is_private_guardian_reviewer().await
+                || task_cancellation_token.is_cancelled()
+                || task_result.is_err())
+                && let Err(err) = sess.flush_rollout().await
+            {
+                warn!("failed to flush rollout before completing turn: {err}");
+                sess.send_event(
+                    ctx_for_finish.as_ref(),
+                    EventMsg::Warning(WarningEvent {
+                        message: format!(
+                            "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
+                        ),
+                    }),
+                )
+                .await;
             }
-            .instrument(task_span),
-        );
+            if !task_cancellation_token.is_cancelled() {
+                // Finish uniformly from the spawn site so all tasks share the same lifecycle.
+                sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result)
+                    .await;
+            }
+            done_clone.notify_waiters();
+        }
+        .instrument(task_span);
+        let handle = tokio::spawn(storage_originator.scope(task_future));
         let timer = turn_context
             .session_telemetry
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
@@ -428,8 +449,8 @@ impl Session {
 
     /// Starts a regular turn when the session is idle and pending work is waiting.
     ///
-    /// Pending work includes mailbox mail marked with `trigger_turn`, or any mailbox mail while
-    /// an outstanding durable sleep is attached to the thread.
+    /// Mail can request a new task with `trigger_turn`, wake durable sleep, or wake a root with
+    /// `wake_on_agent_messages` enabled.
     ///
     /// This helper generates a fresh sub-id for the synthetic turn before delegating to the
     /// explicit-sub-id variant.
@@ -445,74 +466,80 @@ impl Session {
     /// Starts a regular turn with the provided sub-id when pending work should wake an idle
     /// session.
     ///
-    /// The turn is created only when the session is idle and mailbox mail either requests a turn
-    /// or can wake an outstanding durable sleep.
+    /// Starts an idle turn for explicit follow-ups, durable sleep, or enabled message wakes.
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
     ) {
-        if !self.input_queue.has_pending_mailbox_items().await
-            || (!self.input_queue.has_trigger_turn_mailbox_items().await
-                && !self.has_outstanding_durable_sleep())
-        {
+        if !self.input_queue.has_pending_mailbox_items().await {
             return;
         }
 
-        let turn_state = {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                return;
-            }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
+        let Some((turn_state, previous_options)) = self.reserve_pending_work_turn().await else {
+            return;
         };
 
         self.services
             .models_manager
             .refresh_after_auth_change(self.get_config().await.http_client_factory())
             .await;
-        // A completion-triggered wakeup can be interrupted while discovery waits.
-        if self
-            .active_turn
-            .lock()
-            .await
-            .as_ref()
-            .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
-        {
-            return;
-        }
+        let session_configuration = if self.enabled(Feature::WakeOnAgentMessages) {
+            let Some(configuration) = self.pending_work_turn_configuration(&turn_state).await
+            else {
+                return;
+            };
+            Some(configuration)
+        } else {
+            if self
+                .active_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
+            {
+                return;
+            }
+            None
+        };
         let (input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
         if !input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) {
-            // Queue-only mail wakes durable sleep without selecting a new task's settings.
+            // Queue-only wakes retain the previous turn context without selecting a new task.
+            start_options = previous_options;
             start_options.cyber_access_program = self
                 .reference_context_item()
                 .await
                 .and_then(|context| context.cyber_access_program);
         }
-        let turn_context = self
-            .new_turn_with_default_settings(
-                sub_id,
-                NewTurnContextOptions {
-                    final_output_json_schema: start_options.final_output_json_schema,
-                    cyber_access_program: start_options.cyber_access_program,
-                },
-            )
-            .await;
+        let options = NewTurnContextOptions {
+            final_output_json_schema: start_options.final_output_json_schema,
+            cyber_access_program: start_options.cyber_access_program,
+        };
+        let turn_context = match session_configuration {
+            Some(configuration) => {
+                self.new_turn_with_configuration(sub_id, configuration, options)
+                    .await
+            }
+            None => self.new_turn_with_default_settings(sub_id, options).await,
+        };
         if let Some(trigger) = start_options.turn_trigger {
             turn_context.turn_metadata_state.set_turn_trigger(trigger);
         }
         if let Some(id) = start_options.parent_turn_id {
-            if let Some(initiating_agent_path) = input.iter().find_map(|item| {
-                let TurnInput::InterAgentCommunication(communication) = item else {
-                    return None;
-                };
-                communication
-                    .trigger_turn
-                    .then(|| communication.author.clone())
-            }) {
+            if let Some(initiating_agent_path) = input
+                .iter()
+                .find_map(|item| {
+                    let TurnInput::InterAgentCommunication(communication) = item else {
+                        return None;
+                    };
+                    communication
+                        .trigger_turn
+                        .then(|| communication.author.clone())
+                })
+                .or(start_options.initiating_agent_path)
+            {
                 turn_context
                     .turn_metadata_state
                     .set_initiating_agent_path(initiating_agent_path);
@@ -528,6 +555,17 @@ impl Session {
         self.input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
             .await;
+        // Context construction can outlive an interrupt or replacement. Do not let
+        // start_task recreate a turn whose reservation is no longer ours.
+        if self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
+        {
+            return;
+        }
         self.start_task(turn_context, Vec::new(), RegularTask::new())
             .await;
     }
@@ -535,24 +573,23 @@ impl Session {
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
-        let mut turn_context = None;
         if let Some(mut active_turn) = self.take_active_turn(&reason).await {
             let task = active_turn.task.take();
             aborted_turn = task.is_some();
-            turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
-                self.handle_task_abort(task, reason.clone(), &active_turn.turn_state)
-                    .await;
+                self.handle_task_abort(
+                    task,
+                    reason.clone(),
+                    &active_turn.turn_state,
+                    /*error*/ None,
+                )
+                .await;
             }
             if aborted_turn {
                 active_turn_to_clear = Some(active_turn);
             }
         }
 
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
-        }
         if let Some(active_turn) = active_turn_to_clear {
             // Let interrupted tasks observe cancellation before dropping pending approvals, or an
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
@@ -567,6 +604,7 @@ impl Session {
         self: &Arc<Self>,
         turn_id: &str,
         reason: TurnAbortReason,
+        error: Option<ErrorEvent>,
     ) -> bool {
         let active_turn = {
             let mut active = self.active_turn.lock().await;
@@ -586,18 +624,23 @@ impl Session {
                 None
             }
         };
-        let Some(mut active_turn) = active_turn else {
+        let Some(active_turn) = active_turn else {
             return false;
         };
 
+        self.finish_turn_abort(active_turn, reason, error).await;
+        true
+    }
+
+    pub(crate) async fn finish_turn_abort(
+        self: &Arc<Self>,
+        mut active_turn: ActiveTurn,
+        reason: TurnAbortReason,
+        error: Option<ErrorEvent>,
+    ) {
         let task = active_turn.task.take();
-        let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state)
-                .await;
-        }
-        if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
+            self.handle_task_abort(task, reason.clone(), &active_turn.turn_state, error)
                 .await;
         }
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
@@ -607,8 +650,6 @@ impl Session {
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
         }
-
-        true
     }
 
     pub async fn on_task_finished(
@@ -626,6 +667,7 @@ impl Session {
                 self.emit_turn_error_lifecycle(
                     turn_context.as_ref(),
                     err.to_codex_protocol_error(),
+                    err.details(),
                 )
                 .await;
                 self.track_turn_codex_error(turn_context.as_ref(), &err);
@@ -641,11 +683,14 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
+        let finishing = CancellationToken::new();
+        let finish_recording = finishing.clone().drop_guard();
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             active.as_mut().and_then(|active_turn| {
                 let task = active_turn.task.take()?;
                 task.handle.detach();
+                active_turn.finishing = Some(finishing);
                 Some(Arc::clone(&active_turn.turn_state))
             })
         };
@@ -678,6 +723,7 @@ impl Session {
             PersistContext::Standard,
         )
         .await;
+        drop(finish_recording);
         let turn_telemetry = &turn_context.session_telemetry;
         // Emit token usage metrics.
         {
@@ -787,6 +833,11 @@ impl Session {
             .turn_timing_state
             .complete_profile_and_duration_ms()
             .await;
+        crate::turn_timing::record_turn_profile_trace(
+            self.thread_id,
+            &turn_context.sub_id,
+            &profile,
+        );
         self.services
             .analytics_events_client
             .track_turn_profile(TurnProfileFact {
@@ -810,8 +861,10 @@ impl Session {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
             EventMsg::TurnAborted(TurnAbortedEvent {
+                root_turn_id: Some(turn_context.root_turn_id()),
                 turn_id: Some(turn_context.sub_id.clone()),
                 reason,
+                error: None,
                 started_at,
                 completed_at,
                 duration_ms,
@@ -825,6 +878,7 @@ impl Session {
             self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
                 .await;
             EventMsg::TurnComplete(TurnCompleteEvent {
+                root_turn_id: Some(turn_context.root_turn_id()),
                 turn_id: turn_context.sub_id.clone(),
                 last_agent_message,
                 error,
@@ -874,10 +928,14 @@ impl Session {
         if matches!(
             reason,
             TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
-        ) && active
-            .as_ref()
-            .is_some_and(|active_turn| active_turn.task.is_some())
-        {
+        ) && active.as_ref().is_some_and(|turn| {
+            turn.task.is_some()
+                || (self.enabled(Feature::WakeOnAgentMessages) && turn.finishing.is_none())
+        }) {
+            // Message wakes reserve work before registering a task. With the
+            // feature enabled, stopping a reservation must block later mail too.
+            // Finishing turns must retain their status until completion is
+            // persisted, so capacity eviction cannot close their rollout writer.
             self.mark_interrupted();
         }
         active.take()
@@ -906,9 +964,12 @@ impl Session {
         task: RunningTask,
         reason: TurnAbortReason,
         turn_state: &Mutex<TurnState>,
+        error: Option<ErrorEvent>,
     ) {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
+            self.emit_turn_abort_lifecycle(reason, task.turn_context.extension_data.as_ref())
+                .await;
             return;
         }
 
@@ -936,10 +997,16 @@ impl Session {
             },
             _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
                 warn!("task {sub_id} didn't complete gracefully after {}ms", GRACEFULL_INTERRUPTION_TIMEOUT_MS);
+                // Forced teardown can abort independently spawned tool dispatches
+                // whose guards are destroyed later. Do not publish complete totals
+                // for a dependency graph that has not settled.
+                task.turn_context.turn_timing_state.invalidate_critical_path();
             }
         }
 
         task.handle.abort();
+        // Aborting schedules destruction; join before freezing the turn's timing.
+        let _ = task.handle.await;
 
         session_task
             .abort(Arc::clone(self), Arc::clone(&task.turn_context))
@@ -980,15 +1047,24 @@ impl Session {
             .turn_timing_state
             .complete_profile_and_duration_ms()
             .await;
+        crate::turn_timing::record_turn_profile_trace(
+            self.thread_id,
+            &task.turn_context.sub_id,
+            &profile,
+        );
         self.services
             .analytics_events_client
             .track_turn_profile(TurnProfileFact {
                 turn_id: task.turn_context.sub_id.clone(),
                 profile,
             });
+        self.emit_turn_abort_lifecycle(reason.clone(), task.turn_context.extension_data.as_ref())
+            .await;
         let event = EventMsg::TurnAborted(TurnAbortedEvent {
+            root_turn_id: Some(task.turn_context.root_turn_id()),
             turn_id: Some(task.turn_context.sub_id.clone()),
             reason,
+            error,
             started_at,
             completed_at,
             duration_ms,

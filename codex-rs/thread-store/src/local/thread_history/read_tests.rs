@@ -23,6 +23,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::ItemSortKey;
+use crate::ListItemsPosition;
 use crate::ListTimelineParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SortDirection;
@@ -67,6 +68,11 @@ async fn list_turns_pages_projected_rows_and_applies_item_views() {
         )
         .await;
     }
+    sqlx::query("UPDATE thread_turns SET root_turn_id = 'root-1' WHERE thread_id = ? AND turn_id IN ('turn-1', 'turn-3')")
+        .bind(thread_id.to_string())
+        .execute(db)
+        .await
+        .expect("record known causal roots");
     for (turn_id, item_id, ordinal) in [
         ("turn-1", "user-1", 11),
         ("turn-1", "middle-1", 12),
@@ -86,6 +92,14 @@ async fn list_turns_pages_projected_rows_and_applies_item_views() {
         .await
         .expect("first turns page");
     assert_eq!(turn_ids(&first_page), vec!["turn-1", "turn-2"]);
+    assert_eq!(
+        first_page
+            .turns
+            .iter()
+            .map(|turn| turn.root_turn_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("root-1"), None],
+    );
     assert_eq!(
         first_page.turns[0].items,
         vec![
@@ -112,6 +126,7 @@ async fn list_turns_pages_projected_rows_and_applies_item_views() {
         .await
         .expect("second turns page");
     assert_eq!(turn_ids(&second_page), vec!["turn-3"]);
+    assert_eq!(second_page.turns[0].root_turn_id.as_deref(), Some("root-1"));
     assert_eq!(second_page.turns[0].items, Vec::new());
     assert_eq!(second_page.turns[0].status, StoredTurnStatus::InProgress);
     let backwards_page = store
@@ -230,6 +245,169 @@ async fn list_items_pages_whole_thread_and_per_turn_rows() {
         .await
         .expect("next turn item page");
     assert_eq!(item_ids(&next_turn_page), vec!["item-3"]);
+}
+
+#[tokio::test]
+async fn item_anchors_page_exclusively_while_the_turn_grows() {
+    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let db = history_db(&store).await;
+    insert_turn(
+        db,
+        thread_id,
+        "turn",
+        /*rollout_ordinal*/ 1,
+        "inProgress",
+        /*error_json*/ None,
+        /*first_user_item_id*/ None,
+        /*final_agent_item_id*/ None,
+    )
+    .await;
+    for (id, ordinal) in [
+        ("one", 2),
+        ("two", 3),
+        ("anchor", 4),
+        ("four", 5),
+        ("five", 6),
+    ] {
+        insert_item(db, thread_id, "turn", id, ordinal).await;
+    }
+    insert_item(
+        db,
+        thread_id,
+        "other-turn",
+        "anchor",
+        /*rollout_ordinal*/ 8,
+    )
+    .await;
+    for (direction, expected) in [
+        (SortDirection::Asc, vec!["four", "five", "new"]),
+        (SortDirection::Desc, vec!["two", "one"]),
+    ] {
+        let mut params = item_params(
+            thread_id,
+            Some("turn"),
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            direction,
+        );
+        params.position = Some(ListItemsPosition::ItemAnchor {
+            item_id: "anchor".to_string(),
+        });
+        let first = store.list_items(params.clone()).await.expect("anchor page");
+        assert_eq!(item_ids(&first), vec![expected[0]]);
+        if direction == SortDirection::Asc {
+            insert_item(db, thread_id, "turn", "new", /*rollout_ordinal*/ 7).await;
+        }
+        let mut ids = vec![first.items[0].item_id.clone()];
+        params.position = first.next_cursor.map(ListItemsPosition::Cursor);
+        while params.position.is_some() {
+            let page = store
+                .list_items(params.clone())
+                .await
+                .expect("continuation");
+            ids.extend(page.items.into_iter().map(|item| item.item_id));
+            params.position = page.next_cursor.map(ListItemsPosition::Cursor);
+        }
+        assert_eq!(ids, expected);
+        params.position = first.backwards_cursor.map(ListItemsPosition::Cursor);
+        params.sort_direction = match direction {
+            SortDirection::Asc => SortDirection::Desc,
+            SortDirection::Desc => SortDirection::Asc,
+        };
+        let backwards = store.list_items(params).await.expect("reverse page");
+        assert_eq!(item_ids(&backwards), vec![expected[0]]);
+    }
+    for (id, direction) in [("one", SortDirection::Desc), ("new", SortDirection::Asc)] {
+        let mut params = item_params(
+            thread_id,
+            Some("turn"),
+            /*cursor*/ None,
+            /*page_size*/ 2,
+            direction,
+        );
+        params.position = Some(ListItemsPosition::ItemAnchor {
+            item_id: id.to_string(),
+        });
+        let page = store.list_items(params).await.expect("edge anchor");
+        assert!(page.items.is_empty());
+        assert_eq!((page.next_cursor, page.backwards_cursor), (None, None));
+    }
+}
+
+#[tokio::test]
+async fn item_anchors_require_creation_order_without_an_update_watermark() {
+    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    insert_item(
+        history_db(&store).await,
+        thread_id,
+        "turn",
+        "anchor",
+        /*rollout_ordinal*/ 1,
+    )
+    .await;
+    for (sort_key, after_updated_at_ordinal) in [
+        (ItemSortKey::UpdatedAtOrdinal, None),
+        (ItemSortKey::CreatedAtOrdinal, Some(0)),
+    ] {
+        let params = ListItemsParams {
+            position: Some(ListItemsPosition::ItemAnchor {
+                item_id: "anchor".to_string(),
+            }),
+            sort_key,
+            after_updated_at_ordinal,
+            ..item_params(
+                thread_id,
+                Some("turn"),
+                /*cursor*/ None,
+                /*page_size*/ 1,
+                SortDirection::Asc,
+            )
+        };
+        let error = store
+            .list_items(params)
+            .await
+            .expect_err("invalid anchor paging mode");
+        assert!(matches!(error, ThreadStoreError::InvalidRequest { message }
+            if message == "item anchors require creation-order paging without an update watermark"));
+    }
+}
+
+#[tokio::test]
+async fn item_anchors_reject_items_outside_the_requested_scope() {
+    let (_home, store, thread_id) = store_with_mode(ThreadHistoryMode::Paginated).await;
+    let db = history_db(&store).await;
+    insert_item(
+        db,
+        thread_id,
+        "other-turn",
+        "other-turn-item",
+        /*rollout_ordinal*/ 2,
+    )
+    .await;
+    insert_item(
+        db,
+        ThreadId::default(),
+        "turn",
+        "other-thread-item",
+        /*rollout_ordinal*/ 2,
+    )
+    .await;
+    for anchor in ["", "unknown", "other-turn-item", "other-thread-item"] {
+        let mut params = item_params(
+            thread_id,
+            Some("turn"),
+            /*cursor*/ None,
+            /*page_size*/ 1,
+            SortDirection::Asc,
+        );
+        params.position = Some(ListItemsPosition::ItemAnchor {
+            item_id: anchor.to_string(),
+        });
+        let error = store.list_items(params).await.expect_err("invalid anchor");
+        assert!(
+            matches!(error, ThreadStoreError::InvalidRequest { message } if message == "cursor.itemId does not identify an item in the requested history scope")
+        );
+    }
 }
 
 #[tokio::test]
@@ -676,7 +854,7 @@ async fn list_items_filters_exclusive_update_ordinals_across_pages_and_turns() {
     assert_eq!(first_page.items, vec![item_2.clone(), item_3.clone()]);
     for params in [
         ListItemsParams {
-            cursor: creation_page.next_cursor,
+            position: creation_page.next_cursor.map(ListItemsPosition::Cursor),
             ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
         },
         item_params(
@@ -696,7 +874,7 @@ async fn list_items_filters_exclusive_update_ordinals_across_pages_and_turns() {
 
     let second_page = store
         .list_items(ListItemsParams {
-            cursor: first_page.next_cursor,
+            position: first_page.next_cursor.map(ListItemsPosition::Cursor),
             ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
         })
         .await
@@ -723,7 +901,7 @@ async fn list_items_filters_exclusive_update_ordinals_across_pages_and_turns() {
     assert_eq!(descending_page.items, vec![item_1, item_3]);
     let descending_next_page = store
         .list_items(ListItemsParams {
-            cursor: descending_page.next_cursor,
+            position: descending_page.next_cursor.map(ListItemsPosition::Cursor),
             sort_direction: SortDirection::Desc,
             ..updated_item_params(thread_id, /*after_updated_at_ordinal*/ 0)
         })
@@ -992,6 +1170,47 @@ async fn lineage_reads_page_across_parent_and_child_segments() {
         vec!["root-user", "root-agent"]
     );
 
+    let mut anchored = item_params(
+        child_id,
+        Some("root-1"),
+        /*cursor*/ None,
+        /*page_size*/ 2,
+        SortDirection::Desc,
+    );
+    anchored.position = Some(ListItemsPosition::ItemAnchor {
+        item_id: "root-agent".to_string(),
+    });
+    let page = store
+        .list_items(anchored.clone())
+        .await
+        .expect("inherited anchor");
+    assert_eq!(item_ids(&page), vec!["root-user"]);
+    anchored.turn_id = Some("excluded-root".to_string());
+    anchored.position = Some(ListItemsPosition::ItemAnchor {
+        item_id: "excluded-item".to_string(),
+    });
+    assert!(
+        matches!(store.list_items(anchored).await, Err(ThreadStoreError::InvalidRequest { message }) if message == "cursor.itemId does not identify an item in the requested history scope")
+    );
+
+    let inherited_lookup =
+        item_lookup_params(child_id, "root-1", &["root-agent", "root-user", "missing"]);
+    let inherited_lookup = store
+        .list_items(inherited_lookup)
+        .await
+        .expect("lookup inherited items");
+    assert_eq!(item_ids(&inherited_lookup), vec!["root-user", "root-agent"]);
+
+    let excluded_lookup = item_lookup_params(child_id, "excluded-root", &["excluded-item"]);
+    assert!(
+        store
+            .list_items(excluded_lookup)
+            .await
+            .expect("exclude source item after fork cutoff")
+            .items
+            .is_empty()
+    );
+
     for sort_key in [ItemSortKey::CreatedAtOrdinal, ItemSortKey::UpdatedAtOrdinal] {
         let error = store
             .list_items(ListItemsParams {
@@ -1170,6 +1389,8 @@ async fn lineage_reads_nested_forks() {
     for (thread_id, turn_id, ordinal, status, first_user_item_id) in [
         (root_id, "root", 1, "completed", None),
         (root_id, "shared", 2, "completed", Some("before-fork")),
+        (root_id, "child", 4, "completed", None),
+        (middle_id, "child", 3, "completed", None),
         (middle_id, "shared", 5, "interrupted", None),
         (middle_id, "middle", 6, "completed", None),
         (child_id, "child", 8, "completed", None),
@@ -1186,6 +1407,11 @@ async fn lineage_reads_nested_forks() {
         )
         .await;
     }
+    sqlx::query("UPDATE thread_turns SET root_turn_id = 'causal-root' WHERE thread_id = ? AND turn_id = 'shared'")
+        .bind(middle_id.to_string())
+        .execute(db)
+        .await
+        .expect("record terminal turn root");
     insert_item(
         db,
         root_id,
@@ -1214,6 +1440,7 @@ async fn lineage_reads_nested_forks() {
         .await
         .expect("first nested descending page");
     assert_eq!(turn_ids(&first_descending_page), vec!["child", "middle"]);
+    assert_eq!(first_descending_page.turns[0].root_turn_id, None);
     let second_descending_page = store
         .list_turns(turn_params(
             child_id,
@@ -1225,6 +1452,10 @@ async fn lineage_reads_nested_forks() {
         .await
         .expect("second nested descending page");
     assert_eq!(turn_ids(&second_descending_page), vec!["shared", "root"]);
+    assert_eq!(
+        second_descending_page.turns[0].root_turn_id.as_deref(),
+        Some("causal-root")
+    );
     assert_eq!(
         second_descending_page.turns[0].status,
         StoredTurnStatus::Interrupted
@@ -1280,6 +1511,10 @@ async fn lineage_reads_nested_forks() {
         .await
         .expect("navigate to effective occurrence turn");
     assert_eq!(turn_ids(&occurrence_turn), vec!["shared"]);
+    assert_eq!(
+        occurrence_turn.turns[0].root_turn_id.as_deref(),
+        Some("causal-root")
+    );
 }
 
 async fn store_with_mode(history_mode: ThreadHistoryMode) -> (TempDir, LocalThreadStore, ThreadId) {
@@ -1334,7 +1569,7 @@ fn write_rollout_with_end(
     let mut lines = vec![RolloutLine {
         timestamp: "2026-07-16T00:00:00.000Z".to_string(),
         ordinal: Some(initial_ordinal),
-        item: RolloutItem::SessionMeta(SessionMetaLine {
+        item: RolloutItem::SessionMeta(Box::new(SessionMetaLine {
             meta: SessionMeta {
                 session_id: thread_id.into(),
                 id: thread_id,
@@ -1343,7 +1578,7 @@ fn write_rollout_with_end(
                 ..SessionMeta::default()
             },
             git: None,
-        }),
+        })),
     }];
     for offset in 1..next_ordinal {
         let ordinal = initial_ordinal
@@ -1495,10 +1730,11 @@ fn item_params(
     sort_direction: SortDirection,
 ) -> ListItemsParams {
     ListItemsParams {
+        item_ids: None,
         thread_id,
         turn_id: turn_id.map(str::to_owned),
         include_archived: false,
-        cursor,
+        position: cursor.map(ListItemsPosition::Cursor),
         page_size,
         sort_direction,
         sort_key: ItemSortKey::CreatedAtOrdinal,
@@ -1520,12 +1756,27 @@ fn updated_item_params(thread_id: ThreadId, after_updated_at_ordinal: u64) -> Li
     }
 }
 
+fn item_lookup_params(thread_id: ThreadId, turn_id: &str, item_ids: &[&str]) -> ListItemsParams {
+    ListItemsParams {
+        item_ids: Some(item_ids.iter().map(ToString::to_string).collect()),
+        ..item_params(
+            thread_id,
+            Some(turn_id),
+            /*cursor*/ None,
+            item_ids.len(),
+            SortDirection::Asc,
+        )
+    }
+}
+
 fn expected_item(turn_id: &str, item_id: &str, rollout_ordinal: u64) -> StoredThreadItem {
     StoredThreadItem {
         turn_id: turn_id.to_string(),
         item_id: item_id.to_string(),
         updated_at_ordinal: rollout_ordinal,
         created_at_ms: i64::try_from(rollout_ordinal).expect("fixture ordinal fits i64") * 1_000,
+        started_at_ms: None,
+        completed_at_ms: None,
         item_json: fixture_item(item_id).1.into_bytes(),
     }
 }

@@ -37,9 +37,10 @@ use wiremock::matchers::method;
 use super::ExecServerHandler;
 use super::registry::build_router;
 use super::session_registry::SessionRegistry;
-use crate::ExecServerRuntimePaths;
+use crate::ExecServerRuntimeOptions;
 use crate::ExecServerTelemetry;
 use crate::connection::JsonRpcConnectionEvent;
+use crate::discover_v2::capability_manager::CapabilityManager;
 use crate::protocol::EXEC_METHOD;
 use crate::protocol::EXEC_READ_METHOD;
 use crate::protocol::EXEC_TERMINATE_METHOD;
@@ -622,6 +623,9 @@ fn exported_logs(
         tls: None,
     };
     let otel = OtelProvider::try_new(&OtelSettings {
+        http_client_factory: codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
         environment: "test".to_string(),
         service_name: "codex-exec-server".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -639,7 +643,7 @@ fn exported_logs(
         },
         metrics_exporter: OtelExporter::None,
         runtime_metrics: false,
-        span_attributes: BTreeMap::new(),
+        span_attributes: HashMap::new(),
         tracestate: BTreeMap::new(),
     })
     .expect("OTEL settings")
@@ -735,8 +739,9 @@ fn new_handler(
 ) -> Arc<ExecServerHandler> {
     let mut handler = ExecServerHandler::new(
         Arc::clone(sessions),
+        CapabilityManager::new(crate::LocalFileSystem::default()),
         RpcNotificationSender::new(outgoing),
-        ExecServerRuntimePaths::new(
+        ExecServerRuntimeOptions::new(
             std::env::current_exe().expect("test executable"),
             /*codex_linux_sandbox_exe*/ None,
         )

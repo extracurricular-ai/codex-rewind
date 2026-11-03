@@ -22,11 +22,16 @@ use crate::endpoint::realtime_websocket::protocol::parse_realtime_event;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::backoff;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::NetworkPolicyDenied;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeTranscriptDelta;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
+use codex_websocket_client::WebSocketConnection;
+use codex_websocket_client::WebSocketConnector;
+use codex_websocket_client::WebSocketTlsMode;
 use futures::SinkExt;
 use futures::StreamExt;
 use http::HeaderMap;
@@ -37,13 +42,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use tokio::net::TcpStream;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -52,6 +55,7 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::protocol::frame::coding::CloseCode;
 use url::Url;
@@ -64,6 +68,7 @@ const TRUNCATED_TRANSCRIPT_PREFIX: &str = "…";
 struct WsStream {
     tx_command: mpsc::Sender<WsCommand>,
     pump_task: tokio::task::JoinHandle<()>,
+    terminal_policy_error: tokio::sync::watch::Receiver<Option<NetworkPolicyDenied>>,
 }
 
 enum WsCommand {
@@ -72,19 +77,27 @@ enum WsCommand {
         tx_result: oneshot::Sender<Result<(), WsError>>,
     },
     Close {
+        frame: Option<CloseFrame>,
         tx_result: oneshot::Sender<Result<(), WsError>>,
     },
 }
 
 impl WsStream {
     fn new(
-        inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        inner: WebSocketConnection,
     ) -> (Self, async_channel::Receiver<Result<Message, WsError>>) {
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
         let (tx_message, rx_message) = async_channel::unbounded::<Result<Message, WsError>>();
 
+        let (terminal_policy_tx, terminal_policy_error) = tokio::sync::watch::channel(None);
         let pump_task = tokio::spawn(async move {
             let mut inner = inner;
+            let report_write_policy_error = |error: &WsError| {
+                if let Some(denied) = codex_websocket_client::network_policy_denial(error) {
+                    terminal_policy_tx.send_replace(Some(denied));
+                    let _ = tx_message.try_send(Err(Self::policy_error(denied)));
+                }
+            };
             loop {
                 tokio::select! {
                     command = rx_command.recv() => {
@@ -98,17 +111,19 @@ impl WsStream {
                                 let should_break = result.is_err();
                                 if let Err(err) = &result {
                                     error!("realtime websocket send failed: {err}");
+                                    report_write_policy_error(err);
                                 }
                                 let _ = tx_result.send(result);
                                 if should_break {
                                     break;
                                 }
                             }
-                            WsCommand::Close { tx_result } => {
+                            WsCommand::Close { frame, tx_result } => {
                                 info!("realtime websocket sending close");
-                                let result = inner.close(None).await;
+                                let result = inner.send(Message::Close(frame)).await;
                                 if let Err(err) = &result {
                                     error!("realtime websocket close failed: {err}");
+                                    report_write_policy_error(err);
                                 }
                                 let _ = tx_result.send(result);
                                 break;
@@ -124,6 +139,7 @@ impl WsStream {
                                 trace!(payload_len = payload.len(), "realtime websocket received ping");
                                 if let Err(err) = inner.send(Message::Pong(payload)).await {
                                     error!("realtime websocket failed to send pong: {err}");
+                                    terminal_policy_tx.send_replace(codex_websocket_client::network_policy_denial(&err));
                                     let _ = tx_message.send(Err(err)).await;
                                     break;
                                 }
@@ -161,6 +177,7 @@ impl WsStream {
                             }
                             Err(err) => {
                                 error!("realtime websocket receive failed: {err}");
+                                    terminal_policy_tx.send_replace(codex_websocket_client::network_policy_denial(&err));
                                 let _ = tx_message.send(Err(err)).await;
                                 break;
                             }
@@ -175,6 +192,7 @@ impl WsStream {
             Self {
                 tx_command,
                 pump_task,
+                terminal_policy_error,
             },
             rx_message,
         )
@@ -186,9 +204,23 @@ impl WsStream {
     ) -> Result<(), WsError> {
         let (tx_result, rx_result) = oneshot::channel();
         if self.tx_command.send(make_command(tx_result)).await.is_err() {
-            return Err(WsError::ConnectionClosed);
+            return Err(self.closed_error());
         }
-        rx_result.await.unwrap_or(Err(WsError::ConnectionClosed))
+        rx_result.await.unwrap_or_else(|_| Err(self.closed_error()))
+    }
+
+    fn closed_error(&self) -> WsError {
+        match *self.terminal_policy_error.borrow() {
+            Some(denied) => Self::policy_error(denied),
+            None => WsError::ConnectionClosed,
+        }
+    }
+
+    fn policy_error(denied: NetworkPolicyDenied) -> WsError {
+        WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            denied,
+        ))
     }
 
     async fn send(&self, message: Message) -> Result<(), WsError> {
@@ -196,8 +228,10 @@ impl WsStream {
             .await
     }
 
-    async fn close(&self) -> Result<(), WsError> {
-        self.request(|tx_result| WsCommand::Close { tx_result })
+    /// Ask the socket pump to send a close frame to the connected peer and
+    /// return the write result.
+    async fn close(&self, frame: Option<CloseFrame>) -> Result<(), WsError> {
+        self.request(|tx_result| WsCommand::Close { frame, tx_result })
             .await
     }
 }
@@ -237,9 +271,46 @@ pub struct RealtimeTranscriptState {
 
 #[derive(Default)]
 struct ActiveTranscriptState {
-    entries: Vec<RealtimeTranscriptEntry>,
+    entries: Vec<ActiveTranscriptEntry>,
+    last_frame: Option<TranscriptFrame>,
+    frame_sequence: u64,
+    input_last_raw_frame: Option<u64>,
+    output_last_raw_frame: Option<u64>,
     new_input_entry: bool,
     new_output_entry: bool,
+}
+
+impl ActiveTranscriptState {
+    fn take_entries(&mut self) -> Vec<RealtimeTranscriptEntry> {
+        self.input_last_raw_frame = None;
+        self.output_last_raw_frame = None;
+        self.entries
+            .drain(..)
+            .map(|entry| entry.transcript)
+            .collect()
+    }
+}
+
+struct ActiveTranscriptEntry {
+    transcript: RealtimeTranscriptEntry,
+    last_raw_frame: Option<u64>,
+    truncated_prefix_bytes: usize,
+}
+
+impl ActiveTranscriptEntry {
+    fn retained_text(&self) -> &str {
+        if self.truncated_prefix_bytes > 0 {
+            &self.transcript.text[TRUNCATED_TRANSCRIPT_PREFIX.len()..]
+        } else {
+            &self.transcript.text
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+struct TranscriptFrame {
+    start_ms: u64,
+    end_ms: u64,
 }
 
 impl RealtimeWebsocketConnection {
@@ -426,7 +497,7 @@ impl RealtimeWebsocketWriter {
                 )));
             }
         }
-        if let Err(err) = self.stream.close().await
+        if let Err(err) = self.stream.close(/*frame*/ None).await
             && !matches!(err, WsError::ConnectionClosed | WsError::AlreadyClosed)
         {
             return Err(ApiError::Stream(format!(
@@ -434,6 +505,20 @@ impl RealtimeWebsocketWriter {
             )));
         }
         Ok(())
+    }
+
+    /// Detach an observer without ending the frontend-owned realtime session.
+    pub async fn close_transport(&self) -> Result<(), ApiError> {
+        if self.is_closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.stream
+            .close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "".into(),
+            }))
+            .await
+            .map_err(|err| ApiError::Stream(format!("failed to close websocket transport: {err}")))
     }
 
     async fn send_json(&self, message: &RealtimeOutboundMessage) -> Result<(), ApiError> {
@@ -480,8 +565,8 @@ impl RealtimeWebsocketWriter {
 
     pub async fn send_payload(&self, payload: String) -> Result<(), ApiError> {
         if self.is_closed.load(Ordering::SeqCst) {
-            return Err(ApiError::Stream(
-                "realtime websocket connection is closed".to_string(),
+            return Err(map_realtime_websocket_connect_error(
+                self.stream.closed_error(),
             ));
         }
 
@@ -489,7 +574,7 @@ impl RealtimeWebsocketWriter {
         self.stream
             .send(Message::Text(payload.into()))
             .await
-            .map_err(|err| ApiError::Stream(format!("failed to send realtime request: {err}")))?;
+            .map_err(map_realtime_websocket_connect_error)?;
         Ok(())
     }
 }
@@ -518,9 +603,7 @@ impl RealtimeWebsocketEvents {
                 Ok(Err(err)) => {
                     self.is_closed.store(true, Ordering::SeqCst);
                     error!("realtime websocket read failed: {err}");
-                    return Err(ApiError::Stream(format!(
-                        "failed to read websocket message: {err}"
-                    )));
+                    return Err(map_realtime_websocket_connect_error(err));
                 }
                 Err(_) => {
                     self.is_closed.store(true, Ordering::SeqCst);
@@ -539,7 +622,17 @@ impl RealtimeWebsocketEvents {
                 Message::Text(text) => {
                     trace!(target: REALTIME_WIRE_LOG_TARGET, "realtime websocket event: {text}");
                     if let Some(mut event) = parse_realtime_event(&text, self.event_parser) {
-                        self.update_active_transcript(&mut event).await;
+                        let frame = if self.event_parser == RealtimeEventParser::FramelessBidi
+                            && matches!(
+                                event,
+                                RealtimeEvent::InputTranscriptDelta(_)
+                                    | RealtimeEvent::OutputTranscriptDelta(_)
+                            ) {
+                            serde_json::from_str::<TranscriptFrame>(&text).ok()
+                        } else {
+                            None
+                        };
+                        self.update_active_transcript(&mut event, frame).await;
                         debug!(?event, "realtime websocket parsed event");
                         return Ok(Some(event));
                     }
@@ -595,11 +688,26 @@ impl RealtimeWebsocketEvents {
         }
     }
 
-    async fn update_active_transcript(&self, event: &mut RealtimeEvent) {
+    async fn update_active_transcript(
+        &self,
+        event: &mut RealtimeEvent,
+        frame: Option<TranscriptFrame>,
+    ) {
         let mut active_transcript = self.transcript_state.active.lock().await;
+        let frame_sequence = frame.map(|frame| {
+            // Both speakers in one frame have equal recency, regardless of wire event order.
+            // Count observed frames so reconnects do not depend on an absolute timestamp origin.
+            if active_transcript.last_frame != Some(frame) {
+                truncate_active_transcript(&mut active_transcript.entries);
+                active_transcript.frame_sequence += 1;
+                active_transcript.last_frame = Some(frame);
+            }
+            active_transcript.frame_sequence
+        });
         match event {
             RealtimeEvent::InputAudioSpeechStarted(_) => {
                 active_transcript.new_input_entry = true;
+                active_transcript.input_last_raw_frame = None;
             }
             RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
                 let force_new = active_transcript.new_input_entry;
@@ -609,9 +717,11 @@ impl RealtimeWebsocketEvents {
                     delta,
                     force_new,
                     self.event_parser,
+                    frame_sequence,
                 );
                 if !delta.is_empty() || self.event_parser != RealtimeEventParser::FramelessBidi {
                     active_transcript.new_input_entry = false;
+                    active_transcript.input_last_raw_frame = frame_sequence;
                 }
             }
             RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta { delta, .. }) => {
@@ -622,43 +732,53 @@ impl RealtimeWebsocketEvents {
                     delta,
                     force_new,
                     self.event_parser,
+                    frame_sequence,
                 );
                 if !delta.is_empty() || self.event_parser != RealtimeEventParser::FramelessBidi {
                     active_transcript.new_output_entry = false;
+                    active_transcript.output_last_raw_frame = frame_sequence;
                 }
             }
             RealtimeEvent::InputTranscriptDone(done) => {
                 let force_new = active_transcript.new_input_entry;
+                let last_raw_frame = active_transcript.input_last_raw_frame;
                 apply_transcript_done(
                     &mut active_transcript.entries,
                     "user",
                     &done.text,
                     force_new,
                     self.event_parser,
+                    last_raw_frame,
                 );
                 active_transcript.new_input_entry =
                     self.event_parser == RealtimeEventParser::FramelessBidi;
+                active_transcript.input_last_raw_frame = None;
             }
             RealtimeEvent::OutputTranscriptDone(done) => {
                 let force_new = active_transcript.new_output_entry;
+                let last_raw_frame = active_transcript.output_last_raw_frame;
                 apply_transcript_done(
                     &mut active_transcript.entries,
                     "assistant",
                     &done.text,
                     force_new,
                     self.event_parser,
+                    last_raw_frame,
                 );
                 active_transcript.new_output_entry =
                     self.event_parser == RealtimeEventParser::FramelessBidi;
+                active_transcript.output_last_raw_frame = None;
             }
             RealtimeEvent::HandoffRequested(handoff) => {
+                truncate_active_transcript(&mut active_transcript.entries);
                 append_handoff_input(&mut active_transcript.entries, &handoff.input_transcript);
-                handoff.active_transcript = std::mem::take(&mut active_transcript.entries);
+                handoff.active_transcript = active_transcript.take_entries();
                 active_transcript.new_input_entry = true;
                 active_transcript.new_output_entry = true;
             }
             RealtimeEvent::ResponseCreated(_) => {
                 active_transcript.new_output_entry = true;
+                active_transcript.output_last_raw_frame = None;
             }
             RealtimeEvent::SessionUpdated { .. }
             | RealtimeEvent::AudioOut(_)
@@ -672,42 +792,100 @@ impl RealtimeWebsocketEvents {
             | RealtimeEvent::HistoryTranscriptDelta { .. }
             | RealtimeEvent::HistoryItemCompleted(_) => {}
         }
-        truncate_active_transcript(&mut active_transcript.entries);
+        if let Some(frame_sequence) = frame_sequence {
+            // Wait for both speakers before evicting utterances from this frame. Each updated
+            // utterance is bounded independently, so pending transcript text is at most the previous
+            // 8 KiB transcript plus 8 KiB per speaker, even if no further event arrives.
+            for entry in &mut active_transcript.entries {
+                if entry.last_raw_frame == Some(frame_sequence) {
+                    truncate_transcript_entry(entry, MAX_ACTIVE_TRANSCRIPT_BYTES);
+                }
+            }
+        } else {
+            truncate_active_transcript(&mut active_transcript.entries);
+        }
     }
 }
 
 impl RealtimeTranscriptState {
     pub async fn take_transcript_tail(&self) -> Vec<RealtimeTranscriptEntry> {
-        std::mem::take(&mut self.active.lock().await.entries)
+        let mut active = self.active.lock().await;
+        truncate_active_transcript(&mut active.entries);
+        active.take_entries()
     }
 }
 
-fn truncate_active_transcript(entries: &mut Vec<RealtimeTranscriptEntry>) {
-    let mut total_bytes = transcript_entries_bytes(entries);
+fn truncate_active_transcript(entries: &mut Vec<ActiveTranscriptEntry>) {
+    let mut total_bytes = transcript_entries_bytes(entries.iter().map(|entry| &entry.transcript));
     while total_bytes > MAX_ACTIVE_TRANSCRIPT_BYTES && entries.len() > 1 {
-        total_bytes = total_bytes.saturating_sub(transcript_entry_bytes(&entries[0]));
-        entries.remove(0);
+        // An earlier utterance can contain the newest speech. Evict by raw frame recency,
+        // preserving the legacy FIFO policy without timing.
+        let oldest = if entries.iter().all(|entry| entry.last_raw_frame.is_some()) {
+            entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_raw_frame)
+                .map(|(index, _)| index)
+                .unwrap_or_default()
+        } else {
+            0
+        };
+        if let Some(frame) = entries[oldest].last_raw_frame
+            && entries
+                .iter()
+                .all(|entry| entry.last_raw_frame == Some(frame))
+        {
+            // Both speakers have equally recent speech. Keep their suffixes in conversation
+            // order, letting short entries keep their text before dividing the remaining budget.
+            let mut remaining_bytes = MAX_ACTIVE_TRANSCRIPT_BYTES;
+            let mut remaining_entries = entries.len();
+            let mut by_size: Vec<_> = entries.iter_mut().collect();
+            by_size.sort_unstable_by_key(|entry| transcript_entry_bytes(&entry.transcript));
+            for entry in by_size {
+                let entry_budget = remaining_bytes / remaining_entries;
+                truncate_transcript_entry(entry, entry_budget);
+                remaining_bytes -= transcript_entry_bytes(&entry.transcript);
+                remaining_entries -= 1;
+            }
+            return;
+        }
+        total_bytes -= transcript_entry_bytes(&entries.remove(oldest).transcript);
     }
-    let Some(entry) = entries.first_mut() else {
-        return;
-    };
-    let entry_overhead = entry.role.len() + 3;
-    let max_text_bytes = MAX_ACTIVE_TRANSCRIPT_BYTES.saturating_sub(entry_overhead);
-    if entry.text.len() <= max_text_bytes {
+    if let Some(entry) = entries.first_mut() {
+        truncate_transcript_entry(entry, MAX_ACTIVE_TRANSCRIPT_BYTES);
+    }
+}
+
+fn truncate_transcript_entry(entry: &mut ActiveTranscriptEntry, max_bytes: usize) {
+    let entry_overhead = entry.transcript.role.len() + 3;
+    let max_text_bytes = max_bytes.saturating_sub(entry_overhead);
+    if entry.transcript.text.len() <= max_text_bytes {
         return;
     }
     let mut start = entry
+        .transcript
         .text
         .len()
         .saturating_sub(max_text_bytes.saturating_sub(TRUNCATED_TRANSCRIPT_PREFIX.len()));
-    while !entry.text.is_char_boundary(start) {
+    while !entry.transcript.text.is_char_boundary(start) {
         start += 1;
     }
-    entry.text = format!("{TRUNCATED_TRANSCRIPT_PREFIX}{}", &entry.text[start..]);
+    let previous_marker_bytes = if entry.truncated_prefix_bytes > 0 {
+        TRUNCATED_TRANSCRIPT_PREFIX.len()
+    } else {
+        0
+    };
+    entry.truncated_prefix_bytes += start - previous_marker_bytes;
+    entry.transcript.text = format!(
+        "{TRUNCATED_TRANSCRIPT_PREFIX}{}",
+        &entry.transcript.text[start..]
+    );
 }
 
-fn transcript_entries_bytes(entries: &[RealtimeTranscriptEntry]) -> usize {
-    entries.iter().map(transcript_entry_bytes).sum()
+fn transcript_entries_bytes<'a>(
+    entries: impl IntoIterator<Item = &'a RealtimeTranscriptEntry>,
+) -> usize {
+    entries.into_iter().map(transcript_entry_bytes).sum()
 }
 
 fn transcript_entry_bytes(entry: &RealtimeTranscriptEntry) -> usize {
@@ -715,11 +893,12 @@ fn transcript_entry_bytes(entry: &RealtimeTranscriptEntry) -> usize {
 }
 
 fn append_transcript_delta(
-    entries: &mut Vec<RealtimeTranscriptEntry>,
+    entries: &mut Vec<ActiveTranscriptEntry>,
     role: &str,
     delta: &str,
     force_new: bool,
     event_parser: RealtimeEventParser,
+    frame_sequence: Option<u64>,
 ) {
     if delta.is_empty() {
         return;
@@ -728,30 +907,37 @@ fn append_transcript_delta(
     // V3 interleaves the two speakers' transcripts. Legacy protocols retain
     // adjacent speaker runs and their existing response lifecycle semantics.
     let entry = match event_parser {
-        RealtimeEventParser::FramelessBidi => {
-            entries.iter_mut().rev().find(|entry| entry.role == role)
-        }
-        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => {
-            entries.last_mut().filter(|entry| entry.role == role)
-        }
+        RealtimeEventParser::FramelessBidi => entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.transcript.role == role),
+        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => entries
+            .last_mut()
+            .filter(|entry| entry.transcript.role == role),
     };
     if !force_new && let Some(last_entry) = entry {
-        last_entry.text.push_str(delta);
+        last_entry.transcript.text.push_str(delta);
+        last_entry.last_raw_frame = frame_sequence;
         return;
     }
 
-    entries.push(RealtimeTranscriptEntry {
-        role: role.to_string(),
-        text: delta.to_string(),
+    entries.push(ActiveTranscriptEntry {
+        transcript: RealtimeTranscriptEntry {
+            role: role.to_string(),
+            text: delta.to_string(),
+        },
+        last_raw_frame: frame_sequence,
+        truncated_prefix_bytes: 0,
     });
 }
 
 fn apply_transcript_done(
-    entries: &mut Vec<RealtimeTranscriptEntry>,
+    entries: &mut Vec<ActiveTranscriptEntry>,
     role: &str,
     text: &str,
     force_new: bool,
     event_parser: RealtimeEventParser,
+    last_raw_frame: Option<u64>,
 ) {
     if text.is_empty() {
         return;
@@ -760,49 +946,64 @@ fn apply_transcript_done(
     // V3 interleaves the two speakers' transcripts. Legacy protocols retain
     // adjacent speaker runs and their existing response lifecycle semantics.
     let entry = match event_parser {
-        RealtimeEventParser::FramelessBidi => {
-            entries.iter_mut().rev().find(|entry| entry.role == role)
-        }
-        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => {
-            entries.last_mut().filter(|entry| entry.role == role)
-        }
+        RealtimeEventParser::FramelessBidi => entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.transcript.role == role),
+        RealtimeEventParser::V1 | RealtimeEventParser::RealtimeV2 => entries
+            .last_mut()
+            .filter(|entry| entry.transcript.role == role),
     };
     if !force_new && let Some(last_entry) = entry {
         // A delayed V3 final can arrive after deltas from the next utterance.
         // Preserve accumulated speech unless the final extends it.
-        if event_parser != RealtimeEventParser::FramelessBidi || text.starts_with(&last_entry.text)
+        if event_parser != RealtimeEventParser::FramelessBidi
+            || text
+                .get(last_entry.truncated_prefix_bytes..)
+                .is_some_and(|text| text.starts_with(last_entry.retained_text()))
         {
-            last_entry.text = text.to_string();
+            last_entry.transcript.text = text.to_string();
+            last_entry.truncated_prefix_bytes = 0;
         }
         return;
     }
 
-    entries.push(RealtimeTranscriptEntry {
-        role: role.to_string(),
-        text: text.to_string(),
+    entries.push(ActiveTranscriptEntry {
+        transcript: RealtimeTranscriptEntry {
+            role: role.to_string(),
+            text: text.to_string(),
+        },
+        // A final for an evicted current utterance must not become newer than retained speech.
+        last_raw_frame: if force_new { None } else { last_raw_frame },
+        truncated_prefix_bytes: 0,
     });
 }
 
-fn append_handoff_input(entries: &mut Vec<RealtimeTranscriptEntry>, input: &str) {
+fn append_handoff_input(entries: &mut Vec<ActiveTranscriptEntry>, input: &str) {
     let input = input.trim();
     if input.is_empty() || contains_transcript_entry(entries, "user", input) {
         return;
     }
 
-    entries.push(RealtimeTranscriptEntry {
-        role: "user".to_string(),
-        text: input.to_string(),
+    entries.push(ActiveTranscriptEntry {
+        transcript: RealtimeTranscriptEntry {
+            role: "user".to_string(),
+            text: input.to_string(),
+        },
+        last_raw_frame: None,
+        truncated_prefix_bytes: 0,
     });
 }
 
-fn contains_transcript_entry(entries: &[RealtimeTranscriptEntry], role: &str, text: &str) -> bool {
+fn contains_transcript_entry(entries: &[ActiveTranscriptEntry], role: &str, text: &str) -> bool {
     entries
         .iter()
-        .any(|entry| entry.role == role && entry.text.trim() == text.trim())
+        .any(|entry| entry.transcript.role == role && entry.transcript.text.trim() == text.trim())
 }
 
 pub struct RealtimeWebsocketClient {
     provider: Provider,
+    http_client_factory: HttpClientFactory,
     webrtc_sideband_base_url: String,
 }
 
@@ -814,9 +1015,10 @@ enum RealtimeSessionInitialization {
 }
 
 impl RealtimeWebsocketClient {
-    pub fn new(provider: Provider) -> Self {
+    pub fn new(provider: Provider, http_client_factory: HttpClientFactory) -> Self {
         Self {
             provider,
+            http_client_factory,
             webrtc_sideband_base_url: OPENAI_REALTIME_API_BASE_URL.to_string(),
         }
     }
@@ -879,15 +1081,28 @@ impl RealtimeWebsocketClient {
         default_headers: HeaderMap,
         transcript_state: RealtimeTranscriptState,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
-        self.connect_sideband(
-            config,
-            call_id,
-            extra_headers,
-            default_headers,
-            RealtimeSessionInitialization::ExistingCall,
-            transcript_state,
-        )
-        .await
+        // Instant Connect returns a call ID before ICE activates the call. Its sideband
+        // can briefly return 404 while the client connects media in parallel.
+        let mut activation_delays = [100, 300, 800].into_iter();
+        loop {
+            let result = self
+                .connect_sideband(
+                    config.clone(),
+                    call_id,
+                    extra_headers.clone(),
+                    default_headers.clone(),
+                    RealtimeSessionInitialization::ExistingCall,
+                    transcript_state.clone(),
+                )
+                .await;
+            if matches!(&result, Err(ApiError::Api { status, .. }) if *status == StatusCode::NOT_FOUND)
+                && let Some(delay_ms) = activation_delays.next()
+            {
+                sleep(Duration::from_millis(delay_ms)).await;
+                continue;
+            }
+            return result;
+        }
     }
 
     async fn connect_sideband(
@@ -915,6 +1130,9 @@ impl RealtimeWebsocketClient {
                 .await;
             match result {
                 Ok(connection) => return Ok(connection),
+                Err(err @ ApiError::Transport(codex_http_client::TransportError::Policy(_))) => {
+                    return Err(err);
+                }
                 Err(err) if webrtc_sideband_session_ended(&err) => return Err(err),
                 Err(err) if attempt < self.provider.retry.max_attempts => {
                     let delay = backoff(self.provider.retry.base_delay, attempt + 1);
@@ -998,28 +1216,29 @@ impl RealtimeWebsocketClient {
         info!("connecting realtime websocket: {ws_url}");
         // Realtime websocket TLS should honor the same custom-CA env vars as the rest of Codex's
         // outbound HTTPS and websocket traffic.
-        let connector = maybe_build_rustls_client_config_with_custom_ca()
-            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
-            .map(tokio_tungstenite::Connector::Rustls);
+        let tls_config = maybe_build_rustls_client_config_with_custom_ca()
+            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
         // A fresh Windows install may not have downloaded the server's trusted root yet.
         // Use platform validation only for system trust, preserving custom CA semantics.
         #[cfg(windows)]
-        let connector = match connector {
-            Some(connector) => Some(connector),
-            None => Some(tokio_tungstenite::Connector::Rustls(
+        let tls_config = match tls_config {
+            Some(tls_config) => Some(tls_config),
+            None => Some(
                 codex_http_client::build_windows_platform_tls_config().map_err(|err| {
                     ApiError::Stream(format!("failed to configure websocket TLS: {err}"))
                 })?,
-            )),
+            ),
         };
-        let (stream, response) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            Some(websocket_config()),
-            false,
-            connector,
-        )
-        .await
-        .map_err(map_realtime_websocket_connect_error)?;
+        let tls_mode = match tls_config {
+            Some(tls_config) => WebSocketTlsMode::Rustls(tls_config),
+            None => WebSocketTlsMode::TungsteniteDefault,
+        };
+        let connector = WebSocketConnector::new_with_tls_mode(&self.http_client_factory, tls_mode)
+            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
+        let (stream, response) = connector
+            .connect(request, websocket_config())
+            .await
+            .map_err(map_realtime_websocket_connect_error)?;
         info!(
             ws_url = %ws_url,
             status = %response.status(),
@@ -1077,6 +1296,9 @@ fn webrtc_sideband_session_ended(err: &ApiError) -> bool {
 }
 
 fn map_realtime_websocket_connect_error(err: WsError) -> ApiError {
+    if let Some(denied) = codex_websocket_client::network_policy_denial(&err) {
+        return ApiError::Transport(codex_http_client::TransportError::Policy(denied));
+    }
     match err {
         WsError::Http(response) => ApiError::Api {
             status: response.status(),
@@ -1257,6 +1479,7 @@ mod tests {
     use super::*;
     use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptEntry;
     use crate::provider::RetryConfig;
+    use codex_http_client::OutboundProxyPolicy::ReqwestDefault;
     use codex_protocol::protocol::RealtimeHandoffRequested;
     use codex_protocol::protocol::RealtimeInputAudioSpeechStarted;
     use codex_protocol::protocol::RealtimeNoopRequested;
@@ -1277,6 +1500,10 @@ mod tests {
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
     use tungstenite::protocol::CloseFrame;
+
+    fn test_client(provider: Provider) -> RealtimeWebsocketClient {
+        RealtimeWebsocketClient::new(provider, HttpClientFactory::new(ReqwestDefault))
+    }
 
     #[test]
     fn parse_session_updated_event() {
@@ -1384,14 +1611,18 @@ mod tests {
         let mut covered = RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta {
             delta: "already handed off".to_string(),
         });
-        events.update_active_transcript(&mut covered).await;
+        events
+            .update_active_transcript(&mut covered, /*frame*/ None)
+            .await;
         let mut handoff = RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
             handoff_id: "handoff_1".to_string(),
             item_id: "item_1".to_string(),
             input_transcript: "already handed off".to_string(),
             active_transcript: vec![],
         });
-        events.update_active_transcript(&mut handoff).await;
+        events
+            .update_active_transcript(&mut handoff, /*frame*/ None)
+            .await;
         assert_eq!(
             handoff,
             RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
@@ -1408,7 +1639,9 @@ mod tests {
         let mut tail = RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta {
             delta: "tail".to_string(),
         });
-        events.update_active_transcript(&mut tail).await;
+        events
+            .update_active_transcript(&mut tail, /*frame*/ None)
+            .await;
         assert_eq!(
             events.take_transcript_tail().await,
             vec![RealtimeTranscriptEntry {
@@ -1433,7 +1666,9 @@ mod tests {
         let mut partial = RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta {
             delta: "hello wor".to_string(),
         });
-        first_events.update_active_transcript(&mut partial).await;
+        first_events
+            .update_active_transcript(&mut partial, /*frame*/ None)
+            .await;
 
         let (_second_tx, second_rx) = async_channel::unbounded();
         let second_events = RealtimeWebsocketEvents {
@@ -1446,7 +1681,9 @@ mod tests {
         let mut done = RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
             text: "hello world".to_string(),
         });
-        second_events.update_active_transcript(&mut done).await;
+        second_events
+            .update_active_transcript(&mut done, /*frame*/ None)
+            .await;
 
         assert_eq!(
             second_events.take_transcript_tail().await,
@@ -1471,12 +1708,20 @@ mod tests {
         let mut oversized = RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta {
             delta: format!("old{}new", "x".repeat(MAX_ACTIVE_TRANSCRIPT_BYTES)),
         });
-        events.update_active_transcript(&mut oversized).await;
+        for frame in [
+            None,
+            Some(TranscriptFrame {
+                start_ms: 0,
+                end_ms: 200,
+            }),
+        ] {
+            events.update_active_transcript(&mut oversized, frame).await;
 
-        let tail = events.take_transcript_tail().await;
-        assert!(transcript_entries_bytes(&tail) <= MAX_ACTIVE_TRANSCRIPT_BYTES);
-        assert!(tail[0].text.starts_with(TRUNCATED_TRANSCRIPT_PREFIX));
-        assert!(tail[0].text.ends_with("new"));
+            let tail = events.take_transcript_tail().await;
+            assert!(transcript_entries_bytes(&tail) <= MAX_ACTIVE_TRANSCRIPT_BYTES);
+            assert!(tail[0].text.starts_with(TRUNCATED_TRANSCRIPT_PREFIX));
+            assert!(tail[0].text.ends_with("new"));
+        }
     }
 
     #[test]
@@ -1524,6 +1769,59 @@ mod tests {
             TestRealtimeTermination::EventChannelEnd => drop(tx_message),
         }
         events.next_event().await.is_err()
+    }
+
+    #[tokio::test]
+    async fn writer_policy_failure_reaches_realtime_events() {
+        use codex_http_client::DestinationPolicy::Unrestricted;
+        use codex_http_client::NetworkPolicyController;
+        use codex_http_client::NetworkPolicyDenied::Revoked;
+        use codex_http_client::TransportError::Policy;
+        use codex_websocket_client::network_policy_denial;
+        use tokio::time::timeout;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let (writing, started) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let socket = accept_async(socket).await.unwrap();
+            socket.get_ref().peek(&mut [0]).await.unwrap();
+            writing.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let controller = NetworkPolicyController::default();
+        let policy = controller.policy();
+        controller.publish(policy.revision(), Unrestricted);
+        let factory = HttpClientFactory::new(ReqwestDefault).with_network_policy(policy.clone());
+        let connector = WebSocketConnector::new(&factory).unwrap();
+        let request = url.into_client_request().unwrap();
+        let connected = connector.connect(request, websocket_config());
+        let (socket, _) = connected.await.unwrap();
+        let (stream, rx_message) = WsStream::new(socket);
+        let parser = RealtimeEventParser::V1;
+        let transcript = RealtimeTranscriptState::default();
+        let connection = RealtimeWebsocketConnection::new(stream, rx_message, parser, transcript);
+        let stream = Arc::clone(&connection.writer.stream);
+        let payload = Message::Binary(vec![0; 8 * 1024 * 1024].into());
+        let writer = tokio::spawn(async move {
+            loop {
+                if let Err(error) = stream.send(payload.clone()).await {
+                    return error;
+                }
+            }
+        });
+        let deadline = Duration::from_secs(/*secs*/ 5);
+        timeout(deadline, started).await.unwrap().unwrap();
+        policy.invalidate();
+        let writer = timeout(deadline, writer).await.unwrap();
+        let error = writer.unwrap();
+        assert_eq!(network_policy_denial(&error), Some(Revoked));
+        let next = timeout(deadline, connection.next_event());
+        let error = next.await.unwrap().unwrap_err();
+        assert!(matches!(error, ApiError::Transport(Policy(Revoked))));
+        assert!(connection.next_event().await.unwrap().is_none());
+        server.abort();
     }
 
     #[tokio::test]
@@ -2215,7 +2513,7 @@ mod tests {
 
     #[test]
     fn webrtc_frameless_sideband_ignores_provider_base_url() {
-        let client = RealtimeWebsocketClient::new(Provider {
+        let client = test_client(Provider {
             name: "chatgpt".to_string(),
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             query_params: None,
@@ -2425,7 +2723,7 @@ mod tests {
             },
             stream_idle_timeout: Duration::from_secs(5),
         };
-        let client = RealtimeWebsocketClient::new(provider);
+        let client = test_client(provider);
         let connection = client
             .connect(
                 RealtimeSessionConfig {
@@ -2751,7 +3049,7 @@ mod tests {
             },
             stream_idle_timeout: Duration::from_secs(5),
         };
-        let client = RealtimeWebsocketClient::new(provider);
+        let client = test_client(provider);
         let connection = client
             .connect(
                 RealtimeSessionConfig {
@@ -2878,7 +3176,7 @@ mod tests {
             },
             stream_idle_timeout: Duration::from_secs(5),
         };
-        let client = RealtimeWebsocketClient::new(provider);
+        let client = test_client(provider);
         let connection = client
             .connect(
                 RealtimeSessionConfig {
@@ -2984,7 +3282,7 @@ mod tests {
             },
             stream_idle_timeout: Duration::from_secs(5),
         };
-        let client = RealtimeWebsocketClient::new(provider);
+        let client = test_client(provider);
         let connection = client
             .connect(
                 RealtimeSessionConfig {
@@ -3076,7 +3374,7 @@ mod tests {
             },
             stream_idle_timeout: Duration::from_secs(5),
         };
-        let client = RealtimeWebsocketClient::new(provider);
+        let client = test_client(provider);
         let connection = client
             .connect(
                 RealtimeSessionConfig {

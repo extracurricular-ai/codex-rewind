@@ -23,6 +23,20 @@ pub(super) struct ThreadUsageStatusHistory {
 
 impl App {
     pub(super) fn insert_history_cell(&mut self, tui: &mut tui::Tui, cell: Box<dyn HistoryCell>) {
+        // Global deprecations can be delivered again by hidden threads. Scope deduplication to
+        // retained history so clearing or rebuilding a transcript can show the notice again.
+        if let Some(notice) = cell
+            .as_any()
+            .downcast_ref::<history_cell::DeprecationNoticeCell>()
+            && self.transcript_cells.iter().any(|existing| {
+                existing
+                    .as_any()
+                    .downcast_ref::<history_cell::DeprecationNoticeCell>()
+                    == Some(notice)
+            })
+        {
+            return;
+        }
         if !crate::empty_state_animation::is_startup_cell(cell.as_ref()) {
             self.chat_widget
                 .empty_state_animation
@@ -267,11 +281,7 @@ impl App {
         if let Err(err) = webbrowser::open(&url) {
             self.chat_widget
                 .add_error_message(format!("Failed to open browser for {url}: {err}"));
-            return;
         }
-
-        self.chat_widget
-            .add_info_message(format!("Opened {url} in your browser."), /*hint*/ None);
     }
 
     pub(super) fn open_desktop_thread(&mut self, thread_id: ThreadId) {
@@ -293,7 +303,8 @@ impl App {
         width: u16,
         version: &'static str,
     ) -> Vec<Line<'static>> {
-        self.clear_ui_header_cell(version).display_lines(width)
+        self.clear_ui_header_cell(version)
+            .display_lines_for_mode(width, self.chat_widget.history_render_mode())
     }
 
     /// Share the source-backed header between retained drawing and legacy terminal insertion.
@@ -304,10 +315,6 @@ impl App {
         history_cell::SessionHeaderHistoryCell::new(
             self.chat_widget.model_display_name().to_string(),
             self.chat_widget.current_reasoning_effort(),
-            self.chat_widget.should_show_fast_status(
-                self.chat_widget.current_model(),
-                self.chat_widget.current_service_tier(),
-            ),
             self.config.cwd.to_path_buf(),
             version,
         )
@@ -336,7 +343,10 @@ impl App {
             .history_wrap_width(tui.terminal.last_known_screen_size.width);
         let header_lines = self.clear_ui_header_lines(width);
         if !header_lines.is_empty() {
-            tui.insert_history_lines(header_lines);
+            tui.insert_history_lines_with_wrap_policy(
+                header_lines,
+                self.history_line_wrap_policy(),
+            );
             self.has_emitted_history_lines = true;
         }
     }
@@ -381,9 +391,14 @@ impl App {
     pub(super) fn reset_transcript_state_after_clear(&mut self) {
         self.overlay = None;
         self.transcript_cells.clear();
+        self.turn_tips.dismiss();
+        self.chat_widget.warning_display_state.dismissed.clear();
+        self.chat_widget.warning_display_state.transcript = Arc::default();
+        self.chat_widget.warning_display_state.synced_cells = None;
         self.native_history = Default::default();
         self.cancel_pending_key_chord();
         self.transcript_view = Default::default();
+        *self.chat_widget.rendered_selection.borrow_mut() = Default::default();
         self.last_rendered_history_tail = None;
         self.last_thread_usage_status_cell = None;
         self.pending_thread_usage_history_refresh = false;

@@ -1,5 +1,7 @@
 use super::PreviousSectionState;
+use super::SectionTransition;
 use super::WorldStateSection;
+use super::WorldStateUpdate;
 use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
 use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::ContextualUserFragment;
@@ -10,12 +12,14 @@ use std::collections::BTreeSet;
 /// Newly approved command prefixes visible without the full permissions instructions.
 #[derive(Clone, Debug)]
 pub(crate) struct CompactPermissionsState {
+    saved_prefix_heading: Option<String>,
     prefixes: BTreeSet<Vec<String>>,
 }
 
 impl CompactPermissionsState {
-    pub(crate) fn new(exec_policy: &Policy) -> Self {
+    pub(crate) fn new(exec_policy: &Policy, saved_prefix_heading: Option<&str>) -> Self {
         Self {
+            saved_prefix_heading: saved_prefix_heading.map(str::to_owned),
             prefixes: exec_policy.get_allowed_prefixes().into_iter().collect(),
         }
     }
@@ -24,10 +28,6 @@ impl CompactPermissionsState {
 impl WorldStateSection for CompactPermissionsState {
     const ID: &'static str = "approved_command_prefixes";
     type Snapshot = BTreeSet<Vec<String>>;
-
-    fn snapshot(&self) -> Self::Snapshot {
-        self.prefixes.clone()
-    }
 
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "developer"
@@ -39,18 +39,31 @@ impl WorldStateSection for CompactPermissionsState {
     fn render_diff(
         &self,
         previous: PreviousSectionState<'_, Self::Snapshot>,
-    ) -> Option<Box<dyn ContextualUserFragment>> {
+    ) -> SectionTransition<Self::Snapshot> {
+        let current = self.prefixes.clone();
         let added_prefixes = match previous {
             PreviousSectionState::Known(previous) => self
                 .prefixes
                 .difference(previous)
                 .cloned()
                 .collect::<Vec<_>>(),
-            PreviousSectionState::Absent | PreviousSectionState::Unknown => return None,
+            PreviousSectionState::Absent | PreviousSectionState::Unknown => {
+                return (Some(current), Vec::new());
+            }
         };
-        format_allow_prefixes(added_prefixes)
-            .filter(|prefixes| !prefixes.is_empty())
-            .map(|prefixes| Box::new(ApprovedCommandPrefixSaved::new(prefixes)) as _)
+        let fragment: Option<Box<dyn ContextualUserFragment>> =
+            format_allow_prefixes(added_prefixes)
+                .filter(|prefixes| !prefixes.is_empty())
+                .map(|prefixes| {
+                    Box::new(ApprovedCommandPrefixSaved::new(
+                        prefixes,
+                        self.saved_prefix_heading.as_deref(),
+                    )) as _
+                });
+        (
+            Some(current),
+            WorldStateUpdate::optional_boxed_fragment(fragment),
+        )
     }
 }
 

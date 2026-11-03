@@ -6,6 +6,7 @@
 #![deny(clippy::print_stdout)]
 
 mod cli;
+mod daybreak;
 mod event_processor;
 mod event_processor_with_human_output;
 pub(crate) mod event_processor_with_jsonl_output;
@@ -17,7 +18,7 @@ pub use cli::Command;
 pub use cli::ReviewArgs;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::EnvironmentManager;
-use codex_app_server_client::ExecServerRuntimePaths;
+use codex_app_server_client::ExecServerRuntimeOptions;
 use codex_app_server_client::InProcessAppServerClient;
 use codex_app_server_client::InProcessClientStartArgs;
 use codex_app_server_client::InProcessServerEvent;
@@ -26,6 +27,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::McpServerElicitationAction;
+use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewStartParams;
@@ -37,7 +39,10 @@ use codex_app_server_protocol::Thread as AppServerThread;
 use codex_app_server_protocol::ThreadForkParams;
 use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
-use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemsListCursor;
+use codex_app_server_protocol::ThreadItemsListParams;
+use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadReadParams;
@@ -57,7 +62,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_arg0::Arg0DispatchPaths;
-use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+use codex_cloud_config::managed_config_bundle_loader_for_storage;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::ConfigLoadError;
 use codex_config::ConfigLoadOptions;
@@ -95,6 +100,10 @@ use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_KEY;
+use codex_protocol::mcp_approval_meta::APPROVAL_KIND_MCP_TOOL_CALL;
+use codex_protocol::mcp_approval_meta::CANCELLATION_REASON_KEY;
+use codex_protocol::mcp_approval_meta::McpApprovalCancellationReason;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -150,6 +159,7 @@ pub use exec_events::Usage;
 pub use exec_events::WebSearchItem;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::io::Read;
@@ -218,6 +228,7 @@ struct ExecRunArgs {
     command: Option<ExecCommand>,
     config: Config,
     resume_approvals_reviewer_override: Option<codex_app_server_protocol::ApprovalsReviewer>,
+    daybreak_override: Option<bool>,
     dangerously_bypass_approvals_and_sandbox: bool,
     exec_span: tracing::Span,
     images: Vec<PathBuf>,
@@ -231,6 +242,7 @@ struct ExecRunArgs {
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
     thread_source: ThreadSource,
+    cyber_access_program: Option<codex_app_server_protocol::CyberAccessProgram>,
 }
 
 struct ManagedExecWorktree {
@@ -266,6 +278,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         strict_config,
         shared,
         thread_source,
+        cyber_access_program,
         skip_git_repo_check,
         ephemeral,
         ignore_user_config,
@@ -277,6 +290,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         output_schema: output_schema_path,
         mut config_overrides,
     } = cli;
+    if cyber_access_program.is_some() {
+        match command.as_ref() {
+            Some(ExecCommand::Review(_)) => {
+                anyhow::bail!("--cyber-access-program is not supported with `codex exec review`");
+            }
+            Some(ExecCommand::Fork(args)) if args.prompt.is_none() && prompt.is_none() => {
+                anyhow::bail!("Forking with --cyber-access-program requires a prompt");
+            }
+            Some(ExecCommand::Resume(_) | ExecCommand::Fork(_)) | None => {}
+        }
+    }
     let mut shared = shared.into_inner();
     shared.take_auto_review_config_overrides(&mut config_overrides);
     let SharedCliOptions {
@@ -368,7 +392,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         ignore_user_and_project_exec_policy_rules: ignore_rules,
         ..Default::default()
     };
-
     if worktree
         && EnvironmentManager::prepare_from_codex_home(&codex_home)
             .await?
@@ -378,6 +401,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     }
 
     let managed_worktree = if worktree {
+        let embedded_network_policy =
+            codex_app_server_client::EmbeddedNetworkPolicy::load(&loader_overrides).await;
         let gate_bootstrap = load_bootstrap_config_or_exit(
             &codex_home,
             /*cwd*/ None,
@@ -387,8 +412,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             CloudConfigBundleLoader::default(),
         )
         .await;
-        let gate_cloud_config = cloud_config_bundle_loader_for_storage(
-            bootstrap_auth_config(&codex_home, &gate_bootstrap)?,
+        let gate_cloud_config = managed_config_bundle_loader_for_storage(
+            embedded_network_policy
+                .bind_bootstrap_auth(bootstrap_auth_config(&codex_home, &gate_bootstrap)?),
+            gate_bootstrap.config_layer_stack.requirements_toml(),
             /*enable_codex_api_key_env*/ false,
         )
         .await?;
@@ -404,11 +431,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .cloud_config_bundle(gate_cloud_config.clone())
             .build()
             .await?;
-        if !gate_config.features.enabled(Feature::Worktrees) {
-            anyhow::bail!(
-                "--worktree requires the worktrees feature; enable it with --enable worktrees"
-            );
-        }
         if let Some(ExecCommand::Fork(args)) = command.as_mut() {
             let saved_cwd = worktree::fork_source(
                 args,
@@ -416,7 +438,10 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
                 &arg0_paths,
                 &cli_kv_overrides,
                 &loader_overrides,
-                gate_cloud_config.clone(),
+                worktree::ForkNetwork {
+                    cloud_config_bundle: gate_cloud_config.clone(),
+                    policy: embedded_network_policy.clone(),
+                },
                 strict_config,
             )
             .await?;
@@ -471,6 +496,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     } else {
         None
     };
+    let embedded_network_policy =
+        codex_app_server_client::EmbeddedNetworkPolicy::load(&loader_overrides).await;
     let bootstrap_config = load_bootstrap_config_or_exit(
         &codex_home,
         Some(&config_cwd),
@@ -481,12 +508,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )
     .await;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
-    let bootstrap_auth_config = bootstrap_auth_config(&codex_home, &bootstrap_config)?;
+    let bootstrap_auth_config = embedded_network_policy
+        .bind_bootstrap_auth(bootstrap_auth_config(&codex_home, &bootstrap_config)?);
     // API keys cannot fetch workspace-managed configuration. Preserve the
     // existing ChatGPT bootstrap identity even when model requests allow
     // CODEX_API_KEY.
-    let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
+    let cloud_config_bundle = managed_config_bundle_loader_for_storage(
         bootstrap_auth_config,
+        bootstrap_config.config_layer_stack.requirements_toml(),
         /*enable_codex_api_key_env*/ false,
     )
     .await?;
@@ -571,14 +600,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         permission_profile: None,
         default_permissions: None,
         persisted_permission_profile_id: None,
+        persisted_permission_profile: None,
         cwd: resolved_cwd,
         workspace_roots: None,
         model_provider: model_provider.clone(),
         service_tier: None,
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
-        default_zsh_path: None,
+        main_execve_wrapper_exe: None,
         base_instructions: None,
         developer_instructions: None,
         personality: None,
@@ -600,12 +629,17 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             .cloud_config_bundle(cloud_config_bundle.clone())
             .build()
     };
-    let config = build_exec_config(
+    let mut config = build_exec_config(
         overrides,
         dangerously_bypass_approvals_and_sandbox,
         build_config,
     )
     .await?;
+    embedded_network_policy.activate(&mut config);
+    let daybreak_override = cli_kv_overrides
+        .iter()
+        .any(|(key, _)| key == "daybreak")
+        .then_some(config.daybreak_enabled);
     let resume_approvals_reviewer_override = cli_kv_overrides
         .iter()
         .any(|(key, _)| key == "approvals_reviewer")
@@ -677,7 +711,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             range: None,
         })
         .collect();
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
@@ -687,13 +721,16 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     );
     let state_db = codex_core::init_state_db(&config).await;
     let environment_manager = if run_loader_overrides.ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths), config.http_client_factory())
-            .await?
+        EnvironmentManager::from_env(
+            Some(local_runtime_paths),
+            embedded_network_policy.bind(config.http_client_factory()),
+        )
+        .await?
     } else {
         EnvironmentManager::from_codex_home(
             config.codex_home.clone(),
             Some(local_runtime_paths),
-            config.http_client_factory(),
+            embedded_network_policy.bind(config.http_client_factory()),
         )
         .await?
     };
@@ -704,6 +741,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         loader_overrides: run_loader_overrides,
         strict_config,
         cloud_config_bundle: run_cloud_config_bundle,
+        embedded_network_policy,
         feedback: CodexFeedback::new(),
         log_db: None,
         state_db: state_db.clone(),
@@ -724,6 +762,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         command,
         config,
         resume_approvals_reviewer_override,
+        daybreak_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span: exec_span.clone(),
         images,
@@ -737,6 +776,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         skip_git_repo_check,
         stderr_with_ansi,
         thread_source: thread_source.map(Into::into).unwrap_or(ThreadSource::User),
+        cyber_access_program: cyber_access_program.map(Into::into),
     })
     .instrument(exec_span)
     .await
@@ -824,6 +864,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         command,
         config,
         resume_approvals_reviewer_override,
+        daybreak_override,
         dangerously_bypass_approvals_and_sandbox,
         exec_span,
         images,
@@ -837,7 +878,21 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         skip_git_repo_check,
         stderr_with_ansi,
         thread_source,
+        cyber_access_program,
     } = args;
+
+    if config.features.enabled(Feature::CliDaybreak)
+        && config.daybreak_enabled
+        && !matches!(&command, Some(ExecCommand::Review(_)))
+    {
+        anyhow::ensure!(
+            !oss || matches!(
+                &command,
+                Some(ExecCommand::Resume(_) | ExecCommand::Fork(_))
+            ),
+            "Daybreak requires the OpenAI model provider"
+        );
+    }
 
     let mut event_processor: Box<dyn EventProcessor> = match json_mode {
         true => Box::new(EventProcessorWithJsonOutput::new(last_message_file.clone())),
@@ -976,8 +1031,9 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
         })?;
 
+    let mut daybreak_enabled = config.daybreak_enabled;
     // Resolve resume and fork through existing app-server thread lifecycle APIs.
-    let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
+    let (history_mode, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
         command.as_ref()
     {
         if let Some(thread_id) =
@@ -1000,7 +1056,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             let session_configured =
                 session_configured_from_thread_resume_response(&response, &config)
                     .map_err(anyhow::Error::msg)?;
-            (session_configured.thread_id, session_configured)
+            daybreak_enabled = daybreak_override
+                .or(response.thread.daybreak_enabled)
+                .unwrap_or(false);
+            (response.thread.history_mode, session_configured)
         } else {
             let response = start_thread(&client, &mut request_ids, &config, &thread_source)
                 .await
@@ -1008,7 +1067,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             let session_configured =
                 session_configured_from_thread_start_response(&response, &config)
                     .map_err(anyhow::Error::msg)?;
-            (session_configured.thread_id, session_configured)
+            (response.thread.history_mode, session_configured)
         }
     } else if let Some(ExecCommand::Fork(args)) = command.as_ref() {
         let source_args = crate::cli::ResumeArgs {
@@ -1022,6 +1081,24 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             resolve_resume_thread_id(&client, &config, state_db.as_ref(), &source_args)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.session_id))?;
+        let source_daybreak = if config.ephemeral && daybreak_override.is_none() {
+            let response: ThreadReadResponse = send_request_with_response(
+                &client,
+                ClientRequest::ThreadRead {
+                    request_id: request_ids.next(),
+                    params: ThreadReadParams {
+                        thread_id: source_thread_id.clone(),
+                        include_turns: false,
+                    },
+                },
+                "thread/read",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            response.thread.daybreak_enabled
+        } else {
+            None
+        };
         let permissions = permissions_selection_from_config(&config);
         let sandbox = permissions.is_none().then(|| {
             sandbox_mode_from_permission_profile(
@@ -1074,16 +1151,21 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             response.reasoning_effort,
         )
         .map_err(anyhow::Error::msg)?;
-        (session_configured.thread_id, session_configured)
+        daybreak_enabled = daybreak_override
+            .or(response.thread.daybreak_enabled)
+            .or(source_daybreak)
+            .unwrap_or(false);
+        (response.thread.history_mode, session_configured)
     } else {
         let response = start_thread(&client, &mut request_ids, &config, &thread_source)
             .await
             .map_err(anyhow::Error::msg)?;
         let session_configured = session_configured_from_thread_start_response(&response, &config)
             .map_err(anyhow::Error::msg)?;
-        (session_configured.thread_id, session_configured)
+        (response.thread.history_mode, session_configured)
     };
 
+    let primary_thread_id = fallback_session_configured.thread_id;
     if let Some(worktree) = managed_worktree.as_ref() {
         worktree
             .manager
@@ -1102,8 +1184,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
     if !json_mode
-        && let Some(message) =
-            codex_core::config::system_bwrap_warning(config.permissions.permission_profile())
+        && let Some(message) = codex_core::config::system_bwrap_warning(
+            &config.permissions.effective_permission_profile(),
+            &config.cwd,
+        )
     {
         event_processor.process_warning(message);
     }
@@ -1134,6 +1218,21 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             items,
             output_schema,
         } => {
+            let cyber_access_program = match cyber_access_program {
+                Some(program) => Some(program),
+                None if config.features.enabled(Feature::CliDaybreak) => {
+                    daybreak::program_for_turn(
+                        &config.features,
+                        &client,
+                        &mut request_ids,
+                        &session_configured.model,
+                        &session_configured.model_provider_id,
+                        daybreak_enabled,
+                    )
+                    .await?
+                }
+                None => None,
+            };
             let response: TurnStartResponse = send_request_with_response(
                 &client,
                 ClientRequest::TurnStart {
@@ -1142,10 +1241,13 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         disabled_plugin_ids: None,
                         thread_id: primary_thread_id_for_span.clone(),
                         turn_trigger: Some("exec".to_string()),
+                        parent_turn_id: None,
+                        root_turn_id: None,
                         client_user_message_id: None,
                         input: items.into_iter().map(Into::into).collect(),
                         tool_output: None,
                         responsesapi_client_metadata: None,
+                        responsesapi_client_metadata_patch: None,
                         additional_context: None,
                         environments: None,
                         cwd: Some(default_cwd),
@@ -1163,7 +1265,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         output_schema,
                         collaboration_mode: None,
                         multi_agent_mode: None,
-                        cyber_access_program: None,
+                        cyber_access_program,
                     },
                 },
                 "turn/start",
@@ -1271,6 +1373,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 ) {
                     maybe_backfill_turn_completed_items(
                         config.ephemeral,
+                        history_mode,
                         &client,
                         &mut request_ids,
                         &mut notification,
@@ -1364,6 +1467,7 @@ fn thread_start_params_from_config(
         permissions,
         config: thread_config_overrides_from_config(config),
         ephemeral: Some(config.ephemeral),
+        daybreak_enabled: (config.daybreak_enabled && !config.ephemeral).then_some(true),
         history_mode: (!config.ephemeral).then_some(ThreadHistoryMode::Paginated),
         thread_source: Some(thread_source.clone()),
         ..ThreadStartParams::default()
@@ -1565,7 +1669,6 @@ fn session_configured_from_thread_response(
         active_permission_profile,
         cwd,
         reasoning_effort,
-        initial_messages: None,
         network_proxy: None,
         rollout_path,
     })
@@ -1641,14 +1744,13 @@ fn should_process_notification(
 
 async fn maybe_backfill_turn_completed_items(
     thread_ephemeral: bool,
+    history_mode: ThreadHistoryMode,
     client: &InProcessAppServerClient,
     request_ids: &mut RequestIdSequencer,
     notification: &mut ServerNotification,
 ) {
     // In-process delivery may drop non-terminal item notifications under backpressure while still
-    // guaranteeing `turn/completed`. Because app-server currently emits that completion with an
-    // empty `turn.items`, exec does one last `thread/read` here so human/json output can recover
-    // the final message and reconcile any still-running items before shutdown.
+    // guaranteeing `turn/completed`. Recover the completed turn's items before shutdown.
     if !should_backfill_turn_completed_items(thread_ephemeral, notification) {
         return;
     }
@@ -1656,6 +1758,53 @@ async fn maybe_backfill_turn_completed_items(
     let ServerNotification::TurnCompleted(payload) = notification else {
         return;
     };
+
+    if history_mode == ThreadHistoryMode::Paginated {
+        let completion_items = payload.turn.items.clone();
+        let mut items = Vec::new();
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let page: ThreadItemsListResponse = match client
+                .request_typed(ClientRequest::ThreadItemsList {
+                    request_id: request_ids.next(),
+                    params: ThreadItemsListParams {
+                        thread_id: payload.thread_id.clone(),
+                        turn_id: Some(payload.turn.id.clone()),
+                        cursor,
+                        limit: None,
+                        sort_direction: None,
+                    },
+                })
+                .await
+            {
+                Ok(page) => page,
+                Err(err) => {
+                    warn!("thread/items/list failed during turn completion: {err}");
+                    return;
+                }
+            };
+            items.extend(page.data.into_iter().map(ThreadItem::from));
+            let Some(next) = page.next_cursor else { break };
+            if !seen_cursors.insert(next.clone()) {
+                warn!("thread/items/list returned a repeated cursor during turn completion");
+                return;
+            }
+            cursor = Some(ThreadItemsListCursor::Opaque(next));
+        }
+        for completion_item in completion_items {
+            if let Some(item) = items
+                .iter_mut()
+                .find(|item| item.id() == completion_item.id())
+            {
+                *item = completion_item;
+            } else {
+                items.push(completion_item);
+            }
+        }
+        payload.turn.items = items;
+        return;
+    }
 
     let response = send_request_with_response::<ThreadReadResponse>(
         client,
@@ -1698,7 +1847,7 @@ fn should_backfill_turn_completed_items(
 fn turn_items_for_thread(
     thread: &AppServerThread,
     turn_id: &str,
-) -> Option<Vec<AppServerThreadItem>> {
+) -> Option<Vec<codex_app_server_protocol::ThreadItem>> {
     thread
         .turns
         .iter()
@@ -1732,8 +1881,10 @@ async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf {
 
 async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let reader = codex_rollout::open_rollout_seekable_reader(&path).ok()?;
+    let (stop, keep_running) = tokio::sync::oneshot::channel::<()>();
+    let result = tokio::task::spawn_blocking(move || {
+        let reader =
+            codex_rollout::open_rollout_seekable_reader(&path, || stop.is_closed()).ok()?;
         let mut scanner = codex_rollout::ReverseJsonlScanner::new(reader).ok()?;
         while let Some(outcome) = scanner.scan_next_rollout_line().ok()? {
             if let codex_rollout::ScanOutcome::Parsed(RolloutLine {
@@ -1748,7 +1899,9 @@ async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
     })
     .await
     .ok()
-    .flatten()
+    .flatten();
+    drop(keep_running);
+    result
 }
 
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
@@ -1772,6 +1925,8 @@ async fn resolve_resume_thread_id(
                 ClientRequest::ThreadList {
                     request_id: RequestId::Integer(0),
                     params: ThreadListParams {
+                        excluded_thread_ids: None,
+                        attached_to_thread_id: None,
                         originators: None,
                         cursor,
                         limit: Some(100),
@@ -1858,6 +2013,8 @@ async fn resolve_resume_thread_id(
             ClientRequest::ThreadList {
                 request_id: RequestId::Integer(0),
                 params: ThreadListParams {
+                    excluded_thread_ids: None,
+                    attached_to_thread_id: None,
                     originators: None,
                     cursor,
                     limit: Some(100),
@@ -1906,11 +2063,19 @@ fn resume_lookup_model_providers(
     }
 }
 
-fn canceled_mcp_server_elicitation_response() -> Result<Value, String> {
+fn canceled_mcp_server_elicitation_response(
+    request: &McpServerElicitationRequest,
+) -> Result<Value, String> {
+    let tool_approval = matches!(request, McpServerElicitationRequest::Form { meta: Some(meta), .. }
+        if meta.get(APPROVAL_KIND_KEY).and_then(Value::as_str) == Some(APPROVAL_KIND_MCP_TOOL_CALL));
     serde_json::to_value(McpServerElicitationRequestResponse {
         action: McpServerElicitationAction::Cancel,
         content: None,
-        meta: None,
+        meta: tool_approval.then(|| {
+            serde_json::json!({
+                CANCELLATION_REASON_KEY: McpApprovalCancellationReason::NonInteractive,
+            })
+        }),
     })
     .map_err(|err| format!("failed to encode mcp elicitation response: {err}"))
 }
@@ -1981,11 +2146,11 @@ async fn handle_server_request(
 ) {
     let method = server_request_method_name(&request);
     let handle_result = match request {
-        ServerRequest::McpServerElicitationRequest { request_id, .. } => {
+        ServerRequest::McpServerElicitationRequest { request_id, params } => {
             // Exec auto-cancels elicitation instead of surfacing it
             // interactively. Preserve that behavior for attached subagent
             // threads too so we do not turn a cancel into a decline/error.
-            match canceled_mcp_server_elicitation_response() {
+            match canceled_mcp_server_elicitation_response(&params.request) {
                 Ok(value) => {
                     resolve_server_request(
                         client,

@@ -4,6 +4,8 @@ use super::*;
 use crate::app::test_support::make_test_app;
 use crate::history_cell::ComputerActivityCell;
 use crate::history_cell::FinalMessageSeparator;
+use crate::history_cell::ForkedThreadHistoryCell;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::UserInput;
 use pretty_assertions::assert_eq;
@@ -11,13 +13,15 @@ use pretty_assertions::assert_eq;
 fn turn(id: &str, status: TurnStatus, item_ids: &[&str]) -> Turn {
     Turn {
         id: id.to_string(),
+        root_turn_id: None,
         items: item_ids
             .iter()
-            .map(|id| ThreadItem::UserMessage {
+            .map(|id| ThreadItemPayload::UserMessage {
                 id: id.to_string(),
                 client_id: None,
                 content: Vec::new(),
             })
+            .map(ThreadItem::untimed)
             .collect(),
         items_view: TurnItemsView::Full,
         status,
@@ -51,12 +55,51 @@ fn overlapping_history_keeps_live_turn_state_and_newer_items() {
 
 fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
     Arc::new(UserHistoryCell {
-        spoken: false,
+        presentation: Default::default(),
         message: message.to_string(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),
         remote_image_urls: Vec::new(),
     })
+}
+
+#[tokio::test]
+async fn fork_lineage_stays_before_repeated_older_history_pages() {
+    let mut app = make_test_app().await;
+    app.transcript_cells = vec![
+        Arc::new(ForkedThreadHistoryCell(
+            crate::history_cell::PlainHistoryCell::new(vec!["Thread forked from parent".into()]),
+        )),
+        Arc::new(crate::history_cell::PlainHistoryCell::new(vec![
+            "recent history".into(),
+        ])),
+    ];
+
+    app.prepend_older_transcript_cells(vec![Arc::new(crate::history_cell::PlainHistoryCell::new(
+        vec!["older history".into()],
+    ))]);
+    app.prepend_older_transcript_cells(vec![Arc::new(crate::history_cell::PlainHistoryCell::new(
+        vec!["oldest history".into()],
+    ))]);
+
+    let rendered = app
+        .transcript_cells
+        .iter()
+        .flat_map(|cell| cell.display_lines(/*width*/ 80))
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(rendered, @r###"
+    Thread forked from parent
+    oldest history
+    older history
+    recent history
+    "###);
 }
 
 #[test]
@@ -97,19 +140,19 @@ async fn hidden_last_item_keeps_turn_groups_and_completion_boundaries() {
         let expected_completions = usize::from(status == TurnStatus::Completed);
         let mut first = turn("first", status, &[]);
         first.items = vec![
-            ThreadItem::EnteredReviewMode {
+            ThreadItem::untimed(ThreadItemPayload::EnteredReviewMode {
                 id: "enter-review".to_string(),
                 review: "current changes".to_string(),
-            },
+            }),
             computer("older-call"),
-            ThreadItem::UserMessage {
+            ThreadItem::untimed(ThreadItemPayload::UserMessage {
                 id: "hidden".to_string(),
                 client_id: None,
                 content: vec![UserInput::Text {
                     text: "internal review prompt".to_string(),
                     text_elements: Vec::new(),
                 }],
-            },
+            }),
         ];
         first.completed_at = Some(1_700_000_000);
         first.duration_ms = Some(125_000);
@@ -120,7 +163,8 @@ async fn hidden_last_item_keeps_turn_groups_and_completion_boundaries() {
         assert_eq!(hidden, HashSet::from(["hidden"]));
         let items = turns
             .iter()
-            .flat_map(|turn| turn.items.clone())
+            .flat_map(Turn::item_payloads)
+            .cloned()
             .collect::<Vec<_>>();
 
         let cells = app.project_older_history_cells(
@@ -220,7 +264,7 @@ async fn browsing_waits_for_a_prompt_outside_the_initial_history_window() -> Res
         &["older prompt", "latest prompt"],
     );
     for item in &mut review_turn.items {
-        if let ThreadItem::UserMessage { id, content, .. } = item {
+        if let ThreadItemPayload::UserMessage { id, content, .. } = &mut item.payload {
             *content = vec![UserInput::Text {
                 text: id.clone(),
                 text_elements: Vec::new(),
@@ -229,17 +273,17 @@ async fn browsing_waits_for_a_prompt_outside_the_initial_history_window() -> Res
     }
     review_turn.items.insert(
         /*index*/ 0,
-        ThreadItem::EnteredReviewMode {
+        ThreadItem::untimed(ThreadItemPayload::EnteredReviewMode {
             id: "enter".to_string(),
             review: "review".to_string(),
-        },
+        }),
     );
     review_turn.items.insert(
         /*index*/ 2,
-        ThreadItem::ExitedReviewMode {
+        ThreadItem::untimed(ThreadItemPayload::ExitedReviewMode {
             id: "exit".to_string(),
             review: "review".to_string(),
-        },
+        }),
     );
     let turns = [review_turn];
     app.remove_hidden_review_cells(

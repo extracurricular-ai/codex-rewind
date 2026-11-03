@@ -7,6 +7,8 @@ mod paragraph;
 mod source;
 
 pub(crate) use paragraph::HyperlinkParagraph;
+pub(crate) use paragraph::HyperlinkRows;
+pub(crate) use paragraph::HyperlinkText;
 pub(crate) use source::LineWrapPolicy;
 pub(crate) use source::LogicalLineSource;
 
@@ -200,6 +202,24 @@ impl HyperlinkLine {
         }
     }
 
+    pub(crate) fn clip_hyperlinks_to_width(&mut self, width: usize) {
+        self.hyperlinks.retain_mut(|link| {
+            link.columns.end = link.columns.end.min(width);
+            !link.columns.is_empty()
+        });
+    }
+
+    /// Native scrollback paints the row style last. Resolve text styles onto the spans so
+    /// inline Markdown and gutter overrides survive, keeping the background for empty columns.
+    pub(crate) fn resolve_span_styles(mut self) -> Self {
+        let style = std::mem::take(&mut self.line.style);
+        self.line.style.bg = style.bg;
+        for span in &mut self.line.spans {
+            span.style = style.patch(span.style);
+        }
+        self
+    }
+
     pub(crate) fn style(mut self, style: ratatui::style::Style) -> Self {
         self.line = self.line.style(style);
         if let Some(source) = &mut self.source {
@@ -281,24 +301,32 @@ pub(crate) fn prefix_hyperlink_lines(
 
 /// Retain a known first-line label in copy text without changing the existing wrapping.
 ///
-/// Callers pass the suffix of the first row's synthetic prefix that carries meaning, such as
-/// a checkbox or `answer:`. Only that row's shared logical source is updated.
+/// The label may precede Markdown indentation or follow a display-only gutter.
+/// Only the first row's shared logical source is updated.
 pub(crate) fn retain_initial_prefix(lines: &mut [HyperlinkLine], prefix: &str) {
     let Some(origin) = lines.first().and_then(|line| line.source.clone()) else {
         return;
     };
-    debug_assert!(origin.prefix_bytes >= prefix.len());
-    let prefix_line = LogicalLineSource::from_line(&lines[0].line)
-        .styled_range(origin.prefix_bytes - prefix.len()..origin.prefix_bytes);
+    let first = LogicalLineSource::from_line(&lines[0].line);
+    let indent = &first.text[..origin.prefix_bytes];
+    let Some(label_start) = indent.rfind(prefix) else {
+        return;
+    };
+    let retained = &indent[label_start..];
+    let prefix_line = first.styled_range(label_start..origin.prefix_bytes);
     let mut styles = LogicalLineSource::from_line(&prefix_line).styles.to_vec();
     styles.extend(origin.styles.iter().map(|(range, style)| {
         (
-            range.start + prefix.len()..range.end + prefix.len(),
+            range.start + retained.len()..range.end + retained.len(),
             origin.line_style.patch(*style).patch(origin.span_style),
         )
     }));
     let styles = std::sync::Arc::from(styles);
-    let text: std::sync::Arc<str> = format!("{prefix}{}", origin.text).into();
+    let text: std::sync::Arc<str> = format!("{retained}{}", origin.text).into();
+    let labelled_body = origin
+        .copy
+        .as_ref()
+        .map(|_| std::sync::Arc::new((prefix.len(), origin.clone())));
     for (index, line) in lines.iter_mut().enumerate() {
         let Some(source) = line
             .source
@@ -309,12 +337,13 @@ pub(crate) fn retain_initial_prefix(lines: &mut [HyperlinkLine], prefix: &str) {
         };
         source.text = std::sync::Arc::clone(&text);
         source.styles = std::sync::Arc::clone(&styles);
+        source.labelled_body = labelled_body.clone();
         source.line_style = ratatui::style::Style::default();
         source.span_style = ratatui::style::Style::default();
-        source.range = source.range.start + prefix.len()..source.range.end + prefix.len();
+        source.range = source.range.start + retained.len()..source.range.end + retained.len();
         if index == 0 {
             source.range.start = 0;
-            source.prefix_bytes -= prefix.len();
+            source.prefix_bytes -= retained.len();
         }
     }
 }
@@ -387,10 +416,14 @@ pub(crate) fn remap_source_wrapped_line(
             let line = line_to_static(&wrapped.line);
             let displayed = line_text(&line);
             let prefix_columns = display_width(&displayed[..wrapped.prefix_bytes]);
-            source_column += display_width(&text[source_byte..wrapped.range.start]);
+            // Some wrapping paths retain a one-past-the-end cursor sentinel. Span slicing already
+            // clips that sentinel to the visible line; keep hyperlink and source projection on the
+            // same bounded range instead of indexing past the flattened text.
+            let range = wrapped.range.start.min(text.len())..wrapped.range.end.min(text.len());
+            source_column += display_width(&text[source_byte..range.start]);
             let start = source_column;
-            let end = start + display_width(&text[wrapped.range.clone()]);
-            source_byte = wrapped.range.end;
+            let end = start + display_width(&text[range.clone()]);
+            source_byte = range.end;
             source_column = end;
             let hyperlinks = source
                 .hyperlinks
@@ -408,7 +441,7 @@ pub(crate) fn remap_source_wrapped_line(
             HyperlinkLine {
                 line,
                 hyperlinks,
-                source: Some(logical.wrapped(wrapped.range, wrapped.prefix_bytes)),
+                source: Some(logical.wrapped(range, wrapped.prefix_bytes)),
             }
         })
         .collect()
@@ -426,10 +459,16 @@ pub(crate) fn remap_wrapped_line(
     wrapped: Vec<Line<'static>>,
 ) -> Vec<HyperlinkLine> {
     let mut out = plain_hyperlink_lines(wrapped);
-    if source.hyperlinks.is_empty() {
+    if source.hyperlinks.is_empty() && source.source.is_none() {
         return out;
     }
     let source_text = line_text(&source.line);
+    if source_text.trim().is_empty() {
+        for line in &mut out {
+            line.source = source.source.clone();
+        }
+        return out;
+    }
     let mut source_byte = 0usize;
     let mut source_column = 0usize;
     let mut link_index = 0usize;
@@ -447,6 +486,10 @@ pub(crate) fn remap_wrapped_line(
             continue;
         };
         let mapped = &rendered[rendered_start..];
+        line.source = source
+            .source
+            .as_ref()
+            .map(|source| source.wrapped(source_byte..source_byte + mapped.len(), rendered_start));
         let mut output_column = display_width(&rendered[..rendered_start]);
         for grapheme in mapped.graphemes(/*is_extended*/ true) {
             let width = display_width(grapheme);
@@ -576,6 +619,14 @@ fn trailing_url_end(candidate: &str) -> usize {
             unmatched
         } else {
             matches!(ch, ',' | '.' | ';' | '!' | '\'' | '"')
+                || ch == '?'
+                    && match remaining.chars().rev().nth(1) {
+                        Some(')') => balances[0] < 0,
+                        Some(']') => balances[1] < 0,
+                        Some('}') => balances[2] < 0,
+                        Some('>') => balances[3] < 0,
+                        _ => false,
+                    }
         };
         if !trim {
             break;
@@ -880,13 +931,18 @@ mod tests {
 
     #[test]
     fn discovers_punctuated_web_url_columns() {
-        assert_eq!(
-            web_links_in_text("See (https://example.com/a)."),
-            vec![TerminalHyperlink::web(
-                /*columns*/ 5..26,
-                "https://example.com/a".to_string(),
-            )]
-        );
+        for text in [
+            "See (https://example.com/a).",
+            "See (https://example.com/a)?",
+        ] {
+            assert_eq!(
+                web_links_in_text(text),
+                vec![TerminalHyperlink::web(
+                    /*columns*/ 5..26,
+                    "https://example.com/a".to_string(),
+                )]
+            );
+        }
     }
 
     #[test]
@@ -910,14 +966,18 @@ mod tests {
 
     #[test]
     fn preserves_balanced_parentheses_in_bare_web_urls() {
-        let destination = "https://en.wikipedia.org/wiki/Function_(mathematics)";
-        assert_eq!(
-            web_links_in_text(&format!("See ({destination}).")),
-            vec![TerminalHyperlink::web(
-                /*columns*/ 5..5 + usize::from(destination.cell_width()),
-                destination.to_string(),
-            )]
-        );
+        for destination in [
+            "https://en.wikipedia.org/wiki/Function_(mathematics)",
+            "https://en.wikipedia.org/wiki/Function_(mathematics)?q=(alpha)?",
+        ] {
+            assert_eq!(
+                web_links_in_text(&format!("See ({destination}).")),
+                vec![TerminalHyperlink::web(
+                    /*columns*/ 5..5 + usize::from(destination.cell_width()),
+                    destination.to_string(),
+                )]
+            );
+        }
     }
 
     #[test]

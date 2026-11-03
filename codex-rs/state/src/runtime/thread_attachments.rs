@@ -9,10 +9,16 @@ use crate::MAX_THREAD_ATTACHMENT_TYPE_BYTES;
 use crate::MAX_THREAD_ATTACHMENTS_PER_THREAD;
 use crate::RemoveThreadAttachmentOutcome;
 use crate::ThreadAttachment;
+use crate::ThreadAttachmentArchiveFilter;
+use crate::ThreadAttachmentOwner;
+use crate::ThreadAttachmentOwnerPage;
 use crate::ThreadAttachmentPage;
+use crate::sqlite::SqlitePoolWriteExt;
 use anyhow::Context;
 use chrono::Utc;
 use codex_protocol::ThreadId;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::QueryBuilder;
 use sqlx::Row;
@@ -27,7 +33,7 @@ impl StateRuntime {
         source_thread_id: ThreadId,
         destination_thread_id: ThreadId,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         let destination = destination_thread_id.to_string();
         let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
             .bind(&destination)
@@ -79,7 +85,7 @@ impl StateRuntime {
             );
         }
 
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         let thread_id_string = thread_id.to_string();
         let thread_exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
             .bind(&thread_id_string)
@@ -147,7 +153,7 @@ impl StateRuntime {
         identity_key: &str,
     ) -> anyhow::Result<RemoveThreadAttachmentOutcome> {
         validate_attachment_identity(attachment_type, identity_key)?;
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = self.pool.begin_immediate().await?;
         let thread_id_string = thread_id.to_string();
         let thread_exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM threads WHERE id = ?")
             .bind(&thread_id_string)
@@ -172,6 +178,89 @@ impl StateRuntime {
         };
         transaction.commit().await?;
         Ok(outcome)
+    }
+
+    /// Lists current owners of an exact attachment identity, including threads without previews.
+    /// `archive_filter` selects archived, non-archived, or all owners.
+    pub async fn list_thread_attachment_threads(
+        &self,
+        attachment_type: &str,
+        identity_key: &str,
+        archive_filter: ThreadAttachmentArchiveFilter,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<ThreadAttachmentOwnerPage> {
+        validate_attachment_identity(attachment_type, identity_key)?;
+        if !(1..=MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE).contains(&limit) {
+            anyhow::bail!(
+                "invalid thread attachment request: page limit must be between 1 and {MAX_THREAD_ATTACHMENT_LIST_PAGE_SIZE}"
+            );
+        }
+        let archived = match archive_filter {
+            ThreadAttachmentArchiveFilter::All => None,
+            ThreadAttachmentArchiveFilter::NonArchived => Some(false),
+            ThreadAttachmentArchiveFilter::Archived => Some(true),
+        };
+        let anchor = cursor
+            .map(serde_json::from_str::<AttachmentThreadsCursor>)
+            .transpose()
+            .context("invalid thread attachment request: invalid pagination cursor")?;
+        if let Some(anchor) = &anchor
+            && (anchor.attachment_type != attachment_type
+                || anchor.identity_key != identity_key
+                || anchor.archived != archived)
+        {
+            anyhow::bail!("invalid thread attachment request: invalid pagination cursor");
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT thread_attachments.thread_id, threads.archived FROM thread_attachments \
+             JOIN threads ON threads.id = thread_attachments.thread_id \
+             WHERE thread_attachments.attachment_type = ",
+        );
+        query.push_bind(attachment_type);
+        query.push(" AND thread_attachments.identity_key = ");
+        query.push_bind(identity_key);
+        if let Some(archived) = archived {
+            query.push(" AND threads.archived = ");
+            query.push_bind(archived);
+        }
+        if let Some(anchor) = anchor {
+            query.push(" AND thread_attachments.thread_id > ");
+            query.push_bind(anchor.thread_id.to_string());
+        }
+        query.push(" ORDER BY thread_attachments.thread_id ASC LIMIT ");
+        query.push_bind(i64::try_from(limit + 1)?);
+        let rows = query.build().fetch_all(self.pool.as_ref()).await?;
+        let mut threads = rows
+            .iter()
+            .map(|row| -> anyhow::Result<ThreadAttachmentOwner> {
+                Ok(ThreadAttachmentOwner {
+                    thread_id: ThreadId::from_string(row.try_get("thread_id")?)
+                        .context("invalid persisted thread attachment owner")?,
+                    archived: row.try_get("archived")?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let next_cursor = if threads.len() > limit {
+            threads.pop();
+            threads
+                .last()
+                .map(|thread| {
+                    serde_json::to_string(&AttachmentThreadsCursor {
+                        attachment_type: attachment_type.to_owned(),
+                        identity_key: identity_key.to_owned(),
+                        archived,
+                        thread_id: thread.thread_id,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(ThreadAttachmentOwnerPage {
+            threads,
+            next_cursor,
+        })
     }
 
     /// List one bounded page of attachments for one thread in stable keyset order.
@@ -228,6 +317,14 @@ impl StateRuntime {
             next_cursor,
         })
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttachmentThreadsCursor {
+    attachment_type: String,
+    identity_key: String,
+    archived: Option<bool>,
+    thread_id: ThreadId,
 }
 
 fn validate_attachment_identity(attachment_type: &str, identity_key: &str) -> anyhow::Result<()> {

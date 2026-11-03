@@ -1,4 +1,4 @@
-//! Checks retained providers against managed policy without reloading session configuration.
+//! Checks retained providers against managed policy and the current provider selection.
 
 use super::*;
 use anyhow::Result;
@@ -14,13 +14,31 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 use test_case::test_case;
 
-#[test_case(AMAZON_BEDROCK_PROVIDER_ID; "bedrock")]
-#[test_case(AMAZON_BEDROCK_RUNTIME_PROVIDER_ID; "bedrock_runtime")]
+#[test_case(AMAZON_BEDROCK_PROVIDER_ID, "aws.region = 'us-west-2'", "us-west-2", "us-east-1", None; "bedrock")]
+#[test_case(AMAZON_BEDROCK_RUNTIME_PROVIDER_ID, "aws.region = 'us-west-2'", "us-west-2", "us-east-1", None; "bedrock_runtime")]
+#[test_case(GCP_PROVIDER_ID, "project_id = 'example-project'\nlocation = 'us-central1'", "example-project", "other-project", None; "gcp_project")]
+#[test_case(GCP_PROVIDER_ID, "project_id = 'example-project'\nlocation = 'us-central1'", "us-central1", "us-east4", None; "gcp_location")]
+#[test_case(GCP_PROVIDER_ID, "project_id = 'example-project'\nauth.command = 'print-token'", "print-token", "other-token", None; "gcp_auth")]
+#[test_case("openai", "model_catalog_url = 'https://chatgpt.com/backend-api/codex/models'", "https://chatgpt.com/backend-api/codex/models", "https://chatgpt.com/backend-api/codex/other-models", None; "openai_catalog")]
+#[test_case("openai", "model_catalog_url = 'https://chatgpt.com/backend-api/codex/models'", "https://chatgpt.com/backend-api/codex/models", "https://chatgpt.com/backend-api/codex/other-models", Some("https://us.api.openai.com/v1"); "openai_regional_catalog")]
 #[tokio::test]
-async fn provider_requirements_resolve_bedrock_overrides(provider_id: &str) -> Result<()> {
+async fn provider_requirements_resolve_builtin_overrides(
+    provider_id: &str,
+    provider_config: &str,
+    original: &str,
+    replacement: &str,
+    openai_base_url: Option<&str>,
+) -> Result<()> {
     let home = tempdir()?;
+    let workspace = tempdir()?;
+    if let Some(base_url) = openai_base_url {
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!("openai_base_url = '{base_url}'"),
+        )?;
+    }
     let requirements = format!(
-        "model_provider = '{provider_id}'\n[model_providers.{provider_id}.aws]\nregion = 'us-west-2'"
+        "model_provider = '{provider_id}'\n[model_providers.{provider_id}]\n{provider_config}"
     );
     let manager = ConfigManager::new_for_tests(
         home.path().to_path_buf(),
@@ -28,7 +46,17 @@ async fn provider_requirements_resolve_bedrock_overrides(provider_id: &str) -> R
         LoaderOverrides::without_managed_config_for_tests(),
         CloudConfigBundleFixture::loader_with_enterprise_requirement(&requirements),
     );
-    let current = manager.load_latest_config(/*fallback_cwd*/ None).await?;
+    let current = manager
+        .load_latest_config(Some(workspace.path().to_path_buf()))
+        .await?;
+    if provider_id == "openai" {
+        assert_eq!(current.model_provider.base_url.as_deref(), openai_base_url);
+        // Retained threads keep their inference route even if user defaults later change.
+        std::fs::write(
+            home.path().join("config.toml"),
+            "openai_base_url = 'https://eu.api.openai.com/v1'",
+        )?;
+    }
     manager.check_thread_model_provider(&current).await?;
 
     let changed = ConfigManager::new_for_tests(
@@ -36,7 +64,7 @@ async fn provider_requirements_resolve_bedrock_overrides(provider_id: &str) -> R
         Vec::new(),
         LoaderOverrides::without_managed_config_for_tests(),
         CloudConfigBundleFixture::loader_with_enterprise_requirement(
-            requirements.replace("us-west-2", "us-east-1"),
+            requirements.replace(original, replacement),
         ),
     );
     assert_eq!(
@@ -94,6 +122,8 @@ async fn provider_requirements_do_not_reload_thread_config() -> Result<()> {
         .load_retained_session_config(&current.config_layer_stack, &current.cwd)
         .await?;
     assert_eq!(retained.model_provider, current.model_provider);
+    let factory = current.http_client_factory();
+    assert_eq!(retained.http_client_factory(), factory);
 
     manager.cloud_config_bundle = Arc::new(RwLock::new(
         CloudConfigBundleFixture::loader_with_enterprise_requirement("model_provider = 'other'"),
@@ -206,5 +236,87 @@ async fn provider_requirement_load_errors_reject_input() -> Result<()> {
                 .is_err()
         );
     }
+    Ok(())
+}
+
+/// A managed startup selection must disappear when its policy is removed.
+#[tokio::test]
+async fn catalog_reload_uses_latest_model_provider() -> Result<()> {
+    let home = tempdir()?;
+    let manager = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            "model_provider = 'gateway'\n[model_providers.gateway]\nname = 'Gateway'\nbase_url = 'https://example.test'",
+        ),
+    );
+    let startup = manager.load_non_project_config().await?;
+    assert_eq!(startup.model_provider_id, "gateway");
+    manager.clear_chatgpt_config_loader();
+    let refreshed = manager
+        .load_startup_config(/*fallback_cwd*/ None)
+        .await?
+        .config;
+    assert_eq!(refreshed.model_provider_id, "openai");
+    Ok(())
+}
+
+/// Invocation overrides and selected profiles still define the current provider.
+#[test_case("model_provider", "gateway"; "explicit_provider")]
+#[test_case("profile", "gateway-profile"; "selected_profile")]
+#[tokio::test]
+async fn input_provider_check_uses_effective_selection(key: &str, value: &str) -> Result<()> {
+    let home = tempdir()?;
+    std::fs::write(
+        home.path().join("config.toml"),
+        r#"
+model_provider = "openai"
+[model_providers.gateway]
+name = "Gateway"
+"#,
+    )?;
+    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    let cli_overrides = if key == "profile" {
+        std::fs::write(
+            home.path().join(format!("{value}.config.toml")),
+            "model_provider = 'gateway'\n[model_providers.gateway]\nname = 'Gateway'\n",
+        )?;
+        loader_overrides.user_config_path = Some(AbsolutePathBuf::from_absolute_path(
+            home.path().join(format!("{value}.config.toml")),
+        )?);
+        loader_overrides.user_config_profile = Some(value.parse()?);
+        Vec::new()
+    } else {
+        vec![(key.into(), TomlValue::String(value.into()))]
+    };
+    let manager = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        cli_overrides,
+        loader_overrides,
+        CloudConfigBundleLoader::default(),
+    );
+    let current = manager
+        .load_latest_config(Some(home.path().to_path_buf()))
+        .await?;
+    assert_eq!(current.model_provider_id, "gateway");
+    manager
+        .check_thread_model_provider_for_input(&current)
+        .await?;
+    let default_manager =
+        ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+    let error = default_manager
+        .check_thread_model_provider_for_input(&current)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<ModelProviderError>()),
+        Some(&ModelProviderError::ModelProviderMismatch {
+            model_provider: "gateway".into(),
+            current_model_provider: "openai".into(),
+        })
+    );
     Ok(())
 }

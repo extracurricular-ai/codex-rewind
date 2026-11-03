@@ -1,9 +1,37 @@
-//! Proposed-plan and plan-update history cells.
+//! Proposed-plan and plan-update history cells, including foreground contrast on the plan fill.
 
 use super::markdown_render_cache::MarkdownRenderCache;
 use super::*;
 use crate::style::accent_color;
 use crate::terminal_hyperlinks::lines_with_sources_eq;
+
+/// Apply the plan surface after Markdown layout, keeping retained reflow styles in sync.
+pub(crate) fn style_proposed_plan_line(
+    mut line: HyperlinkLine,
+    plan_style: Style,
+) -> HyperlinkLine {
+    if plan_style.bg.is_none() {
+        return line.style(plan_style);
+    }
+    let adapt = |mut style: Style, background| {
+        style.fg = style
+            .fg
+            .map(|foreground| crate::style::readable_color_on(foreground, style.bg.or(background)));
+        style
+    };
+    line.line.style = adapt(line.line.style.patch(plan_style), plan_style.bg);
+    for span in &mut line.line.spans {
+        span.style = adapt(span.style, line.line.style.bg);
+    }
+    if let Some(source) = &mut line.source {
+        source.line_style = adapt(source.line_style.patch(plan_style), plan_style.bg);
+        source.span_style = adapt(source.span_style, source.line_style.bg);
+        for (_, style) in std::sync::Arc::make_mut(&mut source.styles) {
+            *style = adapt(*style, source.span_style.bg.or(source.line_style.bg));
+        }
+    }
+    line
+}
 
 /// Transient active-cell representation of the mutable tail of a proposed-plan stream.
 ///
@@ -141,13 +169,21 @@ impl ProposedPlanCell {
             plan_lines.extend(prefix_hyperlink_lines(body, "  ".into(), "  ".into()));
             plan_lines.push(HyperlinkLine::new(Line::from(" ")));
 
-            lines.extend(plan_lines.into_iter().map(|line| line.style(plan_style)));
+            lines.extend(
+                plan_lines
+                    .into_iter()
+                    .map(|line| style_proposed_plan_line(line, plan_style)),
+            );
             lines
         })
     }
 }
 
 impl HistoryCell for ProposedPlanCell {
+    fn copy_source(&self) -> Option<&str> {
+        Some(&self.plan_markdown)
+    }
+
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         visible_lines(self.display_hyperlink_lines(width))
     }
@@ -207,8 +243,9 @@ impl HistoryCell for PlanUpdateCell {
         vec![self.activity_id.clone()]
     }
 
-    fn has_hidden_activity_details(&self, width: u16) -> bool {
-        self.explanation
+    fn activity_disclosure(&self, width: u16) -> Option<super::ActivityDisclosure> {
+        (self
+            .explanation
             .as_ref()
             .is_some_and(|explanation| !explanation.trim().is_empty())
             || self.plan.len() > super::activity_preview::DETAIL_PREVIEW_LINES
@@ -216,7 +253,8 @@ impl HistoryCell for PlanUpdateCell {
                 let step = item.step.split_whitespace().collect::<Vec<_>>().join(" ");
                 // The compact row reserves four columns for indentation and two for its marker.
                 Line::from(step).width() + 6 > usize::from(width)
-            })
+            }))
+        .then_some(super::ActivityDisclosure::Generic)
     }
 
     fn compact_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {

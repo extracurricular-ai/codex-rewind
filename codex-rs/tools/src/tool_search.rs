@@ -3,6 +3,7 @@ use crate::LoadableToolSpec;
 use crate::ResponsesApiNamespace;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
+use crate::ToolName;
 use crate::ToolSearchSourceInfo;
 use crate::ToolSpec;
 use crate::default_namespace_description;
@@ -16,6 +17,27 @@ pub struct ToolSearchEntry {
 }
 
 impl ToolSearchEntry {
+    /// Iterate candidate identities without materializing their tool schemas.
+    pub fn tool_names(&self) -> impl Iterator<Item = ToolName> + '_ {
+        let (namespace, name, tools): (&str, Option<&str>, &[ResponsesApiNamespaceTool]) =
+            match self.spec.as_ref() {
+                ToolSpec::Function(tool) => (DEFAULT_FUNCTION_NAMESPACE, Some(&tool.name), &[]),
+                ToolSpec::Freeform(tool) => (DEFAULT_FUNCTION_NAMESPACE, Some(&tool.name), &[]),
+                ToolSpec::Namespace(namespace) => {
+                    (&namespace.name, None, namespace.tools.as_slice())
+                }
+                ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {
+                    unreachable!("search entries contain only loadable tools");
+                }
+            };
+        name.into_iter()
+            .chain(tools.iter().map(|tool| match tool {
+                ResponsesApiNamespaceTool::Function(tool) => tool.name.as_str(),
+                ResponsesApiNamespaceTool::Custom(tool) => tool.name.as_str(),
+            }))
+            .map(move |name| ToolName::namespaced(namespace, name))
+    }
+
     /// Materialize only selected results; output schemas remain shared until discarded.
     pub fn to_loadable_spec(&self) -> LoadableToolSpec {
         let Some(output) = normalize_search_spec(self.spec.as_ref().clone()) else {
@@ -99,6 +121,7 @@ fn normalize_search_spec(spec: ToolSpec) -> Option<LoadableToolSpec> {
             ResponsesApiNamespaceTool::Function(tool) => {
                 tool.defer_loading = Some(true);
                 tool.output_schema = None;
+                tool.parameters.mcp_input_schema_max_bytes = None;
             }
             ResponsesApiNamespaceTool::Custom(tool) => {
                 tool.defer_loading = Some(true);
@@ -154,9 +177,9 @@ fn append_function_search_text(tool: &ResponsesApiTool, parts: &mut Vec<String>)
 
 fn append_schema_search_text(schema: &JsonSchema, parts: &mut Vec<String>) {
     if let Some(description) = &schema.description {
-        push_search_part(parts, description.clone());
+        push_search_part(parts, description.to_string());
     }
-    if let Some(properties) = &schema.properties {
+    if let Some(properties) = schema.properties.as_deref() {
         for (name, schema) in properties {
             push_search_part(parts, name.clone());
             append_schema_search_text(schema, parts);

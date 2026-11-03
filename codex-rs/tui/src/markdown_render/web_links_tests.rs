@@ -1,4 +1,5 @@
 use super::WebLinkDisplay;
+use crate::markdown_render::MarkdownStyles;
 use crate::markdown_render::render_markdown_lines_with_width_cwd_and_hidden_link_destinations;
 use crate::markdown_render::render_streaming_markdown_lines_with_width_and_cwd;
 use crate::style::accent_color;
@@ -13,6 +14,7 @@ use pretty_assertions::assert_eq;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::text::Text;
 use std::collections::BTreeSet;
 
@@ -27,14 +29,11 @@ fn bare_urls_are_styled_without_coloring_surrounding_prose() {
         text,
         Text::from(Line::from(vec![
             "界 (".into(),
-            "https://example.com/a".fg(accent_color()).underlined(),
+            Span::styled("https://example.com/a", MarkdownStyles::default().link),
             "); ".into(),
-            "https://example.com/b".fg(accent_color()).underlined(),
+            Span::styled("https://example.com/b", MarkdownStyles::default().link),
             "! ".into(),
-            "https://example.com/c"
-                .bold()
-                .fg(accent_color())
-                .underlined(),
+            Span::styled("https://example.com/c", MarkdownStyles::default().link).bold(),
         ])),
     );
     assert_debug_snapshot!(text);
@@ -68,6 +67,7 @@ fn bare_urls_keep_link_style_when_wrapped_in_tables() {
 
 fn terminal(name: TerminalName) -> TerminalInfo {
     TerminalInfo {
+        backend: None,
         name,
         term_program: None,
         version: None,
@@ -103,27 +103,27 @@ fn supporting_terminals_render_only_the_styled_label_and_keep_its_target() {
         for (markdown, label) in [
             (
                 "[label](https://example.com)",
-                "label".fg(accent_color()).underlined(),
+                Span::styled("label", MarkdownStyles::default().link),
             ),
             (
                 "[`label`](https://example.com)",
-                "label".fg(accent_color()).underlined(),
+                Span::styled("label", MarkdownStyles::default().link),
             ),
             (
                 "[**label**](https://example.com)",
-                "label".fg(accent_color()).bold().underlined(),
+                Span::styled("label", MarkdownStyles::default().link).bold(),
             ),
             (
                 "[*label*](https://example.com)",
-                "label".fg(accent_color()).italic().underlined(),
+                Span::styled("label", MarkdownStyles::default().link).italic(),
             ),
             (
                 "[<b>](https://example.com)",
-                "<b>".fg(accent_color()).underlined(),
+                Span::styled("<b>", MarkdownStyles::default().link),
             ),
             (
                 "[https://example.com](https://example.com)",
-                "https://example.com".fg(accent_color()).underlined(),
+                Span::styled("https://example.com", MarkdownStyles::default().link),
             ),
         ] {
             let label_width = label.width();
@@ -141,6 +141,21 @@ fn supporting_terminals_render_only_the_styled_label_and_keep_its_target() {
             );
         }
     }
+}
+
+#[test]
+fn rex_renders_only_the_label() {
+    let mut rex = terminal(TerminalName::Unknown);
+    rex.term_program = Some("rex".to_string());
+    let markdown = "[label](https://example.com)";
+    assert_eq!(
+        render(
+            markdown,
+            /*width*/ 80,
+            WebLinkDisplay::for_terminal(&rex, /*term*/ None),
+        ),
+        render(markdown, /*width*/ 80, WebLinkDisplay::LabelOnly),
+    );
 }
 
 #[test]

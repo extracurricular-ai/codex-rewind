@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
@@ -17,33 +15,32 @@ pub(crate) enum SelectionDescriptionLayout {
     HideWhenNarrow {
         min_description_width: u16,
     },
+    SelectedBelowWhenNarrow {
+        min_description_width: u16,
+    },
 }
 
 impl SelectionDescriptionLayout {
-    pub(super) fn should_hide(self, width: u16, desc_col: usize) -> bool {
-        let Self::HideWhenNarrow {
-            min_description_width,
-        } = self
-        else {
-            return false;
+    fn is_narrow(self, width: u16, desc_col: usize) -> bool {
+        let min_description_width = match self {
+            Self::Columns => return false,
+            Self::HideWhenNarrow {
+                min_description_width,
+            }
+            | Self::SelectedBelowWhenNarrow {
+                min_description_width,
+            } => min_description_width,
         };
         let desc_col = desc_col.min(width as usize) as u16;
         width.saturating_sub(desc_col) < min_description_width
     }
-}
 
-pub(super) fn line_to_owned(line: Line<'_>) -> Line<'static> {
-    Line {
-        style: line.style,
-        alignment: line.alignment,
-        spans: line
-            .spans
-            .into_iter()
-            .map(|span| Span {
-                style: span.style,
-                content: Cow::Owned(span.content.into_owned()),
-            })
-            .collect(),
+    pub(super) fn should_hide_column(self, width: u16, desc_col: usize) -> bool {
+        matches!(self, Self::HideWhenNarrow { .. }) && self.is_narrow(width, desc_col)
+    }
+
+    pub(super) fn should_show_selected_below(self, width: u16, desc_col: usize) -> bool {
+        matches!(self, Self::SelectedBelowWhenNarrow { .. }) && self.is_narrow(width, desc_col)
     }
 }
 
@@ -58,6 +55,7 @@ fn combined_description(
             if matches!(
                 description_layout,
                 SelectionDescriptionLayout::HideWhenNarrow { .. }
+                    | SelectionDescriptionLayout::SelectedBelowWhenNarrow { .. }
             ) =>
         {
             Some(reason.clone())
@@ -121,9 +119,10 @@ pub(super) fn build_full_line(
     width: u16,
     description_layout: SelectionDescriptionLayout,
 ) -> Line<'static> {
-    let description = (desc_col > 0)
-        .then(|| combined_description(row, description_layout))
-        .flatten();
+    let description = (desc_col > 0
+        && !description_layout.should_show_selected_below(width, desc_col))
+    .then(|| combined_description(row, description_layout))
+    .flatten();
     let name_prefix_width = line_width(&Line::from(row.name_prefix_spans.clone()));
     // Category tags identify the result even when secondary descriptions hide.
     // Reserve their cells before truncating the name on narrow rows.

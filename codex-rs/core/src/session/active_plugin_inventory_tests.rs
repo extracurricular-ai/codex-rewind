@@ -78,17 +78,19 @@ async fn active_plugin_ids_select_and_validate_by_source() {
         let selected_plugins = selected_ids
             .into_iter()
             .map(|plugin_id| SelectedPluginIdentity {
-                selected_root_id: "capability-root".to_string(),
-                plugin_id: plugin_id.to_string(),
+                selected_root_id: Some("capability-root".to_string()),
+                plugin_id: codex_core_plugins::PluginIdentity::Local {
+                    plugin_id: plugin_id.to_string(),
+                },
             })
             .collect::<Vec<_>>();
         turn_context.active_host_plugin_identities = Some(identities);
-        turn_context.extension_data.insert(SelectedPluginSnapshot {
+        let selected_plugins = SelectedPluginSnapshot {
             plugins: selected_plugins,
             ..Default::default()
-        });
+        };
         assert_eq!(
-            turn_context.active_plugin_ids_for_telemetry(),
+            turn_context.active_plugin_ids_for_telemetry(Some(&selected_plugins)),
             expected.map(|ids| ids.into_iter().map(str::to_string).collect::<Vec<_>>()),
             "{name}"
         );
@@ -116,27 +118,26 @@ async fn active_plugin_ids_enforce_bounds_after_selection_and_deduplication() {
                 remote_plugin_id: remote.then_some(id.clone()),
             }];
             turn_context.active_host_plugin_identities = Some(identities);
-            turn_context
-                .extension_data
-                .insert(SelectedPluginSnapshot::default());
             assert_eq!(
-                turn_context.active_plugin_ids_for_telemetry(),
+                turn_context.active_plugin_ids_for_telemetry(/*selected*/ None),
                 (length == 128).then_some(vec![id]),
                 "length={length}, remote={remote}"
             );
         }
         let id = format!("{}@local", "p".repeat(length - 6));
         let selected_plugin = SelectedPluginIdentity {
-            selected_root_id: "capability-root".to_string(),
-            plugin_id: id.clone(),
+            selected_root_id: Some("capability-root".to_string()),
+            plugin_id: codex_core_plugins::PluginIdentity::Local {
+                plugin_id: id.clone(),
+            },
         };
         turn_context.active_host_plugin_identities = Some(Vec::new());
-        turn_context.extension_data.insert(SelectedPluginSnapshot {
+        let selected_plugins = SelectedPluginSnapshot {
             plugins: vec![selected_plugin],
             ..Default::default()
-        });
+        };
         assert_eq!(
-            turn_context.active_plugin_ids_for_telemetry(),
+            turn_context.active_plugin_ids_for_telemetry(Some(&selected_plugins)),
             (length == 128).then_some(vec![id]),
             "selected length={length}"
         );
@@ -156,17 +157,19 @@ async fn active_plugin_ids_enforce_bounds_after_selection_and_deduplication() {
         let selected_plugins = ids[count / 2 - 1..]
             .iter()
             .map(|id| SelectedPluginIdentity {
-                selected_root_id: "capability-root".to_string(),
-                plugin_id: id.clone(),
+                selected_root_id: Some("capability-root".to_string()),
+                plugin_id: codex_core_plugins::PluginIdentity::Local {
+                    plugin_id: id.clone(),
+                },
             })
             .collect::<Vec<_>>();
         turn_context.active_host_plugin_identities = Some(identities);
-        turn_context.extension_data.insert(SelectedPluginSnapshot {
+        let selected_plugins = SelectedPluginSnapshot {
             plugins: selected_plugins,
             ..Default::default()
-        });
+        };
         assert_eq!(
-            turn_context.active_plugin_ids_for_telemetry(),
+            turn_context.active_plugin_ids_for_telemetry(Some(&selected_plugins)),
             (count == 512).then_some(ids),
             "{count} distinct IDs across host and selected inputs, with one overlap"
         );

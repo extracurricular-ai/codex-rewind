@@ -22,6 +22,7 @@ async fn code_mode_runs_with_jit_disabled() {
                 max_output_tokens: None,
             },
             Arc::new(NoopCodeModeSessionDelegate),
+            /*preempt*/ None,
         )
         .await
         .expect("start code-mode cell");
@@ -37,6 +38,7 @@ async fn code_mode_runs_with_jit_disabled() {
             code_mode_host_duration: None,
             cell_id,
             content_items: Vec::new(),
+            result_buffered_for: std::time::Duration::ZERO,
             error_text: None,
         }
     );

@@ -16,14 +16,17 @@ use color_eyre::eyre::WrapErr;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SessionStartAction {
-    Resume(ResumeModelSettings),
+    Resume(
+        ResumeModelSettings,
+        crate::resume_permissions::ResumePermissions,
+    ),
     Fork(ForkPermissionMode),
 }
 
 impl SessionStartAction {
     pub(crate) fn verb(self) -> &'static str {
         match self {
-            Self::Resume(_) => "resume",
+            Self::Resume(..) => "resume",
             Self::Fork(_) => "fork",
         }
     }
@@ -35,10 +38,17 @@ impl SessionStartAction {
         local_settings: &LocalSettings,
         target: &SessionTarget,
     ) -> Result<AppServerStartedThread> {
+        target.ensure_backend(app_server.backend_id())?;
         match self {
-            Self::Resume(settings) => {
+            Self::Resume(settings, permissions) => {
                 app_server
-                    .resume_thread(local_settings, config.clone(), target.thread_id, settings)
+                    .resume_thread_with_permission_overrides(
+                        local_settings,
+                        config.clone(),
+                        target.thread_id,
+                        settings,
+                        permissions,
+                    )
                     .await
             }
             Self::Fork(permission_mode) => {
@@ -78,6 +88,7 @@ pub(crate) async fn complete_session_start(
     initial_result: Result<AppServerStartedThread>,
     confirm: impl AsyncFnOnce() -> Result<UnarchiveChoice>,
 ) -> Result<SessionStartOutcome> {
+    target.ensure_backend(app_server.backend_id())?;
     match initial_result {
         Ok(started) => return Ok(SessionStartOutcome::Started(Box::new(started))),
         Err(err) => {
@@ -94,10 +105,10 @@ pub(crate) async fn complete_session_start(
 
     match confirm().await? {
         UnarchiveChoice::Cancel => {
-            return Ok(match app_server_target {
-                crate::AppServerTarget::LocalDaemon { .. }
-                | crate::AppServerTarget::Remote { .. } => SessionStartOutcome::CommandCenter,
-                crate::AppServerTarget::Embedded => SessionStartOutcome::Exit,
+            return Ok(if app_server_target.supports_command_center() {
+                SessionStartOutcome::CommandCenter
+            } else {
+                SessionStartOutcome::Exit
             });
         }
         UnarchiveChoice::Quit => return Ok(SessionStartOutcome::Exit),

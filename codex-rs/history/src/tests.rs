@@ -134,6 +134,8 @@ fn older_thread_settings_snapshot_defaults_disabled_plugins_to_empty() -> Result
 #[test]
 fn response_item_envelope_accessors_preserve_item() {
     let expected_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -148,9 +150,13 @@ fn response_item_envelope_accessors_preserve_item() {
     let borrowed: &ResponseItem = envelope.borrow();
     assert_eq!(borrowed, &expected_item);
     let replacement_item = ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
+            annotations: None,
+            logprobs: None,
             text: "goodbye".to_string(),
         }],
         phase: None,
@@ -159,6 +165,74 @@ fn response_item_envelope_accessors_preserve_item() {
     *envelope = replacement_item.clone();
 
     assert_eq!(envelope.into_item(), replacement_item);
+}
+
+#[test]
+fn mcp_checkpoint_handles_missing_or_unknown_identity() -> Result<()> {
+    let metadata: CodexHarnessMetadata = serde_json::from_value(json!({}))?;
+    assert_eq!(metadata.mcp_attribution, None);
+
+    let restored: CodexHarnessMetadata = serde_json::from_value(json!({
+        "mcp_attribution": {
+            "status": "complete",
+            "sources": [{
+                "server_name": "example",
+                "tool_name": "search",
+                "first_turn_id": "turn_1",
+                "future_identity": "unknown to this reader"
+            }]
+        }
+    }))?;
+    assert_eq!(
+        restored.mcp_attribution,
+        Some(McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            error_reason: None,
+            sources: Vec::new(),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn mcp_error_diagnostics_do_not_invalidate_checkpoints() -> Result<()> {
+    let metadata = CodexHarnessMetadata {
+        mcp_attribution: Some(McpAttribution {
+            status: McpAttributionStatus::AttributionError,
+            error_reason: Some(
+                codex_protocol::mcp::McpAttributionErrorReason::HistoryMissingCheckpoint,
+            ),
+            sources: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    for (reason, expected_reason) in [
+        (None, None),
+        (
+            Some(json!("future_reason")),
+            Some(codex_protocol::mcp::McpAttributionErrorReason::Unknown),
+        ),
+        (Some(json!({"invalid": true})), None),
+    ] {
+        let mut serialized = serde_json::to_value(&metadata)?;
+        let attribution = serialized["mcp_attribution"]
+            .as_object_mut()
+            .expect("attribution object");
+        if let Some(reason) = reason {
+            attribution.insert("error_reason".to_string(), reason);
+        } else {
+            attribution.remove("error_reason");
+        }
+        let restored: CodexHarnessMetadata = serde_json::from_value(serialized)?;
+        let mut expected = metadata.clone();
+        expected
+            .mcp_attribution
+            .as_mut()
+            .expect("attribution checkpoint")
+            .error_reason = expected_reason;
+        assert_eq!(restored, expected);
+    }
+    Ok(())
 }
 
 #[test]
@@ -189,6 +263,87 @@ fn response_item_rollout_line_preserves_shape() -> Result<()> {
     assert!(matches!(&envelope.item, ResponseItem::Message { .. }));
     assert_eq!(envelope.metadata, None);
     assert_eq!(serde_json::to_value(line)?, legacy_line);
+    Ok(())
+}
+
+#[test]
+fn delivered_assistant_rollout_survives_an_earlier_read_and_rewrite() -> Result<()> {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum EarlierRolloutItem {
+        ResponseItem {
+            payload: ResponseItem,
+            metadata: CodexHarnessMetadata,
+        },
+    }
+
+    for complete in [true, false] {
+        let original = RetainedContextEvent::DeliveredAssistantMessage {
+            message: RetainedUserMessage {
+                origin: crate::UserInputOrigin::User,
+                turn_id: "root-turn".to_owned(),
+                message_id: Some("code-cell:message".to_owned()),
+                text: "May I deploy staging?".to_owned(),
+                complete,
+                phase: None,
+            },
+            acceptance_order: 7,
+        };
+        let wire = serde_json::to_value(RolloutItem::RetainedContext(original.clone()))?;
+        let earlier = serde_json::from_value::<EarlierRolloutItem>(wire)?;
+        let EarlierRolloutItem::ResponseItem { payload, metadata } = &earlier;
+        let ResponseItem::Message {
+            role,
+            content,
+            phase,
+            ..
+        } = payload
+        else {
+            panic!("older readers need an assistant message");
+        };
+        assert_eq!(role, "assistant");
+        // The preceding client's Guardian projection excludes commentary.
+        assert_eq!(phase, &None);
+        assert_eq!(metadata.user_input_order, Some(7));
+        let [ContentItem::OutputText { text, .. }] = content.as_slice() else {
+            panic!("older readers need plain assistant text");
+        };
+        if complete {
+            assert_eq!(text, "May I deploy staging?");
+        } else {
+            assert!(!text.contains("deploy staging"));
+            assert!(text.contains("unavailable"));
+        }
+        let mut earlier_checkpoint = RetainedContext::default();
+        earlier_checkpoint.record_assistant_message(
+            RetainedUserMessage {
+                origin: crate::UserInputOrigin::User,
+                turn_id: payload.turn_id().unwrap().to_owned(),
+                message_id: payload.id().map(ToString::to_string),
+                text: text.clone(),
+                complete: true,
+                phase: None,
+            },
+            RetainedInputSource::Local(metadata.user_input_order),
+        );
+        let rewritten_checkpoint =
+            serde_json::from_value(serde_json::to_value(earlier_checkpoint)?)?;
+        let mut restored_checkpoint = RetainedContext::default();
+        restored_checkpoint.restore(Some(&rewritten_checkpoint), &[]);
+        let preserved = restored_checkpoint
+            .ordered_entries()
+            .find_map(|(_, entry)| match entry {
+                RetainedContextEntry::AssistantMessage(message) => Some(message.text.as_str()),
+                _ => None,
+            });
+        assert_eq!(preserved, Some(text.as_str()));
+
+        let rewritten = serde_json::to_value(earlier)?;
+        let RolloutItem::RetainedContext(restored) = serde_json::from_value(rewritten)? else {
+            panic!("new readers need the model-invisible delivery event");
+        };
+        assert_eq!(restored, original);
+    }
     Ok(())
 }
 
@@ -388,6 +543,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
 
     let serialized = serde_json::to_value(item)?;
@@ -422,6 +578,36 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
             },
         ])
     );
+    Ok(())
+}
+
+#[test]
+fn compacted_resume_metadata_presence_round_trips_empty_values() -> Result<()> {
+    let resume_metadata = CompactionResumeMetadata {
+        dynamic_tools: None,
+        multi_agent_version: None,
+        last_started_turn_id: None,
+        turn_attribution: None,
+        previous_turn_settings: None,
+    };
+    let item = CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: None,
+        retained_context: None,
+        guardian_history: None,
+        mcp_resource_origins: None,
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
+        resume_metadata: Some(resume_metadata.clone()),
+    };
+
+    let serialized = serde_json::to_value(&item)?;
+    assert_eq!(serialized["resume_metadata"], json!(resume_metadata));
+    assert_eq!(serde_json::from_value::<CompactedItem>(serialized)?, item);
     Ok(())
 }
 
@@ -486,8 +672,18 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
     };
     assert_eq!(*legacy_response, response_item);
 
-    let checkpoint = crate::GuardianHistoryCheckpoint(vec![response_item.clone()]);
-    let compacted_line = serde_json::to_value(RolloutItem::Compacted(CompactedItem {
+    let checkpoint = crate::GuardianHistoryCheckpoint(vec![envelope.clone()]);
+    assert_eq!(
+        serde_json::from_value::<Vec<ResponseItem>>(serde_json::to_value(&checkpoint)?)?,
+        vec![response_item.clone()],
+    );
+    assert_eq!(
+        serde_json::from_value::<crate::GuardianHistoryCheckpoint>(serde_json::to_value(vec![
+            response_item.clone()
+        ])?)?,
+        crate::GuardianHistoryCheckpoint(vec![response_item.clone().into()]),
+    );
+    let compacted_line = serde_json::to_value(RolloutItem::Compacted(Box::new(CompactedItem {
         message: "summary".to_string(),
         replacement_history: Some(vec![envelope]),
         retained_context: None,
@@ -499,7 +695,14 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() -> 
         window_id: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
-    }))?;
+        resume_metadata: Some(CompactionResumeMetadata {
+            dynamic_tools: None,
+            multi_agent_version: Some(MultiAgentVersion::V2),
+            last_started_turn_id: Some("turn-1".to_string()),
+            turn_attribution: None,
+            previous_turn_settings: None,
+        }),
+    })))?;
 
     let restored: RolloutItem = serde_json::from_value(compacted_line.clone())?;
     let RolloutItem::Compacted(restored) = restored else {
@@ -647,7 +850,7 @@ fn rollout_item_variants_preserve_existing_payload_shapes() -> Result<()> {
 fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<()> {
     let schema = serde_json::to_value(schemars::schema_for!(RolloutItem))?;
     let variants = schema["oneOf"].as_array().expect("rollout variants");
-    assert_eq!(variants.len(), 12);
+    assert_eq!(variants.len(), 13);
 
     for variant in variants {
         let required = variant["required"].as_array().expect("required fields");
@@ -682,6 +885,8 @@ fn rollout_item_schema_matches_tagged_payload_and_sibling_metadata() -> Result<(
 
 fn response_message(role: &str) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: role.to_string(),
         content: vec![ContentItem::InputText {
@@ -707,6 +912,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
         window_id: Some("019b3f6e-7a10-7cc3-8b6e-1d09e2f7a001".to_string()),
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
 
     assert_eq!(
@@ -746,6 +952,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
             window_id: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }
     );
     Ok(())
@@ -754,7 +961,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
 #[test]
 fn copied_history_uses_persisted_history_mode() -> Result<()> {
     let thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")?;
-    let session_meta = RolloutItem::SessionMeta(SessionMetaLine {
+    let session_meta = RolloutItem::SessionMeta(Box::new(SessionMetaLine {
         meta: SessionMeta {
             session_id: thread_id.into(),
             id: thread_id,
@@ -762,8 +969,9 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
             ..SessionMeta::default()
         },
         git: None,
-    });
+    }));
     let history = InitialHistory::Resumed(ResumedHistory {
+        history_revision: None,
         conversation_id: thread_id,
         history: Arc::new(vec![session_meta.clone()]),
         rollout_path: None,
@@ -783,6 +991,7 @@ fn copied_history_uses_persisted_history_mode() -> Result<()> {
     );
     assert_eq!(
         InitialHistory::Resumed(ResumedHistory {
+            history_revision: None,
             conversation_id: thread_id,
             history: Arc::new(Vec::new()),
             rollout_path: None,
@@ -818,12 +1027,107 @@ fn multi_agent_version_uses_newest_present_session_meta_value() -> Result<()> {
     assert_eq!(
         multi_agent_version_from_items(
             &[
-                RolloutItem::SessionMeta(older_meta),
-                RolloutItem::SessionMeta(newer_meta_without_version),
+                RolloutItem::SessionMeta(Box::new(older_meta)),
+                RolloutItem::SessionMeta(Box::new(newer_meta_without_version)),
             ],
             Some(thread_id),
         ),
         Some(MultiAgentVersion::V2)
     );
+    Ok(())
+}
+
+#[test]
+fn multi_agent_version_uses_compaction_metadata_without_turn_context() -> Result<()> {
+    let compacted = serde_json::from_value::<CompactedItem>(json!({
+        "message": "summary",
+        "replacement_history": [],
+        "window_number": 1,
+        "resume_metadata": {"multi_agent_version": "v2"}
+    }))?;
+
+    assert_eq!(
+        InitialHistory::Forked(vec![RolloutItem::Compacted(Box::new(compacted))])
+            .get_multi_agent_version(),
+        Some(MultiAgentVersion::V2)
+    );
+    Ok(())
+}
+
+#[test]
+fn dynamic_tools_updates_survive_replay_and_explicit_clear() -> Result<()> {
+    let tool = codex_protocol::dynamic_tools::DynamicToolSpec::Function(
+        codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
+            name: "check_release".into(),
+            description: "Check the release.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            defer_loading: false,
+        },
+    );
+    let thread_id = ThreadId::new();
+    let mut items = vec![RolloutItem::SessionMeta(Box::new(SessionMetaLine {
+        meta: SessionMeta {
+            id: thread_id,
+            dynamic_tools: Some(vec![tool.clone()]),
+            ..SessionMeta::default()
+        },
+        git: None,
+    }))];
+    let mut replacement = tool.clone();
+    if let codex_protocol::dynamic_tools::DynamicToolSpec::Function(tool) = &mut replacement {
+        tool.name = "check_deployment".into();
+    }
+    let checkpoint = |thread_id: ThreadId, tools: Vec<DynamicToolSpec>| -> Result<RolloutItem> {
+        Ok(RolloutItem::Compacted(Box::new(serde_json::from_value(
+            json!({
+                "message": "summary",
+                "replacement_history": [],
+                "window_number": 1,
+                "resume_metadata": {
+                    "dynamic_tools": {"thread_id": thread_id, "tools": tools}
+                }
+            }),
+        )?)))
+    };
+    items.push(checkpoint(ThreadId::new(), vec![replacement.clone()])?);
+    assert_eq!(
+        latest_dynamic_tools(&items),
+        Some(std::slice::from_ref(&tool))
+    );
+    for expected in [vec![replacement], Vec::new()] {
+        for item in [
+            checkpoint(thread_id, expected.clone())?,
+            RolloutItem::DynamicToolsUpdated {
+                thread_id,
+                tools: expected.clone(),
+            },
+        ] {
+            items.push(checkpoint(thread_id, vec![tool.clone()])?);
+            items.push(item);
+            // Metadata-only writes and inherited records cannot resurrect a replaced catalog.
+            items.push(items[0].clone());
+            items.push(RolloutItem::DynamicToolsUpdated {
+                thread_id: ThreadId::new(),
+                tools: vec![tool.clone()],
+            });
+            items.push(checkpoint(ThreadId::new(), vec![tool.clone()])?);
+            let serialized = serde_json::to_vec(&items)?;
+            let replayed: Vec<RolloutItem> = serde_json::from_slice(&serialized)?;
+            assert_eq!(
+                InitialHistory::Forked(replayed.clone()).get_dynamic_tools(),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                InitialHistory::Resumed(ResumedHistory {
+                    history_revision: None,
+                    conversation_id: thread_id,
+                    history: Arc::new(replayed),
+                    rollout_path: None,
+                })
+                .get_dynamic_tools(),
+                Some(expected.clone())
+            );
+        }
+    }
     Ok(())
 }

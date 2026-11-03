@@ -32,6 +32,8 @@ use crate::sandbox_bin_dir;
 use crate::sandbox_dir;
 use crate::sandbox_secrets_dir;
 use crate::set_local_user_flags;
+use crate::setup_acl_error::WriteAclOperation;
+use crate::setup_acl_error::record_acl_failure;
 use crate::setup_error_path;
 use crate::setup_log_writer;
 use crate::string_from_sid_bytes;
@@ -81,6 +83,7 @@ use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
@@ -123,6 +126,8 @@ struct Payload {
     #[serde(default)]
     otel: Option<StatsigMetricsSettings>,
     real_user: String,
+    #[serde(default)]
+    user_profile: Option<PathBuf>,
     #[serde(default)]
     mode: SetupMode,
     #[serde(default, skip_serializing_if = "SetupRuntime::is_legacy")]
@@ -211,8 +216,9 @@ fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> 
     let payload_json = serde_json::to_vec(&read_payload)?;
     let payload_b64 = BASE64.encode(payload_json);
     let exe = std::env::current_exe().context("locate setup helper")?;
-    Command::new(&exe)
-        .arg(payload_b64)
+    let mut command = Command::new(&exe);
+    crate::launch_environment::configure_command(&mut command, &payload_b64)?;
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -514,6 +520,16 @@ fn real_main(setup_mode: &mut Option<SetupMode>) -> Result<()> {
         )));
     }
     let payload_b64 = args.remove(1);
+    let payload_b64 = if payload_b64 == crate::launch_environment::ARG {
+        crate::environment_transport::decode(std::env::vars_os()).map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperRequestArgsFailed,
+                format!("failed to read payload environment: {err}"),
+            ))
+        })?
+    } else {
+        payload_b64
+    };
     let payload_json = BASE64.decode(payload_b64).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperRequestArgsFailed,
@@ -870,7 +886,7 @@ fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<(
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSandboxLockFailed,
             format!(
-                "lock sandbox bin dir {} failed: {err}",
+                "lock sandbox bin dir {} failed: {err:#}",
                 sandbox_bin_dir(&payload.codex_home).display()
             ),
         ))
@@ -933,6 +949,50 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             log,
             &format!("applied {} deny-read ACLs", applied_deny_read_paths.len()),
         )?;
+    }
+
+    if let Some(user_profile) = payload.user_profile.as_deref()
+        && user_profile.is_absolute()
+    {
+        let mut cwd_components = payload.command_cwd.components();
+        let cwd_is_under_profile = user_profile.components().all(|profile_component| {
+            cwd_components.next().is_some_and(|cwd_component| {
+                cwd_component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&profile_component.as_os_str().to_string_lossy())
+            })
+        });
+        if cwd_is_under_profile {
+            match unsafe {
+                ensure_allow_mask_aces_with_inheritance(
+                    user_profile,
+                    &[sandbox_group_psid],
+                    FILE_READ_ATTRIBUTES,
+                    /*inheritance*/ 0,
+                )
+            } {
+                Ok(true) => {
+                    log_line(
+                        log,
+                        &format!(
+                            "granted non-inheriting read-attributes ACE on user profile {}",
+                            user_profile.display()
+                        ),
+                    )?;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    log_line(
+                        log,
+                        &format!(
+                            "failed to grant non-inheriting read-attributes ACE on user profile {}: {err:#}; continuing setup",
+                            user_profile.display()
+                        ),
+                    )?;
+                }
+            }
+        }
     }
 
     if payload.read_roots.is_empty() {
@@ -1000,18 +1060,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match path_write_aces_need_refresh(root, &[sandbox_group_psid, root_cap_psid]) {
                 Ok(needs_refresh) => needs_refresh,
                 Err(e) => {
-                    refresh_errors.push(format!(
-                        "write ACE check failed on {}: {}",
-                        root.display(),
-                        e
-                    ));
-                    log_line(
-                        log,
-                        &format!(
-                            "write ACE check failed on {}: {}; continuing",
-                            root.display(),
-                            e
-                        ),
+                    record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Check,
+                        root,
+                        &e,
+                        |message| log_line(log, message),
                     )?;
                     true
                 }
@@ -1063,10 +1117,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    refresh_errors.push(format!("write ACE failed on {}: {}", root.display(), e));
-                    if log_line(
-                        log,
-                        &format!("write ACE grant failed on {}: {}", root.display(), e),
+                    if record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Grant,
+                        &root,
+                        &e,
+                        |message| log_line(log, message),
                     )
                     .is_err()
                     {
@@ -1117,10 +1173,12 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                 }
                 Ok(false) => {}
                 Err(err) => {
-                    refresh_errors.push(format!("deny ACE failed on {}: {err}", path.display()));
-                    log_line(
-                        log,
-                        &format!("deny ACE failed on {}: {err}", path.display()),
+                    record_acl_failure(
+                        &mut refresh_errors,
+                        WriteAclOperation::Deny,
+                        path,
+                        &err,
+                        |message| log_line(log, message),
                     )?;
                 }
             }

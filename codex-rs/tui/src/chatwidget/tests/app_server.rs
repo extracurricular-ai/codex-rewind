@@ -1,6 +1,7 @@
 use super::helpers::drain_insert_history_transcript;
 use super::*;
 use codex_app_server_protocol::AuthRecoveryNotification;
+use codex_app_server_protocol::ThreadItem;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use pretty_assertions::assert_eq;
@@ -38,13 +39,14 @@ fn thread_settings_for_test(
                 },
             },
             multi_agent_mode: Default::default(),
-            personality: Some(Personality::Pragmatic),
+            personality: None,
         },
     }
 }
 
 fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::ThreadSessionState {
     crate::session_state::ThreadSessionState {
+        daybreak_enabled: false,
         windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
@@ -62,7 +64,6 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
         instruction_source_paths: Vec::new(),
         reasoning_effort: None,
         collaboration_mode: None,
-        personality: None,
         message_history: None,
         network_proxy: None,
         rollout_path: None,
@@ -106,6 +107,9 @@ async fn session_header_uses_catalog_display_name_without_changing_model() {
 async fn session_and_settings_sync_server_provider_id() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.config.model_provider.base_url = Some("https://local-provider.example/v1".to_string());
+    chat.local_settings.tui.status_line = Some(vec!["profile".into(), "provider".into()]);
+    chat.refresh_status_line();
+    assert_eq!(status_line_text(&chat), None);
     let status = |chat: &mut ChatWidget| {
         chat.add_status_output(
             /*refreshing_rate_limits*/ false, /*request_id*/ None,
@@ -122,10 +126,25 @@ async fn session_and_settings_sync_server_provider_id() {
     let first_id = ThreadId::new();
     let mut first = configured_thread_session(first_id);
     first.model_provider_id = "server-ollama".to_string();
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: None,
+        plan: None,
+        workspace: Some("account-123".to_string()),
+    });
+    let mut provider = chat.config.model_provider.clone();
+    provider.env_key = Some("CUSTOM_API_KEY".to_string());
+    chat.config
+        .model_providers
+        .insert(first.model_provider_id.clone(), provider);
     chat.handle_thread_session(first.clone());
     let displayed = status(&mut chat);
     assert!(displayed.contains("Model provider:") && displayed.contains("server-ollama"));
     assert!(!displayed.contains("local-provider.example"));
+    assert!(!displayed.contains("ChatGPT workspace:"));
+    assert_eq!(
+        status_line_text(&chat).as_deref(),
+        Some("provider: server-ollama")
+    );
 
     let mut other = configured_thread_session(ThreadId::new());
     other.model_provider_id = "server-bedrock".to_string();
@@ -137,6 +156,15 @@ async fn session_and_settings_sync_server_provider_id() {
     chat.handle_thread_session_quiet(first);
     assert_eq!(chat.config.model_provider_id, "server-ollama");
 
+    chat.config.config_layer_stack = chat
+        .config
+        .config_layer_stack
+        .with_user_config_profile(
+            &chat.config.codex_home.join("work.config.toml"),
+            Some(&"work".parse().unwrap()),
+            toml::Table::new().into(),
+        )
+        .unwrap();
     let mut updated = thread_settings_for_test("gpt-5.4", first_id);
     updated.thread_settings.model_provider = "server-updated".to_string();
     chat.handle_server_notification(
@@ -144,6 +172,10 @@ async fn session_and_settings_sync_server_provider_id() {
         /*replay_kind*/ None,
     );
     assert!(status(&mut chat).contains("server-updated"));
+    insta::assert_snapshot!(
+        status_line_text(&chat).unwrap(),
+        @"profile: work · provider: server-updated"
+    );
 }
 
 fn start_safety_buffering_test_turn(
@@ -162,6 +194,7 @@ fn start_safety_buffering_test_turn(
             thread_id: thread_id.to_string(),
             turn: AppServerTurn {
                 id: turn_id.to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -507,6 +540,78 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
 }
 
 #[tokio::test]
+async fn tool_suggestion_install_url_is_validated_before_opening() {
+    for install_url in [
+        "file:///tmp/connector",
+        "http://example.test/install",
+        "custom://example.test/install",
+        "not a URL",
+        "https://user:password@example.test/install",
+        "https://example.test/install",
+    ] {
+        let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+        let request_thread_id = ThreadId::new();
+        chat.thread_id = Some(ThreadId::new());
+        let initial_popup = render_bottom_popup(&chat, /*width*/ 80);
+
+        chat.handle_elicitation_request_now(
+            codex_app_server_protocol::RequestId::Integer(9),
+            codex_app_server_protocol::McpServerElicitationRequestParams {
+                thread_id: request_thread_id.to_string(),
+                turn_id: Some("turn-install".to_string()),
+                server_name: "connector-server".to_string(),
+                request: codex_app_server_protocol::McpServerElicitationRequest::Form {
+                    meta: Some(serde_json::json!({
+                        "codex_approval_kind": "tool_suggestion",
+                        "tool_type": "connector",
+                        "suggest_type": "install",
+                        "suggest_reason": "Install the connector to continue",
+                        "tool_id": "connector_test",
+                        "tool_name": "Test Connector",
+                        "install_url": install_url,
+                    })),
+                    message: "Install Test Connector".to_string(),
+                    requested_schema: serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                    }))
+                    .expect("valid schema"),
+                },
+            },
+        );
+
+        if install_url == "https://example.test/install" {
+            chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_matches!(
+                rx.try_recv(),
+                Ok(AppEvent::OpenUrlInBrowser { url }) if url == install_url
+            );
+        } else {
+            assert_matches!(
+                rx.try_recv(),
+                Ok(AppEvent::SubmitThreadOp {
+                    thread_id,
+                    op: Op::ResolveElicitation {
+                        server_name,
+                        request_id: codex_app_server_protocol::RequestId::Integer(9),
+                        decision: codex_app_server_protocol::McpServerElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    },
+                }) if thread_id == request_thread_id && server_name == "connector-server"
+            );
+            let popup = render_bottom_popup(&chat, /*width*/ 80);
+            assert_eq!(popup, initial_popup);
+            assert_chatwidget_snapshot!(
+                "declined_tool_suggestion",
+                normalize_snapshot_paths(popup)
+            );
+        }
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
 async fn invalid_url_elicitation_is_declined() {
     let (mut chat, _app_event_tx, mut rx, _op_rx) = make_chatwidget_manual_with_sender().await;
     let visible_thread_id = ThreadId::new();
@@ -553,6 +658,8 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
     let mut session = configured_thread_session(thread_id);
     session.cwd = test_path_buf("/tmp/original-workspace").abs();
     chat.handle_thread_session(session);
+    chat.config.permissions.approval_policy =
+        Constrained::allow_only(AskForApproval::Never.to_core());
     let previous_generation = chat.connector_scope_generation();
     let old_app = serde_json::from_str(r#"{"id":"old","name":"Old","isAccessible":true}"#)
         .expect("valid app");
@@ -594,7 +701,6 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
             .id,
         codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY
     );
-    assert_eq!(chat.config_ref().personality, Some(Personality::Pragmatic));
     assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
     assert!(
         drain_insert_history(&mut rx).is_empty(),
@@ -660,11 +766,10 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
     );
 
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CollabAgentToolCall {
                 id: "call-spawn".to_string(),
                 tool: AppServerCollabAgentTool::SpawnAgent,
                 status: AppServerCollabAgentToolCallStatus::InProgress,
@@ -675,15 +780,15 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
                 reasoning_effort: Some(ReasoningEffortConfig::High),
                 agents_states: HashMap::new(),
             },
-        }),
+            /*started_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CollabAgentToolCall {
                 id: "call-spawn".to_string(),
                 tool: AppServerCollabAgentTool::SpawnAgent,
                 status: AppServerCollabAgentToolCallStatus::Completed,
@@ -700,7 +805,9 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
                     },
                 )]),
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -736,11 +843,10 @@ async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered
     assert!(lines_to_single_string(&inserted[0]).contains("Hi, are you there?"));
 
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::UserMessage {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::UserMessage {
                 id: "user-1".to_string(),
                 client_id: None,
                 content: vec![AppServerUserInput::Text {
@@ -748,7 +854,9 @@ async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered
                     text_elements: Vec::new(),
                 }],
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -760,11 +868,10 @@ async fn live_app_server_user_message_omits_unsupported_media() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::UserMessage {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::UserMessage {
                 id: "user-1".to_string(),
                 client_id: None,
                 content: vec![
@@ -780,7 +887,9 @@ async fn live_app_server_user_message_omits_unsupported_media() {
                     },
                 ],
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -801,6 +910,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -820,7 +930,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         .expect("status indicator should be visible");
     assert_eq!(status.header(), "Working");
 
-    let item = AppServerThreadItem::AgentMessage {
+    let item = AppServerThreadItemPayload::AgentMessage {
         id: "msg-1".to_string(),
         text: "Yes. What do you need?".to_string(),
         phase: Some(MessagePhase::FinalAnswer),
@@ -829,12 +939,13 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         questions: None,
     };
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: item.clone(),
-        }),
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            item.clone(),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -848,8 +959,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Summary,
-                items: vec![item],
+                items: vec![ThreadItem::untimed(item)],
                 status: AppServerTurnStatus::Completed,
                 error: None,
                 started_at: None,
@@ -864,7 +976,10 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         .iter()
         .map(|lines| lines_to_single_string(lines).trim().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(completion_cells, vec!["[completion time]"]);
+    assert_eq!(
+        completion_cells,
+        vec!["Worked for [duration] • [completion time]"]
+    );
     assert!(!chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_widget().is_none());
     assert_eq!(
@@ -882,6 +997,7 @@ async fn live_app_server_turn_started_sets_feedback_turn_id() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1044,38 +1160,104 @@ async fn config_warning_during_turn_retains_transcript_details() {
 }
 
 #[tokio::test]
-async fn startup_config_warning_is_not_repeated_by_thread() {
+async fn sqlite_recovery_warning_shows_backup_and_metadata_limitations() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let message = "Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.";
-
-    for notification in [
+    chat.handle_server_notification(
         ServerNotification::ConfigWarning(ConfigWarningNotification {
-            summary: message.to_string(),
-            details: None,
+            summary: "Codex rebuilt its local database".into(),
+            details: Some("Damaged local databases were rebuilt. Saved conversations remain in rollout files and can restore the thread list and history. Some database-only metadata may be unavailable. The original database files were preserved at the backup locations below.\n\nDatabase path: /codex/state_5.sqlite\nBackup folder: /codex/db-backups/recovery".into()),
             path: None,
             range: None,
         }),
-        ServerNotification::Warning(WarningNotification {
-            thread_id: Some("thread-1".to_string()),
-            message: message.to_string(),
-        }),
-    ] {
-        chat.handle_server_notification(notification, /*replay_kind*/ None);
-    }
-
+        /*replay_kind*/ None,
+    );
     let cells = drain_insert_history_transcript(&mut rx);
-    assert_eq!(cells.len(), 1);
-    insta::assert_snapshot!(lines_to_single_string(&cells[0]), @"
-    ⚠ Codex is ignoring 1 unrecognized configuration setting. Check for typos or
-      deprecated settings.
-    ");
+    insta::assert_snapshot!(
+        "sqlite_recovery_warning",
+        cells
+            .iter()
+            .map(|lines| lines_to_single_string(lines))
+            .collect::<String>()
+    );
+}
+
+#[tokio::test]
+async fn startup_config_warning_is_not_repeated_by_thread() {
+    let mut warnings = Vec::new();
+    for (local_daemon, managed_daemon) in [(false, false), (true, true), (true, false)] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        if local_daemon {
+            chat.remote_connection =
+                Some(crate::status::remote_connection::RemoteConnectionStatus {
+                    address: "local".into(),
+                    version: "v0.153.0".into(),
+                    is_local_daemon: true,
+                    is_managed_daemon: managed_daemon,
+                });
+        }
+        let message = "Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.";
+        for notification in [
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: message.to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+            ServerNotification::Warning(WarningNotification {
+                thread_id: Some("thread-1".to_string()),
+                message: message.to_string(),
+            }),
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "Second config warning".into(),
+                details: Some("A different setting needs attention.".into()),
+                path: None,
+                range: None,
+            }),
+        ] {
+            chat.handle_server_notification(notification, /*replay_kind*/ None);
+        }
+        let cells: Vec<Arc<dyn HistoryCell>> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => Some(Arc::from(cell)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells.len(), 2);
+        let original_warnings = history_cell::warning_entries(&cells);
+        chat.open_warnings(&cells);
+        let first = super::helpers::render_bottom_popup(&chat, /*width*/ 80);
+        if local_daemon && !managed_daemon {
+            assert!(
+                !first.contains("/daemon"),
+                "unmanaged servers cannot be restarted"
+            );
+        } else {
+            warnings.push(format!("local daemon: {local_daemon}\n{first}"));
+        }
+        chat.handle_key_event(KeyCode::Right.into());
+        let second = super::helpers::render_bottom_popup(&chat, /*width*/ 80);
+        assert!(second.contains("Second config warning"));
+        assert!(
+            !second.contains("/daemon"),
+            "one restart hint per warning panel"
+        );
+        chat.handle_key_event(KeyCode::Esc.into());
+        let dismissed = std::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|event| match event {
+                AppEvent::UpdateWarnings { dismissed, .. } => Some(dismissed),
+                _ => None,
+            })
+            .expect("closing the panel dismisses the viewed diagnostics");
+        assert_eq!(dismissed, original_warnings);
+    }
+    insta::assert_snapshot!("startup_config_warning_panel", warnings.join("\n\n"));
 }
 
 #[tokio::test]
 async fn live_app_server_file_change_item_started_preserves_changes() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    let item = AppServerThreadItem::FileChange {
+    let item = AppServerThreadItemPayload::FileChange {
         id: "patch-1".to_string(),
         changes: vec![FileUpdateChange {
             path: "foo.txt".to_string(),
@@ -1085,23 +1267,23 @@ async fn live_app_server_file_change_item_started_preserves_changes() {
         status: AppServerPatchApplyStatus::InProgress,
     };
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: item.clone(),
-        }),
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            item.clone(),
+            /*started_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
     let cells = drain_insert_history(&mut rx);
     assert!(!cells.is_empty(), "expected patch history to be rendered");
     let transcript = lines_to_single_string(cells.last().expect("patch cell"));
-    let AppServerThreadItem::FileChange { id, changes, .. } = item else {
+    let AppServerThreadItemPayload::FileChange { id, changes, .. } = item else {
         unreachable!()
     };
     chat.replay_thread_item(
-        AppServerThreadItem::FileChange {
+        AppServerThreadItemPayload::FileChange {
             id,
             changes,
             status: AppServerPatchApplyStatus::Completed,
@@ -1126,12 +1308,12 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
         shlex::try_join(["/bin/zsh", "-lc", script]).expect("round-trippable shell wrapper");
 
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: AppServerThreadItem::CommandExecution {
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "cmd-1".to_string(),
                 command: command.clone(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -1147,16 +1329,17 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 exit_code: None,
                 duration_ms: None,
             },
-        }),
+            /*started_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::CommandExecution {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CommandExecution {
                 model_context: None,
+                sandbox_type: None,
                 id: "cmd-1".to_string(),
                 command,
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -1172,7 +1355,9 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 exit_code: Some(0),
                 duration_ms: Some(5),
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -1243,7 +1428,9 @@ async fn live_app_server_command_output_delta_transcript_snapshot() {
 #[tokio::test]
 async fn live_app_server_sub_agent_activity_renders_once() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let activity = AppServerThreadItem::SubAgentActivity {
+    let activity = AppServerThreadItemPayload::SubAgentActivity {
+        model: None,
+        reasoning_effort: None,
         id: "activity-1".to_string(),
         kind: codex_app_server_protocol::SubAgentActivityKind::Completed,
         agent_thread_id: ThreadId::new().to_string(),
@@ -1251,21 +1438,22 @@ async fn live_app_server_sub_agent_activity_renders_once() {
     };
 
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: activity.clone(),
-        }),
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            activity.clone(),
+            /*started_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: activity,
-        }),
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            activity,
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -1296,11 +1484,10 @@ async fn live_app_server_collab_wait_items_render_history() {
     );
 
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CollabAgentToolCall {
                 id: "wait-1".to_string(),
                 tool: AppServerCollabAgentTool::Wait,
                 status: AppServerCollabAgentToolCallStatus::InProgress,
@@ -1314,16 +1501,16 @@ async fn live_app_server_collab_wait_items_render_history() {
                 reasoning_effort: None,
                 agents_states: HashMap::new(),
             },
-        }),
+            /*started_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CollabAgentToolCall {
                 id: "wait-1".to_string(),
                 tool: AppServerCollabAgentTool::Wait,
                 status: AppServerCollabAgentToolCallStatus::Completed,
@@ -1352,7 +1539,9 @@ async fn live_app_server_collab_wait_items_render_history() {
                     ),
                 ]),
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -1373,11 +1562,10 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
         ThreadId::from_string("019cff70-2599-75e2-af72-b91781b41a8e").expect("valid thread id");
 
     chat.handle_server_notification(
-        ServerNotification::ItemStarted(ItemStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            started_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemStarted(ItemStartedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CollabAgentToolCall {
                 id: "spawn-1".to_string(),
                 tool: AppServerCollabAgentTool::SpawnAgent,
                 status: AppServerCollabAgentToolCallStatus::InProgress,
@@ -1388,16 +1576,16 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                 reasoning_effort: Some(ReasoningEffortConfig::High),
                 agents_states: HashMap::new(),
             },
-        }),
+            /*started_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
     chat.handle_server_notification(
-        ServerNotification::ItemCompleted(ItemCompletedNotification {
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            completed_at_ms: 0,
-            item: AppServerThreadItem::CollabAgentToolCall {
+        ServerNotification::ItemCompleted(ItemCompletedNotification::new(
+            "thread-1".to_string(),
+            "turn-1".to_string(),
+            AppServerThreadItemPayload::CollabAgentToolCall {
                 id: "spawn-1".to_string(),
                 tool: AppServerCollabAgentTool::SpawnAgent,
                 status: AppServerCollabAgentToolCallStatus::Completed,
@@ -1414,7 +1602,9 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
                     },
                 )]),
             },
-        }),
+            /*started_at_ms*/ None,
+            /*completed_at_ms*/ 0,
+        )),
         /*replay_kind*/ None,
     );
 
@@ -1438,6 +1628,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1473,6 +1664,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::Failed,
@@ -1545,7 +1737,7 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
         /*error*/ None,
     );
     completed_turn.items_view = codex_app_server_protocol::TurnItemsView::Summary;
-    completed_turn.items = vec![AppServerThreadItem::AgentMessage {
+    completed_turn.items = vec![ThreadItem::untimed(AppServerThreadItemPayload::AgentMessage {
         id: "msg-1".to_string(),
         text: concat!(
             "The transport kept this.\nAnd dropped this.\n\n",
@@ -1555,8 +1747,11 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
         phase: Some(MessagePhase::FinalAnswer),
         memory_citation: None,
         delivery: None,
-        questions: None,
-    }];
+        questions: Some(vec![codex_protocol::items::AsyncUserInputQuestion {
+            title: "Which way?".into(),
+            options: None,
+        }]),
+    })];
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
@@ -1586,6 +1781,52 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
         })
         .collect::<Vec<_>>();
     assert_eq!(consolidations.len(), 1);
+    assert_eq!(chat.bottom_pane.question_editor().unanswered_count(), 0);
+    assert!(matches!(
+        chat.pending_notification,
+        Some(Notification::AgentTurnComplete { .. })
+    ));
+}
+
+#[tokio::test]
+async fn live_app_server_interleaved_flush_repairs_mismatched_completion() {
+    for (completed_item_id, completed) in [
+        ("msg-1", "The transport kept this.\nAnd dropped this."),
+        ("msg-2", "The transport kept this."),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+        handle_turn_started(&mut chat, "turn-1");
+        while rx.try_recv().is_ok() {}
+        handle_agent_message_delta(&mut chat, "The transport kept this.");
+        chat.flush_answer_stream_with_separator();
+        while rx.try_recv().is_ok() {}
+
+        complete_assistant_message(
+            &mut chat,
+            completed_item_id,
+            completed,
+            Some(MessagePhase::FinalAnswer),
+        );
+
+        let consolidations = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::ConsolidateAgentMessage {
+                    source,
+                    scrollback_reflow,
+                    ..
+                } => Some((source, scrollback_reflow)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            consolidations,
+            vec![(
+                completed.to_string(),
+                crate::app_event::ConsolidationScrollbackReflow::IfResizeReflowRan,
+            )]
+        );
+    }
 }
 
 #[tokio::test]
@@ -1597,6 +1838,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -1667,45 +1909,63 @@ async fn live_app_server_rate_limit_error_renders_upstream_message() {
 
 #[tokio::test]
 async fn live_app_server_server_overloaded_error_renders_error() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    for (message, error_info) in [
+        ("server overloaded", CodexErrorInfo::ServerOverloaded),
+        (
+            "server overloaded",
+            CodexErrorInfo::PolicyCapacityUnavailable,
+        ),
+        ("", CodexErrorInfo::ServerOverloaded),
+        ("", CodexErrorInfo::PolicyCapacityUnavailable),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.handle_server_notification(
-        ServerNotification::TurnStarted(TurnStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn: AppServerTurn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
-                status: AppServerTurnStatus::InProgress,
-                error: None,
-                started_at: Some(0),
-                completed_at: None,
-                duration_ms: None,
-            },
-        }),
-        /*replay_kind*/ None,
-    );
-    drain_insert_history(&mut rx);
+        chat.handle_server_notification(
+            ServerNotification::TurnStarted(TurnStartedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: AppServerTurn {
+                    id: "turn-1".to_string(),
+                    root_turn_id: None,
+                    items_view: codex_app_server_protocol::TurnItemsView::Full,
+                    items: Vec::new(),
+                    status: AppServerTurnStatus::InProgress,
+                    error: None,
+                    started_at: Some(0),
+                    completed_at: None,
+                    duration_ms: None,
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+        drain_insert_history(&mut rx);
 
-    chat.handle_server_notification(
-        ServerNotification::Error(ErrorNotification {
-            error: AppServerTurnError {
-                misalignment: None,
-                message: "server overloaded".to_string(),
-                codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
-                additional_details: None,
-            },
-            will_retry: false,
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-        }),
-        /*replay_kind*/ None,
-    );
+        chat.handle_server_notification(
+            ServerNotification::Error(ErrorNotification {
+                error: AppServerTurnError {
+                    misalignment: None,
+                    message: message.to_string(),
+                    codex_error_info: Some(error_info),
+                    additional_details: None,
+                },
+                will_retry: false,
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            }),
+            /*replay_kind*/ None,
+        );
 
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1);
-    assert_eq!(lines_to_single_string(&cells[0]), "■ server overloaded\n");
-    assert!(!chat.bottom_pane.is_task_running());
+        let cells = drain_insert_history(&mut rx);
+        assert_eq!(cells.len(), 1);
+        let rendered = lines_to_single_string(&cells[0]);
+        insta::allow_duplicates! {
+            if message.is_empty() {
+                insta::assert_snapshot!(rendered, @"■ Codex is currently experiencing high load.");
+            } else {
+                insta::assert_snapshot!(rendered, @"■ server overloaded");
+            }
+        }
+        assert!(!chat.bottom_pane.is_task_running());
+    }
 }
 
 #[tokio::test]
@@ -1717,6 +1977,7 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
+                root_turn_id: None,
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
@@ -2002,4 +2263,29 @@ async fn permission_discovery_invalidates_on_thread_settings_and_uses_updated_cw
         panic!("expected discovery")
     };
     assert_eq!(thread_cwd, Some(test_path_buf("/tmp/thread-settings")));
+}
+
+#[tokio::test]
+async fn sqlite_log_write_warning_is_visible_in_warnings() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.warning_display_state.startup_complete = true;
+    chat.handle_server_notification(
+        ServerNotification::Warning(WarningNotification {
+            thread_id: None,
+            message: "Codex couldn't save diagnostic logs to its local database. Use /feedback with logs included before closing Codex, or run `codex doctor` for diagnostics.".to_string(),
+        }),
+        /*replay_kind*/ None,
+    );
+    let cells: Vec<Arc<dyn HistoryCell>> = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(Arc::from(cell)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cells.len(), 1);
+    chat.open_warnings(&cells);
+    insta::assert_snapshot!(
+        "sqlite_log_write_warning",
+        super::helpers::render_bottom_popup(&chat, /*width*/ 80)
+    );
 }

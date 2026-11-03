@@ -1,5 +1,5 @@
 use codex_core::TurnInputRequest;
-use core_test_support::test_codex::local_selections;
+use core_test_support::test_codex::local_requests;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -65,7 +65,7 @@ async fn guardian_reused_reviewer_avoids_stale_catalog_lookup() -> Result<()> {
         models: bundled
             .models
             .into_iter()
-            .filter(|model| ["gpt-5.4", "codex-auto-review"].contains(&model.slug.as_str()))
+            .filter(|model| ["gpt-5.5", "codex-auto-review"].contains(&model.slug.as_str()))
             .collect(),
     };
     assert_eq!(catalog.models.len(), 2);
@@ -74,7 +74,7 @@ async fn guardian_reused_reviewer_avoids_stale_catalog_lookup() -> Result<()> {
 
     let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_model("gpt-5.4");
+        .with_model("gpt-5.5");
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
         config.approvals_reviewer = ApprovalsReviewer::AutoReview;
@@ -214,7 +214,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(test.config.cwd.clone())),
+                environments: Some(local_requests(test.config.cwd.clone())),
                 approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -643,10 +643,10 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         available_access_programs: None,
         upgrade: None,
         model_messages: Some(ModelMessages {
+            content_filter_guidance: None,
             persistent_instructions: None,
             tools: None,
             instructions_template: Some("base instructions".to_string()),
-            instructions_variables: None,
             approvals: None,
             collaboration_modes: None,
             auto_review: None,

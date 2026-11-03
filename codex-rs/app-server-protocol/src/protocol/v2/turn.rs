@@ -116,9 +116,12 @@ pub enum AdditionalContextKind {
 pub struct AdditionalContextEntry {
     pub value: String,
     pub kind: AdditionalContextKind,
+    /// Optional name for untrusted context, used to label its tool output.
+    #[ts(optional = nullable)]
+    pub name: Option<String>,
 }
 
-/// Requested cyber treatment for a ChatGPT-authenticated Codex turn.
+/// Requested cyber treatment for an OpenAI model turn.
 /// Authorization and model-tier restrictions remain server-owned.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -157,6 +160,9 @@ pub struct TurnToolOutput {
     pub name: String,
     pub namespace: Option<String>,
     pub output: FunctionCallOutputBody,
+    /// Requests retention of this output in the thread's model history.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain: bool,
 }
 
 #[derive(
@@ -177,9 +183,25 @@ pub struct TurnStartParams {
     /// Ignored when this request steers an already-active turn.
     #[ts(optional = nullable)]
     pub turn_trigger: Option<String>,
+    /// ID of the turn that caused this new turn to start.
+    ///
+    /// Set this when starting work on behalf of another turn, such as delegated
+    /// work in a different thread. Leave unset for work started directly by the
+    /// user. Ignored when this request adds input to an active turn.
+    #[ts(optional = nullable)]
+    pub parent_turn_id: Option<String>,
+    /// ID of the first turn in the chain of work that led to this new turn.
+    ///
+    /// When setting `parentTurnId`, set this to the parent turn's `rootTurnId`
+    /// when known. This keeps descendant work attributed to the original turn.
+    /// If omitted, the new turn becomes its own root. Ignored when this request
+    /// adds input to an active turn.
+    #[ts(optional = nullable)]
+    pub root_turn_id: Option<String>,
     #[ts(optional = nullable)]
     pub tool_output: Option<Box<TurnToolOutput>>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+    /// Replaces unprotected client-provided entries when supplied; an empty map clears them.
     ///
     /// Entries are flattened into the JSON string sent as
     /// `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
@@ -189,6 +211,11 @@ pub struct TurnStartParams {
     #[experimental("turn/start.responsesapiClientMetadata")]
     #[ts(optional = nullable)]
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    /// Merge entries into the ResponsesAPI turn metadata without removing existing entries.
+    /// Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.
+    #[experimental("turn/start.responsesapiClientMetadataPatch")]
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/start.additionalContext")]
     #[ts(optional = nullable)]
@@ -271,7 +298,7 @@ pub struct TurnStartParams {
     #[ts(optional = nullable)]
     pub multi_agent_mode: Option<MultiAgentMode>,
 
-    /// EXPERIMENTAL - Request a workspace-authorized cyber program for this
+    /// EXPERIMENTAL - Request an authorized cyber program for this
     /// turn. Omission preserves automatic behavior. This does not grant access.
     #[experimental("turn/start.cyberAccessProgram")]
     #[ts(optional = nullable)]
@@ -296,6 +323,7 @@ pub struct TurnSteerParams {
     pub client_user_message_id: Option<String>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+    /// Replaces unprotected client-provided entries when supplied; an empty map clears them.
     ///
     /// Entries are flattened into the JSON string sent as
     /// `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
@@ -305,6 +333,11 @@ pub struct TurnSteerParams {
     #[experimental("turn/steer.responsesapiClientMetadata")]
     #[ts(optional = nullable)]
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    /// Merge entries into the ResponsesAPI turn metadata without removing existing entries.
+    /// Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.
+    #[experimental("turn/steer.responsesapiClientMetadataPatch")]
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/steer.additionalContext")]
     #[ts(optional = nullable)]

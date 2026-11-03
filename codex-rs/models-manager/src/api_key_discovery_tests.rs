@@ -1,4 +1,4 @@
-//! API-key discovery rollout must gate network requests and cached catalog authority.
+//! API-key discovery opt-outs must gate network requests and cached catalog authority.
 
 use super::*;
 use pretty_assertions::assert_eq;
@@ -12,11 +12,8 @@ async fn api_key_discovery_disabled_preserves_command_auth_discovery_and_merging
     )];
     let endpoint = Arc::new(TestModelsEndpoint {
         has_command_auth: true,
-        uses_codex_backend: false,
-        responses: Mutex::new(vec![models.clone()].into()),
-        etag: None,
-        fetch_count: AtomicUsize::new(0),
-        observed_proxy_policy: Mutex::new(None),
+        responses: Mutex::new(vec![Ok(models.clone())].into()),
+        ..TestModelsEndpoint::default()
     });
     let manager = OpenAiModelsManager::new_without_cache(
         endpoint.clone(),
@@ -37,7 +34,7 @@ async fn api_key_discovery_disabled_preserves_command_auth_discovery_and_merging
 }
 
 #[tokio::test]
-async fn api_key_discovery_startup_flag_controls_fetches_and_cached_catalogs() {
+async fn api_key_discovery_flag_controls_fetches_and_cached_catalogs() {
     let home = tempdir().unwrap();
     let models = vec![remote_model("dynamic", "Dynamic", /*priority*/ 0)];
     let endpoint = TestModelsEndpoint::without_refresh(vec![models.clone()]);
@@ -45,6 +42,7 @@ async fn api_key_discovery_startup_flag_controls_fetches_and_cached_catalogs() {
     let manager =
         OpenAiModelsManager::new(home.path().into(), endpoint.clone(), Some(auth.clone()));
     let bundled = load_remote_models_from_file().unwrap();
+    let config = ModelsManagerConfig::default();
 
     for strategy in [
         RefreshStrategy::Online,
@@ -70,6 +68,25 @@ async fn api_key_discovery_startup_flag_controls_fetches_and_cached_catalogs() {
             .await
             .models,
         models
+    );
+    assert_eq!(endpoint.fetch_count(), 1);
+    assert_eq!(manager.get_model_info("dynamic", &config).await, models[0]);
+
+    // A runtime rollback must also suppress the already-loaded catalog.
+    manager.set_api_key_model_discovery_enabled(/*enabled*/ false);
+    assert_eq!(
+        manager
+            .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+            .models,
+        bundled
+    );
+    assert_eq!(manager.try_get_remote_models().unwrap(), bundled);
+    assert!(
+        manager
+            .get_model_info("dynamic", &config)
+            .await
+            .used_fallback_model_metadata
     );
     assert_eq!(endpoint.fetch_count(), 1);
 

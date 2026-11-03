@@ -172,7 +172,6 @@ use codex_app_server_protocol::RateLimitResetCreditStatus;
 use codex_app_server_protocol::RateLimitResetCreditsSummary;
 use codex_app_server_protocol::RateLimitResetType;
 use codex_app_server_protocol::RequestId;
-use codex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
 use codex_app_server_protocol::ReviewStartResponse;
 use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
@@ -229,10 +228,12 @@ use codex_app_server_protocol::ThreadIncrementElicitationParams;
 use codex_app_server_protocol::ThreadIncrementElicitationResponse;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadInjectItemsResponse;
-use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadItemEntry;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadItemsListResponse;
+use codex_app_server_protocol::ThreadItemsReadParams;
+use codex_app_server_protocol::ThreadItemsReadResponse;
 use codex_app_server_protocol::ThreadListCwdFilter;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
@@ -370,6 +371,7 @@ use codex_core::read_head_for_summary;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_core::truncate_rollout_after_turn_id;
 use codex_core::truncate_rollout_before_turn_id;
+use codex_core::validate_environment_ids_and_cwds;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core::windows_sandbox::WindowsSandboxSetupMode as CoreWindowsSandboxSetupMode;
 use codex_core::windows_sandbox::WindowsSandboxSetupRequest;
@@ -445,6 +447,8 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
+use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::ConversationSpeechParams;
@@ -458,14 +462,12 @@ use codex_protocol::protocol::GitInfo as CoreGitInfo;
 use codex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeVoicesList;
-use codex_protocol::protocol::ReviewDelivery as CoreReviewDelivery;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget as CoreReviewTarget;
 use codex_protocol::protocol::SessionConfiguredEvent;
 #[cfg(test)]
 use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_protocol::protocol::TurnEnvironmentRequest;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
@@ -476,7 +478,7 @@ use codex_rmcp_client::perform_oauth_login_return_url;
 use codex_rollout::InitialHistory;
 use codex_rollout::ResumedHistory;
 use codex_rollout::RolloutItem;
-use codex_rollout::is_persisted_rollout_item;
+use codex_rollout::persisted_rollout_item;
 use codex_rollout::state_db::StateDbHandle;
 use codex_rollout::state_db::reconcile_rollout;
 use codex_state::ThreadMetadata;
@@ -488,6 +490,7 @@ use codex_thread_store::DeleteThreadsParams as StoreDeleteThreadsParams;
 use codex_thread_store::GitInfoPatch as StoreGitInfoPatch;
 use codex_thread_store::ItemSortKey as StoreItemSortKey;
 use codex_thread_store::ListItemsParams as StoreListItemsParams;
+use codex_thread_store::ListItemsPosition as StoreListItemsPosition;
 use codex_thread_store::ListThreadsParams as StoreListThreadsParams;
 use codex_thread_store::ListTimelineParams as StoreListTimelineParams;
 use codex_thread_store::ListTurnsParams as StoreListTurnsParams;
@@ -538,16 +541,20 @@ use uuid::Uuid;
 #[cfg(test)]
 use codex_app_server_protocol::ServerRequest;
 
-mod account_processor;
+pub(crate) mod account_processor;
 mod apps_processor;
 mod bedrock_auth;
 mod catalog_processor;
 mod command_exec_processor;
-mod config_processor;
+pub(crate) mod config_processor;
+#[cfg(test)]
+#[path = "request_processors/config_reload_tests.rs"]
+mod config_reload_tests;
 mod diagnostics;
 mod environment_processor;
 mod feedback_doctor_report;
 mod feedback_processor;
+mod feedback_rollout_history;
 mod feedback_thread_index;
 mod fs_processor;
 mod git_processor;
@@ -567,8 +574,10 @@ mod thread_attachments;
 mod thread_enrichment;
 mod thread_fork_goal;
 mod thread_input;
+mod thread_memory;
 mod thread_processor;
 mod thread_queue_processor;
+mod thread_read_state;
 mod thread_sections;
 mod token_usage_replay;
 mod turn_processor;
@@ -606,6 +615,7 @@ use crate::error_code::invalid_request;
 use crate::filters::compute_source_filters;
 use crate::filters::source_kind_matches;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::PendingThreadUnloads;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
 use crate::thread_state::ThreadStateManager;
@@ -635,14 +645,14 @@ fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, 
     .transpose()
 }
 
-fn resolve_turn_environment_selections(
+fn resolve_turn_environment_requests(
     thread_manager: &ThreadManager,
     environments: Option<Vec<TurnEnvironmentParams>>,
-) -> Result<Option<Vec<TurnEnvironmentSelection>>, JSONRPCErrorError> {
+) -> Result<Option<Vec<TurnEnvironmentRequest>>, JSONRPCErrorError> {
     let Some(environments) = environments else {
         return Ok(None);
     };
-    let mut selections = Vec::with_capacity(environments.len());
+    let mut requests = Vec::with_capacity(environments.len());
     for environment in environments {
         let environment_id = environment.environment_id;
         let cwd = environment
@@ -672,17 +682,21 @@ fn resolve_turn_environment_selections(
             })
             .transpose()?
             .unwrap_or_else(|| vec![cwd.clone()]);
-        selections.push(TurnEnvironmentSelection {
+        requests.push(TurnEnvironmentRequest {
             environment_id,
             cwd,
             workspace_roots,
             config: EnvironmentConfigState::FromThread,
         });
     }
-    thread_manager
-        .validate_environment_selections(&selections)
-        .map_err(environment_selection_error)?;
-    Ok(Some(selections))
+    validate_environment_ids_and_cwds(
+        &thread_manager.environment_manager(),
+        requests
+            .iter()
+            .map(|request| (request.environment_id.as_str(), &request.cwd)),
+    )
+    .map_err(environment_selection_error)?;
+    Ok(Some(requests))
 }
 
 fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec<AbsolutePathBuf> {
@@ -695,7 +709,7 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
     resolved_roots
 }
 
-mod config_errors;
+pub(crate) mod config_errors;
 mod request_errors;
 mod thread_delete;
 mod thread_goal_processor;
@@ -711,7 +725,6 @@ use self::thread_resume_redaction::*;
 use self::thread_summary::*;
 
 pub(crate) use self::thread_lifecycle::populate_thread_turns_from_history;
-pub(crate) use self::thread_processor::thread_from_stored_thread;
 #[cfg(test)]
 pub(crate) use self::thread_summary::read_summary_from_rollout;
 #[cfg(test)]
@@ -721,8 +734,10 @@ pub(crate) use self::thread_summary::thread_settings_from_config_snapshot;
 pub(crate) fn build_legacy_api_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     let mut builder = ThreadHistoryBuilder::new();
     for item in items {
-        if is_persisted_rollout_item(item, codex_protocol::protocol::ThreadHistoryMode::Legacy) {
-            builder.handle_rollout_item(item);
+        if let Some(item) =
+            persisted_rollout_item(item, codex_protocol::protocol::ThreadHistoryMode::Legacy)
+        {
+            builder.handle_rollout_item(item.as_ref());
         }
     }
     builder.finish()

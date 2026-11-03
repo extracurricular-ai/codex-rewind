@@ -139,7 +139,7 @@ impl App {
         config
             .workspace_roots
             .clone_from(&self.chat_widget.config_ref().workspace_roots);
-        let selected_profile = self.confirmed_server_profile(thread_id);
+        let selected_profile = self.selected_server_profile(thread_id);
         let unrestorable = restore_files
             .then(|| crate::app_backtrack::unrestorable_notice(&config, thread_id, &before_turn_id))
             .flatten();

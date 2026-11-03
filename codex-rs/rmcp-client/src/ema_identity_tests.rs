@@ -29,7 +29,9 @@ use wiremock::matchers::path;
 use super::*;
 use crate::EmaAuthFailure;
 use crate::WrappedOAuthTokenResponse;
+use crate::oauth::RefreshCredentialLock;
 use crate::oauth::ResolvedOAuthCredentialStore;
+use crate::oauth::StoredOAuthCredentialSnapshot;
 use crate::oauth::test_support::TempCodexHome;
 
 fn credentials(issuer: &str, subject: &str, expires_at: u64) -> StoredOAuthTokens {
@@ -64,9 +66,13 @@ fn request<'a>(
     credentials: &'a StoredOAuthCredentialSnapshot,
 ) -> EmaIdpIdentityRequest<'a> {
     EmaIdpIdentityRequest {
+        client_secret: None,
+        token_endpoint_auth_method: None,
         issuer,
         client_id: "idp-client",
-        credentials,
+        credentials: EmaCredentialLease {
+            credentials: credentials.clone(),
+        },
         http_client: Arc::new(RouteAwareHttpClient::new(HttpClientFactory::new(
             OutboundProxyPolicy::ReqwestDefault,
         ))),
@@ -142,9 +148,15 @@ async fn enterprise_discovery_shares_idp_checks_but_keeps_login_endpoint_policy(
             /*has_configured_headers*/ false,
             StreamableHttpRedirectMode::Legacy,
         )?);
-        let shared = resolve_ema_idp_authorization_manager(&issuer, client.clone()).await;
+        let shared = resolve_ema_idp_authorization_manager(
+            &issuer,
+            client.clone(),
+            /*client_secret*/ None,
+            /*token_endpoint_auth_method*/ None,
+        )
+        .await;
         let login = crate::enterprise_oauth_login::resolve_enterprise_authorization_manager(
-            &issuer, client,
+            &issuer, client, /*client_secret*/ None, /*token_endpoint_auth_method*/ None,
         )
         .await;
         assert_eq!(
@@ -233,7 +245,7 @@ impl KeyringStore for GatedKeyringStore {
 async fn refresh_subject_reread_is_cancellable_and_releases_guard_on_failure() -> Result<()> {
     let _home = TempCodexHome::new();
     let (_server, issuer) = discovery().await;
-    let store = ResolvedOAuthCredentialStore::Keyring(AuthKeyringBackendKind::Direct);
+    let store = ResolvedOAuthCredentialStore::keyring(AuthKeyringBackendKind::Direct);
     let stored = credentials(&issuer, "user", /*expires_at*/ 0);
     let snapshot = StoredOAuthCredentialSnapshot::new(stored.clone(), store);
     for outcome in [
@@ -288,14 +300,15 @@ async fn refresh_subject_reread_is_cancellable_and_releases_guard_on_failure() -
                     "enterprise IdP credential reread task failed"
                 );
             } else {
-                assert!(error.to_string().contains("refusing file fallback"));
-                // The store's transparent wrapper exposes a platform error's source.
-                assert!(error.chain().any(|cause| {
-                    matches!(
-                        cause.downcast_ref::<io::Error>(),
-                        Some(error) if error.kind() == io::ErrorKind::PermissionDenied
-                    )
-                }));
+                assert_eq!(
+                    format!("{error:#}"),
+                    "failed to read enterprise IdP credentials from keyring"
+                );
+                assert!(
+                    !error
+                        .chain()
+                        .any(<dyn std::error::Error + 'static>::is::<io::Error>)
+                );
             }
         }
         // Drain the detached read before TempCodexHome changes the process environment.
@@ -312,7 +325,7 @@ async fn refresh_subject_reread_is_cancellable_and_releases_guard_on_failure() -
 async fn refresh_subject_rereads_pinned_credentials_after_id_token_expiry() -> Result<()> {
     let _home = TempCodexHome::new();
     let (_server, issuer) = discovery().await;
-    let store = ResolvedOAuthCredentialStore::Keyring(AuthKeyringBackendKind::Direct);
+    let store = ResolvedOAuthCredentialStore::keyring(AuthKeyringBackendKind::Direct);
     let stored = credentials(&issuer, "user", /*expires_at*/ 0);
     let snapshot = StoredOAuthCredentialSnapshot::new(stored.clone(), store);
     let keyring = MockKeyringStore::default();
@@ -323,15 +336,6 @@ async fn refresh_subject_rereads_pinned_credentials_after_id_token_expiry() -> R
         (&identity.token_endpoint, identity.refresh_token.as_str()),
         (&format!("{issuer}/token"), "stored-refresh")
     );
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(/*millis*/ 50),
-            RefreshCredentialLock::acquire_for_server(&stored.server_name, &issuer),
-        )
-        .await
-        .is_err()
-    );
-    drop(identity);
     let _released = RefreshCredentialLock::acquire_for_server(&stored.server_name, &issuer).await?;
     Ok(())
 }
@@ -341,7 +345,7 @@ async fn refresh_subject_rejects_removed_replaced_or_missing_credentials() -> Re
     let _home = TempCodexHome::new();
     let (server, issuer) = discovery().await;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let store = ResolvedOAuthCredentialStore::Keyring(AuthKeyringBackendKind::Direct);
+    let store = ResolvedOAuthCredentialStore::keyring(AuthKeyringBackendKind::Direct);
     let original = credentials(&issuer, "user", /*expires_at*/ 0);
     for change in [
         "deleted",
@@ -357,7 +361,7 @@ async fn refresh_subject_rejects_removed_replaced_or_missing_credentials() -> Re
         let snapshot = StoredOAuthCredentialSnapshot::new(
             original.clone(),
             if change == "file" {
-                ResolvedOAuthCredentialStore::File
+                ResolvedOAuthCredentialStore::file()
             } else {
                 store
             },

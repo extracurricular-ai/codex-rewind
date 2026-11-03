@@ -6,6 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::InitialHistory;
@@ -14,8 +15,10 @@ use codex_login::CodexAuth;
 use codex_login::auth::BedrockApiKeyAuth;
 use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_5_MODEL_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
+use codex_model_provider_info::GCP_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::AgentPath;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
@@ -28,6 +31,7 @@ use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::user_input::UserInput;
+use core_test_support::ThreadIdle;
 use core_test_support::responses;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
@@ -44,9 +48,12 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use test_case::test_case;
 use tokio::time::Duration;
 use wiremock::ResponseTemplate;
+
+use super::client::ProviderAuthCommandFixture;
 
 #[path = "compact_remote_trimming.rs"]
 mod trimming;
@@ -104,6 +111,7 @@ async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<
             codex_response_item_prefix: None,
             codex_response_handoff_mode:
                 codex_protocol::protocol::CodexResponseHandoffMode::Thinking,
+            backend_reasoning_status: false,
             codex_response_handoff_channel_prefixes: None,
             model: None,
             output_modality: RealtimeOutputModality::Audio,
@@ -113,6 +121,7 @@ async fn start_realtime_conversation(codex: &codex_core::CodexThread) -> Result<
             realtime_end_instructions: None,
             prompt: Some(Some("backend prompt".to_string())),
             realtime_session_id: None,
+            voice_session_id: None,
             transport: None,
             version: None,
             voice: None,
@@ -363,6 +372,8 @@ async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
     )
     .await?;
     let developer = |text: &str| ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "developer".to_string(),
         content: vec![ContentItem::InputText {
@@ -527,18 +538,62 @@ async fn remote_compact_v2_records_usage_before_output_validation() -> Result<()
     Ok(())
 }
 
+enum CompactionProvider {
+    AmazonBedrock,
+    Gcp,
+}
+
+#[test_case(CompactionProvider::AmazonBedrock; "bedrock")]
+#[test_case(CompactionProvider::Gcp; "gcp")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Result<()> {
+async fn provider_automatic_compaction_uses_v2_responses_endpoint(
+    provider: CompactionProvider,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let harness = TestCodexHarness::with_auto_env_builder(amazon_bedrock_test_codex().with_config(
-        |config| {
+    let server = responses::start_mock_server().await;
+    let auth_fixture;
+    let (builder, expected_model, expected_path, expected_auth) = match provider {
+        CompactionProvider::AmazonBedrock => (
+            amazon_bedrock_test_codex(),
+            AMAZON_BEDROCK_GPT_5_5_MODEL_ID,
+            "/v1/responses",
+            "Bearer bedrock-test-api-key",
+        ),
+        CompactionProvider::Gcp => {
+            auth_fixture = ProviderAuthCommandFixture::new(&["vertex-access-token"])?;
+            let mut provider = ModelProviderInfo::create_gcp_provider();
+            provider.base_url = Some(format!(
+                "{}/v1/projects/example-project/locations/global/publishers/openai/v1",
+                server.uri()
+            ));
+            provider.auth = Some(auth_fixture.auth());
+            (
+                test_codex()
+                    .with_model("gpt-6.1-sol")
+                    .with_config(move |config| {
+                        config.model_provider_id = GCP_PROVIDER_ID.to_string();
+                        config.model_provider = provider;
+                        config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
+                        config
+                            .features
+                            .enable(Feature::RemoteCompactionV2)
+                            .expect("test config should allow feature update");
+                    }),
+                "gpt-6.1-sol",
+                "/v1/projects/example-project/locations/global/publishers/openai/v1/responses",
+                "Bearer vertex-access-token",
+            )
+        }
+    };
+    let test = builder
+        .with_config(|config| {
             config.model_auto_compact_token_limit = Some(200);
-        },
-    ))
-    .await?;
+        })
+        .build_with_auto_env(&server)
+        .await?;
     let response_mock = responses::mount_sse_sequence(
-        harness.server(),
+        &server,
         vec![
             sse(vec![
                 responses::ev_assistant_message("message-1", "before automatic compaction"),
@@ -549,7 +604,7 @@ async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Res
                     "type": "response.output_item.done",
                     "item": {
                         "type": "compaction",
-                        "encrypted_content": "BEDROCK_AUTOMATIC_REMOTE_COMPACTED_SUMMARY",
+                        "encrypted_content": "PROVIDER_AUTOMATIC_REMOTE_COMPACTED_SUMMARY",
                     }
                 }),
                 responses::ev_completed("response-compact"),
@@ -562,44 +617,47 @@ async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Res
     )
     .await;
 
-    harness
-        .test()
-        .submit_turn("before automatic compact")
-        .await?;
-    harness
-        .test()
-        .submit_turn("after automatic compact")
-        .await?;
+    test.submit_turn("before automatic compact").await?;
+    test.submit_turn("after automatic compact").await?;
 
     let response_requests = response_mock.requests();
     assert_eq!(response_requests.len(), 3);
     assert!(
         response_requests
             .iter()
-            .all(|request| request.path() == "/v1/responses")
+            .all(|request| request.path() == expected_path)
     );
     let compact_request = &response_requests[1];
     assert_eq!(
         compact_request.header("authorization").as_deref(),
-        Some("Bearer bedrock-test-api-key")
+        Some(expected_auth)
     );
-    assert_eq!(
-        compact_request
-            .header("x-amzn-mantle-client-agent")
-            .as_deref(),
-        Some("codex")
-    );
-    assert_eq!(
-        compact_request.body_json()["model"],
-        AMAZON_BEDROCK_GPT_5_5_MODEL_ID
-    );
+    match provider {
+        CompactionProvider::AmazonBedrock => assert_eq!(
+            compact_request
+                .header("x-amzn-mantle-client-agent")
+                .as_deref(),
+            Some("codex")
+        ),
+        CompactionProvider::Gcp => {
+            for request in &response_requests {
+                assert_eq!(request.body_json()["reasoning"].get("summary"), None);
+                assert_eq!(
+                    request.header("x-openai-internal-codex-responses-lite"),
+                    None
+                );
+                assert!(request.inputs_of_type("additional_tools").is_empty());
+            }
+        }
+    }
+    assert_eq!(compact_request.body_json()["model"], expected_model);
     assert_eq!(
         compact_request.inputs_of_type("compaction_trigger").len(),
         1
     );
     assert!(response_requests[2].input().iter().any(|item| {
         item["type"] == "compaction"
-            && item["encrypted_content"] == "BEDROCK_AUTOMATIC_REMOTE_COMPACTED_SUMMARY"
+            && item["encrypted_content"] == "PROVIDER_AUTOMATIC_REMOTE_COMPACTED_SUMMARY"
     }));
 
     Ok(())
@@ -912,6 +970,19 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
             start_options: Default::default(),
         })
         .await?;
+    let channel_progress = "Message Type: CHANNEL_POST\nSender: /root/child\nChannel: progress\nMessage ID: aaaabbbbcccc\nThread ID: aaaabbbbcccc\nPayload:\nchild channel progress";
+    codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root().join("child").expect("valid child path"),
+                AgentPath::root(),
+                Vec::new(),
+                channel_progress.to_string(),
+                /*trigger_turn*/ false,
+            ),
+            start_options: Default::default(),
+        })
+        .await?;
     codex
         .submit(Op::InterAgentCommunication {
             communication: InterAgentCommunication::new(
@@ -1016,6 +1087,12 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         compact_request
             .inputs_of_type("agent_message")
             .iter()
+            .any(|item| item["content"][0]["text"].as_str() == Some(channel_progress))
+    );
+    assert!(
+        compact_request
+            .inputs_of_type("agent_message")
+            .iter()
             .any(|item| item.to_string().contains("child completion")),
         "expected v2 compaction input to include the child completion"
     );
@@ -1105,6 +1182,12 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
             .iter()
             .all(|item| !item.to_string().contains("child progress")),
         "expected v2 follow-up request to omit the child progress update"
+    );
+    assert!(
+        follow_up_request
+            .inputs_of_type("agent_message")
+            .iter()
+            .all(|item| item["content"][0]["text"].as_str() != Some(channel_progress))
     );
     assert!(
         follow_up_request
@@ -1269,8 +1352,11 @@ async fn remote_compact_v2_rewrites_multiple_trailing_function_call_outputs(
     let second_trimmed_call_id = "second-trimmed-call";
     let retained_output = "retained tool output";
 
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(Arc::new(ThreadIdle));
     let harness = TestCodexHarness::with_builder(
         test_codex()
+            .with_extensions(Arc::new(extensions.build()))
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
                 config.model_context_window = Some(2_000);
@@ -1290,6 +1376,8 @@ async fn remote_compact_v2_rewrites_multiple_trailing_function_call_outputs(
     .await;
     harness.test().submit_turn("initial turn").await?;
     let _ = initial_mock.single_request();
+    // Completion precedes active-turn cleanup; inject the fixture into idle history.
+    ThreadIdle::wait(&codex).await;
     let history = [
         json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": first_user_message}]}),
         json!({"type": "function_call", "call_id": retained_call_id, "name": "exec_command", "arguments": "{}"}),

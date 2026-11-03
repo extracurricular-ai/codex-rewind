@@ -10,14 +10,17 @@ use codex_guardian_context::PlannedActionKind;
 use codex_guardian_context::PreviousReviews;
 use codex_guardian_context::SectionHistory;
 use codex_guardian_context::SectionInput;
+use codex_guardian_context::TranscriptFormat;
 use codex_guardian_context::TrustedSkills;
 use codex_guardian_context::TrustedTool;
+use codex_guardian_context::TrustedToolSource;
 use codex_guardian_context::default_registry;
 use codex_history::RetainedContext;
 use codex_history::RetainedInputSource;
 use codex_history::RetainedUserMessage;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 
 struct History {
@@ -37,6 +40,8 @@ impl SectionHistory for History {
 
 fn user_message(texts: Vec<String>) -> ResponseItem {
     ResponseItem::Message {
+        status: None,
+        encrypted_content: None,
         id: None,
         role: "user".to_owned(),
         content: texts
@@ -49,11 +54,13 @@ fn user_message(texts: Vec<String>) -> ResponseItem {
 }
 
 #[test]
-fn changing_attestations_preserves_history_before_the_current_action() {
+fn changing_retained_context_and_attestations_preserves_history_before_the_current_action() {
     let instruction = "Inspect staging only. Do not publish.";
     let mut retained = RetainedContext::default();
     retained.record_user_message(
         RetainedUserMessage {
+            phase: None,
+            origin: codex_history::UserInputOrigin::User,
             turn_id: "turn-1".to_owned(),
             message_id: None,
             text: instruction.to_owned(),
@@ -62,31 +69,56 @@ fn changing_attestations_preserves_history_before_the_current_action() {
         RetainedInputSource::Local(None),
     );
     // Legacy review history and Felix's retained, thread-owned history use the
-    // same composer. Neither may put changing attestations before that history.
-    for retained in [None, Some(retained)] {
-        let history = History {
+    // same composer. Retained assistant growth and eviction must also preserve its prefix.
+    for (format, retained) in [TranscriptFormat::Line, TranscriptFormat::Json]
+        .into_iter()
+        .flat_map(|format| {
+            [None, Some(retained.clone())]
+                .into_iter()
+                .map(move |retained| (format, retained))
+        })
+    {
+        let mut history = History {
             items: vec![user_message(vec![instruction.to_owned()])],
             retained,
         };
-        let profile = ContextProfile::asynchronous();
+        let mut profile = ContextProfile::asynchronous();
+        profile.transcript_format = format;
         let mut previous_prefix = None;
-        for generation in 0..2 {
-            let reviews = PreviousReviews::try_from_fragments(vec![format!(
-                "Host-attested decision {generation}: denied."
-            )])
-            .unwrap();
+        for generation in 0..10 {
+            let assistant_text = format!("Assistant progress {generation}.");
+            if let Some(retained) = history.retained.as_mut() {
+                retained.record_assistant_message(
+                    RetainedUserMessage {
+                        phase: None,
+                        origin: codex_history::UserInputOrigin::User,
+                        turn_id: "turn-1".to_owned(),
+                        message_id: Some(format!("assistant-{generation}")),
+                        text: assistant_text.clone(),
+                        complete: true,
+                    },
+                    RetainedInputSource::Local(Some(generation + 1)),
+                );
+            }
+            let reviews =
+                PreviousReviews::try_from_fragments(vec![codex_guardian_context::PreviousReview {
+                    id: codex_protocol::ResponseItemId::new("review"),
+                    fragment: format!("Host-attested decision {generation}: denied."),
+                }])
+                .unwrap();
             let tool = TrustedTool {
                 server: format!("server-{generation}"),
                 connector_id: None,
-                source: "user configuration".to_owned(),
+                source: TrustedToolSource::UserConfiguration("user configuration".to_owned()),
             };
             let skills = TrustedSkills {
                 paths: vec![format!("/skills/skill-{generation}/SKILL.md")],
             };
             let action = PlannedAction {
-                json: format!(r#"{{"tool":"inspect","path":"file-{generation}"}}"#),
                 tool_descriptions: None,
-                kind: PlannedActionKind::Command,
+                kind: PlannedActionKind::Command {
+                    json: format!(r#"{{"tool":"inspect","path":"file-{generation}"}}"#),
+                },
                 reason: None,
             };
             let collected = default_registry()
@@ -95,6 +127,7 @@ fn changing_attestations_preserves_history_before_the_current_action() {
                     history: &history,
                     transcript: &profile.transcript,
                     root_conversation: &[],
+                    root_conversation_candidates: None,
                     trusted_user_answers: &[],
                     planned_action: Some(&action),
                     permissions: None,
@@ -105,14 +138,38 @@ fn changing_attestations_preserves_history_before_the_current_action() {
                     node_repl: None,
                 })
                 .unwrap();
-            let transcript = profile.render_transcript(
+            let transcript = profile.prepare_transcript(
                 collected.transcript_entries(),
                 /*entry_number_offset*/ 0,
             );
-            let messages = collected
+            let context = collected
                 .compose(ContextPresentation::Async, transcript)
+                .unwrap();
+            let retained_text = context
+                .retained_instructions()
+                .into_user_inputs()
                 .unwrap()
-                .into_messages();
+                .into_iter()
+                .map(|input| match input {
+                    UserInput::Text { text, .. } => text,
+                    _ => panic!("retained context must be text"),
+                })
+                .collect::<Vec<_>>();
+            if history.retained.is_some() {
+                assert!(
+                    retained_text
+                        .iter()
+                        .any(|text| text.contains(&assistant_text))
+                );
+                if generation == 9 {
+                    assert!(
+                        !retained_text
+                            .iter()
+                            .any(|text| text.contains("Assistant progress 0."))
+                    );
+                }
+            }
+            let messages = context.into_messages();
             let (prefix, suffix) = messages.split_first().expect("history prefix");
             let ResponseItem::Message { role, content, .. } = prefix else {
                 panic!("history remains untrusted user evidence");
@@ -128,10 +185,15 @@ fn changing_attestations_preserves_history_before_the_current_action() {
             assert_eq!(
                 suffix,
                 [
-                    reviews.into_message(),
+                    reviews.into_annotated_message().into_item(),
                     ContextualUserFragment::into(tool),
                     ContextualUserFragment::into(skills),
-                    user_message(action.render(ActionPresentation::Async)),
+                    user_message(
+                        retained_text
+                            .into_iter()
+                            .chain(action.render(ActionPresentation::Async))
+                            .collect(),
+                    ),
                 ]
             );
         }

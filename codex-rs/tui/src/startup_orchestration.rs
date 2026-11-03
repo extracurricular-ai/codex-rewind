@@ -11,7 +11,7 @@ pub(super) async fn run_main_inner(
     mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
-    explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+    mut explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
 ) -> std::io::Result<AppExitInfo> {
     if cli.no_daemon && explicit_remote_endpoint.is_some() {
         return Err(std::io::Error::other(
@@ -23,6 +23,19 @@ pub(super) async fn run_main_inner(
             "--add-dir is not supported with --remote. Configure additional workspace roots on the server.",
         ));
     }
+    #[cfg(windows)]
+    let elevated_warning = if explicit_remote_endpoint.is_none()
+        && !cli.no_daemon
+        && !cli.agents_overview
+        && codex_app_server_daemon::is_elevated().map_err(std::io::Error::other)?
+    {
+        cli.no_daemon = true;
+        Some(daemon_startup::ELEVATED_LAUNCH_WARNING)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let elevated_warning: Option<&str> = None;
     let strict_config = cli.strict_config;
     if cli.shared.worktree {
         if explicit_remote_endpoint.is_some() {
@@ -52,6 +65,7 @@ pub(super) async fn run_main_inner(
         .take_auto_review_config_overrides(&mut cli.config_overrides);
 
     // Map the legacy --search flag to the canonical web_search mode.
+    let overrides_before_search = cli.config_overrides.raw_overrides.len();
     if cli.web_search {
         cli.config_overrides
             .raw_overrides
@@ -63,7 +77,7 @@ pub(super) async fn run_main_inner(
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
     // `oss` model provider.
     let overrides_cli = codex_utils_cli::CliConfigOverrides { raw_overrides };
-    let cli_kv_overrides = match overrides_cli.parse_overrides() {
+    let mut cli_kv_overrides = match overrides_cli.parse_overrides() {
         // Parse `-c` overrides from the CLI.
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
@@ -93,18 +107,47 @@ pub(super) async fn run_main_inner(
         }
     };
 
+    // A bound socket at the default path may be an SSH forward. Keep a verified
+    // endpoint so replacing the advertised alias cannot redirect local config.
+    let explicit_local_daemon_socket = match &explicit_remote_endpoint {
+        Some(RemoteAppServerEndpoint::UnixSocket { socket_path })
+            if codex_app_server_client::app_server_control_socket_path(&codex_home)
+                .is_ok_and(|default_socket| default_socket == *socket_path) =>
+        {
+            // An explicit attachment requires the server to be present. Do not
+            // classify a missing daemon as remote during its restart window.
+            if !socket_path.as_path().try_exists()? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the requested app-server socket is not available",
+                ));
+            }
+            codex_app_server_client::verified_local_daemon_socket(socket_path.as_path())
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+    if let Some(socket_path) = &explicit_local_daemon_socket {
+        explicit_remote_endpoint = Some(RemoteAppServerEndpoint::UnixSocket {
+            socket_path: socket_path.clone(),
+        });
+    }
+
     let mut launch_loader_overrides = loader_overrides.clone();
     if let Some(profile_v2) = cli.config_profile_v2.as_ref() {
         let user_config_path = resolve_profile_v2_config_path(&codex_home, profile_v2);
         launch_loader_overrides.user_config_path = Some(user_config_path);
         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
     }
+    let embedded_network_policy =
+        codex_app_server_client::EmbeddedNetworkPolicy::load(&launch_loader_overrides).await;
     let workload_identity_selected = is_workload_identity_selected();
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         let validation_target = app_server_target_for_launch(
             explicit_remote_endpoint.clone(),
-            /*default_daemon_socket*/ None,
+            explicit_local_daemon_socket.clone(),
             /*can_reuse_implicit_local_daemon*/ false,
             workload_identity_selected,
             std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
@@ -138,6 +181,7 @@ pub(super) async fn run_main_inner(
                 &validation_target,
                 &validation_bootstrap,
                 &codex_home,
+                &embedded_network_policy,
             )
             .await?
         } else {
@@ -178,6 +222,14 @@ pub(super) async fn run_main_inner(
         std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
     );
     let reuse_implicit_local_daemon = daemon_exclusion.is_none();
+    let search_forces_embedded = cli.web_search
+        && daemon_startup::config_exclusion(
+            &cli_kv_overrides[..overrides_before_search],
+            &launch_loader_overrides,
+            strict_config,
+            cli.bypass_hook_trust,
+        )
+        .is_none();
     let search_only_config_override = !workload_identity_selected
         && cli.web_search
         && startup_preflight::has_only_search_config_override(&cli_kv_overrides)
@@ -212,7 +264,7 @@ pub(super) async fn run_main_inner(
     // remote selection and the environment without opening a server connection.
     let presentation_target = app_server_target_for_launch(
         explicit_remote_endpoint.clone(),
-        /*default_daemon_socket*/ None,
+        explicit_local_daemon_socket.clone(),
         reuse_implicit_local_daemon,
         workload_identity_selected,
         std::env::var_os(codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR).as_deref(),
@@ -262,6 +314,19 @@ pub(super) async fn run_main_inner(
             err
         }
     })?;
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        codex_cloud_config::ensure_config_server_login(
+            embedded_network_policy.bind_bootstrap_auth(bootstrap_auth_config(
+                &codex_home,
+                &presentation.bootstrap_config,
+            )?),
+            presentation
+                .bootstrap_config
+                .config_layer_stack
+                .requirements_toml(),
+        )
+        .await?;
+    }
     // Keep normal terminal signals available until local configuration is ready. Once raw
     // mode begins, StartupDraft immediately takes ownership of input.
     let (initialized_terminal, terminal_restore_guard) = tokio::task::spawn_blocking(|| {
@@ -269,11 +334,24 @@ pub(super) async fn run_main_inner(
     })
     .await
     .map_err(std::io::Error::other)??;
+    // Snapshot the backend size sampled during init, before any viewport changes or resizes.
+    let initial_terminal_size = initialized_terminal.terminal.last_known_screen_size;
+    let terminal_size_tags = crate::terminal_size_telemetry::tags(initial_terminal_size);
     let startup_presentation::StartupPresentation {
         bootstrap_config,
         config_cwd,
-        screen,
+        mut screen,
+        local_settings,
     } = presentation;
+    screen.use_alt_screen = determine_alt_screen_mode(
+        cli.no_alt_screen,
+        local_settings.tui.alternate_screen,
+        initialized_terminal.terminal_app_over_ssh,
+    );
+    screen.transcript_mode = crate::transcript_mode::TranscriptMode::resolve(
+        screen.transcript_mode.is_owned(),
+        screen.use_alt_screen,
+    );
     let mut startup_draft = startup_draft::StartupDraft::new(
         initialized_terminal,
         terminal_restore_guard,
@@ -282,12 +360,13 @@ pub(super) async fn run_main_inner(
         screen,
     )?;
 
-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
+    let implicit_connection = explicit_remote_endpoint.is_none();
+    let default_daemon = if implicit_connection && reuse_implicit_local_daemon {
         startup_draft
             .run_until(maybe_probe_default_daemon_socket(&codex_home))
             .await?
     } else {
-        None
+        explicit_local_daemon_socket
     };
     let mut app_server_target = app_server_target_for_launch(
         explicit_remote_endpoint,
@@ -301,7 +380,7 @@ pub(super) async fn run_main_inner(
         .clone()
         .filter(|_| app_server_target.uses_remote_workspace());
 
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),
     )?;
@@ -321,6 +400,7 @@ pub(super) async fn run_main_inner(
             &app_server_target,
             &bootstrap_config,
             &codex_home,
+            &embedded_network_policy,
         ))
         .await??;
     let bootstrap_config_toml = &bootstrap_config.config_toml;
@@ -370,7 +450,7 @@ pub(super) async fn run_main_inner(
                     startup_draft.flush_pending_events().await?;
                     startup_draft
                         .tui_mut()
-                        .with_restored(|| {
+                        .with_restored(crate::tui::TerminalHandoff::Restore, || {
                             oss_selection::select_oss_provider(lmstudio_status, ollama_status)
                         })
                         .await?
@@ -390,6 +470,15 @@ pub(super) async fn run_main_inner(
     } else {
         None
     };
+
+    // Pass the --oss provider to the embedded app-server so catalog reloads keep
+    // the launch choice after workspace requirements are removed.
+    if let Some(provider) = &model_provider_override {
+        cli_kv_overrides.push((
+            "model_provider".to_string(),
+            toml::Value::String(provider.clone()),
+        ));
+    }
 
     // When using `--oss`, let the bootstrapper pick the model based on selected provider
     let model = if let Some(model) = &cli.model {
@@ -414,7 +503,6 @@ pub(super) async fn run_main_inner(
         model_provider: model_provider_override.clone(),
         codex_self_exe: arg0_paths.codex_self_exe.clone(),
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe.clone(),
-        main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         show_raw_agent_reasoning: cli.oss.then_some(true),
         bypass_hook_trust: cli.bypass_hook_trust.then_some(true),
         additional_writable_roots: additional_dirs,
@@ -430,14 +518,23 @@ pub(super) async fn run_main_inner(
             strict_config,
         ))
         .await?;
-    startup_draft.apply_config(&config);
+    if app_server_target.uses_embedded_network_policy() {
+        embedded_network_policy.activate(&mut config);
+    }
+    startup_draft.apply_settings(
+        &crate::local_settings::LocalSettings::from(&config),
+        config.cwd.as_path(),
+    );
 
     let mut cloud_config_bundle = if workload_identity_selected {
         cloud_config_bundle
     } else {
         startup_draft
-            .run_until(cloud_config_bundle_loader_for_storage(
-                app_server_target.auth_config_for_cloud_loader(config.auth_config()),
+            .run_until(managed_config_bundle_loader_for_storage(
+                embedded_network_policy.bind_bootstrap_auth(
+                    app_server_target.auth_config_for_cloud_loader(config.auth_config()),
+                ),
+                config.config_layer_stack.requirements_toml(),
                 /*enable_codex_api_key_env*/ false,
             ))
             .await??
@@ -454,17 +551,25 @@ pub(super) async fn run_main_inner(
                 &app_server_target,
                 &arg0_paths,
                 cloud_config_bundle.clone(),
+                &embedded_network_policy,
             ))
             .await?
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         config = destination;
         cloud_config_bundle = bundle;
-        startup_draft.apply_config(&config);
+        if app_server_target.uses_embedded_network_policy() {
+            embedded_network_policy.activate(&mut config);
+        }
+        startup_draft.apply_settings(
+            &crate::local_settings::LocalSettings::from(&config),
+            config.cwd.as_path(),
+        );
         Some(worktree)
     } else {
         None
     };
     let auto_start_daemon = config.features.enabled(Feature::DaemonAutoStart)
+        && implicit_connection
         && !cli.agents_overview
         && !cli.no_daemon
         && !app_server_target.uses_remote_workspace();
@@ -491,59 +596,92 @@ pub(super) async fn run_main_inner(
         daemon_exclusion = Some("Bedrock sign-in");
         app_server_target = AppServerTarget::Embedded;
     }
-    let daemon_features = daemon_startup::server_features(&cli_kv_overrides);
+    if auto_start_daemon
+        && daemon_exclusion.is_none()
+        && matches!(&app_server_target, AppServerTarget::Embedded)
+        && daemon_startup::uses_wsl_drvfs(&codex_home)
+    {
+        daemon_exclusion = Some(daemon_startup::WSL_DRVFS_EXCLUSION);
+    }
+    let mut managed_daemon = cli.managed_daemon;
     if auto_start_daemon && daemon_exclusion.is_none() {
-        startup_draft.flush_pending_events().await?;
         let output = startup_draft
-            .tui_mut()
-            .with_restored(|| async {
-                // Package installation may print progress; keep ordinary Ctrl+C handling.
-                crossterm::terminal::disable_raw_mode()?;
-                let result = codex_app_server_daemon::start_with_features(&daemon_features).await;
+            .run_until(async {
+                // Daemon startup needs no terminal input. Keep the composer visible and
+                // responsive while it checks the running server or prepares an installation.
+                // Preserve saved daemon settings until any mismatch is confirmed in recovery.
+                let result =
+                    codex_app_server_daemon::start_with_features(&Default::default()).await;
                 daemon_telemetry::record_start(&config, &result).await;
-                result.map_err(|err| {
-                    std::io::Error::other(format!("{err:#}\n{}", daemon_startup::FAILURE_HINT))
-                })
+                match result {
+                    Ok(output) => Ok(Some(output)),
+                    #[cfg(windows)]
+                    Err(err) if err.is::<codex_app_server_daemon::DetachedLaunchRestricted>() => {
+                        Ok(None)
+                    }
+                    Err(err) => Err(std::io::Error::other(format!(
+                        "{err:#}\n{}",
+                        daemon_startup::FAILURE_HINT
+                    ))),
+                }
             })
-            .await?;
-        app_server_target = AppServerTarget::LocalDaemon {
-            endpoint: RemoteAppServerEndpoint::UnixSocket {
-                socket_path: AbsolutePathBuf::from_absolute_path_checked(output.socket_path)?,
-            },
-            allow_embedded_fallback: false,
-        };
+            .await??;
+        if let Some(output) = output {
+            managed_daemon = output.backend.is_some();
+            app_server_target = AppServerTarget::LocalDaemon {
+                endpoint: RemoteAppServerEndpoint::UnixSocket {
+                    socket_path: AbsolutePathBuf::from_absolute_path_checked(output.socket_path)?,
+                },
+                allow_embedded_fallback: false,
+            };
+        } else {
+            app_server_target = AppServerTarget::Embedded;
+            daemon_exclusion = Some("this Windows launcher");
+        }
     }
     // The overview must inspect the shared server's agents regardless of local settings.
     let compatibility_warning = if cli.agents_overview {
         None
     } else {
-        startup_draft
-            .run_until(daemon_startup::compatibility_warning(
-                &app_server_target,
-                &config,
-            ))
-            .await?
+        daemon_recovery::check(
+            &mut startup_draft,
+            &app_server_target,
+            &config,
+            &cli_kv_overrides,
+            managed_daemon,
+        )
+        .await?
     };
     if compatibility_warning.is_some() {
         app_server_target = AppServerTarget::Embedded;
         daemon_exclusion = Some("daemon feature settings");
     }
-    let daemon_startup_warning = compatibility_warning.or_else(|| {
-        daemon_exclusion
+    if app_server_target.uses_embedded_network_policy() {
+        embedded_network_policy.activate(&mut config);
+    }
+    let daemon_startup_warning = elevated_warning
+        .map(str::to_string)
+        .or(compatibility_warning)
+        .or_else(|| {
+            daemon_exclusion
             .filter(|_| auto_start_daemon)
             .map(|reason| {
                 format!(
                     "Running without the shared background server: {reason} requires embedded mode."
                 )
             })
-    });
+        });
     #[cfg(target_os = "macos")]
     let local_runtime_paths = local_runtime_paths.with_allowed_symlinked_codex_home(
         codex_config::allowed_symlinked_codex_home(&config.config_layer_stack, &config.codex_home),
     );
     let environment_manager = Arc::new(
         prepared_environment_manager
-            .build(Some(local_runtime_paths), config.http_client_factory())
+            .build(
+                Some(local_runtime_paths),
+                app_server_target
+                    .environment_http_client_factory(&config, &embedded_network_policy),
+            )
             .map_err(std::io::Error::other)?,
     );
 
@@ -563,7 +701,7 @@ pub(super) async fn run_main_inner(
             startup_draft.flush_pending_events().await?;
             startup_draft
                 .tui_mut()
-                .with_restored(|| async {
+                .with_restored(crate::tui::TerminalHandoff::Restore, || async {
                     #[allow(clippy::print_stderr)]
                     {
                         eprintln!("Could not create otel exporter: {e}");
@@ -594,6 +732,7 @@ pub(super) async fn run_main_inner(
     let selection_reason = match (&app_server_target, daemon_exclusion) {
         (AppServerTarget::Remote { .. }, _) => "explicit_remote",
         _ if cli.agents_overview => "agents",
+        _ if elevated_warning.is_some() => "elevated_windows",
         (_, Some("--no-daemon")) => "explicit_no_daemon",
         (_, Some(_)) => "incompatible_option",
         _ if auto_start_daemon => "auto_start",
@@ -608,6 +747,7 @@ pub(super) async fn run_main_inner(
         Vec::new()
     };
     let mut launch_tags = daemon_settings.to_vec();
+    launch_tags.extend(terminal_size_tags);
     launch_tags.extend([
         ("daemon_selection_reason", selection_reason),
         (
@@ -619,9 +759,12 @@ pub(super) async fn run_main_inner(
             },
         ),
     ]);
+    let selected_local_daemon = matches!(app_server_target, AppServerTarget::LocalDaemon { .. });
     // Record the first connection attempt's actual mode, including embedded fallback; never reconnects.
     let launch_telemetry = move |target: &AppServerTarget, connected: bool| {
-        let Some(metrics) = metrics else { return };
+        let Some(metrics) = metrics else {
+            return Vec::new();
+        };
         let app_server_mode = match (connected, target) {
             (false, _) => "unconfirmed",
             (true, AppServerTarget::Embedded) => "in_process",
@@ -657,6 +800,45 @@ pub(super) async fn run_main_inner(
             ("multiplexer", multiplexer),
         ]);
         let _ = metrics.counter("codex.tui.start", /*inc*/ 1, &launch_tags);
+        if app_server_mode == "in_process" {
+            let reason = match daemon_exclusion {
+                _ if elevated_warning.is_some() => "windows_elevated",
+                Some("--no-daemon") => "explicit_no_daemon",
+                Some("--profile") => "profile",
+                Some("--oss") => "oss",
+                Some("--strict-config") => "strict_config",
+                Some("--dangerously-bypass-hook-trust") => "bypass_hook_trust",
+                Some("workload identity") => "workload_identity",
+                Some("executor selection (CODEX_EXEC_SERVER_URL)") => "exec_server_url",
+                Some("custom configuration loader") => "custom_config_loader",
+                Some(
+                    "command-line configuration overrides (-c, --enable, --disable, or --search)",
+                ) => {
+                    if search_forces_embedded {
+                        "search"
+                    } else {
+                        "config_override"
+                    }
+                }
+                Some("Bedrock sign-in") => "bedrock_sign_in",
+                Some(daemon_startup::WSL_DRVFS_EXCLUSION) => "wsl_drvfs",
+                Some("this Windows launcher") => "windows_detach_restricted",
+                Some("daemon feature settings") => "daemon_compatibility",
+                None if selection_reason == "auto_start_disabled" => {
+                    "auto_start_disabled_no_daemon"
+                }
+                None if selected_local_daemon => "daemon_connection_failed",
+                None if selection_reason == "agents" => "agents_no_daemon_discovered",
+                Some(_) | None => "unclassified",
+            };
+            let _ = metrics.counter(
+                "codex.tui.embedded_start",
+                /*inc*/ 1,
+                &[("reason", reason)],
+            );
+        }
+        launch_tags.retain(|(key, _)| !matches!(*key, "terminal_columns" | "terminal_rows"));
+        launch_tags
     };
     let launch_telemetry = daemon_telemetry::Launch(Some(launch_telemetry));
     let state_db = startup_draft
@@ -776,7 +958,7 @@ pub(super) async fn run_main_inner(
         startup_draft.flush_pending_events().await?;
         startup_draft
             .tui_mut()
-            .with_restored(|| async {
+            .with_restored(crate::tui::TerminalHandoff::Restore, || async {
                 // Provider setup may print progress or block in an external downloader.
                 // Restore ordinary signal handling so Ctrl+C can interrupt that process.
                 crossterm::terminal::disable_raw_mode()?;
@@ -789,7 +971,9 @@ pub(super) async fn run_main_inner(
 
     let otel_tracing_layer = otel.as_ref().and_then(|o| o.tracing_layer());
 
-    let log_db = state_db.clone().map(log_db::start);
+    let log_db = state_db
+        .clone()
+        .map(|state_db| log_db::start(state_db, std::sync::Arc::new(feedback.clone())));
     let log_db_layer = log_db
         .clone()
         .map(|layer| layer.with_filter(log_db::default_filter()));
@@ -824,8 +1008,10 @@ pub(super) async fn run_main_inner(
         log_db,
         state_db,
         environment_manager,
+        embedded_network_policy,
         managed_worktree.clone(),
         daemon_startup_warning,
+        managed_daemon,
         launch_telemetry,
         startup_draft,
     ))

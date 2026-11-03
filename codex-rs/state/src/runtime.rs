@@ -19,6 +19,7 @@ use crate::model::datetime_to_epoch_millis;
 use crate::model::datetime_to_epoch_seconds;
 use crate::model::epoch_millis_to_datetime;
 use crate::paths::file_modified_time_utc;
+use crate::sqlite::SqliteWriteQueryExt;
 use crate::telemetry::DbKind;
 use crate::telemetry::DbTelemetry;
 use chrono::DateTime;
@@ -42,17 +43,22 @@ use tracing::warn;
 mod backfill;
 mod external_agent_config_imports;
 mod goals;
+mod guardian_feedback;
 mod logs;
+mod logs_maintenance;
 mod memories;
 mod memory_versions;
 mod projects;
 mod queued_items;
-mod recovery;
+pub(crate) mod reclamation;
+pub(crate) mod recovery;
 mod remote_control;
 mod rollout_migration;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod thread_attachments;
+mod thread_metadata;
+mod thread_read_state;
 mod thread_section_order;
 mod thread_sections;
 mod threads;
@@ -65,16 +71,21 @@ pub use goals::GoalAccountingMode;
 pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
 pub use goals::GoalUpdate;
+pub use guardian_feedback::GuardianReviewRecord;
+pub use guardian_feedback::MAX_GUARDIAN_REVIEW_BYTES;
+pub use guardian_feedback::MAX_GUARDIAN_REVIEW_RECORDS;
+pub use guardian_feedback::MAX_GUARDIAN_REVIEW_RECORDS_PER_THREAD;
 pub use memories::MemoryStore;
 pub use queued_items::SqliteQueueStore;
-pub use recovery::RuntimeDbBackup;
-pub(super) use recovery::RuntimeDbInitError;
 pub use recovery::backup_runtime_db_for_fresh_start;
+pub use recovery::collect_runtime_db_backups;
 pub use recovery::is_sqlite_corruption_error;
 pub use recovery::runtime_db_path_for_corruption_error;
-pub use recovery::sqlite_error_detail_is_corruption;
 pub use recovery::sqlite_error_detail_is_lock;
 pub use remote_control::RemoteControlEnrollmentRecord;
+pub use thread_read_state::ReadStateOperation;
+pub use thread_read_state::ReadStateUpdate;
+pub use thread_read_state::ThreadReadState;
 pub use threads::ThreadFilterOptions;
 
 // "Partition" is the retained-log-content bucket we cap at 10 MiB:
@@ -98,6 +109,7 @@ pub struct StateRuntime {
     thread_queue: SqliteQueueStore,
     thread_updated_at_millis: Arc<AtomicI64>,
     thread_recency_at_millis: Arc<AtomicI64>,
+    reclamation: Arc<reclamation::SqliteReclamationWorker>,
 }
 
 impl StateRuntime {
@@ -136,7 +148,6 @@ impl StateRuntime {
         let goals_path = sqlite.goals_db_path();
         let memories_path = sqlite.memories_db_path();
         let queue_path = sqlite.queue_db_path();
-        let has_memories_v2 = tokio::fs::try_exists(sqlite.memories_v2_db_path()).await?;
         let pool = match sqlite
             .open_state_db(&state_migrator, telemetry_override)
             .await
@@ -147,6 +158,7 @@ impl StateRuntime {
                 return Err(err);
             }
         };
+        let has_memories_v2 = tokio::fs::try_exists(sqlite.memories_v2_db_path()).await?;
         let logs_pool = match sqlite
             .open_logs_db(&logs_migrator, telemetry_override)
             .await
@@ -253,6 +265,7 @@ impl StateRuntime {
         let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
         let thread_recency_at_millis = thread_recency_at_millis.unwrap_or(0);
         let runtime = Arc::new(Self {
+            reclamation: reclamation::SqliteReclamationWorker::spawn(sqlite.clone()),
             thread_goals: GoalStore::new(Arc::clone(&goals_pool)),
             memories: MemoryStore::new(Arc::clone(&memories_pool), Arc::clone(&pool)),
             memories_v2: Arc::new(tokio::sync::OnceCell::new()),
@@ -274,12 +287,7 @@ impl StateRuntime {
             runtime.close().await;
             return Err(err);
         }
-        if let Err(err) = runtime.run_logs_startup_maintenance().await {
-            warn!(
-                "failed to run startup maintenance for logs db at {}: {err}",
-                logs_path.display(),
-            );
-        }
+        runtime.start_periodic_logs_maintenance(std::time::Duration::from_secs(30 * 60));
         Ok(runtime)
     }
 
@@ -303,6 +311,7 @@ impl StateRuntime {
 
     /// Close all SQLite pools and wait for outstanding pool workers to exit.
     pub async fn close(&self) {
+        self.reclamation.close().await;
         self.thread_queue.close().await;
         self.memories.close().await;
         if let Some(memories) = self.memories_v2.get() {
@@ -383,7 +392,7 @@ ON CONFLICT(id) DO NOTHING
     .bind(1_i64)
     .bind(crate::BackfillStatus::Pending.as_str())
     .bind(Utc::now().timestamp())
-    .execute(pool)
+    .execute_with_busy_retry(pool)
     .await?;
     Ok(())
 }

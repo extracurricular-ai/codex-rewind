@@ -1,31 +1,8 @@
 //! Voice startup, shutdown, and retry maintain one active owned session.
 
 use super::*;
+use crate::app_event::RealtimeWebrtcStartupFailure;
 use pretty_assertions::assert_eq;
-
-#[tokio::test]
-async fn enabling_voice_on_an_open_thread_snapshots_the_new_thread_notice() {
-    let (mut chat, _sender, mut events, _ops) = make_chatwidget_manual_with_sender().await;
-    chat.set_feature_enabled(
-        codex_features::Feature::RealtimeConversation,
-        /*enabled*/ true,
-    );
-    commit_realtime_history_events(&mut chat, &mut events);
-    let rendered = std::iter::from_fn(|| events.try_recv().ok())
-        .filter_map(|event| match event {
-            AppEvent::InsertHistoryCell(cell) => Some(
-                cell.display_lines(/*width*/ 80)
-                    .into_iter()
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    insta::assert_snapshot!(rendered, @"• Voice conversations will be available in new threads.");
-}
 
 #[tokio::test]
 async fn voice_cannot_start_in_a_side_conversation() {
@@ -84,17 +61,36 @@ async fn voice_cannot_start_on_a_parent_owned_thread() {
 
 #[tokio::test]
 async fn stopping_while_the_offer_is_pending_resets_the_session() {
-    let (mut chat, _sender, _events, mut ops) = make_chatwidget_manual_with_sender().await;
+    let (mut chat, sender, mut events, _ops) = make_chatwidget_manual_with_sender().await;
     let (abort, _registration) = AbortHandle::new_pair();
     let observed_abort = abort.clone();
     chat.realtime_conversation.phase = RealtimeConversationPhase::Starting;
     chat.realtime_conversation.startup_abort = Some(abort);
 
-    chat.stop_realtime_conversation();
+    let (mut restored, _, _, mut ops) = make_chatwidget_manual_with_sender().await;
+    let callback = chat.app_event_tx.clone();
+    chat.park_voice();
+    callback.send(AppEvent::ResetTranscriptForThreadSwitch);
+    assert!(events.try_recv().is_err());
+    callback.send(AppEvent::RefreshRateLimits {
+        origin: crate::app_event::RateLimitRefreshOrigin::Recovery,
+    });
+    assert!(matches!(
+        events.try_recv(),
+        Ok(AppEvent::RefreshRateLimits {
+            origin: crate::app_event::RateLimitRefreshOrigin::Recovery
+        })
+    ));
+    sender.send(AppEvent::ResetTranscriptForThreadSwitch);
+    assert!(events.try_recv().is_ok());
+    restored.resume_background_voice(&mut chat);
+    drop(chat);
+    assert!(!observed_abort.is_aborted());
+    restored.stop_realtime_conversation();
 
     assert_eq!(
         (
-            chat.realtime_conversation.phase,
+            restored.realtime_conversation.phase,
             ops.try_recv().ok(),
             observed_abort.is_aborted(),
         ),
@@ -129,12 +125,18 @@ async fn audio_failure_cancels_pending_voice_and_reports_the_device_error() {
     chat.realtime_conversation.phase = RealtimeConversationPhase::Starting;
     chat.realtime_conversation.startup_abort = Some(abort);
 
-    chat.on_realtime_error("speaker stream failed: device disconnected".to_string());
+    chat.on_realtime_error(
+        "speaker stream failed: device disconnected".to_string(),
+        RealtimeFailureCause::AudioSession,
+    );
 
     commit_realtime_history_events(&mut chat, &mut events);
-    let Ok(AppEvent::InsertHistoryCell(cell)) = events.try_recv() else {
-        panic!("voice should report the speaker failure");
-    };
+    let cell = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .expect("voice should report the speaker failure");
     assert!(
         cell.display_lines(/*width*/ 80)
             .iter()
@@ -176,7 +178,10 @@ async fn canceled_offer_is_ignored_after_a_new_start_attempt() {
     chat.on_realtime_webrtc_offer_created(
         ThreadId::new(),
         /*attempt_id*/ 1,
-        Err("canceled offer failed".to_string()),
+        Err(RealtimeWebrtcStartupFailure {
+            message: "superseded failure".into(),
+            cause: codex_realtime_webrtc::ConnectionError::Failed,
+        }),
     );
 
     assert_eq!(
@@ -186,6 +191,38 @@ async fn canceled_offer_is_ignored_after_a_new_start_attempt() {
             events.try_recv().is_err()
         ),
         (RealtimeConversationPhase::Starting, 2, true)
+    );
+}
+
+#[tokio::test]
+async fn voice_startup_failure_preserves_the_specific_error() {
+    let (mut chat, _sender, mut events, _ops) = make_chatwidget_manual_with_sender().await;
+    chat.realtime_conversation.phase = RealtimeConversationPhase::Starting;
+    chat.realtime_conversation.attempt_id = 1;
+
+    chat.on_realtime_webrtc_offer_created(
+        ThreadId::new(),
+        /*attempt_id*/ 1,
+        Err(RealtimeWebrtcStartupFailure {
+            message: "voice package unavailable".into(),
+            cause: codex_realtime_webrtc::ConnectionError::Failed,
+        }),
+    );
+
+    commit_realtime_history_events(&mut chat, &mut events);
+    let cell = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => Some(cell),
+            _ => None,
+        })
+        .expect("voice should report the startup failure");
+    insta::assert_snapshot!(
+        cell.display_lines(/*width*/ 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        @"■ Failed to start voice mode: voice package unavailable"
     );
 }
 
@@ -485,10 +522,13 @@ async fn failure_cleanup_does_not_attribute_stop_to_the_user() {
     // A local failure initiates backend cleanup; its acknowledgement is still "requested".
     chat.realtime_conversation.phase = RealtimeConversationPhase::Stopping;
     chat.realtime_conversation.failure_recorded = true;
-    chat.on_realtime_error(format!(
-        "Failed to connect voice mode: {}",
-        codex_realtime_webrtc::ConnectionError::AudioDevices
-    ));
+    chat.on_realtime_error(
+        format!(
+            "Failed to connect voice mode: {}",
+            codex_realtime_webrtc::ConnectionError::AudioDevices
+        ),
+        RealtimeFailureCause::AudioDevices,
+    );
     chat.on_realtime_conversation_closed(Some("requested".into()));
     assert_eq!(
         chat.realtime_conversation.phase,

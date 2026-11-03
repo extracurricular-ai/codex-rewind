@@ -8,6 +8,7 @@ use codex_protocol::auth::KnownPlan as InternalKnownPlan;
 use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::protocol::SessionSource;
 
+use anyhow::Context;
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
@@ -59,8 +60,8 @@ fn header_auth_exposes_a_valid_chatgpt_account_id() {
 }
 
 #[tokio::test]
-async fn refresh_without_id_token() {
-    let codex_home = tempdir().unwrap();
+async fn refresh_without_id_token() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
     let fake_jwt = write_auth_file(
         AuthFileParams {
             openai_api_key: None,
@@ -68,26 +69,69 @@ async fn refresh_without_id_token() {
             chatgpt_account_id: None,
         },
         codex_home.path(),
-    )
-    .expect("failed to write auth file");
+    )?;
 
     let storage = create_auth_storage(
         codex_home.path().to_path_buf(),
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
     );
+    let provenance = AccountOAuthProvenance {
+        issuer: "https://idp.example".to_string(),
+        client_id: "codex-client".to_string(),
+    };
+    let initial = storage
+        .load()?
+        .context("stored auth")?
+        .tokens
+        .context("stored tokens")?;
     let updated = super::persist_tokens(
         &storage,
+        &initial,
+        Some(provenance.clone()),
         /*id_token*/ None,
         Some("new-access-token".to_string()),
         Some("new-refresh-token".to_string()),
-    )
-    .expect("update_tokens should succeed");
+    )?;
 
-    let tokens = updated.tokens.expect("tokens should exist");
+    let tokens = updated.tokens.context("persisted auth is missing tokens")?;
     assert_eq!(tokens.id_token.raw_jwt, fake_jwt);
     assert_eq!(tokens.access_token, "new-access-token");
     assert_eq!(tokens.refresh_token, "new-refresh-token");
+    assert_eq!(tokens.oauth_provenance, Some(provenance.clone()));
+
+    let updated = super::persist_tokens(
+        &storage,
+        &tokens,
+        /*provenance*/ None,
+        /*id_token*/ None,
+        Some("later-access-token".to_string()),
+        /*refresh_token*/ None,
+    )?;
+    let previous = tokens;
+    let tokens = updated.tokens.context("persisted auth is missing tokens")?;
+    assert_eq!(tokens.refresh_token, "new-refresh-token");
+    assert_eq!(tokens.oauth_provenance, None);
+
+    // Preserve ordinary same-login refresh behavior when the stored tokens changed.
+    let mut expected = previous.clone();
+    expected.access_token = "stale-access-token".into();
+    expected.refresh_token = "stale-refresh-token".into();
+    expected.oauth_provenance = Some(provenance.clone());
+    assert_eq!(
+        super::persist_tokens(
+            &storage,
+            &previous,
+            Some(provenance),
+            /*id_token*/ None,
+            Some("stale-access-token".into()),
+            Some("stale-refresh-token".into()),
+        )?
+        .tokens,
+        Some(expected)
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -103,26 +147,32 @@ fn login_with_api_key_overwrites_existing_auth_json() {
             "account_id": "stale-acc"
         }
     });
-    std::fs::write(
-        &auth_path,
-        serde_json::to_string_pretty(&stale_auth).unwrap(),
-    )
-    .unwrap();
-
-    super::login_with_api_key(
-        dir.path(),
+    for api_key in [
         "sk-new",
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )
-    .expect("login_with_api_key should succeed");
+        "sk-proj-fedramp-synthetic-test-key",
+        "sk-svcacct-fedramp-synthetic-test-key",
+    ] {
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&stale_auth).unwrap(),
+        )
+        .unwrap();
 
-    let storage = FileAuthStorage::new(dir.path().to_path_buf());
-    let auth = storage
-        .try_read_auth_json(&auth_path)
-        .expect("auth.json should parse");
-    assert_eq!(auth.openai_api_key.as_deref(), Some("sk-new"));
-    assert!(auth.tokens.is_none(), "tokens should be cleared");
+        super::login_with_api_key(
+            dir.path(),
+            api_key,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .expect("login_with_api_key should succeed");
+
+        let storage = FileAuthStorage::new(dir.path().to_path_buf());
+        let auth = storage
+            .try_read_auth_json(&auth_path)
+            .expect("auth.json should parse");
+        assert_eq!(auth.openai_api_key.as_deref(), Some(api_key));
+        assert!(auth.tokens.is_none(), "tokens should be cleared");
+    }
 }
 
 #[tokio::test]
@@ -566,6 +616,10 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         },
         codex_home.path(),
     )?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let mut stored = storage.load()?.expect("auth should exist");
+    stored.tokens.as_mut().unwrap().login_owner_id = Some("login-a".into());
+    storage.save(&stored)?;
     let auth = super::load_auth(
         codex_home.path(),
         /*enable_codex_api_key_env*/ false,
@@ -579,6 +633,10 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
     )
     .await?
     .expect("auth should load");
+
+    // An older client rewrites the same credentials without login metadata.
+    stored.tokens.as_mut().unwrap().login_owner_id = None;
+    storage.save(&stored)?;
 
     assert!(
         auth.agent_identity_auth(
@@ -648,6 +706,8 @@ async fn chatgpt_auth_registers_agent_identity_when_enabled() -> anyhow::Result<
         .expect("identity should persist");
     assert_eq!(persisted.agent_runtime_id, "agent-runtime-123");
     assert_eq!(persisted.task_id.as_deref(), Some("task-123"));
+    stored.agent_identity = Some(AgentIdentityStorage::Record(agent_auth.record().clone()));
+    assert_eq!(storage.load()?, Some(stored));
 
     let reloaded = super::load_auth(
         codex_home.path(),
@@ -1064,6 +1124,8 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
                 },
                 access_token: "test-access-token".to_string(),
                 refresh_token: "test-refresh-token".to_string(),
+                oauth_provenance: None,
+                login_owner_id: None,
                 account_id: None,
             }),
             last_refresh: Some(last_refresh),
@@ -1082,30 +1144,60 @@ async fn loads_api_key_from_auth_json() {
     let dir = tempdir().unwrap();
     let _access_token_guard = remove_access_token_env_var();
     let auth_file = dir.path().join("auth.json");
-    std::fs::write(
-        auth_file,
-        r#"{"OPENAI_API_KEY":"sk-test-key","tokens":null,"last_refresh":null}"#,
-    )
-    .unwrap();
+    for (api_key, expected_fedramp) in [
+        ("sk-test-key", false),
+        ("sk-proj-fedramp-synthetic-test-key", true),
+        ("sk-svcacct-fedramp-synthetic-test-key", true),
+        ("sk-proj-synthetic-test-key", false),
+        ("sk-svcacct-synthetic-test-key", false),
+        ("sk-proj-fedramp", false),
+        ("sk-svcacct-fedrampish-test-key", false),
+        ("sk-proj-FEDRAMP-test-key", false),
+        ("sk-admin-fedramp-test-key", false),
+        ("other-sk-proj-fedramp-test-key", false),
+    ] {
+        std::fs::write(
+            &auth_file,
+            json!({"OPENAI_API_KEY": api_key, "tokens": null, "last_refresh": null}).to_string(),
+        )
+        .unwrap();
 
-    let auth = super::load_auth(
-        dir.path(),
-        /*enable_codex_api_key_env*/ false,
+        let auth = super::load_auth(
+            dir.path(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*allowed_login_methods*/ None,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::Direct,
+            /*agent_identity_authapi_base_url*/ None,
+            &crate::test_support::transport_default_auth_route_config(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(auth.auth_mode(), AuthMode::ApiKey);
+        assert_eq!(auth.api_key(), Some(api_key));
+        assert_eq!(
+            (auth.get_token().unwrap(), auth.is_fedramp_account()),
+            (api_key.to_string(), expected_fedramp)
+        );
+
+        assert!(auth.get_token_data().is_err());
+    }
+}
+
+#[test]
+fn logout_does_not_create_a_missing_file_store() -> std::io::Result<()> {
+    let root = tempdir()?;
+    let missing_home = root.path().join("missing");
+    assert!(!logout(
+        &missing_home,
         AuthCredentialsStoreMode::File,
-        /*allowed_login_methods*/ None,
-        /*forced_chatgpt_workspace_id*/ None,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::Direct,
-        /*agent_identity_authapi_base_url*/ None,
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(auth.auth_mode(), AuthMode::ApiKey);
-    assert_eq!(auth.api_key(), Some("sk-test-key"));
-
-    assert!(auth.get_token_data().is_err());
+        AuthKeyringBackendKind::default()
+    )?);
+    assert!(!missing_home.exists());
+    Ok(())
 }
 
 #[test]
@@ -1654,7 +1746,7 @@ impl ProviderAuthScript {
         #[cfg(unix)]
         let (command, args) = {
             let script_path = tempdir.path().join("print-token.sh");
-            std::fs::write(
+            codex_utils_cargo_bin::write_executable(
                 &script_path,
                 r#"#!/bin/sh
 if [ -f fail-once ]; then
@@ -1667,12 +1759,6 @@ tail -n +2 tokens.txt > tokens.next
 mv tokens.next tokens.txt
 "#,
             )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
             ("./print-token.sh".to_string(), Vec::new())
         };
 
@@ -1721,18 +1807,12 @@ move /y tokens.next tokens.txt >nul
         #[cfg(unix)]
         let (command, args) = {
             let script_path = tempdir.path().join("fail.sh");
-            std::fs::write(
+            codex_utils_cargo_bin::write_executable(
                 &script_path,
                 r#"#!/bin/sh
 exit 1
 "#,
             )?;
-            let mut permissions = std::fs::metadata(&script_path)?.permissions();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                permissions.set_mode(0o755);
-            }
-            std::fs::set_permissions(&script_path, permissions)?;
             ("./fail.sh".to_string(), Vec::new())
         };
 

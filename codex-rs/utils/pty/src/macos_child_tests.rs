@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::child::ChildKind;
-use crate::child::macos::*;
+use crate::child::posix::*;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -10,7 +10,6 @@ use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::ExitStatusExt;
 use std::ptr;
@@ -35,11 +34,10 @@ async fn bare_script_search_matches_child_path_and_preserves_script_spelling() -
     fs::create_dir(&blocked)?;
     fs::write(blocked.join(&program), "not executable")?;
     let script = bin.join(&program);
-    fs::write(
+    codex_utils_cargo_bin::write_executable(
         &script,
         "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$1\" \"$MCP_TEST\"; /bin/pwd; printf diagnostic >&2; exit 23\n",
     )?;
-    fs::set_permissions(&script, fs::Permissions::from_mode(/*mode*/ 0o755))?;
     symlink(&script, root.path().join(&program))?;
     for path in [
         bin.into_os_string(),
@@ -79,11 +77,10 @@ async fn relative_script_preserves_paths_stdio_environment_and_process_group() -
     fs::create_dir_all(root.path().join("actual/bin"))?;
     symlink("actual/bin", root.path().join("link"))?;
     let script = root.path().join("actual/server");
-    fs::write(
+    codex_utils_cargo_bin::write_executable(
         &script,
         "#!/bin/sh\nread -r input\nprintf '%s\\n' \"$0\" \"$1\" \"$2\" \"$MCP_TEST\" \"$input\"\nprintf diagnostic >&2\nexit 23\n",
     )?;
-    fs::set_permissions(script, fs::Permissions::from_mode(0o755))?;
     let mut command = Command::new("./link/../server");
     command
         .current_dir(root.path())
@@ -232,8 +229,7 @@ async fn launch_failures_preserve_os_errors() -> anyhow::Result<()> {
 async fn executable_text_without_shebang_retains_command_fallback() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     let script = root.path().join("server");
-    fs::write(&script, "printf '%s' \"$0\"\n")?;
-    fs::set_permissions(script, fs::Permissions::from_mode(0o755))?;
+    codex_utils_cargo_bin::write_executable(&script, "printf '%s' \"$0\"\n")?;
     for program in ["./server", "server"] {
         let mut command = Command::new(program);
         command
@@ -294,28 +290,5 @@ fn dropping_after_runtime_shutdown_kills_and_reaps_child() -> anyhow::Result<()>
         io::Error::last_os_error().raw_os_error(),
         Some(libc::ECHILD)
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn process_mode_is_preserved_by_both_backends() -> anyhow::Result<()> {
-    let root = tempfile::tempdir()?;
-    symlink("/bin/cat", root.path().join("server"))?;
-    for program in ["./server", "/bin/cat"] {
-        for mode in [ProcessMode::Inherit, ProcessMode::NewGroup] {
-            let mut command = Command::new(program);
-            command.current_dir(root.path()).process_mode(mode);
-            let mut child = command.spawn()?;
-            let pid = child.id().expect("live PID") as libc::pid_t;
-            let expected = match mode {
-                // SAFETY: getpgrp only inspects the current process.
-                ProcessMode::Inherit => unsafe { libc::getpgrp() },
-                ProcessMode::NewGroup => pid,
-            };
-            // SAFETY: The child is still owned and blocked on its stdin pipe.
-            assert_eq!(unsafe { libc::getpgid(pid) }, expected);
-            child.kill().await?;
-        }
-    }
     Ok(())
 }

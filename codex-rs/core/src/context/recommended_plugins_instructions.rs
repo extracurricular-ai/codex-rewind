@@ -1,5 +1,7 @@
 use super::ContextualUserFragment;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::input_text;
 use codex_tools::DiscoverableTool;
 
 const RECOMMENDED_PLUGINS_INTRO: &str =
@@ -32,7 +34,7 @@ impl ContextualUserFragment for RecommendedPluginsInstructions {
     }
 
     fn role(&self) -> &'static str {
-        "user"
+        "developer"
     }
 
     fn markers(&self) -> (&'static str, &'static str) {
@@ -43,13 +45,13 @@ impl ContextualUserFragment for RecommendedPluginsInstructions {
         ("<recommended_plugins>", "</recommended_plugins>")
     }
 
-    fn body(&self) -> String {
+    fn body(&self) -> ContentItem {
         let plugins = self
             .plugins
             .iter()
             .map(|plugin| format!("- {} ({})", plugin.name(), plugin.id()))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("\n{RECOMMENDED_PLUGINS_INTRO}\n\n{plugins}\n")
+        input_text(format!("\n{RECOMMENDED_PLUGINS_INTRO}\n\n{plugins}\n"))
     }
 }

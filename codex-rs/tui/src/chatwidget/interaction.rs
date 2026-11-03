@@ -1,12 +1,30 @@
 //! Key routing and composer-adjacent UI interaction for `ChatWidget`.
 
+use super::clipboard::PendingCopy;
 use super::*;
 use crate::bottom_pane::BottomPaneView;
-use crate::clipboard_copy::CopyFormat;
+use crate::clipboard_copy::CopyStatus;
+use crate::clipboard_copy::worker::CopyResult;
+
+/// An input action the app must finish before processing the next key.
+#[derive(Debug)]
+pub(crate) enum KeyEventAction {
+    None,
+    CopyLastResponse(Arc<str>),
+    PasteImage { text_fallback: Option<KeyCode> },
+}
 
 impl ChatWidget {
+    pub(crate) fn clear_composer_selection(&mut self) {
+        self.bottom_pane.clear_composer_selection();
+    }
+
     pub(crate) fn end_composer_drag(&mut self) {
         self.bottom_pane.end_composer_drag();
+    }
+
+    pub(crate) fn cancel_composer_primary(&mut self) {
+        self.bottom_pane.cancel_composer_primary();
     }
 
     pub(crate) fn copy_composer_selection(
@@ -17,28 +35,75 @@ impl ChatWidget {
         self.bottom_pane.copy_composer_selection(event, copy)
     }
 
+    pub(crate) fn copy_composer_selection_on_release(
+        &mut self,
+        event: crossterm::event::MouseEvent,
+        selection_copy: crate::tui::SelectionCopy,
+        copy: impl FnOnce(&str, crate::tui::SelectionCopy) -> (CopyResult, Option<Arc<()>>),
+    ) -> Option<(usize, Option<CopyResult>)> {
+        self.bottom_pane
+            .copy_composer_selection_on_release(event, selection_copy, copy)
+    }
+
     pub(crate) fn handle_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
         self.bottom_pane.handle_composer_mouse(event)
+    }
+
+    /// Snapshot the paste target without changing pending submissions. Unlike mouse paste,
+    /// a keyboard paste may replace a composer selection or complete an active popup.
+    pub(crate) fn clipboard_paste_target(
+        &self,
+        shortcut: Option<KeyCode>,
+    ) -> Option<crate::bottom_pane::ClipboardPasteTarget> {
+        if self.blocks_direct_input {
+            return None;
+        }
+        self.bottom_pane.clipboard_paste_target(shortcut)
     }
 
     pub(crate) fn prepare_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
         self.bottom_pane.prepare_composer_mouse(event)
     }
 
-    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
-        self.bottom_pane.set_agents_navigation_enabled(enabled);
+    pub(crate) fn set_command_center_enabled(&mut self, enabled: bool) {
+        self.bottom_pane.set_command_center_enabled(enabled);
+    }
+
+    pub(crate) fn agents_navigation_key_available(&self) -> bool {
+        self.bottom_pane.agents_navigation_key_available()
     }
 
     pub(crate) fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
         self.bottom_pane.keymap_contexts()
     }
 
-    pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+    pub(crate) fn take_key_chord_reset(&mut self) -> bool {
+        std::mem::take(&mut self.bottom_pane.key_chord_reset_requested)
+    }
+
+    pub(crate) fn consume_view_transition_key_event(&mut self, key_event: KeyEvent) -> bool {
+        self.bottom_pane
+            .consume_view_transition_key_event(key_event)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) -> KeyEventAction {
+        self.handle_key_event_with_activation_key(key_event, /*activation_key*/ None)
+    }
+
+    pub(crate) fn handle_key_event_with_activation_key(
+        &mut self,
+        key_event: KeyEvent,
+        activation_key: Option<crate::key_hint::KeyBinding>,
+    ) -> KeyEventAction {
+        if self.handle_quick_dial_menu(key_event) {
+            return KeyEventAction::None;
+        }
         if self.handle_startup_submission_key(key_event) {
-            return;
+            return KeyEventAction::None;
         }
         if self.handle_question_key(key_event) {
-            return;
+            return KeyEventAction::None;
         }
         if self.bottom_pane.has_active_view()
             && !matches!(
@@ -57,19 +122,29 @@ impl ChatWidget {
             let should_pause_active_goal = self
                 .bottom_pane
                 .active_view_will_interrupt_turn_on_key_event(key_event);
-            self.bottom_pane.handle_key_event(key_event);
+            self.bottom_pane
+                .handle_key_event_with_activation_key(key_event, activation_key);
             if should_pause_active_goal {
                 self.pause_active_goal_for_interrupt();
             }
             if self.bottom_pane.no_modal_or_popup_active() {
                 self.on_modal_or_popup_closed();
             }
-            return;
+            return KeyEventAction::None;
         }
 
         if self.shortcut_overlay_visible() && key_hint::plain(KeyCode::Esc).is_press(key_event) {
-            self.bottom_pane.handle_key_event(key_event);
-            return;
+            self.bottom_pane
+                .handle_key_event_with_activation_key(key_event, activation_key);
+            return KeyEventAction::None;
+        }
+
+        if key_event.kind == KeyEventKind::Press
+            && self.chat_keymap.open_presets.is_pressed(key_event)
+            && self.bottom_pane.no_modal_or_popup_active()
+        {
+            self.open_quick_dial_menu();
+            return KeyEventAction::None;
         }
 
         if (self.chat_keymap.interrupt_turn.is_pressed(key_event)
@@ -87,14 +162,14 @@ impl ChatWidget {
             } else {
                 self.cancel_image_submission();
             }
-            return;
+            return KeyEventAction::None;
         }
 
         if self.handle_reasoning_shortcut(key_event) || self.handle_permission_shortcut(key_event) {
             self.bottom_pane.clear_quit_shortcut_hint();
             self.quit_shortcut_expires_at = None;
             self.quit_shortcut_key = None;
-            return;
+            return KeyEventAction::None;
         }
 
         if key_event.kind == KeyEventKind::Press
@@ -103,20 +178,7 @@ impl ChatWidget {
             self.bottom_pane.clear_quit_shortcut_hint();
             self.quit_shortcut_expires_at = None;
             self.quit_shortcut_key = None;
-            self.copy_last_agent_markdown();
-            return;
-        }
-
-        if key_event.kind == KeyEventKind::Press
-            && self.chat_keymap.toggle_voice.is_pressed(key_event)
-            && self.bottom_pane.no_modal_or_popup_active()
-        {
-            self.toggle_realtime_conversation();
-            return;
-        }
-
-        if self.handle_realtime_microphone_shortcut(key_event) {
-            return;
+            return self.prepare_last_response_copy();
         }
 
         match key_event {
@@ -127,7 +189,7 @@ impl ChatWidget {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
                 self.on_ctrl_c();
-                return;
+                return KeyEventAction::None;
             }
             KeyEvent {
                 code: KeyCode::Char(c),
@@ -136,43 +198,43 @@ impl ChatWidget {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'d') => {
                 if self.on_ctrl_d() {
-                    return;
+                    return KeyEventAction::None;
                 }
                 self.bottom_pane.clear_quit_shortcut_hint();
                 self.quit_shortcut_expires_at = None;
                 self.quit_shortcut_key = None;
             }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                kind: KeyEventKind::Press,
-                ..
-            } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && c.eq_ignore_ascii_case(&'v') =>
+            key if key.kind == KeyEventKind::Press
+                && ((matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+                    || (cfg!(windows) && key_hint::shift(KeyCode::Insert).is_press(key))) =>
             {
-                match paste_image_to_temp_png() {
-                    Ok((path, info)) => {
-                        tracing::debug!(
-                            "pasted image size={}x{} format={}",
-                            info.width,
-                            info.height,
-                            info.encoded_format.label()
-                        );
-                        self.attach_image(path);
-                    }
-                    Err(err) => {
-                        tracing::warn!("failed to paste image: {err}");
-                        self.add_to_history(history_cell::new_error_event(format!(
-                            "Failed to paste image: {err}",
-                        )));
-                    }
+                if Instant::now() < self.suppress_image_paste_until {
+                    self.suppress_image_paste_until =
+                        Instant::now() + clipboard::IMAGE_PASTE_REPEAT_WINDOW;
+                    return KeyEventAction::None;
                 }
-                return;
+                self.suppress_image_paste_until =
+                    Instant::now() + clipboard::IMAGE_PASTE_REPEAT_WINDOW;
+                let text_fallback = (cfg!(windows)
+                    && (key.modifiers == KeyModifiers::CONTROL
+                        || key_hint::shift(KeyCode::Insert).is_press(key)))
+                .then_some(key.code);
+                if text_fallback.is_some() {
+                    self.bottom_pane.prepare_composer_clipboard_paste();
+                }
+                return KeyEventAction::PasteImage { text_fallback };
             }
             other if other.kind == KeyEventKind::Press => {
+                self.suppress_image_paste_until = Instant::now();
                 self.bottom_pane.clear_quit_shortcut_hint();
                 self.quit_shortcut_expires_at = None;
                 self.quit_shortcut_key = None;
+            }
+            other if other.kind == KeyEventKind::Release => {
+                self.suppress_image_paste_until = Instant::now();
             }
             _ => {}
         }
@@ -190,7 +252,7 @@ impl ChatWidget {
             } else {
                 self.cancel_image_submission();
             }
-            return;
+            return KeyEventAction::None;
         }
 
         const REVIEW_STEER_UNAVAILABLE_MESSAGE: &str = "Steer messages aren't supported during /review. Press Ctrl+C now to cancel the review.";
@@ -204,7 +266,7 @@ impl ChatWidget {
             && !self.should_handle_vim_insert_escape(key_event)
         {
             self.add_warning_message(REVIEW_STEER_UNAVAILABLE_MESSAGE.to_string());
-            return;
+            return KeyEventAction::None;
         }
 
         if self.chat_keymap.interrupt_turn.is_pressed(key_event)
@@ -219,11 +281,11 @@ impl ChatWidget {
             } else {
                 self.input_queue.submit_pending_steers_after_interrupt = false;
             }
-            return;
+            return KeyEventAction::None;
         }
 
         if self.handle_plugins_popup_key_event(key_event) {
-            return;
+            return KeyEventAction::None;
         }
 
         match key_event {
@@ -245,7 +307,9 @@ impl ChatWidget {
                 let had_modal_or_popup = !self.bottom_pane.no_modal_or_popup_active();
                 let should_pause_active_goal =
                     self.bottom_pane.should_interrupt_running_task(key_event);
-                let input_result = self.bottom_pane.handle_key_event(key_event);
+                let input_result = self
+                    .bottom_pane
+                    .handle_key_event_with_activation_key(key_event, activation_key);
                 if matches!(
                     input_result,
                     InputResult::None | InputResult::ParentOwnedInputBlocked
@@ -260,6 +324,7 @@ impl ChatWidget {
                 self.handle_composer_input_result(input_result, had_modal_or_popup);
             }
         }
+        KeyEventAction::None
     }
 
     /// Attach a local image to the composer when the active model supports image inputs.
@@ -299,6 +364,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
+        self.quick_dial_menu = false;
         if items.is_some() {
             // Active input instructions supersede transient feedback from a previous action.
             self.bottom_pane
@@ -367,92 +433,39 @@ impl ChatWidget {
         false
     }
 
-    /// Copy the last response as Markdown with HTML for rich-text destinations.
-    pub(crate) fn copy_last_agent_markdown(&mut self) {
-        self.copy_last_agent_markdown_with(|text| {
-            crate::clipboard_copy::copy_to_clipboard(text, CopyFormat::Markdown)
-        });
-    }
-
-    /// Inner implementation with an injectable clipboard backend for testing.
-    pub(super) fn copy_last_agent_markdown_with(
-        &mut self,
-        copy_fn: impl FnOnce(&str) -> Result<crate::clipboard_copy::CopyOutcome, String>,
-    ) {
-        // The shortcut bypasses composer submission, which normally reveals local feedback.
+    /// Capture the last response for the app to copy before processing another key.
+    pub(super) fn prepare_last_response_copy(&mut self) -> KeyEventAction {
         self.app_event_tx.send(AppEvent::FollowTranscript);
-        match self.transcript.last_agent_markdown.clone() {
+        let action = match self.transcript.last_agent_markdown.as_deref() {
             Some(markdown) if !markdown.is_empty() => {
-                match self.write_clipboard(&markdown, copy_fn) {
-                    Ok(status) => {
-                        self.add_to_history(history_cell::new_info_event(
-                            status.message("last message"),
-                            /*hint*/ None,
-                        ));
-                    }
-                    Err(error) => self.add_to_history(history_cell::new_error_event(format!(
-                        "Copy failed: {error}"
-                    ))),
-                }
+                KeyEventAction::CopyLastResponse(markdown.into())
             }
-            _ => self.add_to_history(history_cell::new_error_event(
-                "No agent response to copy".into(),
-            )),
-        }
-        self.request_redraw();
-    }
-
-    /// Report a transcript copy without adding history and return its outcome to the viewport.
-    pub(crate) fn copy_transcript_selection(
-        &mut self,
-        text: &str,
-    ) -> Result<crate::clipboard_copy::CopyStatus, String> {
-        self.copy_transcript_selection_with(text, |text| {
-            crate::clipboard_copy::copy_to_clipboard(text, CopyFormat::PlainText)
-        })
-    }
-
-    /// The owned viewport renders its own copy feedback above the composer.
-    pub(super) fn copy_transcript_selection_with(
-        &mut self,
-        text: &str,
-        copy_fn: impl FnOnce(&str) -> Result<crate::clipboard_copy::CopyOutcome, String>,
-    ) -> Result<crate::clipboard_copy::CopyStatus, String> {
-        let result = self.write_clipboard(text, copy_fn);
-        let line = match &result {
-            Ok(status) => Line::from(status.message("selection").dim()),
-            Err(error) => Line::from(format!("Copy failed: {error}").red()),
+            _ => {
+                self.add_error_message("No agent response to copy".into());
+                KeyEventAction::None
+            }
         };
-        self.bottom_pane
-            .show_footer_flash(line, Duration::from_secs(/*secs*/ 3));
-        result
+        self.request_redraw();
+        action
     }
 
-    pub(crate) fn copy_selection(&mut self, text: Arc<str>, label: String, format: CopyFormat) {
-        self.copy_selection_with(&text, &label, |text| {
-            crate::clipboard_copy::copy_to_clipboard(text, format)
-        });
+    /// Report a selection copy in the footer without adding history.
+    pub(crate) fn show_selection_copy_result(&mut self, result: CopyResult) {
+        if let Ok(CopyStatus::Pending(id)) = result {
+            self.pending_clipboard = Some(PendingCopy::Selection(id));
+        }
+        self.show_clipboard_flash(&result);
     }
 
-    pub(super) fn copy_selection_with(
-        &mut self,
-        text: &str,
-        label: &str,
-        copy_fn: impl FnOnce(&str) -> Result<crate::clipboard_copy::CopyOutcome, String>,
-    ) {
-        match self.write_clipboard(text, copy_fn) {
+    pub(crate) fn show_copy_result(&mut self, label: &str, result: CopyResult) {
+        if let Ok(CopyStatus::Pending(id)) = result {
+            self.pending_clipboard = Some(PendingCopy::Message(id, label.into()));
+        }
+        match result {
             Ok(status) => self.add_info_message(status.message(label), /*hint*/ None),
             Err(error) => self.add_error_message(format!("Copy failed: {error}")),
         }
         self.request_redraw();
-    }
-
-    fn write_clipboard(
-        &mut self,
-        text: &str,
-        copy_fn: impl FnOnce(&str) -> Result<crate::clipboard_copy::CopyOutcome, String>,
-    ) -> Result<crate::clipboard_copy::CopyStatus, String> {
-        Ok(copy_fn(text)?.store(&mut self.clipboard_lease))
     }
 
     #[cfg(test)]
@@ -528,6 +541,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn handle_paste(&mut self, text: String) {
+        self.cancel_quick_dial_menu();
         if self.external_writer_view && !self.bottom_pane.has_active_view() {
             return;
         }
@@ -538,6 +552,10 @@ impl ChatWidget {
         self.refresh_startup_recovery();
     }
 
+    pub(crate) fn is_in_paste_burst(&self) -> bool {
+        self.bottom_pane.is_in_paste_burst()
+    }
+
     // Returns true if caller should skip rendering this frame (a future frame is scheduled).
     pub(crate) fn handle_paste_burst_tick(&mut self, frame_requester: FrameRequester) -> bool {
         if self.bottom_pane.flush_paste_burst_if_due() {
@@ -545,7 +563,7 @@ impl ChatWidget {
             // A paste just flushed; request an immediate redraw and skip this frame.
             self.request_redraw();
             true
-        } else if self.bottom_pane.is_in_paste_burst() {
+        } else if self.is_in_paste_burst() {
             // While capturing a burst, schedule a follow-up tick and skip this frame
             // to avoid redundant renders between ticks.
             frame_requester.schedule_frame_in(

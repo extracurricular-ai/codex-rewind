@@ -279,9 +279,13 @@ enabled = true
     Ok(())
 }
 
+#[test_case("", true; "without default")]
+#[test_case("[plugins._default]\nenabled = false", false; "default disabled")]
 #[tokio::test]
-async fn plugin_installed_prefers_remote_curated_conflicts_when_remote_plugin_enabled() -> Result<()>
-{
+async fn plugin_installed_prefers_remote_curated_conflicts_when_remote_plugin_enabled(
+    plugin_config: &str,
+    expected_remote_enabled: bool,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_openai_curated_marketplace(codex_home.path(), &["linear", "calendar"])?;
@@ -301,6 +305,8 @@ enabled = true
 
 [plugins."calendar@openai-curated"]
 enabled = true
+
+{plugin_config}
 "#,
             server.uri()
         ),
@@ -356,9 +362,9 @@ enabled = true
         local_marketplace
             .plugins
             .iter()
-            .map(|plugin| plugin.id.clone())
+            .map(|plugin| (plugin.id.clone(), plugin.enabled))
             .collect::<Vec<_>>(),
-        vec!["calendar@openai-curated".to_string()]
+        vec![("calendar@openai-curated".to_string(), true)]
     );
     let remote_marketplace = response
         .marketplaces
@@ -372,6 +378,7 @@ enabled = true
             .map(|plugin| {
                 (
                     plugin.id.clone(),
+                    plugin.enabled,
                     plugin.install_policy_source,
                     plugin.must_show_installation_interstitial,
                 )
@@ -380,11 +387,13 @@ enabled = true
         vec![
             (
                 "linear@openai-curated-remote".to_string(),
+                expected_remote_enabled,
                 Some(PluginInstallPolicySource::WorkspaceSetting),
                 Some(false),
             ),
             (
                 "remote-only@openai-curated-remote".to_string(),
+                expected_remote_enabled,
                 Some(PluginInstallPolicySource::WorkspaceSetting),
                 Some(false),
             ),
@@ -1332,8 +1341,15 @@ async fn plugin_catalogs_skip_invalid_project_config_and_report_cwd_error() -> R
     Ok(())
 }
 
+#[test_case("", "enabled = true", true; "legacy explicit enabled")]
+#[test_case("[plugins._default]\nenabled = false", "mcp_servers.example.tools.search.approval_mode = 'approve'", false; "default disabled approval-only entry")]
+#[test_case("[plugins._default]\nenabled = false", "enabled = true", true; "explicitly enabled overrides default")]
 #[tokio::test]
-async fn plugin_list_includes_install_and_enabled_state_from_config() -> Result<()> {
+async fn plugin_list_includes_install_and_enabled_state_from_config(
+    plugin_default: &str,
+    plugin_settings: &str,
+    expected_enabled: bool,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     let repo_root = TempDir::new()?;
     std::fs::create_dir_all(repo_root.path().join(".git"))?;
@@ -1374,15 +1390,19 @@ async fn plugin_list_includes_install_and_enabled_state_from_config() -> Result<
     )?;
     std::fs::write(
         codex_home.path().join("config.toml"),
-        r#"[features]
+        format!(
+            r#"[features]
 plugins = true
 
+{plugin_default}
+
 [plugins."enabled-plugin@codex-curated"]
-enabled = true
+{plugin_settings}
 
 [plugins."disabled-plugin@codex-curated"]
 enabled = false
 "#,
+        ),
     )?;
 
     let mut mcp = TestAppServer::builder()
@@ -1427,7 +1447,7 @@ enabled = false
     assert_eq!(marketplace.plugins[0].id, "enabled-plugin@codex-curated");
     assert_eq!(marketplace.plugins[0].name, "enabled-plugin");
     assert_eq!(marketplace.plugins[0].installed, true);
-    assert_eq!(marketplace.plugins[0].enabled, true);
+    assert_eq!(marketplace.plugins[0].enabled, expected_enabled);
     assert_eq!(
         marketplace.plugins[0].install_policy,
         PluginInstallPolicy::Available
@@ -1462,6 +1482,35 @@ enabled = false
     assert_eq!(
         marketplace.plugins[2].auth_policy,
         PluginAuthPolicy::OnInstall
+    );
+
+    let request_id = mcp
+        .send_plugin_installed_request(PluginInstalledParams {
+            cwds: Some(vec![AbsolutePathBuf::try_from(repo_root.path())?]),
+            install_suggestion_plugin_names: None,
+        })
+        .await?;
+    let response: PluginInstalledResponse =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(request_id)).await??;
+    let installed = response
+        .marketplaces
+        .into_iter()
+        .find(|entry| entry.path == marketplace.path)
+        .expect("expected installed repo marketplace entry");
+    assert_eq!(
+        installed
+            .plugins
+            .into_iter()
+            .map(|plugin| (plugin.id, plugin.installed, plugin.enabled))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "enabled-plugin@codex-curated".to_string(),
+                true,
+                expected_enabled,
+            ),
+            ("disabled-plugin@codex-curated".to_string(), true, false),
+        ]
     );
     Ok(())
 }
@@ -1912,7 +1961,8 @@ enabled = true
 }
 
 #[tokio::test]
-async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> Result<()> {
+async fn app_server_startup_downloads_installed_plugin_bundles_without_discovery_prefetch()
+-> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
     write_remote_plugin_catalog_config(
@@ -1952,11 +2002,24 @@ async fn app_server_startup_sync_downloads_remote_installed_plugin_bundles() -> 
         .await;
     mount_empty_user_installed_plugins(&server).await;
 
+    for endpoint in [
+        "/backend-api/ps/plugins/list",
+        "/backend-api/plugins/featured",
+        "/backend-api/ps/plugins/suggested/codex",
+    ] {
+        Mock::given(path(endpoint))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
+
     let installed_path = codex_home
         .path()
         .join("plugins/cache/openai-curated-remote/linear/1.2.3");
     let _mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
+        .with_args(&["-c", "features.plugin_discovery_prefetch=false"])
         .with_plugin_startup_tasks()
         .with_env_overrides(&[(TEST_ALLOW_HTTP_REMOTE_PLUGIN_BUNDLE_DOWNLOADS, Some("1"))])
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
@@ -2088,12 +2151,20 @@ enum ProjectPluginConfiguration {
     Invalid,
 }
 
-#[test_case(ProjectPluginConfiguration::None; "without project override")]
-#[test_case(ProjectPluginConfiguration::Disabled; "project disables local plugins")]
-#[test_case(ProjectPluginConfiguration::Invalid; "invalid project preserves remote plugins")]
+#[test_case(ProjectPluginConfiguration::None, None, "plugin_discovery_prefetch = false", true, true; "without discovery prefetch")]
+#[test_case(ProjectPluginConfiguration::Disabled, None, "", true, true; "project disables local plugins")]
+#[test_case(ProjectPluginConfiguration::Invalid, None, "", true, true; "invalid project preserves remote plugins")]
+#[test_case(ProjectPluginConfiguration::None, Some("tpp"), "", true, true; "configured product sku")]
+#[test_case(ProjectPluginConfiguration::None, None, "[plugins._default]\nenabled = false", true, false; "default disabled")]
+#[test_case(ProjectPluginConfiguration::None, None, "[plugins._default]\nenabled = false\n[plugins.\"linear@openai-curated-remote\"]\nenabled = true", true, true; "explicitly enabled")]
+#[test_case(ProjectPluginConfiguration::None, None, "[plugins._default]\nenabled = false\n[plugins.\"linear@openai-curated-remote\"]\nenabled = true", false, false; "source disabled")]
 #[tokio::test]
 async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
     project_configuration: ProjectPluginConfiguration,
+    product_sku: Option<&str>,
+    plugin_config: &str,
+    source_enabled: bool,
+    expected_enabled: bool,
 ) -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
@@ -2101,6 +2172,9 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         codex_home.path(),
         &format!("{}/backend-api/", server.uri()),
     )?;
+    let config_path = codex_home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?;
+    std::fs::write(config_path, format!("{config}\n{plugin_config}\n"))?;
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("chatgpt-token")
@@ -2208,13 +2282,16 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
   }
 }"#;
 
+    let mut global_installed_body: serde_json::Value = serde_json::from_str(global_installed_body)?;
+    global_installed_body["plugins"][0]["enabled"] = serde_json::json!(source_enabled);
+    let expected_product_sku = product_sku.unwrap_or("codex");
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/list"))
         .and(query_param("scope", "GLOBAL"))
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(global_directory_body))
         .mount(&server)
         .await;
@@ -2224,25 +2301,27 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/installed"))
         .and(query_param("scope", "GLOBAL"))
+        .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(global_installed_body))
+        .and(header("oai-product-sku", expected_product_sku))
+        .respond_with(ResponseTemplate::new(200).set_body_json(global_installed_body))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/backend-api/ps/plugins/installed"))
         .and(query_param("scope", "WORKSPACE"))
+        .and(query_param("limit", "200"))
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
-        .and(header("oai-product-sku", "codex"))
+        .and(header("oai-product-sku", expected_product_sku))
         .respond_with(ResponseTemplate::new(200).set_body_string(empty_page_body))
         .mount(&server)
         .await;
@@ -2255,8 +2334,11 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
+    let mut builder = TestAppServer::builder().with_codex_home(codex_home.path());
+    if let Some(product_sku) = product_sku {
+        builder = builder.with_args(&["-c", &format!("apps_mcp_product_sku=\"{product_sku}\"")]);
+    }
+    let mut mcp = builder
         .build_initialized_with_timeout(DEFAULT_TIMEOUT)
         .await?;
 
@@ -2323,7 +2405,7 @@ async fn plugin_list_includes_remote_marketplaces_when_remote_plugin_enabled(
         remote_marketplace.plugins[0].installed_at,
         Some(1_767_312_000)
     );
-    assert_eq!(remote_marketplace.plugins[0].enabled, true);
+    assert_eq!(remote_marketplace.plugins[0].enabled, expected_enabled);
     assert_eq!(
         remote_marketplace.plugins[0].install_policy_source,
         Some(PluginInstallPolicySource::ImplicitCanonicalApp)
@@ -3849,9 +3931,16 @@ trusted_hash = "sha256:unrelated"
     )?)?;
     let hook_states = config["hooks"]["state"].as_table().expect("hook states");
     for hook in &hooks {
+        let (declaration_hash, content_hash) = hook
+            .current_hash
+            .split_once('/')
+            .expect("declaration and content hashes");
         assert_eq!(
-            hook_states[hook.key.as_str()]["trusted_hash"].as_str(),
-            Some(hook.current_hash.as_str())
+            (
+                hook_states[hook.key.as_str()]["trusted_hash"].as_str(),
+                hook_states[hook.key.as_str()]["trusted_content_hash"].as_str(),
+            ),
+            (Some(declaration_hash), Some(content_hash))
         );
     }
     assert!(
@@ -5139,6 +5228,7 @@ async fn wait_for_plugin_hooks(
             let request_id = mcp
                 .send_hooks_list_request(HooksListParams {
                     cwds: vec![cwd.to_path_buf()],
+                    ..Default::default()
                 })
                 .await?;
             let HooksListResponse { data } = mcp.read_response(request_id).await?;

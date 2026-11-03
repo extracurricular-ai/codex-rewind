@@ -158,11 +158,13 @@ pub(super) fn chats() -> super::chats::Chats {
                 thread_id: format!("test-{index}"),
                 estimated_usage_credits_micros: credits * 1_000_000,
                 estimated_usage_usd_micros: None,
+                native_usage_usd_micros: None,
                 groups: vec![ThreadUsageBreakdownGroup {
                     model: Some("GPT-5.6-Sol".into()),
                     reasoning_effort: Some("high".into()),
                     speed: Some("standard".into()),
                     estimated_usage_credits_micros: credits * 1_000_000,
+                    native_usage_usd_micros: None,
                     net_new_input_tokens: None,
                     cached_input_tokens: None,
                     input_tokens: None,
@@ -221,6 +223,7 @@ pub(super) fn view(kind: super::models::AccountKind) -> super::AnalyticsView {
 /// Populate explicit report state after a test chooses its account, period, and grouping.
 pub(super) fn seed_reports(view: &mut super::AnalyticsView) {
     use super::data::Load;
+    view.clock_format = crate::clock_format::ClockFormat::TwentyFourHour;
     if view.business() {
         view.chats = Load::Ready(chats());
     }

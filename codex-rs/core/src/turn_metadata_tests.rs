@@ -9,6 +9,7 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::responses_metadata::FORKED_FROM_ORDINAL_EXCLUSIVE_KEY;
 use crate::responses_metadata::INSTALLATION_ID_KEY;
 use crate::responses_metadata::LEGACY_CODE_MODE_TOOL_NAMES_KEY;
+use crate::responses_metadata::MCP_ATTRIBUTION_CLIENT_METADATA_KEY;
 use crate::responses_metadata::NODE_REPL_AUTO_REVIEW_REQUIRED_KEY;
 use crate::responses_metadata::NODE_REPL_DISABLED_KEY;
 use crate::responses_metadata::PARENT_TURN_ID_KEY;
@@ -181,7 +182,7 @@ async fn detached_memory_responses_metadata_starts_an_independent_root_turn() {
     let turn_id = parsed["turn_id"].as_str().expect("memory turn ID");
     uuid::Uuid::parse_str(turn_id).expect("memory turn ID is a UUID");
     assert_eq!(parsed[ROOT_TURN_ID_KEY], parsed["turn_id"]);
-    let client_metadata = metadata.client_metadata();
+    let client_metadata = metadata.client_metadata(/*include_internal*/ true);
     assert_eq!(
         client_metadata.get("turn_id").map(String::as_str),
         Some(turn_id)
@@ -607,6 +608,72 @@ async fn execution_metadata_applies_captured_settings_to_responses_metadata() {
     assert_eq!(metadata[NODE_REPL_DISABLED_KEY], true);
 }
 
+#[tokio::test]
+async fn guardian_affinity_requires_the_captured_parent_and_stays_out_of_metadata() {
+    let uri = "wss://metadata-affinity.chatgpt.com/backend-api/codex/responses"
+        .parse()
+        .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::SET_COOKIE,
+        http::HeaderValue::from_static("__oailb=private-parent-pin; Path=/; Secure; Max-Age=3600"),
+    );
+    let affinity =
+        codex_http_client::ChatGptRoutingAffinity::from_response(&uri, &headers).unwrap();
+    for (subagent, request_parent, expected) in [
+        (Some("guardian"), "parent", true),
+        (Some("guardian"), "other-parent", false),
+        (None, "parent", false),
+    ] {
+        let (session, mut turn) = make_session_and_context().await;
+        Arc::get_mut(&mut turn.turn_metadata_state)
+            .unwrap()
+            .subagent_header = subagent.map(str::to_owned);
+        turn.turn_metadata_state
+            .update_responsesapi_client_metadata(
+                codex_protocol::turn_input::ResponsesApiClientMetadataUpdate {
+                    replacement: Some(HashMap::from([(
+                        "parent_response_id".to_owned(),
+                        request_parent.to_owned(),
+                    )])),
+                    patch: None,
+                },
+            );
+        session
+            .services
+            .thread_extension_data
+            .insert(crate::guardian::PendingReviewRouting(Some(Arc::new(
+                crate::guardian::ParentResponse {
+                    id: "parent".to_owned(),
+                    routing_affinity: Some(affinity.clone()),
+                },
+            ))));
+        let step = StepContext::for_test(Arc::new(turn));
+        let metadata = session
+            .responses_metadata(&step, CodexResponsesRequestKind::Turn)
+            .await;
+        assert_eq!(
+            metadata
+                .parent_routing_affinity
+                .as_ref()
+                .and_then(|pin| pin.cookie_header(&uri)),
+            expected.then(|| http::HeaderValue::from_static("__oailb=private-parent-pin"))
+        );
+        assert!(
+            !metadata
+                .turn_metadata_json()
+                .unwrap()
+                .contains("private-parent-pin")
+        );
+        assert!(
+            !serde_json::to_string(&metadata.client_metadata(/*include_internal*/ true))
+                .unwrap()
+                .contains("private-parent-pin")
+        );
+        assert!(!format!("{:?}", metadata.compatibility_headers()).contains("private-parent-pin"));
+    }
+}
+
 #[test]
 fn turn_metadata_state_marks_user_input_requested_during_turn_only_for_mcp_request_meta() {
     let temp_dir = TempDir::new().expect("temp dir");
@@ -683,7 +750,7 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
         /*auto_review_enabled*/ false,
         &model_info_from_slug("gpt-5.4"),
     );
-    state.set_responsesapi_client_metadata(HashMap::from([
+    let client_metadata = HashMap::from([
         (
             LEGACY_CODE_MODE_TOOL_NAMES_KEY.to_string(),
             "client-supplied".to_string(),
@@ -708,6 +775,10 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
         (ROOT_TURN_ID_KEY.to_string(), "client-supplied".to_string()),
         ("subagent_kind".to_string(), "client-supplied".to_string()),
         (
+            "history_initialization".to_string(),
+            "client-supplied".to_string(),
+        ),
+        (
             SANDBOX_MODE_KEY.to_string(),
             "danger-full-access".to_string(),
         ),
@@ -717,7 +788,11 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
             "true".to_string(),
         ),
         (NODE_REPL_DISABLED_KEY.to_string(), "true".to_string()),
-    ]));
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
 
     let header = test_turn_metadata_header(&state);
     let json: Value = serde_json::from_str(&header).expect("json");
@@ -730,6 +805,7 @@ fn turn_metadata_state_ignores_client_reserved_metadata_before_start() {
     assert!(json.get("parent_turn_id").is_none());
     assert!(json.get(ROOT_TURN_ID_KEY).is_none());
     assert!(json.get("subagent_kind").is_none());
+    assert!(json.get("history_initialization").is_none());
     assert_eq!(json[SANDBOX_MODE_KEY].as_str(), Some("read-only"));
     assert_eq!(json[AUTO_REVIEW_ENABLED_KEY].as_bool(), Some(false));
     assert_eq!(
@@ -786,7 +862,7 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     state.set_parent_turn_id("parent-turn-a".to_string());
     state.set_root_turn_id("root-turn-a".to_string());
     state.set_turn_trigger("goal".to_string());
-    state.set_responsesapi_client_metadata(HashMap::from([
+    let client_metadata = HashMap::from([
         (
             "codex_security_surface".to_string(),
             "client-supplied".to_string(),
@@ -855,7 +931,11 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
             "turn_started_at_unix_ms".to_string(),
             "client-supplied".to_string(),
         ),
-    ]));
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
     state.set_turn_started_at_unix_ms(/*turn_started_at_unix_ms*/ 1_700_000_000_123);
     let header = test_turn_metadata_header(&state);
     assert!(header.is_ascii());
@@ -958,6 +1038,14 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
     assert!(meta.get(WINDOW_ID_KEY).is_none());
     assert!(meta.get("codex_security_surface").is_none());
     assert!(meta.get(ANALYTICS_ENABLED_KEY).is_none());
+    let extension_meta = state
+        .current_meta_value_for_extension_request(test_mcp_turn_metadata_context())
+        .expect("extension metadata should be present");
+    assert_eq!(extension_meta["codex_security_surface"], "sdk");
+    assert_eq!(extension_meta["source"], " Configured_Source ");
+    assert_eq!(extension_meta[TURN_TRIGGER_KEY], "goal");
+    assert_eq!(extension_meta["model"], "gpt-5.4");
+    assert!(extension_meta.get(TOOL_NAMESPACES_INFO_KEY).is_none());
     assert_eq!(state.workspace_kind().as_deref(), Some("projectless"));
     assert_eq!(
         (state.turn_trigger(), state.codex_turn_source()),
@@ -990,12 +1078,15 @@ fn turn_metadata_state_merges_client_metadata_without_replacing_reserved_fields(
                 .into_iter()
                 .collect(),
         );
-        state.set_responsesapi_client_metadata(
-            client
-                .map(|source| ("source".to_string(), source))
-                .into_iter()
-                .collect(),
-        );
+        state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+            replacement: Some(
+                client
+                    .map(|source| ("source".to_string(), source))
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        });
         assert_eq!(state.codex_turn_source(), expected);
     }
 }
@@ -1030,8 +1121,12 @@ fn turn_metadata_state_bounds_trigger_only_for_analytics() {
     }
 }
 
-#[test]
-fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
+#[test_case::test_case(r#"{"review_target":"RB._~:-opaque"}"#, None; "target")]
+#[test_case::test_case(r#"{"timestamp":1750000000}"#, Some(r#"{"timestamp":1750000000}"#); "legacy_timestamp")]
+fn turn_metadata_state_overlays_compaction_only_on_compaction_requests(
+    continuation: &str,
+    compaction_override: Option<&str>,
+) {
     let temp_dir = TempDir::new().expect("temp dir");
     let cwd = temp_dir.path().abs();
     let permission_profile = PermissionProfile::read_only();
@@ -1050,14 +1145,36 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
         /*auto_review_enabled*/ false,
         &model_info_from_slug("gpt-5.4"),
     );
-    state.set_responses_api_metadata(BTreeMap::from([(
-        "codex_security_surface".to_string(),
-        "sdk".to_string(),
-    )]));
-    state.set_responsesapi_client_metadata(HashMap::from([(
-        "compaction".to_string(),
-        "client-supplied".to_string(),
-    )]));
+    state.set_responses_api_metadata(BTreeMap::from([
+        ("codex_security_surface".to_string(), "sdk".to_string()),
+        (
+            "misalignment_override".to_string(),
+            r#"{"review_target":"RC"}"#.to_string(),
+        ),
+    ]));
+    let ordinary_json: Value =
+        serde_json::from_str(&test_turn_responses_metadata_json(&state, "thread-a:1"))
+            .expect("json");
+    assert!(ordinary_json.get("misalignment_override").is_none());
+    let client_metadata = HashMap::from([
+        ("compaction".to_string(), "client-supplied".to_string()),
+        (
+            "misalignment_override".to_string(),
+            continuation.to_string(),
+        ),
+    ]);
+    state.update_responsesapi_client_metadata(ResponsesApiClientMetadataUpdate {
+        replacement: Some(client_metadata),
+        ..Default::default()
+    });
+
+    let mcp_metadata = state
+        .current_meta_value_for_mcp_request(test_mcp_turn_metadata_context())
+        .expect("MCP metadata");
+    assert_eq!(
+        mcp_metadata["misalignment_override"].as_str(),
+        compaction_override
+    );
 
     let compact_header = test_compaction_responses_metadata_json(
         &state,
@@ -1075,6 +1192,10 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
     assert_eq!(compact_json[WINDOW_ID_KEY].as_str(), Some("thread-a:2"));
     assert_eq!(compact_json["codex_security_surface"].as_str(), Some("sdk"));
     assert_eq!(
+        compact_json["misalignment_override"].as_str(),
+        compaction_override
+    );
+    assert_eq!(
         compact_json["compaction"],
         serde_json::json!({
             "trigger": "auto",
@@ -1087,6 +1208,7 @@ fn turn_metadata_state_overlays_compaction_only_on_compaction_requests() {
 
     let regular_header = test_turn_responses_metadata_json(&state, "thread-a:3");
     let regular_json: Value = serde_json::from_str(&regular_header).expect("json");
+    assert_eq!(regular_json["misalignment_override"], continuation);
     assert_eq!(regular_json["request_kind"].as_str(), Some("turn"));
     assert_eq!(regular_json[WINDOW_ID_KEY].as_str(), Some("thread-a:3"));
     assert_eq!(regular_json["codex_security_surface"].as_str(), Some("sdk"));
@@ -1100,6 +1222,7 @@ fn responses_api_metadata_rejects_reserved_keys() {
         TURN_TRIGGER_KEY,
         WINDOW_ID_KEY,
         CONTEXT_WINDOW_ID_KEY,
+        MCP_ATTRIBUTION_CLIENT_METADATA_KEY,
     ] {
         assert_eq!(
             validate_extra_metadata(
